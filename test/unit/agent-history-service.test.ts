@@ -241,6 +241,23 @@ describe("agent history service", () => {
     });
   });
 
+  test("forwards firstSeenAtMs through resolveCompactHistory to discovery", async () => {
+    const discovered = ref(await sourceFile("discovered.jsonl"));
+    const fakeReader = reader();
+    let discoveryInput: AgentHistoryLookupInput | undefined;
+    const svc = createAgentHistoryService({
+      discover: async (input) => {
+        discoveryInput = input;
+        return discovered;
+      },
+      readers: [fakeReader.fake],
+    });
+
+    await svc.resolveCompactHistory({ ...lookup, firstSeenAtMs: 123 }, { forceDiscovery: true });
+
+    expect(discoveryInput?.firstSeenAtMs).toBe(123);
+  });
+
   test("uses session-specific cache keys for OpenCode DB refs", () => {
     const first: AgentHistoryRef = {
       kind: "discovered_file",

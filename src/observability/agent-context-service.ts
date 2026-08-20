@@ -187,6 +187,7 @@ function historyLookup(agent: AgentIndexRecord) {
     agent: agent.agent,
     agentSession: agent.agentSession,
     cwd: agent.cwd,
+    firstSeenAtMs: agent.firstSeenAt.getTime(),
     foregroundCwd: agent.foregroundCwd,
   };
 }

@@ -4,11 +4,21 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts.js";
 
+// A pane agent's authoritative session ref (herdr detection or shepherd-pi
+// registration) may not have landed when the agent is first observed, so
+// discovery falls back to cwd-based guessing. A session file untouched since
+// before the agent was first seen cannot be that agent's live session.
+// Herdr observation delay is on the second scale, so a 10-minute grace window
+// is far more generous than needed; it only discards sessions that had already
+// stopped being written well before the agent appeared.
+export const DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
+
 export type AgentHistoryLookupInput = {
   agent: string | null;
   agentSession: AgentSessionRef | null;
   cwd: string | null;
   foregroundCwd: string | null;
+  firstSeenAtMs?: number;
   homeDir?: string;
 };
 
@@ -61,13 +71,19 @@ export async function discoverAgentHistory(
     const ref = discoverOpenCodeSession({ cwd, homeDir, sessionId: null });
     if (ref) return ref;
   }
-  const ranked = candidates.sort((a, b) => {
-    const aMatch = cwd && a.cwd === cwd ? 1 : 0;
-    const bMatch = cwd && b.cwd === cwd ? 1 : 0;
-    if (aMatch !== bMatch) return bMatch - aMatch;
-    if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
-    return a.path.localeCompare(b.path);
-  });
+  const ranked = candidates
+    .filter(
+      (candidate) =>
+        input.firstSeenAtMs === undefined ||
+        candidate.mtimeMs >= input.firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS,
+    )
+    .sort((a, b) => {
+      const aMatch = cwd && a.cwd === cwd ? 1 : 0;
+      const bMatch = cwd && b.cwd === cwd ? 1 : 0;
+      if (aMatch !== bMatch) return bMatch - aMatch;
+      if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
+      return a.path.localeCompare(b.path);
+    });
   const best = ranked[0];
   return best
     ? { kind: "discovered_file", path: best.path, source: best.source, value: best.path }

@@ -1,9 +1,13 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vitest";
-import { discoverAgentHistory, historySourceFromSessionRef } from "@/agent-history/discovery.js";
+import {
+  DISCOVERY_RECENCY_GRACE_MS,
+  discoverAgentHistory,
+  historySourceFromSessionRef,
+} from "@/agent-history/discovery.js";
 
 const tempDirs: string[] = [];
 
@@ -138,6 +142,152 @@ describe("agent history discovery", () => {
       kind: "discovered_file",
       path: sessionPath,
       source: "gemini-json",
+      value: sessionPath,
+    });
+  });
+
+  test("drops stale candidates whose mtime predates firstSeenAtMs by more than the grace window", async () => {
+    const homeDir = await tempHome("shepherd-codex-stale-home-");
+    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
+    await mkdir(dir, { recursive: true });
+    const path = join(
+      dir,
+      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
+    );
+    await writeFile(
+      path,
+      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
+    );
+    await utimes(path, new Date(1000), new Date(1000));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "codex",
+        agentSession: null,
+        cwd: "/repo",
+        firstSeenAtMs: Date.UTC(2026, 6, 9, 14, 0, 0),
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  test("keeps a candidate whose mtime is at or after firstSeenAtMs", async () => {
+    const homeDir = await tempHome("shepherd-codex-recent-home-");
+    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
+    await mkdir(dir, { recursive: true });
+    const path = join(
+      dir,
+      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
+    );
+    await writeFile(
+      path,
+      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
+    );
+    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
+    const mtimeMs = firstSeenAtMs + 60_000;
+    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "codex",
+        agentSession: null,
+        cwd: "/repo",
+        firstSeenAtMs,
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toMatchObject({
+      kind: "discovered_file",
+      path,
+      source: "codex-jsonl",
+      value: path,
+    });
+  });
+
+  test("keeps a candidate whose mtime is before firstSeenAtMs but within the grace window", async () => {
+    const homeDir = await tempHome("shepherd-codex-grace-home-");
+    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
+    await mkdir(dir, { recursive: true });
+    const path = join(
+      dir,
+      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
+    );
+    await writeFile(
+      path,
+      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
+    );
+    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
+    const mtimeMs = firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS + 1_000; // 1s inside the grace window
+    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "codex",
+        agentSession: null,
+        cwd: "/repo",
+        firstSeenAtMs,
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toMatchObject({
+      kind: "discovered_file",
+      path,
+      source: "codex-jsonl",
+      value: path,
+    });
+  });
+
+  test("keeps old behavior when firstSeenAtMs is omitted", async () => {
+    const homeDir = await tempHome("shepherd-codex-noftime-home-");
+    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
+    await mkdir(dir, { recursive: true });
+    const path = join(
+      dir,
+      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
+    );
+    await writeFile(
+      path,
+      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
+    );
+    await utimes(path, new Date(1000), new Date(1000));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "codex",
+        agentSession: null,
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toMatchObject({
+      kind: "discovered_file",
+      path,
+      source: "codex-jsonl",
+      value: path,
+    });
+  });
+
+  test("leaves the authoritative agentSession path resolve unaffected by firstSeenAtMs", async () => {
+    const homeDir = await tempHome("shepherd-path-home-");
+    const sessionPath = join(homeDir, ".pi", "agent", "sessions", "ses-1.jsonl");
+    await mkdir(join(homeDir, ".pi", "agent", "sessions"), { recursive: true });
+    await writeFile(sessionPath, "{}");
+    await utimes(sessionPath, new Date(1000), new Date(1000));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: { agent: "pi", kind: "path", source: "herdr:pi", value: sessionPath },
+        cwd: null,
+        firstSeenAtMs: Date.UTC(2026, 6, 9, 14, 0, 0),
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toMatchObject({
+      kind: "agent_session",
+      path: sessionPath,
+      source: "pi-jsonl",
       value: sessionPath,
     });
   });
