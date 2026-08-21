@@ -722,7 +722,12 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
           state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
           setShepherdUi(ctx);
         } catch {
-          failBatch();
+          // Keep the event pending so the next Shepherd round retries the acknowledgement.
+          // Acknowledgement failure must not block delivery of the main turn.
+          ctx.ui.notify?.(
+            "Shepherd couldn’t acknowledge agent updates · updates remain pending",
+            "warning",
+          );
           break;
         }
       }

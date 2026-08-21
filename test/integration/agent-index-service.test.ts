@@ -198,6 +198,83 @@ describe("AgentIndexService", () => {
     unknownHarness.sqlite.close();
   });
 
+  test("deduplicates a refresh transition repeated by a realtime event in the same session", async () => {
+    const harness = openObservabilityDbHarness();
+    let current = oneAgent("idle", 10);
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return current;
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    current = oneAgent("working", 11);
+    await index.refreshHerdrSession(sessionInput());
+    await index.handleHerdrEvent({
+      event: { agent_status: "working", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+
+    const events = harness.agentEvents
+      .listAfter({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+      })
+      .filter((event) => event.type === "agent.status.changed");
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({
+      payload: expect.objectContaining({ from: "idle", to: "working" }),
+      type: "agent.status.changed",
+    });
+    harness.sqlite.close();
+  });
+
+  test("preserves opposite status transitions repeated within the same second", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("idle", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    for (const status of ["working", "idle", "working"] as const) {
+      await index.handleHerdrEvent({
+        event: { agent_status: status, pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInput(),
+      });
+    }
+
+    const events = harness.agentEvents
+      .listAfter({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+      })
+      .filter((event) => event.type === "agent.status.changed");
+    expect(events).toHaveLength(3);
+    expect(
+      events.map((event) => {
+        const payload = event.payload as { from: string; to: string };
+        return { from: payload.from, to: payload.to };
+      }),
+    ).toEqual([
+      { from: "idle", to: "working" },
+      { from: "working", to: "idle" },
+      { from: "idle", to: "working" },
+    ]);
+    harness.sqlite.close();
+  });
+
   test("coalesces same-epoch refreshes and queues a later refresh after a status mutation", async () => {
     const harness = openObservabilityDbHarness();
     let snapshots = 0;

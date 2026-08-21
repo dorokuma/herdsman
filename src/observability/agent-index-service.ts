@@ -62,7 +62,6 @@ export class AgentIndexService {
     { epoch: number; promise: Promise<AgentIndexRefreshResult> }
   >();
   readonly #sessionOperationTail = new Map<string, Promise<void>>();
-  #observationSequence = 0;
 
   constructor(options: {
     clientFactory?: (input: {
@@ -215,7 +214,6 @@ export class AgentIndexService {
             agent,
             compactHistory:
               refreshed?.compactHistory ?? this.#context.getAgentSnapshot(agent.id)?.compactHistory,
-            evidence: { id: `snapshot:${agent.lastSeenAt.getTime()}` },
             from: prior.agentStatus,
             to: agent.agentStatus,
           });
@@ -280,7 +278,6 @@ export class AgentIndexService {
       const statusEvent = this.#appendStatusEvents({
         agent: current,
         compactHistory: refreshed.snapshot.compactHistory,
-        evidence: event,
         from,
         to,
       });
@@ -344,14 +341,17 @@ export class AgentIndexService {
     compactHistory:
       | NonNullable<ReturnType<AgentContextService["getAgentSnapshot"]>>["compactHistory"]
       | undefined;
-    evidence: Record<string, unknown>;
     from: AgentStatus;
     to: AgentStatus;
   }): AgentEventRecord | undefined {
     if (input.from === input.to || !input.compactHistory) return undefined;
-    const observationId =
-      eventIdentity(input.evidence) ??
-      `observed:${input.agent.lastSeenAt.getTime()}:${this.#observationSequence++}`;
+    const latest = this.#stores.agentEvents.latestStatusTransition(
+      input.agent.id,
+      input.agent.herdrSessionName,
+    );
+    if (latest && statusTransitionMatches(latest, input.from, input.to)) return undefined;
+    const observationId = `transition:${latest?.id ?? 0}`;
+
     let lastEvent = this.#stores.agentEvents.append({
       agentId: input.agent.id,
       compactHistory: input.compactHistory,
@@ -498,12 +498,13 @@ function idempotencyKey(
   return `${type}:${agent.herdrSessionName}:${agent.paneId}:${from}:${to}:${observationId}`;
 }
 
-function eventIdentity(event: Record<string, unknown>): string | null {
-  for (const value of [event.seq, event.id, event.timestamp]) {
-    if (typeof value === "string" && value.length > 0) return value;
-    if (typeof value === "number" && Number.isFinite(value)) return String(value);
-  }
-  return null;
+function statusTransitionMatches(
+  event: AgentEventRecord,
+  from: AgentStatus,
+  to: AgentStatus,
+): boolean {
+  const eventPayload = event.payload as { from?: AgentStatus; to?: AgentStatus };
+  return eventPayload.from === from && eventPayload.to === to;
 }
 
 function record(value: unknown): Record<string, unknown> {

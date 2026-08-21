@@ -91,19 +91,33 @@ describe("shepherd-pi orchestrator bridge", () => {
     })(pi);
     const ctx = fakeCtx();
 
-    await pi.emit("session_start", {}, ctx);
-    expect(clients).toBe(0);
-    expect(ctx.statuses.get("shepherd")).toBeUndefined();
-    await pi.command("", ctx);
-    expect(ctx.notifications.at(-1)).toEqual(["Shepherd requires a Herdr workspace", "error"]);
+    const previous = {
+      HERDR_ENV: process.env.HERDR_ENV,
+      HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+      HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
+      HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID,
+    };
+    delete process.env.HERDR_ENV;
+    delete process.env.HERDR_PANE_ID;
+    delete process.env.HERDR_SOCKET_PATH;
+    delete process.env.HERDR_WORKSPACE_ID;
+    try {
+      await pi.emit("session_start", {}, ctx);
+      expect(clients).toBe(0);
+      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      await pi.command("", ctx);
+      expect(ctx.notifications.at(-1)).toEqual(["Shepherd requires a Herdr workspace", "error"]);
+    } finally {
+      restoreEnv(previous);
+    }
 
-    const previous = withHerdrEnv();
+    const herdrPrevious = withHerdrEnv();
     delete process.env.HERDR_PANE_ID;
     try {
       await pi.emit("session_start", {}, ctx);
       expect(clients).toBe(0);
     } finally {
-      restoreEnv(previous);
+      restoreEnv(herdrPrevious);
     }
   });
 
@@ -1135,7 +1149,7 @@ describe("shepherd-pi orchestrator bridge", () => {
     }
   });
 
-  test("suppresses automatic retry after acknowledgement failure until a newer outcome", async () => {
+  test("retries acknowledgement failure on the next Shepherd round", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const baseResponse = client.response;
@@ -1154,12 +1168,11 @@ describe("shepherd-pi orchestrator bridge", () => {
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.customMessages).toHaveLength(2);
 
       client.emitStream({ method: "agent.event", params: { event: event(87, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.customMessages).toHaveLength(2);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [87] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

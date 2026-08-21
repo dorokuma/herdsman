@@ -68,6 +68,21 @@ export class AgentEventStore {
     return this.get(Number(result.lastInsertRowid));
   }
 
+  // Agent rows are session-scoped; query ownership is constrained by agent_id and herdr_session_name.
+  latestStatusTransition(
+    agentId: string,
+    herdrSessionName: string,
+  ): AgentEventRecord | undefined {
+    const row = this.#sqlite
+      .prepare(
+        `select * from agent_events
+         where agent_id = ? and herdr_session_name = ? and type = 'agent.status.changed'
+         order by id desc limit 1`,
+      )
+      .get(agentId, herdrSessionName) as AgentEventRow | undefined;
+    return row ? mapAgentEvent(row) : undefined;
+  }
+
   listAfter(
     input: AgentQueryScope & { afterEventId?: number; limit?: number },
   ): AgentEventRecord[] {
