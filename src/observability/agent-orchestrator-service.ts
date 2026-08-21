@@ -16,6 +16,7 @@ export type AgentOrchestratorChange = {
 
 export class AgentOrchestratorService {
   readonly #agentEvents: AgentEventStore;
+  readonly #agents: AgentStore;
   readonly #scopes: AgentOrchestratorScopeStore;
 
   constructor(options: {
@@ -24,6 +25,7 @@ export class AgentOrchestratorService {
     scopes: AgentOrchestratorScopeStore;
   }) {
     this.#agentEvents = options.agentEvents;
+    this.#agents = options.agents;
     this.#scopes = options.scopes;
   }
 
@@ -52,6 +54,11 @@ export class AgentOrchestratorService {
     if (!state?.owner || state.owner.terminalId !== input.terminalId) return [];
 
     const limit = input.limit ?? 100;
+    const validAgents = new Map(
+      this.#agents
+        .list(input)
+        .map((agent) => [agent.id, agent.paneId]),
+    );
     const pending: AgentEventRecord[] = [];
     let afterEventId = state.ackedEventId;
     let scanned = 0;
@@ -65,7 +72,14 @@ export class AgentOrchestratorService {
       scanned += batch.length;
       afterEventId = batch.at(-1)?.id ?? afterEventId;
       for (const event of batch) {
-        if (event.terminalId !== null && event.terminalId !== input.terminalId) pending.push(event);
+        // Strict identity prevents an old event from being delivered after a pane is rebound.
+        const valid =
+          event.agentId !== null &&
+          validAgents.get(event.agentId) === event.paneId &&
+          event.herdrSessionName === input.herdrSessionName;
+        if (valid && event.terminalId !== null && event.terminalId !== input.terminalId) {
+          pending.push(event);
+        }
         if (pending.length === limit) break;
       }
     }

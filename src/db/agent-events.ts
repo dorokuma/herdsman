@@ -117,6 +117,14 @@ export class AgentEventStore {
            and workspace_id = ?
            and terminal_id is not null
            and terminal_id != ?
+           and agent_id is not null
+           and exists (
+             select 1 from agents
+             where agents.id = agent_events.agent_id
+               and agents.herdr_session_name = agent_events.herdr_session_name
+               and agents.workspace_id = agent_events.workspace_id
+               and agents.pane_id = agent_events.pane_id
+           )
          order by id asc
          limit 1`,
       )

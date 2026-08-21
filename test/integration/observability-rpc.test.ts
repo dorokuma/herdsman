@@ -274,7 +274,7 @@ describe("ObservabilityRpcServer", () => {
       generic.request("agent.events", { workspaceId: "wB" }),
     ]);
 
-    const beforeOwner = appendRoutedEvent(harness, "term_agent", "wB");
+    const beforeOwner = appendRoutedEvent(harness, "term_b", "wB");
     server.publishAgentEvent(beforeOwner);
     await tick();
     expect(piA.notifications).toEqual([]);
@@ -291,15 +291,20 @@ describe("ObservabilityRpcServer", () => {
     expect(piC.notifications).toEqual([]);
     expect(generic.notifications).toEqual([]);
 
-    const agentEvent = appendRoutedEvent(harness, "term_agent", "wB");
+    const agentEvent = appendRoutedEvent(harness, "term_b", "wB");
     server.publishAgentEvent(agentEvent);
     await expect(piA.waitForNotification("agent.event")).resolves.toMatchObject({
       params: { event: { id: agentEvent.id } },
     });
     expect(piB.notifications).toEqual([]);
+    await expect(
+      piA.request("agent.notifications.ack", { eventId: agentEvent.id }),
+    ).resolves.toMatchObject({
+      acknowledged: true,
+      state: { ackedEventId: agentEvent.id },
+    });
 
     const self = appendRoutedEvent(harness, "term_a", "wB");
-    server.publishAgentEvent(self);
     const unknownTerminal = harness.agentEvents.append({
       herdrSessionName: "default",
       payload: {},
@@ -314,10 +319,7 @@ describe("ObservabilityRpcServer", () => {
     const replacement = await piB.request("agent.orchestrator.set", { enabled: true });
     expect(replacement).toMatchObject({
       changed: true,
-      events: [
-        expect.objectContaining({ id: agentEvent.id }),
-        expect.objectContaining({ id: self.id }),
-      ],
+      events: [expect.objectContaining({ id: self.id })],
       state: { owner: { terminalId: "term_b" } },
     });
     await Promise.all([
@@ -353,7 +355,7 @@ describe("ObservabilityRpcServer", () => {
       piB.waitForNotification("agent.orchestrator.changed"),
     ]);
 
-    const ownerless = appendRoutedEvent(harness, "term_agent", "wB");
+    const ownerless = appendRoutedEvent(harness, "term_b", "wB");
     await expect(piA.request("agent.orchestrator.set", { enabled: true })).resolves.toMatchObject({
       changed: true,
       events: [],
@@ -611,7 +613,10 @@ function appendRoutedEvent(
   terminalId: string,
   workspaceId: string,
 ) {
+  const agent = harness.agents.findByTerminal({ herdrSessionName: "default", terminalId });
   return harness.agentEvents.append({
+    agentId: agent?.id ?? null,
+    paneId: agent?.paneId ?? null,
     herdrSessionName: "default",
     payload: {},
     terminalId,

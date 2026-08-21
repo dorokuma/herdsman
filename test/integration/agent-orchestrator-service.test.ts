@@ -25,13 +25,41 @@ function appendEvent(
   harness: ReturnType<typeof openObservabilityDbHarness>,
   input: { terminalId: string; workspaceId?: string },
 ) {
-  return harness.agentEvents.append({
+  const workspaceId = input.workspaceId ?? "wB";
+  const paneId = `${workspaceId}:${input.terminalId}`;
+  const existing = harness.agents.list({ all: true, herdrSessionName: "default" }).map((agent) => ({
+    agent: agent.agent,
+    agent_status: agent.agentStatus,
+    focused: agent.focused,
+    name: agent.name,
+    pane_id: agent.paneId,
+    terminal_id: agent.terminalId,
+    workspace_id: agent.workspaceId,
+  }));
+  const agent = harness.agents.replaceForSession({
     herdrSessionName: "default",
-    paneId: `${input.workspaceId ?? "wB"}:pane`,
+    agents: [
+      ...existing,
+      {
+        agent: "codex",
+        agent_status: "working",
+        focused: false,
+        name: input.terminalId,
+        pane_id: paneId,
+        terminal_id: input.terminalId,
+        workspace_id: workspaceId,
+      },
+    ],
+  }).find((candidate) => candidate.terminalId === input.terminalId);
+  if (!agent) throw new Error("Expected indexed agent");
+  return harness.agentEvents.append({
+    agentId: agent.id,
+    herdrSessionName: "default",
+    paneId,
     payload: {},
     terminalId: input.terminalId,
     type: "agent.done",
-    workspaceId: input.workspaceId ?? "wB",
+    workspaceId,
   });
 }
 
@@ -117,6 +145,74 @@ describe("AgentOrchestratorService", () => {
     expect(() => service.ack({ ...scope, eventId: later.id, terminalId: "term_b" })).toThrow(
       "Only the current orchestrator can acknowledge notifications",
     );
+  });
+
+  test("filters deleted and rebound agents, and ack advances past filtered events", () => {
+    const { harness, service } = openService();
+    const initial = harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [{ agent: "codex", pane_id: "wB:p1", terminal_id: "term_agent", workspace_id: "wB" }],
+    })[0];
+    if (!initial) throw new Error("Expected indexed agent");
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const deleted = harness.agentEvents.append({
+      agentId: initial.id,
+      herdrSessionName: "default",
+      paneId: "wB:p1",
+      payload: {},
+      terminalId: "term_agent",
+      type: "agent.done",
+      workspaceId: "wB",
+    });
+    harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
+    const visible = harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [{ agent: "codex", pane_id: "wB:p2", terminal_id: "term_agent", workspace_id: "wB" }],
+    })[0];
+    if (!visible) throw new Error("Expected indexed agent");
+    const visibleEvent = harness.agentEvents.append({
+      agentId: visible.id,
+      herdrSessionName: "default",
+      paneId: "wB:p2",
+      payload: {},
+      terminalId: "term_agent",
+      type: "agent.done",
+      workspaceId: "wB",
+    });
+    expect(harness.sqlite.prepare("select agent_id, pane_id from agent_events").all()).toHaveLength(2);
+    expect(harness.agents.list({ herdrSessionName: "default", workspaceId: "wB" })).toHaveLength(1);
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: visibleEvent.id }),
+    ]);
+    expect(service.ack({ ...scope, eventId: visibleEvent.id, terminalId: "term_owner" }).ackedEventId).toBe(
+      visibleEvent.id,
+    );
+    expect(deleted.id).toBeLessThan(visibleEvent.id);
+  });
+
+  test("does not deliver an event after its agent is rebound to another pane", () => {
+    const { harness, service } = openService();
+    const agent = harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [{ agent: "codex", pane_id: "wB:p1", terminal_id: "term_agent", workspace_id: "wB" }],
+    })[0];
+    if (!agent) throw new Error("Expected indexed agent");
+    const event = harness.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      paneId: "wB:p1",
+      payload: {},
+      terminalId: "term_agent",
+      type: "agent.done",
+      workspaceId: "wB",
+    });
+    harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [{ agent: "codex", pane_id: "wB:p2", terminal_id: "term_agent", workspace_id: "wB" }],
+    });
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([]);
+    expect(event.id).toBeGreaterThan(0);
   });
 
   test("moves ownership with target ownerless-drop and active-owner preservation", () => {

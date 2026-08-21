@@ -132,6 +132,15 @@ export class AgentStore {
         }
       }
 
+      const removedIds = existing
+        .map((agent) => agent.id)
+        .filter((id) => !retainedIds.includes(id));
+      if (removedIds.length > 0) {
+        const placeholders = removedIds.map(() => "?").join(", ");
+        this.#sqlite
+          .prepare(`delete from agent_context_snapshots where agent_id in (${placeholders})`)
+          .run(...removedIds);
+      }
       if (retainedIds.length === 0) {
         this.#sqlite
           .prepare("delete from agents where herdr_session_name = ?")

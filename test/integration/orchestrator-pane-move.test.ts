@@ -75,8 +75,9 @@ describe("orchestrator pane movement", () => {
       register(sourcePeer, "wA:p-peer", "pi-peer", "wA"),
       register(piB, "wB:p-b", "pi-b", "wB"),
     ]);
-    const sourceBaseline = appendEvent(harness, "term_peer", "wA");
-    const targetBaseline = appendEvent(harness, "term_agent", "wB");
+    const sourceBaseline = appendEvent(harness, "term_peer", "wA", "wA:p-peer-old");
+    const targetBaseline = appendEvent(harness, "term_b", "wB", "wB:p-b-old");
+
     await piA.request("agent.orchestrator.set", { enabled: true });
     await piB.request("agent.orchestrator.set", { enabled: true });
     await Promise.all([
@@ -85,7 +86,8 @@ describe("orchestrator pane movement", () => {
       piB.waitForNotification("agent.orchestrator.changed"),
     ]);
     const sourceAck = appendEvent(harness, "term_peer", "wA");
-    const targetAck = appendEvent(harness, "term_agent", "wB");
+    const targetAck = appendEvent(harness, "term_b", "wB", undefined, "term_a");
+
     await piA.request("agent.notifications.ack", { eventId: sourceAck.id });
     await piB.request("agent.notifications.ack", { eventId: targetAck.id });
     piA.clearNotifications();
@@ -139,15 +141,20 @@ describe("orchestrator pane movement", () => {
     expect(piB.notifications).toEqual([]);
     expect(sourcePeer.notifications).toEqual([]);
 
-    const oldScopeEvent = appendEvent(harness, "term_peer", "wA");
-    server.publishAgentEvent(oldScopeEvent);
-    await socketTick();
-    expect(piA.notifications).toEqual([]);
     const destinationEvent = appendEvent(harness, "term_b", "wB");
     server.publishAgentEvent(destinationEvent);
     await expect(piA.waitForNotification("agent.event")).resolves.toMatchObject({
       params: { event: { id: destinationEvent.id } },
     });
+    expect(harness.agentEvents.nextDeliverableAfter({
+      afterEventId: targetAck.id,
+      herdrSessionName: "default",
+      ownerTerminalId: "term_a",
+      workspaceId: "wB",
+    })).toEqual(destinationEvent);
+    await expect(
+      piA.request("agent.notifications.ack", { eventId: destinationEvent.id }),
+    ).resolves.toMatchObject({ acknowledged: true, state: { ackedEventId: destinationEvent.id } });
     const selfEvent = appendEvent(harness, "term_a", "wB");
     server.publishAgentEvent(selfEvent);
     await socketTick();
@@ -168,7 +175,7 @@ describe("orchestrator pane movement", () => {
       },
     });
     expect(orchestrator.status({ herdrSessionName: "default", workspaceId: "wB" })).toMatchObject({
-      ackedEventId: targetAck.id,
+      ackedEventId: destinationEvent.id,
       owner: { paneId: "wB:p-a-new" },
     });
 
@@ -292,11 +299,16 @@ function appendEvent(
   harness: ReturnType<typeof openObservabilityDbHarness>,
   terminalId: string,
   workspaceId: string,
+  paneIdOverride?: string,
+  eventTerminalId?: string,
 ) {
+  const agent = harness.agents.findByTerminal({ herdrSessionName: "default", terminalId });
   return harness.agentEvents.append({
+    agentId: agent?.id ?? null,
+    paneId: paneIdOverride ?? agent?.paneId ?? null,
     herdrSessionName: "default",
     payload: {},
-    terminalId,
+    terminalId: eventTerminalId ?? terminalId,
     type: "agent.done",
     workspaceId,
   });

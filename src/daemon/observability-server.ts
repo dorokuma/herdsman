@@ -201,6 +201,7 @@ export class ObservabilityRpcServer {
     for (const [socket, presence] of this.#piPresenceBySocket) {
       if (presence.herdrSessionName !== input.herdrSessionName) continue;
       const agent = byTerminal.get(presence.terminalId);
+      // Missing terminal owners are retained until an explicit disconnect/release; this refresh only relocates known agents.
       if (!agent) continue;
       this.#piPresenceBySocket.set(socket, {
         ...presence,
@@ -215,6 +216,7 @@ export class ObservabilityRpcServer {
       const current = this.#orchestrator.status(ownerState);
       if (current?.owner?.terminalId !== owner.terminalId) continue;
       const agent = byTerminal.get(owner.terminalId);
+      // Missing terminal owners are retained until an explicit disconnect/release; this refresh only relocates known agents.
       if (!agent) continue;
       if (agent.workspaceId === ownerState.workspaceId) {
         if (agent.paneId === owner.paneId) continue;
