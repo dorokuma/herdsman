@@ -352,3 +352,64 @@ describe("AgentOrchestratorService", () => {
     expect(service.persistedOwners()).toHaveLength(2);
   });
 });
+
+describe("AgentOrchestratorService ack regression", () => {
+  test("acknowledges a delivered event after its worker pane is retired", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_worker" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: event.id }),
+    ]);
+    harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
+
+    expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toMatchObject({
+      ackedEventId: event.id,
+    });
+  });
+
+  test("acknowledges a delivered event when no later event is deliverable", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_worker" });
+    harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
+
+    expect(
+      service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" }).ackedEventId,
+    ).toBe(event.id);
+  });
+
+  test("still rejects acknowledging past a later deliverable event", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const first = appendEvent(harness, { terminalId: "term_first" });
+    const second = appendEvent(harness, { terminalId: "term_second" });
+
+    expect(() => service.ack({ ...scope, eventId: second.id, terminalId: "term_owner" })).toThrow(
+      "Only the next pending orchestrator event can be acknowledged",
+    );
+    expect(first.id).toBeLessThan(second.id);
+  });
+
+  test("rejects nonexistent and cross-scope event ids", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const otherScopeEvent = appendEvent(harness, { terminalId: "term_other", workspaceId: "wC" });
+
+    expect(() =>
+      service.ack({ ...scope, eventId: otherScopeEvent.id, terminalId: "term_owner" }),
+    ).toThrow("Only the next pending orchestrator event can be acknowledged");
+    expect(() =>
+      service.ack({ ...scope, eventId: otherScopeEvent.id + 10_000, terminalId: "term_owner" }),
+    ).toThrow("Only the next pending orchestrator event can be acknowledged");
+  });
+
+  test("repeated acknowledgement is idempotent and never moves the cursor backward", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_worker" });
+    const first = service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" });
+
+    expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toEqual(first);
+  });
+});

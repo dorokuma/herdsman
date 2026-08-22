@@ -91,14 +91,33 @@ export class AgentOrchestratorService {
       throw new Error("Only the current orchestrator can acknowledge notifications");
     }
     if (input.eventId <= state.ackedEventId) return state;
+    let event: AgentEventRecord;
+    try {
+      event = this.#agentEvents.get(input.eventId);
+    } catch {
+      throw new Error("Only the next pending orchestrator event can be acknowledged");
+    }
+    if (
+      event.herdrSessionName !== input.herdrSessionName ||
+      event.workspaceId !== input.workspaceId ||
+      event.deliverable !== 1
+    ) {
+      throw new Error("Only the next pending orchestrator event can be acknowledged");
+    }
+    const eventAgent = event.agentId ? this.#agents.get(event.agentId) : undefined;
+    if (eventAgent && !isDeliverableAgentEvent(event, eventAgent, input, input.terminalId)) {
+      throw new Error("Only the next pending orchestrator event can be acknowledged");
+    }
     const next = this.#agentEvents.nextDeliverableAfter({
       ...input,
       afterEventId: state.ackedEventId,
       ownerTerminalId: input.terminalId,
       getAgent: (agentId) => this.#agents.get(agentId),
     });
-    if (next?.id === input.eventId) return this.#scopes.ack(input);
-    throw new Error("Only the next pending orchestrator event can be acknowledged");
+    if (next && input.eventId > next.id) {
+      throw new Error("Only the next pending orchestrator event can be acknowledged");
+    }
+    return this.#scopes.ack(input);
   }
 
   move(input: {
