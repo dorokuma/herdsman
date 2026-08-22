@@ -14,7 +14,9 @@ type AgentEventRow = {
   id: number;
   idempotency_key: string | null;
   pane_id: string | null;
+  pane_generation: string | null;
   payload_json: string;
+  deliverable: 0 | 1;
   terminal_id: string | null;
   type: AgentEventType;
   workspace_id: string | null;
@@ -33,6 +35,7 @@ export class AgentEventStore {
     herdrSessionName: string;
     idempotencyKey?: string | null;
     paneId?: string | null;
+    paneGeneration?: string | null;
     payload: unknown;
     terminalId?: string | null;
     type: AgentEventType;
@@ -50,13 +53,14 @@ export class AgentEventStore {
     const result = this.#sqlite
       .prepare(
         `insert into agent_events
-         (herdr_session_name, agent_id, pane_id, workspace_id, terminal_id, type, payload_json, compact_history_json, idempotency_key, created_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (herdr_session_name, agent_id, pane_id, pane_generation, workspace_id, terminal_id, type, payload_json, compact_history_json, idempotency_key, deliverable, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
       )
       .run(
         input.herdrSessionName,
         input.agentId ?? null,
         input.paneId ?? null,
+        input.paneGeneration ?? null,
         input.workspaceId ?? null,
         input.terminalId ?? null,
         input.type,
@@ -68,7 +72,16 @@ export class AgentEventStore {
     return this.get(Number(result.lastInsertRowid));
   }
 
-  // Agent rows are session-scoped; query ownership is constrained by agent_id and herdr_session_name.
+  invalidatePane(input: { herdrSessionName: string; paneId: string; paneGeneration?: string | null }): void {
+    this.#sqlite
+      .prepare(
+        `update agent_events set deliverable = 0
+         where herdr_session_name = ? and pane_id = ?
+           and (? is null or pane_generation = ? or pane_generation is null)`,
+      )
+      .run(input.herdrSessionName, input.paneId, input.paneGeneration ?? null, input.paneGeneration ?? null);
+  }
+
   latestStatusTransition(
     agentId: string,
     herdrSessionName: string,
@@ -113,6 +126,7 @@ export class AgentEventStore {
       .prepare(
         `select * from agent_events
          where id > ?
+           and deliverable = 1
            and herdr_session_name = ?
            and workspace_id = ?
            and terminal_id is not null
@@ -162,13 +176,14 @@ export class AgentEventStore {
 }
 
 export function mapAgentEvent(row: AgentEventRow): AgentEventRecord {
-  return {
+    return {
     agentId: row.agent_id,
     compactHistory: parseJson<CompactAgentHistory>(row.compact_history_json),
     createdAt: new Date(row.created_at),
     herdrSessionName: row.herdr_session_name,
     id: row.id,
     paneId: row.pane_id,
+    paneGeneration: row.pane_generation,
     payload: parseJson<unknown>(row.payload_json) ?? {},
     terminalId: row.terminal_id,
     type: row.type,

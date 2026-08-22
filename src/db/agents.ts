@@ -25,6 +25,7 @@ type AgentRow = {
   name: string | null;
   pane_id: string;
   pane_revision: number | null;
+  pane_generation: string | null;
   tab_id: string | null;
   terminal_id: string | null;
   workspace_id: string;
@@ -69,10 +70,13 @@ export class AgentStore {
       const matched = snapshots.map((snapshot) => {
         const terminalMatch = snapshot.terminalId ? byTerminal.get(snapshot.terminalId) : undefined;
         const paneMatch = byPane.get(snapshot.paneId);
+        const incomingGeneration = paneGeneration(snapshot.agent);
         const canUsePaneFallback =
           paneMatch && (snapshot.terminalId === null || paneMatch.terminal_id === null);
+        const generationMatches =
+          !incomingGeneration || !paneMatch?.pane_generation || incomingGeneration === paneMatch.pane_generation;
         return {
-          existing: terminalMatch ?? (canUsePaneFallback ? paneMatch : undefined),
+          existing: terminalMatch ?? (generationMatches && canUsePaneFallback ? paneMatch : undefined),
           snapshot,
         };
       });
@@ -106,6 +110,7 @@ export class AgentStore {
           agentSessionJson(snapshot.agent.agent_session),
           sessionHint,
           integerValue(snapshot.agent.revision),
+          paneGeneration(snapshot.agent) ?? current?.pane_generation ?? null,
           stringValue(snapshot.agent.cwd),
           stringValue(snapshot.agent.foreground_cwd) ?? stringValue(snapshot.agent.foregroundCwd),
           snapshot.agent.focused === true ? 1 : 0,
@@ -116,7 +121,7 @@ export class AgentStore {
             .prepare(
               `update agents
                set pane_id = ?, terminal_id = ?, tab_id = ?, workspace_id = ?, agent = ?, name = ?,
-                   agent_status = ?, agent_session_json = ?, agent_session_hint_json = ?, pane_revision = ?,
+                   agent_status = ?, agent_session_json = ?, agent_session_hint_json = ?, pane_revision = ?, pane_generation = ?,
                    cwd = ?, foreground_cwd = ?, focused = ?, last_seen_at = ?
                where id = ?`,
             )
@@ -125,8 +130,8 @@ export class AgentStore {
           this.#sqlite
             .prepare(
               `insert into agents
-               (id, herdr_session_name, pane_id, terminal_id, tab_id, workspace_id, agent, name, agent_status, agent_session_json, agent_session_hint_json, pane_revision, cwd, foreground_cwd, focused, first_seen_at, last_seen_at)
-               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (id, herdr_session_name, pane_id, terminal_id, tab_id, workspace_id, agent, name, agent_status, agent_session_json, agent_session_hint_json, pane_revision, pane_generation, cwd, foreground_cwd, focused, first_seen_at, last_seen_at)
+               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(id, input.herdrSessionName, ...values, now);
         }
@@ -299,12 +304,21 @@ function mapAgent(row: AgentRow): AgentIndexRecord {
     name: row.name,
     paneId: row.pane_id,
     paneRevision: row.pane_revision,
+    ...(row.pane_generation === null ? {} : { paneGeneration: row.pane_generation }),
     tabId: row.tab_id,
     terminalId: row.terminal_id,
     workspaceId: row.workspace_id,
   };
 }
 
+function paneGeneration(agent: HerdrAgentLike): string | null {
+  return (
+    stringValue(agent.pane_generation) ??
+    stringValue(agent.paneGeneration) ??
+    stringValue(agent.creation_id) ??
+    stringValue(agent.creationId)
+  );
+}
 function agentSessionJson(value: unknown): string | null {
   if (typeof value !== "object" || value === null) return null;
   const record = value as Record<string, unknown>;
