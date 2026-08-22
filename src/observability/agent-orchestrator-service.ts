@@ -57,7 +57,7 @@ export class AgentOrchestratorService {
     const validAgents = new Map(
       this.#agents
         .list(input)
-        .map((agent) => [agent.id, agent.paneId]),
+        .map((agent) => [agent.id, agent]),
     );
     const pending: AgentEventRecord[] = [];
     let afterEventId = state.ackedEventId;
@@ -75,7 +75,12 @@ export class AgentOrchestratorService {
         // Strict identity prevents an old event from being delivered after a pane is rebound.
         const valid =
           event.agentId !== null &&
-          validAgents.get(event.agentId) === event.paneId &&
+          event.deliverable === 1 &&
+          validAgents.get(event.agentId)?.paneId === event.paneId &&
+          (event.paneGeneration === null ||
+            validAgents.get(event.agentId)?.paneGeneration === event.paneGeneration) &&
+          validAgents.get(event.agentId)?.workspaceId === input.workspaceId &&
+          event.workspaceId === input.workspaceId &&
           event.herdrSessionName === input.herdrSessionName;
         if (valid && event.terminalId !== null && event.terminalId !== input.terminalId) {
           pending.push(event);
@@ -103,6 +108,10 @@ export class AgentOrchestratorService {
       if (
         candidate.herdrSessionName === input.herdrSessionName &&
         candidate.workspaceId === input.workspaceId &&
+        candidate.agentId !== null &&
+        candidate.paneId !== null &&
+        (candidate.paneGeneration === null ||
+          candidate.paneGeneration === this.#agents.get(candidate.agentId).paneGeneration) &&
         candidate.id > state.ackedEventId
       ) {
         return this.#scopes.ack(input);

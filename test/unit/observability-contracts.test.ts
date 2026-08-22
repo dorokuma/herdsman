@@ -169,6 +169,7 @@ describe("agent observability contracts", () => {
       agentId: null,
       compactHistory: null,
       createdAt: new Date(),
+      deliverable: 0,
       herdrSessionName: "default",
       id: 1,
       paneId: "wB:p1",

@@ -1,5 +1,6 @@
-import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
 import type { AgentEventStore } from "@/db/agent-events.js";
+import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
+import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentStore, HerdrAgentLike } from "@/db/agents.js";
 import type { HerdrSessionStore } from "@/db/herdr-sessions.js";
@@ -37,6 +38,7 @@ export type AgentIndexServiceStores = {
     typeof AgentContextService
   >[0]["stores"]["agentContextSnapshots"];
   agentEvents: AgentEventStore;
+  agentOrchestratorScopes?: AgentOrchestratorScopeStore;
   agentHistoryCache?: AgentHistoryCacheStore;
   agents: AgentStore;
   herdrSessions: HerdrSessionStore;
@@ -242,7 +244,27 @@ export class AgentIndexService {
     if (!paneId) return { contextChangedScopes: [], events: [] };
     if (event.type === "pane.closed") {
       this.#stores.agentEvents.invalidatePane({ herdrSessionName: input.herdrSessionName, paneId });
-      return { contextChangedScopes: [], events: [] };
+      const retired = this.#stores.agents.retirePane({
+        herdrSessionName: input.herdrSessionName,
+        paneId,
+      });
+      const scopes = new Map<string, AgentScope>();
+      for (const agent of retired) {
+        const scope = scopeOf(agent);
+        const terminalId = stringValue(event.terminal_id) ?? stringValue(event.terminalId) ?? agent.terminalId;
+        if (terminalId && this.#stores.agentOrchestratorScopes) {
+          const change = this.#stores.agentOrchestratorScopes.releaseIfOwner({
+            ...scope,
+            terminalId,
+          });
+          if (change.changed) addScope(scopes, scope);
+        }
+        addScope(scopes, scope);
+      }
+      return {
+        contextChangedScopes: sortedScopes(scopes),
+        events: [],
+      };
     }
     if (event.type !== "pane.agent_status_changed") return { contextChangedScopes: [], events: [] };
     let agent = this.#stores.agents.findByPane({

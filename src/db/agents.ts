@@ -162,6 +162,24 @@ export class AgentStore {
     });
   }
 
+  retirePane(input: { herdrSessionName: string; paneId: string }): AgentIndexRecord[] {
+    return this.#transaction(() => {
+      const agents = this.#sqlite
+        .prepare("select * from agents where herdr_session_name = ? and pane_id = ?")
+        .all(input.herdrSessionName, input.paneId) as AgentRow[];
+      if (agents.length === 0) return [];
+      const ids = agents.map((agent) => agent.id);
+      const placeholders = ids.map(() => "?").join(", ");
+      this.#sqlite
+        .prepare(`delete from agent_context_snapshots where agent_id in (${placeholders})`)
+        .run(...ids);
+      this.#sqlite
+        .prepare("delete from agents where herdr_session_name = ? and pane_id = ?")
+        .run(input.herdrSessionName, input.paneId);
+      return agents.map(mapAgent);
+    });
+  }
+
   setSessionRefByTerminal(input: {
     agentSession: AgentSessionRef;
     herdrSessionName: string;

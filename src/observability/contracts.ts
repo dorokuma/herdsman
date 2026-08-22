@@ -147,6 +147,7 @@ export type AgentEventRecord = {
   id: number;
   paneId: string | null;
   paneGeneration?: string | null;
+  deliverable: 0 | 1;
   payload: unknown;
   terminalId: string | null;
   type: AgentEventType;

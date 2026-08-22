@@ -99,7 +99,7 @@ export class AgentEventStore {
   listAfter(
     input: AgentQueryScope & { afterEventId?: number; limit?: number },
   ): AgentEventRecord[] {
-    const clauses = ["id > ?"];
+    const clauses = ["id > ?", "deliverable = 1"];
     const params: Array<number | string | null> = [input.afterEventId ?? 0];
     if (input.herdrSessionName) {
       clauses.push("herdr_session_name = ?");
@@ -184,6 +184,7 @@ export function mapAgentEvent(row: AgentEventRow): AgentEventRecord {
     id: row.id,
     paneId: row.pane_id,
     paneGeneration: row.pane_generation,
+    deliverable: row.deliverable,
     payload: parseJson<unknown>(row.payload_json) ?? {},
     terminalId: row.terminal_id,
     type: row.type,

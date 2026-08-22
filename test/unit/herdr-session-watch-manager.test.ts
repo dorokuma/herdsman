@@ -388,6 +388,7 @@ function event(workspaceId = "wB") {
     agentId: null,
     compactHistory: null,
     createdAt: new Date(),
+    deliverable: 0 as const,
     herdrSessionName: "default",
     id: 1,
     paneId: "wB:p2",

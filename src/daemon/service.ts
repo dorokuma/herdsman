@@ -53,7 +53,14 @@ export async function runObservabilityDaemonService(
   });
   const index = new AgentIndexService({
     context: daemonServices.context,
-    stores: { agentEvents, agentHistoryCache, agents, herdrSessions, herdrWorkspaces },
+    stores: {
+      agentEvents,
+      agentHistoryCache,
+      agentOrchestratorScopes,
+      agents,
+      herdrSessions,
+      herdrWorkspaces,
+    },
   });
 
   const server = new ObservabilityRpcServer({
