@@ -75,6 +75,7 @@ type LaunchIdentity = {
 type DeliveredBatch = {
   assistantFinalSucceeded: boolean;
   events: AgentEventWireRecord[];
+  hasSubstantiveWork: boolean;
   invalidated: boolean;
   ownerTerminalId: string;
   herdsmanTriggered: boolean;
@@ -312,6 +313,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             events: batchEvents.filter((event) =>
               batchOutcomes.some((outcome) => outcome.eventId === event.id),
             ),
+            hasSubstantiveWork: false,
             invalidated: false,
             ownerTerminalId,
             herdsmanTriggered: true,
@@ -347,7 +349,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }, WAKE_SETTLE_MS);
     };
 
-    const loseRole = (ctx: PiContext | undefined) => {
+    const loseRole = (ctx: PiContext | undefined, options: { abort?: boolean } = {}) => {
       if (state.deliveredBatch) {
         state.deliveredBatch.invalidated = true;
         const lastEventId = state.deliveredBatch.events.at(-1)?.id;
@@ -357,7 +359,13 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             lastEventId,
           );
         }
-        if (state.deliveredBatch.herdsmanTriggered) ctx?.abort?.();
+        if (
+          options.abort &&
+          state.deliveredBatch.herdsmanTriggered &&
+          !state.deliveredBatch.hasSubstantiveWork
+        ) {
+          ctx?.abort?.();
+        }
       }
       if (state.wakeRequestedThroughEventId > 0) {
         state.failedWakeThroughEventId = Math.max(
@@ -375,14 +383,21 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     const markDisconnected = (ctx: PiContext | undefined) => {
       const reconnectingFromOn = state.reconnectingFromOn || state.isOrchestrator;
-      loseRole(ctx);
+      loseRole(ctx, { abort: false });
       state.reconnectingFromOn = reconnectingFromOn;
       setHerdsmanUi(ctx);
     };
 
     const resetForScopeChange = (ctx: PiContext | undefined) => {
       clearAgentContext();
-      if (state.deliveredBatch?.herdsmanTriggered) ctx?.abort?.();
+      if (
+        state.deliveredBatch?.herdsmanTriggered &&
+        !state.deliveredBatch.hasSubstantiveWork
+      ) {
+        // Scope changes invalidate the batch; an in-flight wake is only aborted
+        // when it is still the pure, empty Herdsman wake turn.
+        ctx?.abort?.();
+      }
       if (state.deliveredBatch) state.deliveredBatch.invalidated = true;
       state.deliveredBatch = undefined;
       cancelWake();
@@ -487,7 +502,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         terminalId,
         workspaceId: change.current.workspaceId,
       };
-      loseRole(ctx);
+      loseRole(ctx, { abort: true });
       if (!state.roleMutationInFlight) {
         ctx?.ui.notify?.(
           change.current.owner
@@ -642,7 +657,22 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (state.deliveredBatch) {
         state.deliveredBatch.assistantFinalSucceeded =
           stopReason === "stop" || stopReason === "length";
+        if (
+          message.content !== undefined &&
+          ((typeof message.content === "string" && message.content.length > 0) ||
+            (Array.isArray(message.content) && message.content.length > 0))
+        ) {
+          state.deliveredBatch.hasSubstantiveWork = true;
+        }
       }
+    });
+
+    pi.on("tool_execution_start", () => {
+      if (state.deliveredBatch) state.deliveredBatch.hasSubstantiveWork = true;
+    });
+
+    pi.on("tool_result", () => {
+      if (state.deliveredBatch) state.deliveredBatch.hasSubstantiveWork = true;
     });
 
     pi.on("agent_start", () => {

@@ -1439,7 +1439,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("invalidates and aborts a delivered Herdsman batch on same-terminal workspace move", async () => {
+  test("invalidates a delivered Herdsman batch on same-terminal workspace move without aborting substantive work", async () => {
     vi.useFakeTimers();
     const target = event(110, "term_agent", {
       paneId: "wC:p-agent",
@@ -1465,6 +1465,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.emitStream({ method: "agent.event", params: { event: event(109, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       await pi.emit("agent_start", {}, ctx);
+      await pi.emit("tool_execution_start", { toolName: "bash", toolCallId: "tool-1" }, ctx);
       moved = true;
       client.emitStream({
         method: "agent.orchestrator.changed",
@@ -1474,8 +1475,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
 
-      expect(ctx.aborts).toBe(1);
-      expect(client.calls).not.toContainEqual(["agent.notifications.ack", { eventId: 109 }]);
+      expect(ctx.aborts).toBe(0);
       expect(
         pi.customMessages.map(([message]) => (message.details as { eventIds: number[] }).eventIds),
       ).toEqual([[109], [110]]);
