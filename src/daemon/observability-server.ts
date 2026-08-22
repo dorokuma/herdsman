@@ -180,7 +180,15 @@ export class ObservabilityRpcServer {
   }
 
   publishAgentEvent(event: AgentEventRecord): void {
-    if (!event.workspaceId || !event.terminalId) return;
+    if (!event.workspaceId || !event.terminalId || !event.agentId) return;
+    // Pi is an interactive observer. Its routine idle/status transitions are
+    // persisted for history, but never routed as worker wake events.
+    const agent = this.#stores.agents.get(event.agentId);
+    if (
+      agent.agent === "pi" &&
+      (event.type === "agent.idle" || event.type === "agent.status.changed")
+    )
+      return;
     const scope = { herdrSessionName: event.herdrSessionName, workspaceId: event.workspaceId };
     const owner = this.#orchestrator.status(scope)?.owner;
     if (!owner || event.terminalId === owner.terminalId) return;

@@ -54,11 +54,7 @@ export class AgentOrchestratorService {
     if (!state?.owner || state.owner.terminalId !== input.terminalId) return [];
 
     const limit = input.limit ?? 100;
-    const validAgents = new Map(
-      this.#agents
-        .list(input)
-        .map((agent) => [agent.id, agent]),
-    );
+    const validAgents = new Map(this.#agents.list(input).map((agent) => [agent.id, agent]));
     const pending: AgentEventRecord[] = [];
     let afterEventId = state.ackedEventId;
     let scanned = 0;
@@ -75,6 +71,10 @@ export class AgentOrchestratorService {
         // Strict identity prevents an old event from being delivered after a pane is rebound.
         const valid =
           event.agentId !== null &&
+          !(
+            validAgents.get(event.agentId)?.agent === "pi" &&
+            (event.type === "agent.idle" || event.type === "agent.status.changed")
+          ) &&
           event.deliverable === 1 &&
           validAgents.get(event.agentId)?.paneId === event.paneId &&
           (event.paneGeneration === null ||
@@ -102,16 +102,29 @@ export class AgentOrchestratorService {
       afterEventId: state.ackedEventId,
       ownerTerminalId: input.terminalId,
     });
-    if (next?.id === input.eventId) return this.#scopes.ack(input);
+    if (next?.id === input.eventId) {
+      const nextAgent = next.agentId ? this.#agents.get(next.agentId) : undefined;
+      if (
+        nextAgent?.agent !== "pi" ||
+        (next?.type !== "agent.idle" && next?.type !== "agent.status.changed")
+      ) {
+        return this.#scopes.ack(input);
+      }
+    }
     if (!next) {
       const candidate = this.#agentEvents.get(input.eventId);
+      const candidateAgent = candidate.agentId ? this.#agents.get(candidate.agentId) : undefined;
       if (
         candidate.herdrSessionName === input.herdrSessionName &&
         candidate.workspaceId === input.workspaceId &&
         candidate.agentId !== null &&
+        !(
+          candidateAgent?.agent === "pi" &&
+          (candidate.type === "agent.idle" || candidate.type === "agent.status.changed")
+        ) &&
         candidate.paneId !== null &&
         (candidate.paneGeneration === null ||
-          candidate.paneGeneration === this.#agents.get(candidate.agentId).paneGeneration) &&
+          candidate.paneGeneration === candidateAgent?.paneGeneration) &&
         candidate.id > state.ackedEventId
       ) {
         return this.#scopes.ack(input);

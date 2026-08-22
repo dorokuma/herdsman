@@ -23,7 +23,12 @@ function openService() {
 
 function appendEvent(
   harness: ReturnType<typeof openObservabilityDbHarness>,
-  input: { terminalId: string; workspaceId?: string },
+  input: {
+    agent?: string;
+    terminalId: string;
+    type?: "agent.done" | "agent.idle";
+    workspaceId?: string;
+  },
 ) {
   const workspaceId = input.workspaceId ?? "wB";
   const paneId = `${workspaceId}:${input.terminalId}`;
@@ -36,21 +41,23 @@ function appendEvent(
     terminal_id: agent.terminalId,
     workspace_id: agent.workspaceId,
   }));
-  const agent = harness.agents.replaceForSession({
-    herdrSessionName: "default",
-    agents: [
-      ...existing,
-      {
-        agent: "codex",
-        agent_status: "working",
-        focused: false,
-        name: input.terminalId,
-        pane_id: paneId,
-        terminal_id: input.terminalId,
-        workspace_id: workspaceId,
-      },
-    ],
-  }).find((candidate) => candidate.terminalId === input.terminalId);
+  const agent = harness.agents
+    .replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        ...existing,
+        {
+          agent: input.agent ?? "codex",
+          agent_status: "working",
+          focused: false,
+          name: input.terminalId,
+          pane_id: paneId,
+          terminal_id: input.terminalId,
+          workspace_id: workspaceId,
+        },
+      ],
+    })
+    .find((candidate) => candidate.terminalId === input.terminalId);
   if (!agent) throw new Error("Expected indexed agent");
   return harness.agentEvents.append({
     agentId: agent.id,
@@ -58,7 +65,7 @@ function appendEvent(
     paneId,
     payload: {},
     terminalId: input.terminalId,
-    type: "agent.done",
+    type: input.type ?? "agent.done",
     workspaceId,
   });
 }
@@ -90,6 +97,30 @@ describe("AgentOrchestratorService", () => {
     });
   });
 
+  test("does not deliver interactive Pi observer events", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const observerEvent = appendEvent(harness, {
+      agent: "pi",
+      terminalId: "term_other",
+      type: "agent.idle",
+    });
+
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([]);
+    expect(() =>
+      service.ack({ ...scope, eventId: observerEvent.id, terminalId: "term_owner" }),
+    ).toThrow("Only the next pending orchestrator event can be acknowledged");
+  });
+
+  test("still delivers dispatched worker events", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const workerEvent = appendEvent(harness, { agent: "codex", terminalId: "term_worker" });
+
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: workerEvent.id }),
+    ]);
+  });
   test("returns ordered non-self pending events across bounded scan pages", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p1", terminalId: "term_owner" });
@@ -179,14 +210,16 @@ describe("AgentOrchestratorService", () => {
       type: "agent.done",
       workspaceId: "wB",
     });
-    expect(harness.sqlite.prepare("select agent_id, pane_id from agent_events").all()).toHaveLength(2);
+    expect(harness.sqlite.prepare("select agent_id, pane_id from agent_events").all()).toHaveLength(
+      2,
+    );
     expect(harness.agents.list({ herdrSessionName: "default", workspaceId: "wB" })).toHaveLength(1);
     expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
       expect.objectContaining({ id: visibleEvent.id }),
     ]);
-    expect(service.ack({ ...scope, eventId: visibleEvent.id, terminalId: "term_owner" }).ackedEventId).toBe(
-      visibleEvent.id,
-    );
+    expect(
+      service.ack({ ...scope, eventId: visibleEvent.id, terminalId: "term_owner" }).ackedEventId,
+    ).toBe(visibleEvent.id);
     expect(deleted.id).toBeLessThan(visibleEvent.id);
   });
 
