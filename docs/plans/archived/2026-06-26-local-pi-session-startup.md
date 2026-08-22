@@ -2,19 +2,19 @@
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task.
 
-**Goal:** Make `shepherd` with no arguments create a new Shepherd session for the current working directory, ensure a matching Pi session file through the Gateway, and open Pi without successful-path CLI output.
+**Goal:** Make `herdsman` with no arguments create a new Herdsman session for the current working directory, ensure a matching Pi session file through the Gateway, and open Pi without successful-path CLI output.
 
-**Architecture:** Keep the Gateway as the owner of Shepherd session state and Pi metadata. The CLI becomes a thin local launcher that calls Gateway RPCs, then spawns `pi --session <file>`. Working contexts are resolved by the Gateway from an explicit `workingContextPath`; Pi and Shepherd session names stay synchronized only through explicit rename paths.
+**Architecture:** Keep the Gateway as the owner of Herdsman session state and Pi metadata. The CLI becomes a thin local launcher that calls Gateway RPCs, then spawns `pi --session <file>`. Working contexts are resolved by the Gateway from an explicit `workingContextPath`; Pi and Herdsman session names stay synchronized only through explicit rename paths.
 
-**Tech Stack:** TypeScript ESM with NodeNext, Node.js `node:net`/`node:child_process`, SQLite through `node:sqlite`, Drizzle schema/migrations, Vitest, Biome, and the JavaScript `packages/shepherd-pi` Pi extension.
+**Tech Stack:** TypeScript ESM with NodeNext, Node.js `node:net`/`node:child_process`, SQLite through `node:sqlite`, Drizzle schema/migrations, Vitest, Biome, and the JavaScript `packages/herdsman-pi` Pi extension.
 
 **Status:** Done
 
 **Progress:**
 - Done — Task 1 changed working context identity to path-first storage and passed `pnpm test -- test/integration/working-contexts.test.ts`.
 - Done — Task 2 added `session.create` `workingContextPath`, `pi.ensure_session`, TUI client support, and passed `pnpm check`.
-- Done — Task 3 made no-argument `shepherd` launch local Pi sessions through Gateway RPC and moved `open --session` to `pi.ensure_session`; `pnpm check` passed.
-- Done — Task 4 added explicit Shepherd/Pi rename synchronization in the Pi extension and passed `pnpm pi-package:check`.
+- Done — Task 3 made no-argument `herdsman` launch local Pi sessions through Gateway RPC and moved `open --session` to `pi.ensure_session`; `pnpm check` passed.
+- Done — Task 4 added explicit Herdsman/Pi rename synchronization in the Pi extension and passed `pnpm pi-package:check`.
 - Done — Task 5 updated English/Japanese README usage and passed the README grep check.
 - Done — Task 6 final validation passed: targeted tests, `pnpm db:check`, `pnpm pi-package:check`, `pnpm check`, and `pnpm build`.
 
@@ -23,31 +23,31 @@
 
 ## Global Constraints
 
-- Do not add `shepherd new` or `shepherd here` commands.
-- `shepherd` with no args creates a new session every time; resume/continue is out of scope.
+- Do not add `herdsman new` or `herdsman here` commands.
+- `herdsman` with no args creates a new session every time; resume/continue is out of scope.
 - `process.cwd()` is the working context path exactly. Do not detect git roots or rewrite the path.
 - If `context.allowed_roots` is configured, `workingContextPath` must be inside one allowed root. If no `allowed_roots` are configured, local RPC clients may create a working context for any explicit path.
 - The Gateway must not be auto-started. Socket connection failure should show a fixed startup hint.
-- Successful `shepherd` no-arg startup prints nothing before Pi takes over stdio.
-- Initial Shepherd `title` is `null`; initial Pi session name is unset.
+- Successful `herdsman` no-arg startup prints nothing before Pi takes over stdio.
+- Initial Herdsman `title` is `null`; initial Pi session name is unset.
 - Do not implement automatic title generation.
 - Session name synchronization is explicit only:
-  - Shepherd -> Pi: `session.renamed` event sets `pi.setSessionName(title ?? "")`. This uses a string for both named and cleared Shepherd titles.
-  - Pi -> Shepherd: `/shepherd rename <title>` in `shepherd-pi` sets Pi session name and calls `session.rename`.
+  - Herdsman -> Pi: `session.renamed` event sets `pi.setSessionName(title ?? "")`. This uses a string for both named and cleared Herdsman titles.
+  - Pi -> Herdsman: `/herdsman rename <title>` in `herdsman-pi` sets Pi session name and calls `session.rename`.
   - External extensions that call `pi.setSessionName()` directly are not synchronized.
-- `shepherd open --session <id>` should also require Gateway RPC and use `pi.ensure_session`; do not keep DB direct-write behavior for open.
+- `herdsman open --session <id>` should also require Gateway RPC and use `pi.ensure_session`; do not keep DB direct-write behavior for open.
 - Use path-based working context identity: same path reuses one context; same basename at a different path creates a distinct context with a disambiguated slug.
 - After implementation changes, run `pnpm check`. If DB schema changes, run `pnpm db:generate` and inspect the generated SQL before `pnpm check`.
 
 ## Current Context
 
-- `src/cli/shepherd.ts` currently parses no args as `{ command: "help" }` and `open --session` directly opens SQLite, applies migrations, uses `PiSessionMetadataStore.ensureForSession()`, then spawns `pi --session <file>`.
+- `src/cli/herdsman.ts` currently parses no args as `{ command: "help" }` and `open --session` directly opens SQLite, applies migrations, uses `PiSessionMetadataStore.ensureForSession()`, then spawns `pi --session <file>`.
 - `src/tui/client.ts` already has `createSession`, `renameSession`, `subscribe`, `listTools`, and `runTool`, but does not expose `pi.ensure_session`.
 - `src/gateway/server.ts` currently handles `session.create`, `session.rename`, `pi.handshake`, `pi.attach`, `pi.heartbeat`, Gateway run queue RPCs, and tool RPCs. It does not handle `workingContextPath` or `pi.ensure_session`.
 - `src/gateway/pi-sessions.ts` already has `PiSessionMetadataStore.ensureForSession(sessionId)` and should be reused by the new RPC.
 - `src/db/working-contexts.ts` currently deduplicates by slug in `upsert()`, which can incorrectly merge `/repo/api` and `/other/api`.
 - `src/db/schema.ts` defines a unique index on `working_contexts.slug` only. Path uniqueness requires a schema change and generated migration.
-- `packages/shepherd-pi/extensions/index.js` already subscribes to Shepherd events after `pi.attach`, registers Shepherd tools, and has `/shepherd attach`, `detach`, and status behavior.
+- `packages/herdsman-pi/extensions/index.js` already subscribes to Herdsman events after `pi.attach`, registers Herdsman tools, and has `/herdsman attach`, `detach`, and status behavior.
 - Pi extension docs confirm `pi.setSessionName(name)` and `pi.getSessionName()` exist; there is no documented session-name-changed event.
 
 ## File Structure
@@ -57,15 +57,15 @@
 - Modify: `src/gateway/working-contexts.ts` — support the local path rule for Gateway `session.create` while keeping scan behavior tied to configured roots.
 - Modify: `src/gateway/server.ts` — support `workingContextPath` in `session.create`; add `pi.ensure_session`; publish `session.renamed` reliably to subscribers.
 - Modify: `src/tui/client.ts` — add typed inputs/results for `workingContextPath` and `ensurePiSession`.
-- Modify: `src/cli/shepherd.ts` — parse no args as a local Pi startup command; route no-arg startup and `open --session` through Gateway RPCs; emit Gateway-start hint on connection failure.
-- Modify: `packages/shepherd-pi/extensions/index.js` — add `/shepherd rename`, react to `session.renamed`, and keep existing attach/queue behavior.
-- Modify: `README.md` and `README.ja.md` — document `shepherd` no-arg startup and Gateway-first requirement.
+- Modify: `src/cli/herdsman.ts` — parse no args as a local Pi startup command; route no-arg startup and `open --session` through Gateway RPCs; emit Gateway-start hint on connection failure.
+- Modify: `packages/herdsman-pi/extensions/index.js` — add `/herdsman rename`, react to `session.renamed`, and keep existing attach/queue behavior.
+- Modify: `README.md` and `README.ja.md` — document `herdsman` no-arg startup and Gateway-first requirement.
 - Generate: `drizzle/0004_*.sql` and `drizzle/meta/0004_snapshot.json` — migration for `working_contexts.path` uniqueness.
 - Test: `test/integration/working-contexts.test.ts` — path identity and slug collision behavior.
 - Test: `test/integration/gateway-rpc.test.ts` — `session.create` with `workingContextPath`, `pi.ensure_session`, and rename event behavior.
 - Test: `test/integration/tui-client.test.ts` — typed client methods.
 - Test: `test/unit/cli.test.ts` — no-arg parsing, open parsing, Gateway hint, and Pi spawn argument construction.
-- Test: add `test/unit/shepherd-pi-extension.test.js` only if the project already has a JS extension test harness by implementation time. If no harness exists, validate the extension by `pnpm pi-package:check` and targeted manual review in this plan's final validation.
+- Test: add `test/unit/herdsman-pi-extension.test.js` only if the project already has a JS extension test harness by implementation time. If no harness exists, validate the extension by `pnpm pi-package:check` and targeted manual review in this plan's final validation.
 
 ## Tasks
 
@@ -219,13 +219,13 @@ enableLocalWorkingContexts?: boolean;
 enablePiSessionStore?: boolean;
 ```
 
-When `enableLocalWorkingContexts` is true, the harness must pass a real `WorkingContextResolver` backed by `new WorkingContextStore(sqlite)` to `ShepherdGatewayServer`. When `allowedRoots` is omitted, pass `allowedRoots: []` and `allowUnconfiguredLocalPaths: true`. When `enablePiSessionStore` is true, the harness must pass `new PiSessionMetadataStore({ events: store, sessionDir: join(dir, "pi-sessions") })` to `ShepherdGatewayServer`.
+When `enableLocalWorkingContexts` is true, the harness must pass a real `WorkingContextResolver` backed by `new WorkingContextStore(sqlite)` to `HerdsmanGatewayServer`. When `allowedRoots` is omitted, pass `allowedRoots: []` and `allowUnconfiguredLocalPaths: true`. When `enablePiSessionStore` is true, the harness must pass `new PiSessionMetadataStore({ events: store, sessionDir: join(dir, "pi-sessions") })` to `HerdsmanGatewayServer`.
 
 Add a test for `session.create` path resolution inside configured roots:
 
 ```ts
 test("creates sessions with a local working context path", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-local-context-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-local-context-"));
   tempDirs.push(dir);
   const project = join(dir, "project");
   mkdirSync(project);
@@ -262,7 +262,7 @@ Add a test for the no-`allowed_roots` local rule:
 
 ```ts
 test("creates local working contexts when allowed roots are unconfigured", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-local-context-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-local-context-"));
   tempDirs.push(dir);
   const project = join(dir, "unconfigured-project");
   mkdirSync(project);
@@ -289,7 +289,7 @@ Add a rejection test:
 
 ```ts
 test("rejects local working context paths outside configured allowed roots", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-local-context-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-local-context-"));
   tempDirs.push(dir);
   const outside = join(dir, "outside");
   mkdirSync(outside);
@@ -398,7 +398,7 @@ Do not change `discover({ scanAllowedRoots: true })`: with no allowed roots it s
 
 - [ ] **Step 4: Add server dependencies**
 
-In `src/gateway/server.ts`, extend `ShepherdGatewayServerOptions` with optional local-context and Pi metadata dependencies:
+In `src/gateway/server.ts`, extend `HerdsmanGatewayServerOptions` with optional local-context and Pi metadata dependencies:
 
 ```ts
 type LocalWorkingContextResolver = {
@@ -488,7 +488,7 @@ Implement:
 
 - [ ] **Step 7: Wire production runtime dependencies**
 
-In `src/cli/shepherd.ts`, where `ShepherdGatewayServer` is constructed for `gateway run`, create one `WorkingContextResolver` and one `PiSessionMetadataStore` for the server regardless of whether a config file was provided:
+In `src/cli/herdsman.ts`, where `HerdsmanGatewayServer` is constructed for `gateway run`, create one `WorkingContextResolver` and one `PiSessionMetadataStore` for the server regardless of whether a config file was provided:
 
 ```ts
 const workingContexts = new WorkingContextResolver({
@@ -502,7 +502,7 @@ const piSessions = new PiSessionMetadataStore({
 });
 ```
 
-This preserves the requirement that `allowed_roots` is enforced when configured and explicit local paths are allowed when no roots are configured. Pass both to `new ShepherdGatewayServer({ localWorkingContexts: workingContexts, piSessions, ... })`.
+This preserves the requirement that `allowed_roots` is enforced when configured and explicit local paths are allowed when no roots are configured. Pass both to `new HerdsmanGatewayServer({ localWorkingContexts: workingContexts, piSessions, ... })`.
 
 - [ ] **Step 8: Update typed TUI client**
 
@@ -529,16 +529,16 @@ Expected: all listed tests pass.
 - [ ] **Step 10: Commit**
 
 ```bash
-git add src/gateway/server.ts src/gateway/working-contexts.ts src/tui/client.ts src/cli/shepherd.ts test/integration/gateway-rpc.test.ts test/integration/tui-client.test.ts test/integration/working-contexts.test.ts
+git add src/gateway/server.ts src/gateway/working-contexts.ts src/tui/client.ts src/cli/herdsman.ts test/integration/gateway-rpc.test.ts test/integration/tui-client.test.ts test/integration/working-contexts.test.ts
 git commit -m "gateway: create local sessions through rpc"
 ```
 
 ### Task 3: Implement no-argument CLI startup and Gateway-first `open`
 
-**Objective:** Make `shepherd` with no args create a local session through Gateway RPC and open Pi; make `open --session` use `pi.ensure_session`.
+**Objective:** Make `herdsman` with no args create a local session through Gateway RPC and open Pi; make `open --session` use `pi.ensure_session`.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Test: `test/unit/cli.test.ts`
 
 **Interfaces:**
@@ -555,14 +555,14 @@ In `test/unit/cli.test.ts`, add:
 test("parses no args as local Pi startup", () => {
   expect(
     parseCliArgs([], {
-      SHEPHERD_DB_PATH: "/tmp/shepherd.sqlite",
-      SHEPHERD_GATEWAY_SOCKET_PATH: "/tmp/shepherd.sock",
-      PWD: "/repo/shepherd",
+      SHEPHERD_DB_PATH: "/tmp/herdsman.sqlite",
+      SHEPHERD_GATEWAY_SOCKET_PATH: "/tmp/herdsman.sock",
+      PWD: "/repo/herdsman",
     }),
   ).toEqual({
     command: "start-local",
-    dbPath: "/tmp/shepherd.sqlite",
-    socketPath: "/tmp/shepherd.sock",
+    dbPath: "/tmp/herdsman.sqlite",
+    socketPath: "/tmp/herdsman.sock",
     workingContextPath: process.cwd(),
   });
 });
@@ -582,7 +582,7 @@ Expected: no-arg parser currently returns help.
 
 - [ ] **Step 3: Extend CLI command model**
 
-In `src/cli/shepherd.ts`, add a `start-local` command variant:
+In `src/cli/herdsman.ts`, add a `start-local` command variant:
 
 ```ts
 | {
@@ -599,8 +599,8 @@ Change `parseCliArgs`:
 if (!command) {
   return {
     command: "start-local",
-    dbPath: environment.SHEPHERD_DB_PATH ?? "shepherd.sqlite",
-    socketPath: environment.SHEPHERD_GATEWAY_SOCKET_PATH ?? "/tmp/shepherd.sock",
+    dbPath: environment.SHEPHERD_DB_PATH ?? "herdsman.sqlite",
+    socketPath: environment.SHEPHERD_GATEWAY_SOCKET_PATH ?? "/tmp/herdsman.sock",
     workingContextPath: process.cwd(),
   };
 }
@@ -618,17 +618,17 @@ Add this exported helper. It always prints the same command shape and substitute
 
 ```ts
 export function gatewayStartHint(environment: NodeJS.ProcessEnv = env): string {
-  return `Shepherd Gateway is not reachable. Start the Gateway first:\n  shepherd gateway start --config ${environment.SHEPHERD_CONFIG ?? "<path>"}`;
+  return `Herdsman Gateway is not reachable. Start the Gateway first:\n  herdsman gateway start --config ${environment.SHEPHERD_CONFIG ?? "<path>"}`;
 }
 ```
 
 Add testable runner dependency types near the CLI helpers:
 
 ```ts
-type ShepherdClientLike = Pick<ShepherdSessionClient, "close" | "createSession" | "ensurePiSession">;
+type HerdsmanClientLike = Pick<HerdsmanSessionClient, "close" | "createSession" | "ensurePiSession">;
 
 type LocalPiStartupDeps = {
-  connect(socketPath: string): Promise<ShepherdClientLike>;
+  connect(socketPath: string): Promise<HerdsmanClientLike>;
   readGatewayId(stateDir: string): string;
   runPi(input: {
     gatewayId: string;
@@ -656,7 +656,7 @@ Add `defaultLocalPiStartupDeps`:
 const defaultLocalPiStartupDeps: LocalPiStartupDeps = {
   async connect(socketPath) {
     try {
-      return await ShepherdSessionClient.connect(socketPath);
+      return await HerdsmanSessionClient.connect(socketPath);
     } catch (error) {
       throw new GatewayConnectionError(error instanceof Error ? error.message : String(error));
     }
@@ -739,8 +739,8 @@ test("local startup creates a session, ensures Pi metadata, and runs Pi", async 
     runLocalPiStartup(
       {
         command: "start-local",
-        dbPath: "/tmp/state/shepherd.sqlite",
-        socketPath: "/tmp/shepherd.sock",
+        dbPath: "/tmp/state/herdsman.sqlite",
+        socketPath: "/tmp/herdsman.sock",
         workingContextPath: "/repo/app",
       },
       {
@@ -761,7 +761,7 @@ test("local startup creates a session, ensures Pi metadata, and runs Pi", async 
   ).resolves.toBe(0);
 
   expect(calls).toEqual([
-    ["connect", "/tmp/shepherd.sock"],
+    ["connect", "/tmp/herdsman.sock"],
     ["createSession", { title: null, workingContextPath: "/repo/app" }],
     ["ensurePiSession", { sessionId: "session-1" }],
     ["readGatewayId", "/tmp/state"],
@@ -771,7 +771,7 @@ test("local startup creates a session, ensures Pi metadata, and runs Pi", async 
         gatewayId: "gateway-1",
         piSessionFile: "/tmp/pi-session.jsonl",
         sessionId: "session-1",
-        socketPath: "/tmp/shepherd.sock",
+        socketPath: "/tmp/herdsman.sock",
       },
     ],
     ["close"],
@@ -801,9 +801,9 @@ test("open uses Gateway pi.ensure_session instead of DB metadata writes", async 
     runOpenPiSession(
       {
         command: "open",
-        dbPath: "/tmp/state/shepherd.sqlite",
+        dbPath: "/tmp/state/herdsman.sqlite",
         sessionId: "session-1",
-        socketPath: "/tmp/shepherd.sock",
+        socketPath: "/tmp/herdsman.sock",
       },
       {
         async connect(socketPath) {
@@ -823,7 +823,7 @@ test("open uses Gateway pi.ensure_session instead of DB metadata writes", async 
   ).resolves.toBe(0);
 
   expect(calls).toMatchObject([
-    ["connect", "/tmp/shepherd.sock"],
+    ["connect", "/tmp/herdsman.sock"],
     ["ensurePiSession", { sessionId: "session-1" }],
     ["readGatewayId", "/tmp/state"],
     ["runPi", { sessionId: "session-1", piSessionFile: "/tmp/pi-session.jsonl" }],
@@ -836,10 +836,10 @@ Add a hint test:
 
 ```ts
 test("renders Gateway startup hint", () => {
-  expect(gatewayStartHint({ SHEPHERD_CONFIG: "/tmp/shepherd.yaml" })).toBe(
-    "Shepherd Gateway is not reachable. Start the Gateway first:\n  shepherd gateway start --config /tmp/shepherd.yaml",
+  expect(gatewayStartHint({ SHEPHERD_CONFIG: "/tmp/herdsman.yaml" })).toBe(
+    "Herdsman Gateway is not reachable. Start the Gateway first:\n  herdsman gateway start --config /tmp/herdsman.yaml",
   );
-  expect(gatewayStartHint({})).toContain("shepherd gateway start --config <path>");
+  expect(gatewayStartHint({})).toContain("herdsman gateway start --config <path>");
 });
 ```
 
@@ -851,7 +851,7 @@ test("local startup exposes Gateway connection failures as GatewayConnectionErro
     runLocalPiStartup(
       {
         command: "start-local",
-        dbPath: "/tmp/state/shepherd.sqlite",
+        dbPath: "/tmp/state/herdsman.sqlite",
         socketPath: "/tmp/missing.sock",
         workingContextPath: "/repo/app",
       },
@@ -914,30 +914,30 @@ Expected: all CLI unit tests pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/cli/shepherd.ts test/unit/cli.test.ts
+git add src/cli/herdsman.ts test/unit/cli.test.ts
 git commit -m "cli: launch local pi sessions by default"
 ```
 
-### Task 4: Synchronize explicit Shepherd and Pi session renames
+### Task 4: Synchronize explicit Herdsman and Pi session renames
 
-**Objective:** Keep session names equal when the rename occurs through Shepherd events or the shepherd-pi extension.
+**Objective:** Keep session names equal when the rename occurs through Herdsman events or the herdsman-pi extension.
 
 **Files:**
-- Modify: `packages/shepherd-pi/extensions/index.js`
+- Modify: `packages/herdsman-pi/extensions/index.js`
 - Test: no existing JS unit harness is present in the repo; validate by `pnpm pi-package:check` and the extension package syntax check.
 
 **Interfaces:**
-- Adds `/shepherd rename <title>`.
+- Adds `/herdsman rename <title>`.
 - Adds event handling for `session.renamed`.
 - Uses existing Gateway RPC `session.rename`.
 
-- [ ] **Step 1: Update `/shepherd` command behavior**
+- [ ] **Step 1: Update `/herdsman` command behavior**
 
-In `packages/shepherd-pi/extensions/index.js`, update the command description to:
+In `packages/herdsman-pi/extensions/index.js`, update the command description to:
 
 ```js
 description:
-  "Attach, rename, or inspect a Shepherd session: /shepherd attach <session-id> | rename <title> | status | detach",
+  "Attach, rename, or inspect a Herdsman session: /herdsman attach <session-id> | rename <title> | status | detach",
 ```
 
 Change argument parsing so `rename` preserves spaces in the title:
@@ -953,13 +953,13 @@ Add a branch:
 ```js
 if (command === "rename" && value) {
   if (!state.sessionId) {
-    ctx.ui.notify?.("Not attached to a Shepherd session. Use /shepherd attach <session-id>.", "warning");
+    ctx.ui.notify?.("Not attached to a Herdsman session. Use /herdsman attach <session-id>.", "warning");
     return;
   }
   await ensureClient(state, ctx);
   pi.setSessionName(value);
   await state.client.request("session.rename", { sessionId: state.sessionId, title: value });
-  ctx.ui.notify?.(`Renamed Shepherd session: ${value}`, "info");
+  ctx.ui.notify?.(`Renamed Herdsman session: ${value}`, "info");
   return;
 }
 ```
@@ -981,7 +981,7 @@ if (event.type === "session.renamed") {
 
 Do not try to sync external `pi.setSessionName()` calls.
 
-Handle cleared Shepherd titles by passing an empty string, which keeps the call within Pi's documented string-shaped API:
+Handle cleared Herdsman titles by passing an empty string, which keeps the call within Pi's documented string-shaped API:
 
 ```js
 if (title === null) {
@@ -993,13 +993,13 @@ if (title === null) {
 
 Run: `pnpm pi-package:check`
 
-Expected: `node --check packages/shepherd-pi/extensions/index.js` passes and `npm pack --dry-run` for `packages/shepherd-pi` succeeds.
+Expected: `node --check packages/herdsman-pi/extensions/index.js` passes and `npm pack --dry-run` for `packages/herdsman-pi` succeeds.
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add packages/shepherd-pi/extensions/index.js
-git commit -m "pi: sync explicit shepherd session renames"
+git add packages/herdsman-pi/extensions/index.js
+git commit -m "pi: sync explicit herdsman session renames"
 ```
 
 ### Task 5: Update README usage and command list
@@ -1018,22 +1018,22 @@ git commit -m "pi: sync explicit shepherd session renames"
 In `README.md` Usage section, add the local startup flow after Gateway startup:
 
 ```md
-Start a new local Shepherd session from the current directory and open Pi:
+Start a new local Herdsman session from the current directory and open Pi:
 
 ```bash
-shepherd
+herdsman
 ```
 
-The Gateway must already be running. `shepherd` does not auto-start it. The current working directory becomes the Shepherd working context exactly as invoked.
+The Gateway must already be running. `herdsman` does not auto-start it. The current working directory becomes the Herdsman working context exactly as invoked.
 ```
 
 Update the existing create-session Node snippet to either remove it or label it as low-level RPC verification. Keep `open --session` documented for Slack-created sessions:
 
 ```md
-Open an existing Shepherd session, for example one created from Slack:
+Open an existing Herdsman session, for example one created from Slack:
 
 ```bash
-shepherd open --session "$SHEPHERD_SESSION_ID"
+herdsman open --session "$SHEPHERD_SESSION_ID"
 ```
 ```
 
@@ -1043,15 +1043,15 @@ Mirror the English changes in `README.ja.md` using Japanese wording. Preserve ex
 
 - [ ] **Step 3: Manual doc check**
 
-Run: `rg "createSession|shepherd open|shepherd$" README.md README.ja.md`
+Run: `rg "createSession|herdsman open|herdsman$" README.md README.ja.md`
 
-Expected: README examples show `shepherd` as the primary local startup path and keep `open --session` only for existing sessions.
+Expected: README examples show `herdsman` as the primary local startup path and keep `open --session` only for existing sessions.
 
 - [ ] **Step 4: Commit**
 
 ```bash
 git add README.md README.ja.md
-git commit -m "docs: document local shepherd startup"
+git commit -m "docs: document local herdsman startup"
 ```
 
 ### Task 6: Full validation and cleanup
@@ -1112,19 +1112,19 @@ Only run this when a real Gateway and Pi are available in the developer environm
 Terminal 1:
 
 ```bash
-export SHEPHERD_DB_PATH=/tmp/shepherd.sqlite
-export SHEPHERD_GATEWAY_SOCKET_PATH=/tmp/shepherd.sock
-shepherd gateway start --db "$SHEPHERD_DB_PATH" --socket "$SHEPHERD_GATEWAY_SOCKET_PATH" --config /tmp/shepherd.local.yaml
+export SHEPHERD_DB_PATH=/tmp/herdsman.sqlite
+export SHEPHERD_GATEWAY_SOCKET_PATH=/tmp/herdsman.sock
+herdsman gateway start --db "$SHEPHERD_DB_PATH" --socket "$SHEPHERD_GATEWAY_SOCKET_PATH" --config /tmp/herdsman.local.yaml
 ```
 
 Terminal 2:
 
 ```bash
 cd /path/inside/allowed/root
-shepherd
+herdsman
 ```
 
-Expected: Pi TUI opens without a preceding success log line; `/shepherd` reports an attached Shepherd session; `shepherd audit --session <id> --db "$SHEPHERD_DB_PATH"` can read events after interaction.
+Expected: Pi TUI opens without a preceding success log line; `/herdsman` reports an attached Herdsman session; `herdsman audit --session <id> --db "$SHEPHERD_DB_PATH"` can read events after interaction.
 
 - [ ] **Step 6: Commit validation-only fixes if needed**
 
@@ -1132,7 +1132,7 @@ If validation required source changes, commit only those files:
 
 ```bash
 git add <changed-files>
-git commit -m "fix: stabilize local shepherd startup"
+git commit -m "fix: stabilize local herdsman startup"
 ```
 
 ## Validation
@@ -1141,12 +1141,12 @@ git commit -m "fix: stabilize local shepherd startup"
 - `pnpm db:check` — generated migration state matches schema.
 - `pnpm pi-package:check` — Pi extension syntax and package dry-run pass.
 - `pnpm check` — full repository quality gate passes.
-- Optional manual smoke test with a real Gateway and Pi confirms `shepherd` opens Pi silently on success and Gateway connection errors show the fixed startup hint.
+- Optional manual smoke test with a real Gateway and Pi confirms `herdsman` opens Pi silently on success and Gateway connection errors show the fixed startup hint.
 
 ## Risks, Tradeoffs, and Open Questions
 
 - Adding a unique path index can fail on existing user databases that already contain duplicate `working_contexts.path` rows. Before applying the migration to a long-lived database, inspect duplicates with `select path, count(*) from working_contexts group by path having count(*) > 1;`. If duplicates exist, clean them manually before migration.
-- `pi.setSessionName("")` may display an empty name instead of restoring Pi's first-message fallback. This is accepted for this implementation because it keeps explicit Shepherd title clearing deterministic and avoids undocumented non-string calls.
-- `shepherd` no-arg startup depends on a running Gateway by design. This keeps behavior simple but makes the first-run error path important.
+- `pi.setSessionName("")` may display an empty name instead of restoring Pi's first-message fallback. This is accepted for this implementation because it keeps explicit Herdsman title clearing deterministic and avoids undocumented non-string calls.
+- `herdsman` no-arg startup depends on a running Gateway by design. This keeps behavior simple but makes the first-run error path important.
 - This plan does not remove the legacy provider runner. The local startup work should not expand or refactor provider selection.
 - This plan does not implement session resume/continue, session picker, automatic title generation, or Gateway autostart.

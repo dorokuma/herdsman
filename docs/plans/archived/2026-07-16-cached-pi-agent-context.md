@@ -4,9 +4,9 @@
 
 **Status:** Completed
 
-**Goal:** Preserve owner Pi awareness of other agents while removing all daemon RPC and history I/O from the user-message path by maintaining a daemon-owned, persisted agent context cache and pushing owner-scoped snapshots to shepherd-pi.
+**Goal:** Preserve owner Pi awareness of other agents while removing all daemon RPC and history I/O from the user-message path by maintaining a daemon-owned, persisted agent context cache and pushing owner-scoped snapshots to herdsman-pi.
 
-**Architecture:** The Shepherd daemon is the source of truth for current agent context. It persists one latest compact snapshot per indexed agent, detects dirty panes from Herdr pane revisions and status events, reuses resolved history paths, and pushes current-workspace snapshots only to the `/shepherd on` owner. shepherd-pi keeps a local mirror, pins it for one agent run, and injects it ephemerally through Pi's synchronous `context` hook without performing RPC or file I/O from the prompt path.
+**Architecture:** The Herdsman daemon is the source of truth for current agent context. It persists one latest compact snapshot per indexed agent, detects dirty panes from Herdr pane revisions and status events, reuses resolved history paths, and pushes current-workspace snapshots only to the `/herdsman on` owner. herdsman-pi keeps a local mirror, pins it for one agent run, and injects it ephemerally through Pi's synchronous `context` hook without performing RPC or file I/O from the prompt path.
 
 **Tech Stack:** TypeScript ESM + NodeNext, Node.js >= 24.18.0, pnpm 11.9.0, SQLite via `node:sqlite`, Drizzle schema/migrations, TypeBox/Ajv, Vitest, Node `net`, Herdr socket protocol/pane revisions, Pi >= 0.80.6 extension events.
 
@@ -16,19 +16,19 @@
 - Follow TDD: focused red test, failing-test confirmation, minimal implementation, focused green test, then refactor.
 - Do not add runtime dependencies.
 - Do not change Herdr or Pi minimum versions: Herdr remains `>= 0.7.0`; Pi remains `>= 0.80.6`.
-- The user-message path must perform **zero Shepherd daemon RPCs and zero filesystem/history reads**. This applies to `before_agent_start`, `agent_start`, and `context` handlers.
+- The user-message path must perform **zero Herdsman daemon RPCs and zero filesystem/history reads**. This applies to `before_agent_start`, `agent_start`, and `context` handlers.
 - `before_agent_start` must no longer call `agent.orchestrator.get` or `agent.list`. Remove the handler when no other behavior remains.
 - Pi's `context` handler may only filter message objects, read in-memory extension state, format bounded text, and return messages. It must not `await`, call `client.request`, call `pi.exec`, or read files.
-- Agent context, `agent.event`, pending-count UI, auto-wake, and acknowledgement are delivered only to the active `/shepherd on` owner for the exact `(herdrSessionName, workspaceId)` scope.
-- A non-owner/off Pi keeps connection-bound presence so `/shepherd on`, owner replacement, pane movement, and reconnect recovery continue to work. It receives no agent context, no agent events, and sends no per-turn telemetry.
+- Agent context, `agent.event`, pending-count UI, auto-wake, and acknowledgement are delivered only to the active `/herdsman on` owner for the exact `(herdrSessionName, workspaceId)` scope.
+- A non-owner/off Pi keeps connection-bound presence so `/herdsman on`, owner replacement, pane movement, and reconnect recovery continue to work. It receives no agent context, no agent events, and sends no per-turn telemetry.
 - Every Pi presence registration includes the exact Pi session path known from `ctx.sessionManager.getSessionFile()`, regardless of owner state. This is identity metadata, not turn telemetry.
 - Owner context excludes only the receiving Pi's `terminalId`. Other Pi terminals in the same workspace remain visible as other agents.
-- If no current-scope local snapshot exists, Pi injects no Shepherd context and proceeds immediately. It never waits for an initial snapshot or reconnect.
+- If no current-scope local snapshot exists, Pi injects no Herdsman context and proceeds immediately. It never waits for an initial snapshot or reconnect.
 - Pin the local snapshot at the start of one Pi agent run and keep it unchanged through tool continuations, retries, and compaction retries until `agent_settled`.
-- Auto-wake runs use only `shepherd-wake-context`; do not add the normal all-agent snapshot to a Shepherd-triggered run.
+- Auto-wake runs use only `herdsman-wake-context`; do not add the normal all-agent snapshot to a Herdsman-triggered run.
 - Agent updates that arrive before or during a normal user run are not mixed into that run. Existing busy deferral schedules an independent wake after `agent_settled`.
 - Keep `WAKE_SETTLE_MS = 500`, `DISCONNECT_GRACE_MS = 5_000`, and `STARTUP_RECONNECT_GRACE_MS = 10_000` unchanged.
-- Normal cached context is ephemeral provider context. Do not append a new persistent `shepherd-agent-context` message each turn. Filter legacy persisted `shepherd-agent-context` messages before appending the current ephemeral message.
+- Normal cached context is ephemeral provider context. Do not append a new persistent `herdsman-agent-context` message each turn. Filter legacy persisted `herdsman-agent-context` messages before appending the current ephemeral message.
 - Preserve the existing normal-context format and `oneLine()` bound of 240 characters per last-user/last-assistant excerpt.
 - Persist latest agent context snapshots and resolved history refs in SQLite so daemon restart does not require an empty cache window or unconditional rediscovery.
 - Store Herdr `agent_session` and Pi presence session hints separately. Effective priority is Herdr-reported ref, exact Pi hint, then discovery.
@@ -49,15 +49,15 @@
 
 ## Current Context
 
-- `packages/shepherd-pi/src/index.ts` currently awaits `agent.orchestrator.get` and `agent.list` in `before_agent_start`; measured `agent.list` latency in the dogfood workspace is 3.76–3.90 seconds.
+- `packages/herdsman-pi/src/index.ts` currently awaits `agent.orchestrator.get` and `agent.list` in `before_agent_start`; measured `agent.list` latency in the dogfood workspace is 3.76–3.90 seconds.
 - The same workspace has null `agentSession` for Pi, Claude, and Codex. Fallback discovery scans 141 Pi JSONL files (112.5 MiB), 256 Claude files (281.2 MiB), and 1,164 Codex files (1,175.8 MiB).
 - `src/agent-history/discovery.ts` recursively lists every candidate and calls `readFile()` on each entire JSONL before inspecting up to 100 records for cwd.
 - `src/agent-history/service.ts` checks the content cache only after discovery, so `agent_history_cache` does not avoid root scanning.
 - `HerdrSessionWatchManager` already refreshes every running Herdr session at startup and every 60 seconds, but `AgentIndexService.refreshHerdrSession()` resolves compact history for every agent before checking whether status changed.
-- Herdr protocol 16 exposes pane `revision` in `session.snapshot`. Arbitrary `pane_output_changed` is not available as a wildcard `events.subscribe` subscription, so Shepherd must compare revisions from lightweight snapshots.
-- Direct Herdr `session.snapshot` measured 103–111 ms; the expensive work is Shepherd history discovery.
+- Herdr protocol 16 exposes pane `revision` in `session.snapshot`. Arbitrary `pane_output_changed` is not available as a wildcard `events.subscribe` subscription, so Herdsman must compare revisions from lightweight snapshots.
+- Direct Herdr `session.snapshot` measured 103–111 ms; the expensive work is Herdsman history discovery.
 - Pi's official `context` hook runs before each LLM call and can non-destructively replace the outgoing message list. It does not persist returned-only messages to the Pi session.
-- `sendMessage({ triggerTurn: true })` for Shepherd wake bypasses `before_agent_start`, so wake delivery already has its own `shepherd-wake-context` path.
+- `sendMessage({ triggerTurn: true })` for Herdsman wake bypasses `before_agent_start`, so wake delivery already has its own `herdsman-wake-context` path.
 - The daemon currently accepts `agent.telemetry` and returns `{ accepted: true }` without persistence or processing.
 - The Pi extension knows its exact session file at `session_start` but does not send it in presence registration.
 
@@ -98,7 +98,7 @@
 1. Complete child 01 so every later layer uses final wire and persistence contracts.
 2. Complete child 02 so history resolution and cached list assembly exist independently of scheduling and sockets.
 3. Complete child 03 so the daemon refreshes, persists, serves, and pushes snapshots before Pi consumes them.
-4. Complete child 04 so shepherd-pi migrates from prompt-time pull to owner-only local context without changing wake guarantees.
+4. Complete child 04 so herdsman-pi migrates from prompt-time pull to owner-only local context without changing wake guarantees.
 5. Complete child 05 after all focused tests pass; remove dead telemetry, update public docs, run full validation, and dogfood the latency-sensitive path.
 
 ## Progress
@@ -127,7 +127,7 @@ No implementation work remains.
 - `pnpm test test/unit/agent-history-service.test.ts test/integration/agent-index-service.test.ts` — preferred refs and dirty-agent updates avoid global rediscovery.
 - `pnpm test test/unit/herdr-session-watch-manager.test.ts test/integration/herdr-socket-client.test.ts` — adaptive revision polling and event recovery are deterministic.
 - `pnpm test test/integration/observability-rpc.test.ts test/integration/orchestrator-pane-move.test.ts test/integration/orchestrator-disconnect-grace.test.ts` — cached list and owner-scoped push preserve daemon behavior.
-- `pnpm test test/unit/shepherd-pi-extension.test.ts test/integration/shepherd-pi-daemon-client.test.ts` — local mirror, ephemeral context, run pinning, no-RPC prompt path, and wake separation pass.
+- `pnpm test test/unit/herdsman-pi-extension.test.ts test/integration/herdsman-pi-daemon-client.test.ts` — local mirror, ephemeral context, run pinning, no-RPC prompt path, and wake separation pass.
 - `pnpm check` — typecheck, all tests, Biome, Drizzle, root package, Pi package, and Herdr plugin checks pass.
 - `pnpm build` — compiled daemon/CLI and alias resolution pass.
 - `pnpm package:check` — root tarball contents remain valid.
@@ -141,5 +141,5 @@ No implementation work remains.
 - **Session replacement and revision reset:** a new session can reuse agent/cwd/pane and reset revision. Any revision change with an unchanged source fingerprint forces one rediscovery so the old history path is not pinned forever.
 - **Persisted stale rows:** agent context rows cascade with agent deletion and are returned only for running Herdr sessions. Scope changes clear Pi local state before new owner context arrives.
 - **Context hook frequency:** Pi calls `context` before every provider call. The extension must pin once per run and perform only synchronous in-memory formatting.
-- **Wake history:** `shepherd-wake-context` and visible wake output remain persistent conversation history by design; only normal all-agent context is ephemeral.
+- **Wake history:** `herdsman-wake-context` and visible wake output remain persistent conversation history by design; only normal all-agent context is ephemeral.
 - **No unresolved product questions remain.** Exact constants, owner semantics, cache-miss behavior, CLI freshness, and telemetry removal were decided in the `/dig` session.

@@ -10,9 +10,9 @@ import {
 } from "./daemon-client.js";
 import {
   type AgentUpdateMessageDetails,
-  formatShepherdFooterStatus,
+  formatHerdsmanFooterStatus,
   renderAgentUpdateMessage,
-  type ShepherdFooterState,
+  type HerdsmanFooterState,
 } from "./agent-update-ui.js";
 import {
   projectAgentOutcomes,
@@ -52,7 +52,7 @@ type ConnectionStateResponse = {
   state: AgentOrchestratorWireState | null;
 };
 
-export type ShepherdDaemonClient = {
+export type HerdsmanDaemonClient = {
   close(): void;
   onConnected: (() => Promise<void> | void) | undefined;
   onDisconnected: ((error: Error) => void) | undefined;
@@ -78,11 +78,11 @@ type DeliveredBatch = {
   events: AgentEventWireRecord[];
   invalidated: boolean;
   ownerTerminalId: string;
-  shepherdTriggered: boolean;
+  herdsmanTriggered: boolean;
 };
 
-type ShepherdState = {
-  client: ShepherdDaemonClient | undefined;
+type HerdsmanState = {
+  client: HerdsmanDaemonClient | undefined;
   connected: boolean;
   currentScope: CurrentScope | undefined;
   deliveredBatch: DeliveredBatch | undefined;
@@ -142,29 +142,29 @@ type PiApi = {
 };
 
 type ExtensionOptions = {
-  clientFactory?: () => ShepherdDaemonClient;
+  clientFactory?: () => HerdsmanDaemonClient;
 };
 
-const DEFAULT_HOME_NAME = ".shepherd";
-const COMMAND_USAGE = "Usage: /shepherd [on|off|status]";
-const HERDR_REQUIRED_MESSAGE = "Shepherd requires a Herdr workspace";
-const RECONNECTING_MESSAGE = "Shepherd is reconnecting · try again shortly";
+const DEFAULT_HOME_NAME = ".herdsman";
+const COMMAND_USAGE = "Usage: /herdsman [on|off|status]";
+const HERDR_REQUIRED_MESSAGE = "Herdsman requires a Herdr workspace";
+const RECONNECTING_MESSAGE = "Herdsman is reconnecting · try again shortly";
 
-function defaultShepherdHome() {
+function defaultHerdsmanHome() {
   return process.env.SHEPHERD_HOME || `${process.env.HOME || ""}/${DEFAULT_HOME_NAME}`;
 }
 
 export function defaultSocketPath() {
-  return `${defaultShepherdHome().replace(/\/$/, "")}/shepherd.sock`;
+  return `${defaultHerdsmanHome().replace(/\/$/, "")}/herdsman.sock`;
 }
 
-export function createShepherdPiExtension(options: ExtensionOptions = {}) {
-  return function shepherdPiExtension(pi: PiApi): void {
-    pi.registerMessageRenderer?.("shepherd-wake", renderAgentUpdateMessage);
+export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
+  return function herdsmanPiExtension(pi: PiApi): void {
+    pi.registerMessageRenderer?.("herdsman-wake", renderAgentUpdateMessage);
 
     const projector = createAgentOutcomeProjector();
 
-    const state: ShepherdState = {
+    const state: HerdsmanState = {
       client: undefined,
       connected: false,
       currentScope: undefined,
@@ -189,9 +189,9 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
     let activeContext: PiContext | undefined;
     let wakeGeneration = 0;
 
-    const setShepherdUi = (ctx: PiContext | undefined) => {
+    const setHerdsmanUi = (ctx: PiContext | undefined) => {
       if (!ctx) return;
-      const footerState: ShepherdFooterState = state.reconnectingFromOn
+      const footerState: HerdsmanFooterState = state.reconnectingFromOn
         ? { kind: "reconnecting" }
         : state.isOrchestrator
           ? {
@@ -199,7 +199,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
               updateCount: projectAgentOutcomes(state.pendingEvents).outcomes.length,
             }
           : { kind: "off" };
-      ctx.ui.setStatus?.("shepherd", formatShepherdFooterStatus(footerState));
+      ctx.ui.setStatus?.("herdsman", formatHerdsmanFooterStatus(footerState));
     };
 
     const cancelWakeTimer = () => {
@@ -216,7 +216,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
     };
 
     const wakeLabel = (count: number) =>
-      `Shepherd received ${count} agent update${count === 1 ? "" : "s"}.`;
+      `Herdsman received ${count} agent update${count === 1 ? "" : "s"}.`;
 
     const clearAgentContext = () => {
       state.latestContext = undefined;
@@ -279,7 +279,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
               requestedThroughEventId,
             );
             ctx.ui.notify?.(
-              "Shepherd couldn’t load agent updates · updates remain pending",
+              "Herdsman couldn’t load agent updates · updates remain pending",
               "warning",
             );
             return;
@@ -315,7 +315,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
             events: batchEvents,
             invalidated: false,
             ownerTerminalId,
-            shepherdTriggered: true,
+            herdsmanTriggered: true,
           };
           state.wakeTimer = undefined;
           state.wakeRequested = true;
@@ -323,7 +323,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
           pi.sendMessage?.(
             {
               content: formatAgentOutcomeUpdates(batchOutcomes),
-              customType: "shepherd-wake-context",
+              customType: "herdsman-wake-context",
               details: { eventIds: batchEvents.map((event) => event.id) },
               display: false,
             },
@@ -332,7 +332,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
           pi.sendMessage?.(
             {
               content: wakeLabel(current.length),
-              customType: "shepherd-wake",
+              customType: "herdsman-wake",
               details: {
                 eventIds: current.map((outcome) => outcome.eventId),
                 outcomes: current,
@@ -358,7 +358,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
             lastEventId,
           );
         }
-        if (state.deliveredBatch.shepherdTriggered) ctx?.abort?.();
+        if (state.deliveredBatch.herdsmanTriggered) ctx?.abort?.();
       }
       if (state.wakeRequestedThroughEventId > 0) {
         state.failedWakeThroughEventId = Math.max(
@@ -371,32 +371,32 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
       state.isOrchestrator = false;
       state.pendingEvents = [];
       state.reconnectingFromOn = false;
-      setShepherdUi(ctx);
+      setHerdsmanUi(ctx);
     };
 
     const markDisconnected = (ctx: PiContext | undefined) => {
       const reconnectingFromOn = state.reconnectingFromOn || state.isOrchestrator;
       loseRole(ctx);
       state.reconnectingFromOn = reconnectingFromOn;
-      setShepherdUi(ctx);
+      setHerdsmanUi(ctx);
     };
 
     const resetForScopeChange = (ctx: PiContext | undefined) => {
       clearAgentContext();
-      if (state.deliveredBatch?.shepherdTriggered) ctx?.abort?.();
+      if (state.deliveredBatch?.herdsmanTriggered) ctx?.abort?.();
       if (state.deliveredBatch) state.deliveredBatch.invalidated = true;
       state.deliveredBatch = undefined;
       cancelWake();
       state.failedWakeThroughEventId = 0;
       state.pendingEvents = [];
-      setShepherdUi(ctx);
+      setHerdsmanUi(ctx);
     };
 
     const addPendingEvents = (events: AgentEventWireRecord[], ctx: PiContext | undefined) => {
       const byId = new Map(state.pendingEvents.map((event) => [event.id, event]));
       for (const event of events) byId.set(event.id, event);
       state.pendingEvents = [...byId.values()].sort((left, right) => left.id - right.id);
-      setShepherdUi(ctx);
+      setHerdsmanUi(ctx);
     };
 
     const applyConnectionStateResponse = (
@@ -422,8 +422,8 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
         if (reconnectingOwner) {
           ctx?.ui.notify?.(
             response.state?.owner
-              ? `Shepherd is off · moved to ${response.state.owner.paneId}`
-              : "Shepherd is off",
+              ? `Herdsman is off · moved to ${response.state.owner.paneId}`
+              : "Herdsman is off",
             "info",
           );
         }
@@ -432,7 +432,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
       state.isOrchestrator = true;
       state.reconnectingFromOn = false;
       applyOwnerContext(response);
-      setShepherdUi(ctx);
+      setHerdsmanUi(ctx);
       addPendingEvents(response.events ?? [], ctx);
       scheduleWake(ctx);
     };
@@ -441,7 +441,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
       if (!state.isOrchestrator || !state.currentScope || !event.terminalId) return;
       if (event.terminalId === state.currentScope.terminalId) return;
       addPendingEvents([event], ctx);
-      pi.appendEntry?.("shepherd.agent_event", event);
+      pi.appendEntry?.("herdsman.agent_event", event);
       scheduleWake(ctx);
     };
 
@@ -477,7 +477,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
         const gainedRole = !state.isOrchestrator;
         state.isOrchestrator = true;
         state.reconnectingFromOn = false;
-        setShepherdUi(ctx);
+        setHerdsmanUi(ctx);
         if (gainedRole || scopeChanged) void refreshAfterRoleGain(ctx);
         return;
       }
@@ -492,8 +492,8 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
       if (!state.roleMutationInFlight) {
         ctx?.ui.notify?.(
           change.current.owner
-            ? `Shepherd is off · moved to ${change.current.owner.paneId}`
-            : "Shepherd is off",
+            ? `Herdsman is off · moved to ${change.current.owner.paneId}`
+            : "Herdsman is off",
           "info",
         );
       }
@@ -525,7 +525,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
       const sessionRef = state.sessionRef;
       if (!client || !launchIdentity || !subscriberId) return Promise.resolve();
       if (!sessionRef?.value) {
-        return Promise.reject(new Error("Pi session file is unavailable for Shepherd presence"));
+        return Promise.reject(new Error("Pi session file is unavailable for Herdsman presence"));
       }
       const registration = client
         .request("agent.orchestrator.register", {
@@ -554,8 +554,8 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
       return registration;
     };
 
-    pi.registerCommand?.("shepherd", {
-      description: "Watch Shepherd agent updates in this Pi",
+    pi.registerCommand?.("herdsman", {
+      description: "Watch Herdsman agent updates in this Pi",
       getArgumentCompletions(prefix: string) {
         const items = ["on", "off", "status"]
           .filter((value) => value.startsWith(prefix))
@@ -650,13 +650,13 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
       if (state.runActive) return;
       state.runActive = true;
       state.pinnedContext =
-        state.isOrchestrator && !state.deliveredBatch?.shepherdTriggered
+        state.isOrchestrator && !state.deliveredBatch?.herdsmanTriggered
           ? state.latestContext
           : undefined;
     });
 
     pi.on("context", (event: { messages: PiAgentMessage[] }) => {
-      const messages = event.messages.filter((message) => !isNormalShepherdContext(message));
+      const messages = event.messages.filter((message) => !isNormalHerdsmanContext(message));
       const snapshot = state.pinnedContext;
       if (!snapshot || snapshot.agents.length === 0) return { messages };
       return {
@@ -667,7 +667,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
               agents: snapshot.agents,
               workspaceId: snapshot.workspaceId,
             }),
-            customType: "shepherd-agent-context",
+            customType: "herdsman-agent-context",
             display: false,
             role: "custom",
             timestamp: Date.now(),
@@ -697,13 +697,13 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
           );
         }
         ctx.ui.notify?.(
-          "Shepherd couldn’t acknowledge agent updates · updates remain pending",
+          "Herdsman couldn’t acknowledge agent updates · updates remain pending",
           "warning",
         );
       };
       const finishBatch = () => {
         state.wakeDeferredUntilSettled = false;
-        setShepherdUi(ctx);
+        setHerdsmanUi(ctx);
         scheduleWake(ctx);
       };
 
@@ -723,12 +723,12 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
         try {
           await state.client.request("agent.notifications.ack", { eventId: event.id });
           state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
-          setShepherdUi(ctx);
+          setHerdsmanUi(ctx);
         } catch {
-          // Keep the event pending so the next Shepherd round retries the acknowledgement.
+          // Keep the event pending so the next Herdsman round retries the acknowledgement.
           // Acknowledgement failure must not block delivery of the main turn.
           ctx.ui.notify?.(
-            "Shepherd couldn’t acknowledge agent updates · updates remain pending",
+            "Herdsman couldn’t acknowledge agent updates · updates remain pending",
             "warning",
           );
           break;
@@ -740,7 +740,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
   };
 }
 
-export default createShepherdPiExtension();
+export default createHerdsmanPiExtension();
 
 export function formatHiddenAgentContext(input: {
   agents: AgentContextListItem[];
@@ -761,7 +761,7 @@ export function formatHiddenAgentContext(input: {
         `  last assistant: ${oneLine(history.lastAssistantMessage?.text ?? "")}`,
       ].join("\n");
     }),
-    "Use shepherd agent get/read if details are needed.",
+    "Use herdsman agent get/read if details are needed.",
   ].join("\n");
 }
 
@@ -784,9 +784,9 @@ export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string
   ].join("\n");
 }
 
-function isNormalShepherdContext(message: PiAgentMessage): boolean {
+function isNormalHerdsmanContext(message: PiAgentMessage): boolean {
   return (
-    message.customType === "shepherd-agent-context" ||
+    message.customType === "herdsman-agent-context" ||
     contentIncludesMarker(message.content, "[SHEPHERD AGENT CONTEXT]")
   );
 }
@@ -811,9 +811,9 @@ function isLocalOwner(response: ConnectionStateResponse): boolean {
 }
 
 function localStatusMessage(response: ConnectionStateResponse): string {
-  if (!isLocalOwner(response) || !response.state?.owner) return "Shepherd is off";
+  if (!isLocalOwner(response) || !response.state?.owner) return "Herdsman is off";
   const scope = `${response.presence.herdrSessionName}/${response.presence.workspaceId}`;
-  return `Shepherd is watching agent updates · ${scope} · ${response.state.owner.paneId}`;
+  return `Herdsman is watching agent updates · ${scope} · ${response.state.owner.paneId}`;
 }
 
 function notifyLocalStatus(response: ConnectionStateResponse, ctx: PiContext): void {

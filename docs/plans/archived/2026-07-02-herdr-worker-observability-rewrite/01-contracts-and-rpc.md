@@ -204,25 +204,25 @@ notification.ack
 runtime.telemetry
 ```
 
-`worker.start` is semantic, not a general Herdr proxy. It starts an agent and immediately observes it as a worker. Low-level `pane.split`, `pane.read`, `tab.create`, and raw Herdr resource reads are not exposed as Shepherd public API in the MVP.
+`worker.start` is semantic, not a general Herdr proxy. It starts an agent and immediately observes it as a worker. Low-level `pane.split`, `pane.read`, `tab.create`, and raw Herdr resource reads are not exposed as Herdsman public API in the MVP.
 
 ### CLI commands
 
 Replace old session commands with:
 
 ```text
-shepherd daemon [start|stop|restart|status]
-shepherd observe --herdr-session <name> --workspace <workspace-id> [--json]
-shepherd observe-current [--json]
-shepherd snapshot <observed-workspace-id> [--json]
-shepherd events <observed-workspace-id> [--after EVENT_ID] [--json]
-shepherd notifications <observed-workspace-id> --subscriber <id> [--auto-resume] [--json]
-shepherd ack --subscription <id> --event <event-id> [--json]
-shepherd message-worker <worker-id> <text>
-shepherd wait-worker <worker-id> --state <blocked|done|idle|unknown|working> [--timeout-ms N]
+herdsman daemon [start|stop|restart|status]
+herdsman observe --herdr-session <name> --workspace <workspace-id> [--json]
+herdsman observe-current [--json]
+herdsman snapshot <observed-workspace-id> [--json]
+herdsman events <observed-workspace-id> [--after EVENT_ID] [--json]
+herdsman notifications <observed-workspace-id> --subscriber <id> [--auto-resume] [--json]
+herdsman ack --subscription <id> --event <event-id> [--json]
+herdsman message-worker <worker-id> <text>
+herdsman wait-worker <worker-id> --state <blocked|done|idle|unknown|working> [--timeout-ms N]
 ```
 
-The command `shepherd observe-current` requires `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_WORKSPACE_ID`; otherwise it exits with code `2` and prints `observe-current requires a Herdr-managed pane`.
+The command `herdsman observe-current` requires `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_WORKSPACE_ID`; otherwise it exits with code `2` and prints `observe-current requires a Herdr-managed pane`.
 
 ## Tasks
 

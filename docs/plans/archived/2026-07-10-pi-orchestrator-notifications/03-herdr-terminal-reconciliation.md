@@ -27,7 +27,7 @@
 - `AgentIndexService.refreshHerdrSession()` currently returns `Promise<void>` despite already collecting final indexed agents.
 - `HerdrSessionWatchManager.#watch()` refreshes before subscribing, handles status events inline, and breaks/restarts for `pane.moved` and other topology events.
 - `AgentStore` will preserve terminal identity after child 01.
-- The current shepherd-pi process environment cannot change after a cross-workspace move; the daemon must return/stream updated presence scope.
+- The current herdsman-pi process environment cannot change after a cross-workspace move; the daemon must return/stream updated presence scope.
 
 ## File Structure
 
@@ -260,4 +260,4 @@ git commit -m "feat(orchestrator): follow moved herdr terminals"
 
 ## Next Steps
 
-Completed. The shepherd-pi extension and UX were implemented and verified in child 04.
+Completed. The herdsman-pi extension and UX were implemented and verified in child 04.

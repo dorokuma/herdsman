@@ -2,7 +2,7 @@
 
 Date: 2026-06-25
 
-Parent: [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
+Parent: [Herdsman Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
 
 ## Status
 
@@ -10,30 +10,30 @@ Done.
 
 ## Progress
 
-- **Done** — Setup command shape decided: `brew install shepherd` and `pi install npm:shepherd-pi`.
-- **Done** — Dedicated `shepherd setup` and `shepherd doctor` are deferred for MVP.
+- **Done** — Setup command shape decided: `brew install herdsman` and `pi install npm:herdsman-pi`.
+- **Done** — Dedicated `herdsman setup` and `herdsman doctor` are deferred for MVP.
 - **Done** — Gateway startup should fail fast when Pi readiness fails.
 - **Done** — Config schema accepts `gateway.pi` and Slack streaming settings; old provider fields remain accepted only as a temporary legacy path for existing tests/compatibility.
 - **Done** — Pi readiness probe launches `pi --mode rpc --no-session`, waits for Gateway `pi.handshake`, and requires `get_available_models` to return at least one model before Slack starts.
 
 ## Next steps
 
-Complete. The Pi runtime path uses readiness checks, stable Gateway identity, `shepherd-pi` package validation, and skips old provider runtime construction when only `gateway.pi` is configured.
+Complete. The Pi runtime path uses readiness checks, stable Gateway identity, `herdsman-pi` package validation, and skips old provider runtime construction when only `gateway.pi` is configured.
 
 ## Distribution
 
 Expected user setup:
 
 ```bash
-brew install shepherd
-pi install npm:shepherd-pi
+brew install herdsman
+pi install npm:herdsman-pi
 ```
 
-The `shepherd-pi` Pi package must be installed in the user's Pi environment. Missing extension means setup is incomplete.
+The `herdsman-pi` Pi package must be installed in the user's Pi environment. Missing extension means setup is incomplete.
 
 ## Config changes
 
-### Remove Shepherd-owned LLM provider config
+### Remove Herdsman-owned LLM provider config
 
 Remove or deprecate these config concepts from the active Pi runtime config shape:
 
@@ -70,7 +70,7 @@ Initial defaults:
 
 ### Keep Herdr agent config
 
-Keep Shepherd-owned Herdr worker profile config:
+Keep Herdsman-owned Herdr worker profile config:
 
 ```yaml
 default_agent: implementer
@@ -102,17 +102,17 @@ Tool progress defaults to `off` for Slack, following Hermes' Slack default.
 
 ## Gateway readiness check
 
-`shepherd gateway start` must verify Pi readiness before starting Slack Socket Mode.
+`herdsman gateway start` must verify Pi readiness before starting Slack Socket Mode.
 
 Startup checks:
 
-1. Resolve Shepherd config, DB path, socket path, and Gateway identity.
+1. Resolve Herdsman config, DB path, socket path, and Gateway identity.
 2. Verify `pi` exists on `PATH`.
 3. Launch a short-lived readiness process:
    ```bash
    pi --mode rpc --no-session
    ```
-4. Wait for a `shepherd-pi` extension handshake.
+4. Wait for a `herdsman-pi` extension handshake.
 5. Call Pi RPC `get_available_models` and require at least one available model.
 6. Stop the readiness process.
 7. Start Slack and normal Gateway services only after success.
@@ -120,13 +120,13 @@ Startup checks:
 Failure examples:
 
 ```text
-Shepherd Pi extension is not installed.
+Herdsman Pi extension is not installed.
 
 Install it with:
-  pi install npm:shepherd-pi
+  pi install npm:herdsman-pi
 
 Then restart:
-  shepherd gateway start
+  herdsman gateway start
 ```
 
 ```text
@@ -141,7 +141,7 @@ Run:
 
 The Gateway requires Pi readiness. CLI-only commands can remain Pi-independent:
 
-- `shepherd audit`
+- `herdsman audit`
 - config parsing helpers
 - future read-only inspection commands
 

@@ -27,9 +27,9 @@ Task 12 and Task 13.
 **Objective:** Make Pi send bounded worker telemetry, receive non-invasive notifications, inject hidden context on next turn, and optionally autoResume.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `packages/shepherd-pi/package.json` if description changes
-- Test: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `packages/herdsman-pi/package.json` if description changes
+- Test: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: daemon RPC methods `runtime.telemetry`, `notification.subscribe`, `notification.ack`, `workspace.observe`, `workspace.snapshot`.
@@ -49,7 +49,7 @@ Test with fake Pi API:
 
 - [x] **Step 2: Run test to verify it fails**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: old session/Gateway extension behavior fails.
 
@@ -60,8 +60,8 @@ Use state fields:
 ```ts
 import type { AgentSessionRef, WorkerEventWireRecord } from "@/observability/contracts.js";
 
-type ShepherdState = {
-  client?: ShepherdDaemonClient;
+type HerdsmanState = {
+  client?: HerdsmanDaemonClient;
   currentObservedWorkspaceId?: string;
   currentSubscriptionId?: string;
   heartbeatTimer?: ReturnType<typeof setInterval>;
@@ -97,7 +97,7 @@ Default mode:
 [SHEPHERD WORKER NOTIFICATIONS]
 - worker.completed impl: completed tests. Evidence: pi-session:/path#entry=a2
 - worker.blocked reviewer: needs input on API shape. Evidence: event 42
-Use shepherd_worker_snapshot if details are needed.
+Use herdsman_worker_snapshot if details are needed.
 ```
 
 Optional autoResume mode:
@@ -107,14 +107,14 @@ Optional autoResume mode:
 
 - [x] **Step 6: Run tests**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: extension tests pass.
 
 - [x] **Step 7: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts packages/shepherd-pi/package.json test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/index.ts packages/herdsman-pi/package.json test/unit/herdsman-pi-extension.test.ts
 git commit -m "feat(pi): bridge worker telemetry and notifications"
 ```
 
@@ -123,10 +123,10 @@ git commit -m "feat(pi): bridge worker telemetry and notifications"
 **Objective:** Provide Herdr-native observe action and dashboard pane without making plugin the event-stream core.
 
 **Files:**
-- Create: `packages/shepherd-herdr-plugin/herdr-plugin.toml`
-- Create: `packages/shepherd-herdr-plugin/package.json`
-- Create: `packages/shepherd-herdr-plugin/tsconfig.json`
-- Create: `packages/shepherd-herdr-plugin/src/index.ts`
+- Create: `packages/herdsman-herdr-plugin/herdr-plugin.toml`
+- Create: `packages/herdsman-herdr-plugin/package.json`
+- Create: `packages/herdsman-herdr-plugin/tsconfig.json`
+- Create: `packages/herdsman-herdr-plugin/src/index.ts`
 - Test: `test/unit/herdr-plugin-package.test.ts`
 
 **Interfaces:**
@@ -137,11 +137,11 @@ git commit -m "feat(pi): bridge worker telemetry and notifications"
 
 Assert:
 
-1. manifest has plugin id `shepherd.observability`.
+1. manifest has plugin id `herdsman.observability`.
 2. manifest declares action `observe-workspace` with context `workspace`.
 3. manifest declares pane `dashboard`.
-4. plugin command runs inside Herdr context and calls `shepherd observe-current --json`, which forwards `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` to the daemon.
-5. dashboard command calls `shepherd snapshot <observedWorkspaceId> --json` and renders worker rows.
+4. plugin command runs inside Herdr context and calls `herdsman observe-current --json`, which forwards `HERDR_SOCKET_PATH` and `HERDR_WORKSPACE_ID` to the daemon.
+5. dashboard command calls `herdsman snapshot <observedWorkspaceId> --json` and renders worker rows.
 
 - [x] **Step 2: Run test to verify it fails**
 
@@ -151,25 +151,25 @@ Expected: package missing.
 
 - [x] **Step 3: Create manifest**
 
-`packages/shepherd-herdr-plugin/herdr-plugin.toml`:
+`packages/herdsman-herdr-plugin/herdr-plugin.toml`:
 
 ```toml
-id = "shepherd.observability"
-name = "Shepherd Observability"
+id = "herdsman.observability"
+name = "Herdsman Observability"
 version = "0.1.0"
 min_herdr_version = "0.7.0"
-description = "Observe Herdr workers through Shepherd snapshots and notifications."
+description = "Observe Herdr workers through Herdsman snapshots and notifications."
 platforms = ["linux", "macos", "windows"]
 
 [[actions]]
 id = "observe-workspace"
-title = "Observe workspace with Shepherd"
+title = "Observe workspace with Herdsman"
 contexts = ["workspace"]
 command = ["node", "dist/index.js", "observe-workspace"]
 
 [[panes]]
 id = "dashboard"
-title = "Shepherd Workers"
+title = "Herdsman Workers"
 placement = "split"
 command = ["node", "dist/index.js", "dashboard"]
 ```
@@ -179,14 +179,14 @@ command = ["node", "dist/index.js", "dashboard"]
 `observe-workspace` behavior:
 
 - require `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_WORKSPACE_ID`
-- call local `shepherd observe-current --json`
+- call local `herdsman observe-current --json`
 - print observed workspace id
 - exit with code `2` and print `observe-workspace requires a Herdr-managed pane` when the Herdr env vars are missing
 
 `dashboard` behavior:
 
 - read observed workspace id from `SHEPHERD_OBSERVED_WORKSPACE_ID`, or call `observe-workspace` first
-- call `shepherd snapshot <id> --json`
+- call `herdsman snapshot <id> --json`
 - render compact rows: `status agent summary recommendedAction`
 - refresh every 5 seconds until process exits
 
@@ -199,7 +199,7 @@ Expected: plugin package tests pass.
 - [x] **Step 6: Commit**
 
 ```bash
-git add packages/shepherd-herdr-plugin test/unit/herdr-plugin-package.test.ts
-git commit -m "feat(herdr): add Shepherd plugin companion"
+git add packages/herdsman-herdr-plugin test/unit/herdr-plugin-package.test.ts
+git commit -m "feat(herdr): add Herdsman plugin companion"
 ```
 

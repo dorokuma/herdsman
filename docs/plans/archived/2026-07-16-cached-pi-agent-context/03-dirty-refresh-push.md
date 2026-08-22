@@ -49,7 +49,7 @@
 - Modify: `test/integration/orchestrator-pane-move.test.ts` — old-owner clearing and destination-owner context after movement.
 - Modify: `test/integration/orchestrator-disconnect-grace.test.ts` — reconnect registration restores owner context.
 - Modify: `src/daemon/service.ts` — inject shared context service and changed-scope callback.
-- Modify: `packages/shepherd-pi/src/daemon-client.ts` type declarations only if needed to compile integration fixtures; behavioral client work is in child 04.
+- Modify: `packages/herdsman-pi/src/daemon-client.ts` type declarations only if needed to compile integration fixtures; behavioral client work is in child 04.
 
 ## Interfaces
 

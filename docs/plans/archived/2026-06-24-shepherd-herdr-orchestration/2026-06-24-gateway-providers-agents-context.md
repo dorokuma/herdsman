@@ -1,8 +1,8 @@
-# Shepherd Gateway Providers, Herdr Agents, and Context
+# Herdsman Gateway Providers, Herdr Agents, and Context
 
 Date: 2026-06-24
 
-Parent: [Shepherd Herdr Orchestration Plan](../2026-06-24-shepherd-herdr-orchestration.md)
+Parent: [Herdsman Herdr Orchestration Plan](../2026-06-24-herdsman-herdr-orchestration.md)
 
 ## Status
 
@@ -11,15 +11,15 @@ Archived. The provider-based gateway MVP was implemented, but new active work su
 ## Progress
 
 - **Done** — Provider registry, context builder, logical tools, summaries, and Herdr agent profile guidance were implemented for the original MVP.
-- **Superseded** — Shepherd-owned LLM provider auth/model selection is replaced by Pi runtime assumptions in the active plan.
+- **Superseded** — Herdsman-owned LLM provider auth/model selection is replaced by Pi runtime assumptions in the active plan.
 
 ## Next steps
 
-- Reuse Herdr agent profile and logical tool decisions. Do not extend Shepherd-owned LLM providers unless the Pi runtime direction changes.
+- Reuse Herdr agent profile and logical tool decisions. Do not extend Herdsman-owned LLM providers unless the Pi runtime direction changes.
 
 ## Goal
 
-Define how Shepherd configures the gateway LLM, Herdr worker agents, and conversation context.
+Define how Herdsman configures the gateway LLM, Herdr worker agents, and conversation context.
 
 ## Implementation status
 
@@ -32,7 +32,7 @@ Implemented:
 - environment-only API key lookup for API-key providers.
 - provider router with message/turn, session, and channel/thread overrides.
 - provider-independent logical tool registry converted to AI SDK tools with TypeBox/Ajv runtime validation.
-- daemon logical tool RPC and standalone `shepherd-tools` stdio helper over the same logical tool registry.
+- daemon logical tool RPC and standalone `herdsman-tools` stdio helper over the same logical tool registry.
 - gateway prompt builder with Herdr control-plane role, progress narration guidance, default agent, and `when` descriptions.
 - recent event context builder, `herdr.progress` context projection, and threshold-based `session_summary` updates.
 - Herdr orchestration tools listed below, including `herdr_read`, attach, pane text send, waits, and agent messaging.
@@ -41,20 +41,20 @@ Implemented:
 
 MVP limits:
 
-- The Codex gateway still uses the AI SDK executable tool bridge by default, while the dedicated Hermes-style `shepherd-tools` stdio helper is available for callback-style integrations over the daemon socket.
-- Provider-native approval requests can be recorded and delivered as Shepherd events, but response plumbing back into Codex app-server or worker-agent-specific approval APIs is deferred.
+- The Codex gateway still uses the AI SDK executable tool bridge by default, while the dedicated Hermes-style `herdsman-tools` stdio helper is available for callback-style integrations over the daemon socket.
+- Provider-native approval requests can be recorded and delivered as Herdsman events, but response plumbing back into Codex app-server or worker-agent-specific approval APIs is deferred.
 - `auxiliary.summary` is reserved in config, but summary generation currently uses the gateway provider/model.
-- Rich Herdr progress detection is prompt and event-context based, not a separate auxiliary progress model. Compact `herdr.progress` events are recorded from Herdr event waits for Shepherd-bound workspaces and projected into gateway context.
+- Rich Herdr progress detection is prompt and event-context based, not a separate auxiliary progress model. Compact `herdr.progress` events are recorded from Herdr event waits for Herdsman-bound workspaces and projected into gateway context.
 
 ## Gateway LLM role
 
-The gateway LLM is a Herdr control-plane operator. It decides how to use Shepherd and Herdr tools. It is not the main coding agent.
+The gateway LLM is a Herdr control-plane operator. It decides how to use Herdsman and Herdr tools. It is not the main coding agent.
 
 It may:
 
 - resolve working contexts
 - inspect Herdr sessions, workspaces, tabs, panes, and agents
-- create Shepherd-managed Herdr resources
+- create Herdsman-managed Herdr resources
 - start agents in panes
 - send prompts/input to agents or panes
 - wait for Herdr agent status changes
@@ -66,36 +66,36 @@ It should not:
 - directly edit project files outside Herdr
 - directly run implementation commands outside Herdr
 - act as the main coding agent
-- attach to non-Shepherd Herdr resources without explicit user instruction
+- attach to non-Herdsman Herdr resources without explicit user instruction
 
 ## Provider architecture
 
-Shepherd owns:
+Herdsman owns:
 
 - provider registry
 - config schema
 - provider selection
 - auth source policy
 - toolset policy
-- Shepherd logical tool registry
+- Herdsman logical tool registry
 - gateway prompt
 - Herdr tool execution
 
-AI SDK provider packages can implement requests and streaming behind Shepherd's provider interface. They are replaceable implementation details. Shepherd must not depend on Vercel AI Gateway or a Vercel account.
+AI SDK provider packages can implement requests and streaming behind Herdsman's provider interface. They are replaceable implementation details. Herdsman must not depend on Vercel AI Gateway or a Vercel account.
 
-## Shepherd logical tools
+## Herdsman logical tools
 
-Gateway tools are provider-independent Shepherd logical tools. Shepherd owns the tool names, descriptions, JSON Schemas, policy checks, execution, DB event logging, and result projection.
+Gateway tools are provider-independent Herdsman logical tools. Herdsman owns the tool names, descriptions, JSON Schemas, policy checks, execution, DB event logging, and result projection.
 
 Provider adapters only translate the same logical tool registry into provider-specific wire formats:
 
-- Codex app-server uses the MVP AI SDK executable tool bridge by default. A standalone internal `shepherd-tools` stdio callback is also available over daemon `tool.list`/`tool.run` without changing logical tool definitions.
+- Codex app-server uses the MVP AI SDK executable tool bridge by default. A standalone internal `herdsman-tools` stdio callback is also available over daemon `tool.list`/`tool.run` without changing logical tool definitions.
 - OpenAI, OpenRouter, and Anthropic use normal function/tool calling through their AI SDK-backed adapters.
 - A future direct Codex OAuth Responses provider would use normal Responses function tools.
 
 The gateway prompt and policy should describe the same logical tool surface regardless of provider. Do not create Codex-only and OpenAI-only tool definitions unless a provider cannot represent a tool at all.
 
-"High-level tools" does not mean the gateway LLM cannot operate Herdr. It means the gateway LLM operates Herdr through Shepherd-owned orchestration tools rather than raw Herdr socket methods. Shepherd remains responsible for binding validation, policy, event logging, and translating each logical tool into the appropriate Herdr CLI/socket calls.
+"High-level tools" does not mean the gateway LLM cannot operate Herdr. It means the gateway LLM operates Herdr through Herdsman-owned orchestration tools rather than raw Herdr socket methods. Herdsman remains responsible for binding validation, policy, event logging, and translating each logical tool into the appropriate Herdr CLI/socket calls.
 
 Provider capabilities:
 
@@ -140,14 +140,14 @@ Decisions:
 - `providers` is a map.
 - `gateway.default_provider` is required.
 - `gateway.model` is the default model when no override supplies a model.
-- `gateway.provider_overrides.sessions` can override provider/model by Shepherd session id.
+- `gateway.provider_overrides.sessions` can override provider/model by Herdsman session id.
 - `gateway.provider_overrides.channels` can override provider/model by `platform:spaceId` or `platform:spaceId:threadId`.
 - Message-level `providerOverride` from daemon RPC or local CLI takes precedence over configured overrides.
 - API-key providers read credentials from environment variables only.
 - Do not allow API key literals in config for MVP.
-- Codex OAuth reads the Shepherd daemon user's existing Codex CLI login.
-- Gateway Codex auth and Herdr worker Codex auth are separate when Shepherd and Herdr run on different machines.
-- `approvalPolicy` configures provider-native approval behavior where the provider supports it. Shepherd has an approval event surface for recording and delivery; provider-specific response plumbing is deferred.
+- Codex OAuth reads the Herdsman daemon user's existing Codex CLI login.
+- Gateway Codex auth and Herdr worker Codex auth are separate when Herdsman and Herdr run on different machines.
+- `approvalPolicy` configures provider-native approval behavior where the provider supports it. Herdsman has an approval event surface for recording and delivery; provider-specific response plumbing is deferred.
 
 ## Codex gateway provider
 
@@ -156,9 +156,9 @@ Use `ai-sdk-provider-codex-cli` as the initial implementation.
 MVP mode:
 
 - `codexAppServer`, not `codexExec`
-- persistent Codex app-server process inside the Shepherd daemon
+- persistent Codex app-server process inside the Herdsman daemon
 - stateless calls by default
-- Shepherd DB provides conversation history each turn
+- Herdsman DB provides conversation history each turn
 - Codex `threadId` may be stored as provider metadata but is not the source of truth
 
 Rationale:
@@ -170,11 +170,11 @@ Rationale:
 Important limitation:
 
 - Codex CLI providers do not use normal AI SDK custom tools the same way API providers do.
-- MVP uses the same Shepherd logical tool registry through the AI SDK tool bridge. The `shepherd-tools` stdio callback can be used by callback-style transports without changing logical tool definitions.
+- MVP uses the same Herdsman logical tool registry through the AI SDK tool bridge. The `herdsman-tools` stdio callback can be used by callback-style transports without changing logical tool definitions.
 - Any callback remains an implementation detail, not a user-facing MCP integration surface.
-- Do not let Codex operate directly on the Shepherd daemon environment.
+- Do not let Codex operate directly on the Herdsman daemon environment.
 
-Initial Shepherd logical tools:
+Initial Herdsman logical tools:
 
 - `resolve_working_context`
 - `session_read`
@@ -193,13 +193,13 @@ Initial Shepherd logical tools:
 - `read_agent_output`
 - gateway progress narration for long-running Herdr agents
 
-Do not expose through the Shepherd logical tool bridge:
+Do not expose through the Herdsman logical tool bridge:
 
 - generic shell/file/edit tools already owned by Codex or worker agents
 - arbitrary Herdr raw socket methods
-- non-Shepherd Herdr resources unless the user explicitly attached them
+- non-Herdsman Herdr resources unless the user explicitly attached them
 
-`run_pane_command` is allowed only inside Shepherd-managed Herdr panes. It is for tests, dev servers, logs, and controlled terminal workflows; it is not a general Shepherd-daemon shell escape.
+`run_pane_command` is allowed only inside Herdsman-managed Herdr panes. It is for tests, dev servers, logs, and controlled terminal workflows; it is not a general Herdsman-daemon shell escape.
 
 ## External OAuth proxy option
 
@@ -215,17 +215,17 @@ Do not make it a core dependency in MVP:
 - it is unofficial and uses ChatGPT/Codex backend endpoints directly
 - it depends on AI SDK internal APIs
 
-Users can still run it separately and configure Shepherd as an OpenAI-compatible provider later.
+Users can still run it separately and configure Herdsman as an OpenAI-compatible provider later.
 
 ## Direct Codex OAuth Responses option
 
 A Pi/OpenCode-style direct Codex OAuth Responses provider is a useful future experiment:
 
-- Shepherd would own ChatGPT OAuth token storage and refresh.
-- Shepherd/Herdr tools would be passed as normal Responses function tools.
+- Herdsman would own ChatGPT OAuth token storage and refresh.
+- Herdsman/Herdr tools would be passed as normal Responses function tools.
 - It avoids the Codex app-server tool callback, but directly targets ChatGPT/Codex backend endpoints and carries more maintenance risk.
 
-Do not make this the MVP default. Keep `codexAppServer` plus Shepherd logical tools as the MVP path.
+Do not make this the MVP default. Keep `codexAppServer` plus Herdsman logical tools as the MVP path.
 
 ## Herdr worker agents
 
@@ -251,7 +251,7 @@ agents:
 Rules:
 
 - `command` is resolved by the Herdr server side `$PATH`.
-- Shepherd does not preflight `command -v`; it tries `agent.start` and reports failures.
+- Herdsman does not preflight `command -v`; it tries `agent.start` and reports failures.
 - `args` is an argv array.
 - `when` is only for the gateway LLM. It is not sent to the worker agent.
 - If no `when` clearly matches, use `default_agent`.
@@ -273,7 +273,7 @@ Do not include empty sections or boilerplate that adds no value.
 
 ## Context management
 
-Shepherd DB stores full history. Gateway LLM receives active context only.
+Herdsman DB stores full history. Gateway LLM receives active context only.
 
 Sent to Gateway LLM:
 
@@ -330,7 +330,7 @@ Future slots can include:
 - `herdr_progress`
 - `slack_digest`
 
-Hermes has many auxiliary slots such as compression, vision, web extract, approval, session search, and curator. Shepherd should add only slots that map to Shepherd needs.
+Hermes has many auxiliary slots such as compression, vision, web extract, approval, session search, and curator. Herdsman should add only slots that map to Herdsman needs.
 
 ## Prompt structure
 
@@ -338,14 +338,14 @@ Borrow Hermes' layered prompt idea, but keep it small.
 
 ```text
 stable:
-  - Shepherd identity and role
+  - Herdsman identity and role
   - Herdr control-plane rules
   - non-implementation boundary
   - policy/toolset summary
   - platform rendering hint
 
 context:
-  - Shepherd session metadata
+  - Herdsman session metadata
   - platform binding metadata
   - working context binding
   - Herdr named session/workspace binding

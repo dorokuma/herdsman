@@ -12,7 +12,7 @@ afterEach(() => {
 
 describe("daemon service", () => {
   test("finds migrations from the package root instead of the launch cwd", () => {
-    const root = mkdtempSync(join(tmpdir(), "shepherd-daemon-service-"));
+    const root = mkdtempSync(join(tmpdir(), "herdsman-daemon-service-"));
     tempDirs.push(root);
     const moduleDir = join(root, "dist", "src", "daemon");
     const migrationsFolder = join(root, "drizzle");

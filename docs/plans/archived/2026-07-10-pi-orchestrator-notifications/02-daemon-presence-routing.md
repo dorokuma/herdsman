@@ -372,7 +372,7 @@ Expected: Drizzle creates migration index `0002`, drops `agent_notification_curs
 
 Run: `rg "agent\.notifications\.subscribe|subscriptionId|AgentNotification(CursorStore|Service)" src test -n`
 
-Expected: no daemon/source references; shepherd-pi and its old tests may still match until child 04.
+Expected: no daemon/source references; herdsman-pi and its old tests may still match until child 04.
 
 - [x] **Step 6: Run routing and migration tests**
 
@@ -465,7 +465,7 @@ git commit -m "feat(orchestrator): expire disconnected owners"
 
 - Socket writes can fail after owner selection. Keep events unacked; reconnect replay provides at-least-once delivery.
 - A generic client cannot subscribe to streams under the new protocol. This is intentional; `agent.events` remains the explicit pull API.
-- Startup grace requires indexed agents before registration can resolve. `runObservabilityDaemonService()` must retain server/watch startup ordering and shepherd-pi retries registration failures.
+- Startup grace requires indexed agents before registration can resolve. `runObservabilityDaemonService()` must retain server/watch startup ordering and herdsman-pi retries registration failures.
 - No product questions remain for this child plan.
 
 ## Next Steps

@@ -1,0 +1,11 @@
+herdsman is a fork of shepherd.
+
+Upstream: https://github.com/ryonakae/shepherd
+Original author: Ryo Nakae (GitHub: https://github.com/ryonakae; npm: ryonakae)
+Fork point: commit dfdd3a2 (v0.5.1)
+
+Modification scope: package and product rebranding, local runtime path and service migration,
+and maintenance of the daemon, CLI, pi extension, and herdr plugin while preserving the
+upstream SQLite schema and agent event protocol.
+
+MIT License.

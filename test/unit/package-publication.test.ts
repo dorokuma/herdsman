@@ -19,18 +19,18 @@ async function readManifest(relativePath: string): Promise<PackageManifest> {
 }
 
 describe("npm publication metadata", () => {
-  test("keeps public packages scoped and the Herdr integration private", async () => {
+  test("publishes the scoped runtime and public Herdr integration", async () => {
     const root = await readManifest("../../package.json");
-    const pi = await readManifest("../../packages/shepherd-pi/package.json");
-    const herdr = await readManifest("../../packages/shepherd-herdr-plugin/package.json");
+    const pi = await readManifest("../../packages/herdsman-pi/package.json");
+    const herdr = await readManifest("../../packages/herdsman-herdr-plugin/package.json");
     const pluginToml = await readFile(
-      new URL("../../packages/shepherd-herdr-plugin/herdr-plugin.toml", import.meta.url),
+      new URL("../../packages/herdsman-herdr-plugin/herdr-plugin.toml", import.meta.url),
       "utf8",
     );
     const pluginVersion = /^version = "([^"]+)"$/m.exec(pluginToml)?.[1];
 
-    expect(root.name).toBe("@ryonakae/shepherd");
-    expect(root.bin).toEqual({ shepherd: "dist/src/cli/shepherd.js" });
+    expect(root.name).toBe("@dorokuma/herdsman");
+    expect(root.bin).toEqual({ herdsman: "dist/src/cli/herdsman.js" });
     expect(root.files).toEqual(["dist", "drizzle"]);
     expect(root.publishConfig?.access).toBe("public");
     expect(root.scripts).toMatchObject({
@@ -43,16 +43,16 @@ describe("npm publication metadata", () => {
     expect(root.scripts?.build).toContain("pnpm clean:dist");
     expect(root.scripts?.check).toContain("pnpm package:check");
 
-    expect(pi.name).toBe("@ryonakae/shepherd-pi");
+    expect(pi.name).toBe("@dorokuma/herdsman-pi");
     expect(pi.files).toEqual(["src"]);
     expect(pi.publishConfig?.access).toBe("public");
     expect(pi.repository).toEqual({
       type: "git",
-      url: "git+https://github.com/ryonakae/shepherd.git",
-      directory: "packages/shepherd-pi",
+      url: "git+https://github.com/dorokuma/herdsman.git",
+      directory: "packages/herdsman-pi",
     });
 
-    expect(herdr.private).toBe(true);
+    expect(herdr.private).not.toBe(true);
     expect(pluginVersion).toBeDefined();
     expect(new Set([root.version, pi.version, herdr.version, pluginVersion])).toEqual(
       new Set([root.version]),

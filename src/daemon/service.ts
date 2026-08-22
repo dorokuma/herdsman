@@ -76,7 +76,7 @@ export async function runObservabilityDaemonService(
 
   await server.start();
   await watchManager.start();
-  console.log(`Shepherd daemon listening on ${runtime.paths.socketPath}`);
+  console.log(`Herdsman daemon listening on ${runtime.paths.socketPath}`);
 
   const stop = async () => {
     await watchManager.stop();
@@ -97,7 +97,7 @@ export function resolveMigrationsFolder(startDir: string): string {
     }
     const parent = dirname(current);
     if (parent === current) {
-      throw new Error(`Cannot find Shepherd migrations above ${startDir}`);
+      throw new Error(`Cannot find Herdsman migrations above ${startDir}`);
     }
     current = parent;
   }

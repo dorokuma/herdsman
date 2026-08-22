@@ -124,15 +124,15 @@ export class ReconnectingDaemonClient {
     this.#reconnectTimer = undefined;
     this.#socket?.destroy();
     this.#socket = undefined;
-    this.#rejectAll(new Error("Shepherd daemon client is closed"));
+    this.#rejectAll(new Error("Herdsman daemon client is closed"));
   }
 
   request(method: string, params: unknown): Promise<unknown> {
     if (this.#state === "closed") {
-      return Promise.reject(new Error("Shepherd daemon client is closed"));
+      return Promise.reject(new Error("Herdsman daemon client is closed"));
     }
     if (this.#state !== "connected" || !this.#socket) {
-      return Promise.reject(new Error("Shepherd daemon client is not connected"));
+      return Promise.reject(new Error("Herdsman daemon client is not connected"));
     }
     const id = `pi-${this.#nextId}`;
     this.#nextId += 1;
@@ -173,7 +173,7 @@ export class ReconnectingDaemonClient {
       }
     });
     socket.on("error", disconnect);
-    socket.on("close", () => disconnect(new Error("Shepherd daemon socket closed")));
+    socket.on("close", () => disconnect(new Error("Herdsman daemon socket closed")));
   }
 
   #handleDisconnect(error: Error, generation: number): void {
@@ -214,7 +214,7 @@ export class ReconnectingDaemonClient {
       const pending = this.#pending.get(String(message.id));
       if (!pending) continue;
       this.#pending.delete(String(message.id));
-      if (message.error) pending.reject(new Error(message.error.message ?? "Shepherd RPC failed"));
+      if (message.error) pending.reject(new Error(message.error.message ?? "Herdsman RPC failed"));
       else pending.resolve(message.result);
     }
   }

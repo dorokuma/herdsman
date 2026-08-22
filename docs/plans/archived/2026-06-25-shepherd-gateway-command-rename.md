@@ -1,4 +1,4 @@
-# Shepherd Gateway Command and Naming Unification Plan
+# Herdsman Gateway Command and Naming Unification Plan
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task.
 
@@ -14,18 +14,18 @@ Active.
 
 ## Next steps
 
-Implement Task 1 first. Do not keep backward compatibility for `shepherd daemon`, `SHEPHERD_DAEMON_ID`, `daemonId`, `src/daemon`, or daemon-named tests because Shepherd has not been released.
+Implement Task 1 first. Do not keep backward compatibility for `herdsman daemon`, `SHEPHERD_DAEMON_ID`, `daemonId`, `src/daemon`, or daemon-named tests because Herdsman has not been released.
 
-**Goal:** Make Shepherd's local background service consistently named **Gateway** across CLI, code, wire contracts, Pi bridge metadata, tests, README, and active plans. Add `shepherd gateway start/stop/restart/status` as the primary service management surface.
+**Goal:** Make Herdsman's local background service consistently named **Gateway** across CLI, code, wire contracts, Pi bridge metadata, tests, README, and active plans. Add `herdsman gateway start/stop/restart/status` as the primary service management surface.
 
-**Architecture:** `Shepherd Gateway` is the local long-running service that owns the Unix socket, JSON Lines RPC, platform adapters, Pi supervision, run queueing, recovery, and logical tools. Existing `gateway.*` RPC methods, `gateway.*` event types, and the `gateway_runs` database table already use the right product term and stay unchanged. The previous foreground service implementation moves from `src/daemon/*` into `src/gateway/*`; a small process manager starts/stops a detached `shepherd gateway run` child for `start/stop/restart/status`.
+**Architecture:** `Herdsman Gateway` is the local long-running service that owns the Unix socket, JSON Lines RPC, platform adapters, Pi supervision, run queueing, recovery, and logical tools. Existing `gateway.*` RPC methods, `gateway.*` event types, and the `gateway_runs` database table already use the right product term and stay unchanged. The previous foreground service implementation moves from `src/daemon/*` into `src/gateway/*`; a small process manager starts/stops a detached `herdsman gateway run` child for `start/stop/restart/status`.
 
 **Tech Stack:** TypeScript ESM with `NodeNext`, Node.js `node:child_process`, `node:net`, `node:fs`, Vitest, Biome, SQLite via `node:sqlite`, Pi extension JavaScript.
 
 ## Global Constraints
 
 - No compatibility aliases for the old unreleased surface:
-  - `shepherd daemon` must become an unknown command.
+  - `herdsman daemon` must become an unknown command.
   - `SHEPHERD_DAEMON_ID` must be replaced by `SHEPHERD_GATEWAY_ID`.
   - Pi binding/RPC field `daemonId` must be replaced by `gatewayId`.
   - The persisted identity file must be `gateway-id`, not `daemon-id`.
@@ -39,13 +39,13 @@ Implement Task 1 first. Do not keep backward compatibility for `shepherd daemon`
 
 ## Current Context
 
-- `src/cli/shepherd.ts` currently parses `shepherd daemon [--socket <path>] [--db <path>] [--config <path>]` and runs the service in the foreground.
-- `src/daemon/server.ts` exports `ShepherdDaemonServer`, owns the Unix socket, JSON Lines RPC, Pi handshake/attach/heartbeat, session events, logical tool RPC, and external gateway run RPC.
+- `src/cli/herdsman.ts` currently parses `herdsman daemon [--socket <path>] [--db <path>] [--config <path>]` and runs the service in the foreground.
+- `src/daemon/server.ts` exports `HerdsmanDaemonServer`, owns the Unix socket, JSON Lines RPC, Pi handshake/attach/heartbeat, session events, logical tool RPC, and external gateway run RPC.
 - `src/daemon/identity.ts` stores a stable id in `<stateDir>/daemon-id` and exports `readOrCreateDaemonId`.
 - `src/daemon/recovery.ts` exports `recoverDaemonState` and writes recovery notes for queued/running gateway runs.
 - `src/daemon/json-lines.ts` is imported by the TUI client, Herdr socket clients, CLI tools, Pi readiness tests, and server tests.
-- `packages/shepherd-pi/extensions/index.js` has `ShepherdDaemonClient`, reads `SHEPHERD_DAEMON_ID` and `SHEPHERD_SOCKET_PATH`, writes binding entries with `daemonId`, and displays daemon-oriented error messages.
-- `test/unit/cli.test.ts` asserts `shepherd daemon` parsing and `SHEPHERD_DAEMON_ID` in Pi open environment.
+- `packages/herdsman-pi/extensions/index.js` has `HerdsmanDaemonClient`, reads `SHEPHERD_DAEMON_ID` and `SHEPHERD_SOCKET_PATH`, writes binding entries with `daemonId`, and displays daemon-oriented error messages.
+- `test/unit/cli.test.ts` asserts `herdsman daemon` parsing and `SHEPHERD_DAEMON_ID` in Pi open environment.
 - `test/integration/daemon-rpc.test.ts`, `test/integration/daemon-recovery.test.ts`, and `test/unit/daemon-identity.test.ts` directly encode daemon naming in filenames, imports, `describe` labels, temp prefixes, and expected wire fields.
 - `README.md`, `README.ja.md`, and active plans under `docs/plans/2026-06-25-pi-runtime-gateway*` still describe daemon startup and daemon identity.
 
@@ -56,18 +56,18 @@ Implement Task 1 first. Do not keep backward compatibility for `shepherd daemon`
 - Move: `src/daemon/recovery.ts` -> `src/gateway/recovery.ts` — Gateway startup recovery for in-flight runs.
 - Move: `src/daemon/json-lines.ts` -> `src/gateway/json-lines.ts` — Gateway JSON Lines framing used by all local clients.
 - Create: `src/gateway/process-manager.ts` — detached process management for `start/stop/restart/status`.
-- Modify: `src/cli/shepherd.ts` — parse `gateway` subcommands, foreground `gateway run`, background management commands, env names, help text.
-- Modify: `src/cli/shepherd-tools.ts` — import JSON Lines from `@/gateway/json-lines.js` and read `SHEPHERD_GATEWAY_SOCKET_PATH`.
+- Modify: `src/cli/herdsman.ts` — parse `gateway` subcommands, foreground `gateway run`, background management commands, env names, help text.
+- Modify: `src/cli/herdsman-tools.ts` — import JSON Lines from `@/gateway/json-lines.js` and read `SHEPHERD_GATEWAY_SOCKET_PATH`.
 - Modify: `src/tui/client.ts` — import JSON Lines from `@/gateway/json-lines.js` and use gateway wording.
 - Modify: `src/herdr/socket-client.ts` and `src/herdr/managed-socket-client.ts` tests as needed — update JSON Lines imports only.
-- Modify: `src/gateway/pi-readiness.ts` — import `PiHandshakeRecord` from `@/gateway/server.js`, use `shepherd gateway start` guidance, read `SHEPHERD_GATEWAY_SOCKET_PATH` in spawned Pi env.
+- Modify: `src/gateway/pi-readiness.ts` — import `PiHandshakeRecord` from `@/gateway/server.js`, use `herdsman gateway start` guidance, read `SHEPHERD_GATEWAY_SOCKET_PATH` in spawned Pi env.
 - Modify: `src/gateway/pi-supervisor.ts` — pass `SHEPHERD_GATEWAY_SOCKET_PATH` to headless Pi sessions.
-- Modify: `packages/shepherd-pi/extensions/index.js` — rename client class, env variables, binding key, messages.
-- Modify: `packages/shepherd-pi/package.json` — update description.
+- Modify: `packages/herdsman-pi/extensions/index.js` — rename client class, env variables, binding key, messages.
+- Modify: `packages/herdsman-pi/package.json` — update description.
 - Move: `test/integration/daemon-rpc.test.ts` -> `test/integration/gateway-rpc.test.ts`.
 - Move: `test/integration/daemon-recovery.test.ts` -> `test/integration/gateway-recovery.test.ts`.
 - Move: `test/unit/daemon-identity.test.ts` -> `test/unit/gateway-identity.test.ts`.
-- Modify: `test/unit/shepherd-tools.test.ts` and `test/unit/pi-supervisor.test.ts` — assert gateway env names.
+- Modify: `test/unit/herdsman-tools.test.ts` and `test/unit/pi-supervisor.test.ts` — assert gateway env names.
 - Modify: all tests importing `@/daemon/json-lines.js` or `@/daemon/server.js` to use `@/gateway/...`.
 - Modify: `README.md`, `README.ja.md` — user-facing commands and project layout.
 - Move: `docs/plans/2026-06-25-pi-runtime-gateway/2026-06-25-daemon-pi-supervisor-run-queue.md` -> `docs/plans/2026-06-25-pi-runtime-gateway/2026-06-25-gateway-pi-supervisor-run-queue.md`.
@@ -87,17 +87,17 @@ Implement Task 1 first. Do not keep backward compatibility for `shepherd daemon`
 - Move: `test/unit/daemon-identity.test.ts` -> `test/unit/gateway-identity.test.ts`
 - Move: `test/integration/daemon-recovery.test.ts` -> `test/integration/gateway-recovery.test.ts`
 - Move: `test/integration/daemon-rpc.test.ts` -> `test/integration/gateway-rpc.test.ts`
-- Modify: `src/cli/shepherd.ts`, `src/cli/shepherd-tools.ts`, `src/tui/client.ts`, `src/herdr/socket-client.ts`, `src/gateway/pi-readiness.ts`, tests importing `@/daemon/*`
+- Modify: `src/cli/herdsman.ts`, `src/cli/herdsman-tools.ts`, `src/tui/client.ts`, `src/herdr/socket-client.ts`, `src/gateway/pi-readiness.ts`, tests importing `@/daemon/*`
 
 **Interfaces:**
-- Consumes: existing `ShepherdDaemonServer`, `recoverDaemonState`, `readOrCreateDaemonId`, `PiHandshakeRecord` behavior.
-- Produces: `ShepherdGatewayServer`, `recoverGatewayState`, `readOrCreateGatewayId`, `PiHandshakeRecord` with `gatewayId`.
+- Consumes: existing `HerdsmanDaemonServer`, `recoverDaemonState`, `readOrCreateDaemonId`, `PiHandshakeRecord` behavior.
+- Produces: `HerdsmanGatewayServer`, `recoverGatewayState`, `readOrCreateGatewayId`, `PiHandshakeRecord` with `gatewayId`.
 
 - [ ] **Step 1: Write the failing rename expectations**
 
 Update the renamed tests before implementation:
 
-1. In `test/unit/gateway-identity.test.ts`, import `readOrCreateGatewayId` from `@/gateway/identity.js`, use `describe("readOrCreateGatewayId", ...)`, use temp prefix `shepherd-gateway-id-`, and assert the identity file is `gateway-id`:
+1. In `test/unit/gateway-identity.test.ts`, import `readOrCreateGatewayId` from `@/gateway/identity.js`, use `describe("readOrCreateGatewayId", ...)`, use temp prefix `herdsman-gateway-id-`, and assert the identity file is `gateway-id`:
 
 ```ts
 import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
@@ -116,7 +116,7 @@ afterEach(() => {
 
 describe("readOrCreateGatewayId", () => {
   test("creates and reuses a stable gateway id", () => {
-    const dir = mkdtempSync(join(tmpdir(), "shepherd-gateway-id-"));
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-gateway-id-"));
     tempDirs.push(dir);
 
     const first = readOrCreateGatewayId(dir);
@@ -133,13 +133,13 @@ describe("readOrCreateGatewayId", () => {
 
 ```ts
 expect(events.listEvents("session-1")[0]?.payload).toMatchObject({
-  message: "Gateway run was in flight during gateway startup. Shepherd did not replay it automatically.",
+  message: "Gateway run was in flight during gateway startup. Herdsman did not replay it automatically.",
 });
 ```
 
-3. In `test/integration/gateway-rpc.test.ts`, import `ShepherdGatewayServer` and `encodeJsonLine`/`JsonLineDecoder` from `@/gateway/...`, use `describe("ShepherdGatewayServer JSON Lines RPC", ...)`, rename helper option `gatewayId?: string`, construct `new ShepherdGatewayServer({ gatewayId: ... })`, and replace expected `daemonId` fields with `gatewayId`.
+3. In `test/integration/gateway-rpc.test.ts`, import `HerdsmanGatewayServer` and `encodeJsonLine`/`JsonLineDecoder` from `@/gateway/...`, use `describe("HerdsmanGatewayServer JSON Lines RPC", ...)`, rename helper option `gatewayId?: string`, construct `new HerdsmanGatewayServer({ gatewayId: ... })`, and replace expected `daemonId` fields with `gatewayId`.
 
-4. Update all remaining imports from `@/daemon/json-lines.js`, `@/daemon/server.js`, `@/daemon/recovery.js`, and `@/daemon/identity.js` to `@/gateway/...`. This includes `src/cli/shepherd-tools.ts`, `test/unit/shepherd-tools.test.ts`, TUI client tests, Herdr socket client tests, and Pi readiness tests.
+4. Update all remaining imports from `@/daemon/json-lines.js`, `@/daemon/server.js`, `@/daemon/recovery.js`, and `@/daemon/identity.js` to `@/gateway/...`. This includes `src/cli/herdsman-tools.ts`, `test/unit/herdsman-tools.test.ts`, TUI client tests, Herdr socket client tests, and Pi readiness tests.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -168,8 +168,8 @@ git mv test/integration/daemon-rpc.test.ts test/integration/gateway-rpc.test.ts
 Apply these semantic renames:
 
 ```text
-ShepherdDaemonServerOptions -> ShepherdGatewayServerOptions
-ShepherdDaemonServer -> ShepherdGatewayServer
+HerdsmanDaemonServerOptions -> HerdsmanGatewayServerOptions
+HerdsmanDaemonServer -> HerdsmanGatewayServer
 #daemonId -> #gatewayId
 options.daemonId -> options.gatewayId
 PiHandshakeRecord.daemonId -> PiHandshakeRecord.gatewayId
@@ -216,14 +216,14 @@ export function recoverGatewayState(options: {
 }): GatewayRecoveryResult {
   // Same loop as the current implementation.
   // The recovery message must be exactly:
-  // "Gateway run was in flight during gateway startup. Shepherd did not replay it automatically."
+  // "Gateway run was in flight during gateway startup. Herdsman did not replay it automatically."
 }
 ```
 
 In `src/gateway/server.ts`, change the Pi handshake and attach wire results to `gatewayId`:
 
 ```ts
-type ShepherdGatewayServerOptions = {
+type HerdsmanGatewayServerOptions = {
   configPath?: string;
   gatewayId?: string;
   // keep the rest of the existing option fields unchanged
@@ -288,23 +288,23 @@ Expected: all listed tests pass.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add src/gateway src/cli/shepherd.ts src/tui/client.ts src/herdr/socket-client.ts test/unit test/integration
+git add src/gateway src/cli/herdsman.ts src/tui/client.ts src/herdr/socket-client.ts test/unit test/integration
 git add -u src/daemon test/unit/daemon-identity.test.ts test/integration/daemon-recovery.test.ts test/integration/daemon-rpc.test.ts
 git commit -m "refactor: rename local service internals to gateway"
 ```
 
-### Task 2: Replace `shepherd daemon` with `shepherd gateway run` and update env parsing
+### Task 2: Replace `herdsman daemon` with `herdsman gateway run` and update env parsing
 
-**Objective:** Make the foreground service command `shepherd gateway run` and remove the old top-level `daemon` command.
+**Objective:** Make the foreground service command `herdsman gateway run` and remove the old top-level `daemon` command.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `test/unit/cli.test.ts`
 - Modify: `src/gateway/pi-readiness.ts`
 - Modify: `test/unit/pi-readiness.test.ts`
 
 **Interfaces:**
-- Consumes: `ShepherdGatewayServer`, `readOrCreateGatewayId`, `recoverGatewayState` from Task 1.
+- Consumes: `HerdsmanGatewayServer`, `readOrCreateGatewayId`, `recoverGatewayState` from Task 1.
 - Produces: CLI parse result for `gateway run`, gateway-prefixed socket/id env names, help text with gateway commands.
 
 - [ ] **Step 1: Write the failing CLI tests**
@@ -318,18 +318,18 @@ test("parses gateway run options", () => {
       "gateway",
       "run",
       "--socket",
-      "/tmp/shepherd.sock",
+      "/tmp/herdsman.sock",
       "--db",
-      "/tmp/shepherd.sqlite",
+      "/tmp/herdsman.sqlite",
       "--config",
-      "/tmp/shepherd.yaml",
+      "/tmp/herdsman.yaml",
     ]),
   ).toEqual({
     command: "gateway",
     action: "run",
-    configPath: "/tmp/shepherd.yaml",
-    dbPath: "/tmp/shepherd.sqlite",
-    socketPath: "/tmp/shepherd.sock",
+    configPath: "/tmp/herdsman.yaml",
+    dbPath: "/tmp/herdsman.sqlite",
+    socketPath: "/tmp/herdsman.sock",
   });
 });
 
@@ -357,9 +357,9 @@ test("rejects old daemon command", () => {
 Update the help test:
 
 ```ts
-expect(helpText()).toContain("shepherd gateway start");
-expect(helpText()).toContain("shepherd gateway run");
-expect(helpText()).not.toContain("shepherd daemon");
+expect(helpText()).toContain("herdsman gateway start");
+expect(helpText()).toContain("herdsman gateway run");
+expect(helpText()).not.toContain("herdsman daemon");
 ```
 
 Update Pi open env test to expect `SHEPHERD_GATEWAY_ID` and `SHEPHERD_GATEWAY_SOCKET_PATH`:
@@ -370,17 +370,17 @@ expect(
     environment: { PATH: "/bin" },
     gatewayId: "gateway-1",
     sessionId: "session-1",
-    socketPath: "/tmp/shepherd.sock",
+    socketPath: "/tmp/herdsman.sock",
   }),
 ).toMatchObject({
   PATH: "/bin",
   SHEPHERD_GATEWAY_ID: "gateway-1",
-  SHEPHERD_GATEWAY_SOCKET_PATH: "/tmp/shepherd.sock",
+  SHEPHERD_GATEWAY_SOCKET_PATH: "/tmp/herdsman.sock",
   SHEPHERD_SESSION_ID: "session-1",
 });
 ```
 
-In `test/unit/pi-readiness.test.ts`, assert the spawned Pi env key is `SHEPHERD_GATEWAY_SOCKET_PATH` and readiness guidance contains `shepherd gateway start`.
+In `test/unit/pi-readiness.test.ts`, assert the spawned Pi env key is `SHEPHERD_GATEWAY_SOCKET_PATH` and readiness guidance contains `herdsman gateway start`.
 
 - [ ] **Step 2: Run tests to verify they fail**
 
@@ -390,11 +390,11 @@ Run:
 pnpm test -- test/unit/cli.test.ts test/unit/pi-readiness.test.ts
 ```
 
-Expected: CLI tests fail because `gateway run` is unknown, old env variables are still used, and guidance still says `shepherd daemon`.
+Expected: CLI tests fail because `gateway run` is unknown, old env variables are still used, and guidance still says `herdsman daemon`.
 
 - [ ] **Step 3: Implement foreground gateway parsing and env names**
 
-In `src/cli/shepherd.ts`, replace the daemon command union member with:
+In `src/cli/herdsman.ts`, replace the daemon command union member with:
 
 ```ts
 type GatewayAction = "restart" | "run" | "start" | "status" | "stop";
@@ -434,9 +434,9 @@ if (command === "gateway") {
   const configPath = parsed.config ?? environment.SHEPHERD_CONFIG;
   const base = {
     command: "gateway" as const,
-    dbPath: parsed.db ?? environment.SHEPHERD_DB_PATH ?? "shepherd.sqlite",
+    dbPath: parsed.db ?? environment.SHEPHERD_DB_PATH ?? "herdsman.sqlite",
     socketPath:
-      parsed.socket ?? environment.SHEPHERD_GATEWAY_SOCKET_PATH ?? "/tmp/shepherd.sock",
+      parsed.socket ?? environment.SHEPHERD_GATEWAY_SOCKET_PATH ?? "/tmp/herdsman.sock",
   };
 
   if (action === "run") {
@@ -456,16 +456,16 @@ if (command === "gateway") {
 
 Change existing send/open/watch/rename defaults from `environment.SHEPHERD_SOCKET_PATH` to `environment.SHEPHERD_GATEWAY_SOCKET_PATH`.
 
-In `src/cli/shepherd-tools.ts`, change the default socket env in `parseShepherdToolsArgs` from `environment.SHEPHERD_SOCKET_PATH` to `environment.SHEPHERD_GATEWAY_SOCKET_PATH`, and update its JSON Lines import to `@/gateway/json-lines.js`. In `test/unit/shepherd-tools.test.ts`, change the parser test to:
+In `src/cli/herdsman-tools.ts`, change the default socket env in `parseHerdsmanToolsArgs` from `environment.SHEPHERD_SOCKET_PATH` to `environment.SHEPHERD_GATEWAY_SOCKET_PATH`, and update its JSON Lines import to `@/gateway/json-lines.js`. In `test/unit/herdsman-tools.test.ts`, change the parser test to:
 
 ```ts
-expect(parseShepherdToolsArgs([], { SHEPHERD_GATEWAY_SOCKET_PATH: "/tmp/custom.sock" })).toEqual({
+expect(parseHerdsmanToolsArgs([], { SHEPHERD_GATEWAY_SOCKET_PATH: "/tmp/custom.sock" })).toEqual({
   command: "serve",
   socketPath: "/tmp/custom.sock",
 });
 ```
 
-Also rename the test label `bridges JSON Lines stdio frames to the Shepherd daemon client` to `bridges JSON Lines stdio frames to the Shepherd Gateway client`.
+Also rename the test label `bridges JSON Lines stdio frames to the Herdsman daemon client` to `bridges JSON Lines stdio frames to the Herdsman Gateway client`.
 
 Change `piOpenEnvironment` input and output:
 
@@ -492,10 +492,10 @@ Update imports from Task 1:
 ```ts
 import { readOrCreateGatewayId } from "@/gateway/identity.js";
 import { recoverGatewayState } from "@/gateway/recovery.js";
-import { ShepherdGatewayServer } from "@/gateway/server.js";
+import { HerdsmanGatewayServer } from "@/gateway/server.js";
 ```
 
-Use `recoverGatewayState`, `ShepherdGatewayServer`, and `gatewayId: readOrCreateGatewayId(stateDir)` in the foreground service path.
+Use `recoverGatewayState`, `HerdsmanGatewayServer`, and `gatewayId: readOrCreateGatewayId(stateDir)` in the foreground service path.
 
 - [ ] **Step 4: Update help text and readiness guidance**
 
@@ -503,23 +503,23 @@ Use this command section in `helpText()`:
 
 ```text
 Usage:
-  shepherd gateway start [--socket <path>] [--db <path>] [--config <path>] [--pid <path>] [--log <path>]
-  shepherd gateway stop [--socket <path>] [--db <path>] [--pid <path>] [--timeout-ms <ms>]
-  shepherd gateway restart [--socket <path>] [--db <path>] [--config <path>] [--pid <path>] [--log <path>] [--timeout-ms <ms>]
-  shepherd gateway status [--socket <path>] [--db <path>] [--pid <path>]
-  shepherd gateway run [--socket <path>] [--db <path>] [--config <path>]
-  shepherd send --session <id> --text <text> [--socket <path>] [--actor <id>] [--display-name <name>] [--provider <name>] [--model <id>]
-  shepherd open --session <id> [--socket <path>] [--db <path>]
-  shepherd watch --session <id> [--socket <path>] [--after <event-id>]
-  shepherd rename --session <id> --title <title> [--socket <path>]
-  shepherd audit --session <id> [--db <path>] [--after <event-id>] [--limit <n>] [--json true]
+  herdsman gateway start [--socket <path>] [--db <path>] [--config <path>] [--pid <path>] [--log <path>]
+  herdsman gateway stop [--socket <path>] [--db <path>] [--pid <path>] [--timeout-ms <ms>]
+  herdsman gateway restart [--socket <path>] [--db <path>] [--config <path>] [--pid <path>] [--log <path>] [--timeout-ms <ms>]
+  herdsman gateway status [--socket <path>] [--db <path>] [--pid <path>]
+  herdsman gateway run [--socket <path>] [--db <path>] [--config <path>]
+  herdsman send --session <id> --text <text> [--socket <path>] [--actor <id>] [--display-name <name>] [--provider <name>] [--model <id>]
+  herdsman open --session <id> [--socket <path>] [--db <path>]
+  herdsman watch --session <id> [--socket <path>] [--after <event-id>]
+  herdsman rename --session <id> --title <title> [--socket <path>]
+  herdsman audit --session <id> [--db <path>] [--after <event-id>] [--limit <n>] [--json true]
 
 Commands:
-  gateway   Manage the local Shepherd Gateway
-  send      Send a user message into a Shepherd session
+  gateway   Manage the local Herdsman Gateway
+  send      Send a user message into a Herdsman session
   open      Open the matching Pi session in the Pi TUI
   watch     Print session events as JSON Lines
-  rename    Rename a Shepherd session
+  rename    Rename a Herdsman session
   audit     Print stored session events from the SQLite audit log
   help      Show this help
 ```
@@ -528,7 +528,7 @@ In `src/gateway/pi-readiness.ts`, replace the setup guidance command with:
 
 ```text
 Then restart:
-  shepherd gateway restart
+  herdsman gateway restart
 ```
 
 and make spawned Pi env use `SHEPHERD_GATEWAY_SOCKET_PATH`.
@@ -538,7 +538,7 @@ and make spawned Pi env use `SHEPHERD_GATEWAY_SOCKET_PATH`.
 Run:
 
 ```bash
-pnpm test -- test/unit/cli.test.ts test/unit/shepherd-tools.test.ts test/unit/pi-readiness.test.ts test/integration/gateway-rpc.test.ts test/integration/tui-client.test.ts
+pnpm test -- test/unit/cli.test.ts test/unit/herdsman-tools.test.ts test/unit/pi-readiness.test.ts test/integration/gateway-rpc.test.ts test/integration/tui-client.test.ts
 ```
 
 Expected: all listed tests pass; `parseCliArgs(["daemon"])` throws `Unknown command: daemon`.
@@ -546,17 +546,17 @@ Expected: all listed tests pass; `parseCliArgs(["daemon"])` throws `Unknown comm
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/cli/shepherd.ts src/cli/shepherd-tools.ts src/gateway/pi-readiness.ts test/unit/cli.test.ts test/unit/shepherd-tools.test.ts test/unit/pi-readiness.test.ts test/integration/gateway-rpc.test.ts test/integration/tui-client.test.ts
+git add src/cli/herdsman.ts src/cli/herdsman-tools.ts src/gateway/pi-readiness.ts test/unit/cli.test.ts test/unit/herdsman-tools.test.ts test/unit/pi-readiness.test.ts test/integration/gateway-rpc.test.ts test/integration/tui-client.test.ts
 git commit -m "feat: replace daemon command with gateway run"
 ```
 
-### Task 3: Add `shepherd gateway start/stop/restart/status`
+### Task 3: Add `herdsman gateway start/stop/restart/status`
 
 **Objective:** Add the requested service-management commands without reintroducing daemon terminology.
 
 **Files:**
 - Create: `src/gateway/process-manager.ts`
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Create: `test/unit/gateway-process-manager.test.ts`
 - Modify: `test/unit/cli.test.ts`
 
@@ -575,26 +575,26 @@ test("parses gateway managed actions", () => {
       "gateway",
       "start",
       "--socket",
-      "/tmp/shepherd.sock",
+      "/tmp/herdsman.sock",
       "--db",
-      "/tmp/shepherd.sqlite",
+      "/tmp/herdsman.sqlite",
       "--config",
-      "/tmp/shepherd.yaml",
+      "/tmp/herdsman.yaml",
       "--pid",
-      "/tmp/shepherd.pid",
+      "/tmp/herdsman.pid",
       "--log",
-      "/tmp/shepherd.log",
+      "/tmp/herdsman.log",
       "--timeout-ms",
       "2500",
     ]),
   ).toEqual({
     action: "start",
     command: "gateway",
-    configPath: "/tmp/shepherd.yaml",
-    dbPath: "/tmp/shepherd.sqlite",
-    logPath: "/tmp/shepherd.log",
-    pidPath: "/tmp/shepherd.pid",
-    socketPath: "/tmp/shepherd.sock",
+    configPath: "/tmp/herdsman.yaml",
+    dbPath: "/tmp/herdsman.sqlite",
+    logPath: "/tmp/herdsman.log",
+    pidPath: "/tmp/herdsman.pid",
+    socketPath: "/tmp/herdsman.sock",
     timeoutMs: 2500,
   });
 
@@ -607,7 +607,7 @@ test("parses gateway managed actions", () => {
 
 Create `test/unit/gateway-process-manager.test.ts` with fake dependencies for filesystem and process checks. Cover these cases:
 
-1. `resolveGatewayControlPaths({ dbPath: "/tmp/shepherd.sqlite" })` returns pid path `/tmp/shepherd.gateway.pid` and log path `/tmp/shepherd.gateway.log`.
+1. `resolveGatewayControlPaths({ dbPath: "/tmp/herdsman.sqlite" })` returns pid path `/tmp/herdsman.gateway.pid` and log path `/tmp/herdsman.gateway.log`.
 2. `getGatewayStatus` returns `stopped` when no pid file exists.
 3. `getGatewayStatus` returns `running` when pid file contains a live process id.
 4. `startGatewayProcess` refuses to start when status is already `running`.
@@ -676,8 +676,8 @@ export function resolveGatewayControlPaths(input: {
 }): GatewayControlPaths {
   const stateDir = dirname(resolve(input.dbPath));
   return {
-    logPath: input.logPath ?? resolve(stateDir, "shepherd.gateway.log"),
-    pidPath: input.pidPath ?? resolve(stateDir, "shepherd.gateway.pid"),
+    logPath: input.logPath ?? resolve(stateDir, "herdsman.gateway.log"),
+    pidPath: input.pidPath ?? resolve(stateDir, "herdsman.gateway.pid"),
   };
 }
 
@@ -724,7 +724,7 @@ export async function startGatewayProcess(input: {
     socketPath: input.socketPath,
   });
   if (status.state === "running") {
-    throw new Error(`Shepherd Gateway is already running with pid ${status.pid}`);
+    throw new Error(`Herdsman Gateway is already running with pid ${status.pid}`);
   }
 
   mkdirSync(dirname(input.pidPath), { recursive: true });
@@ -756,7 +756,7 @@ export async function startGatewayProcess(input: {
   }
 
   if (!child.pid) {
-    throw new Error("Failed to start Shepherd Gateway: child pid was not assigned");
+    throw new Error("Failed to start Herdsman Gateway: child pid was not assigned");
   }
 
   child.unref();
@@ -791,7 +791,7 @@ export async function stopGatewayProcess(input: {
     await waitMs(50);
   }
 
-  throw new Error(`Timed out waiting for Shepherd Gateway pid ${status.pid} to stop`);
+  throw new Error(`Timed out waiting for Herdsman Gateway pid ${status.pid} to stop`);
 }
 
 function defaultIsProcessRunning(pid: number): boolean {
@@ -822,7 +822,7 @@ If TypeScript complains about `spawnProcess` overloads in tests, narrow the depe
 
 - [ ] **Step 4: Wire process manager into CLI main**
 
-In `src/cli/shepherd.ts`, import:
+In `src/cli/herdsman.ts`, import:
 
 ```ts
 import {
@@ -900,18 +900,18 @@ Run:
 
 ```bash
 pnpm build
-node dist/src/cli/shepherd.js --help
-node dist/src/cli/shepherd.js gateway status --db /tmp/shepherd-plan-smoke.sqlite --socket /tmp/shepherd-plan-smoke.sock
+node dist/src/cli/herdsman.js --help
+node dist/src/cli/herdsman.js gateway status --db /tmp/herdsman-plan-smoke.sqlite --socket /tmp/herdsman-plan-smoke.sock
 ```
 
 Expected:
-- Help contains `shepherd gateway start`, `stop`, `restart`, `status`, and `run`.
+- Help contains `herdsman gateway start`, `stop`, `restart`, `status`, and `run`.
 - Status prints JSON with `"state":"stopped"`.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/gateway/process-manager.ts src/cli/shepherd.ts test/unit/cli.test.ts test/unit/gateway-process-manager.test.ts
+git add src/gateway/process-manager.ts src/cli/herdsman.ts test/unit/cli.test.ts test/unit/gateway-process-manager.test.ts
 git commit -m "feat: add gateway service management commands"
 ```
 
@@ -920,18 +920,18 @@ git commit -m "feat: add gateway service management commands"
 **Objective:** Make the Pi extension, Pi binding entries, and Pi handshake/attach tests use `gatewayId` and Gateway wording.
 
 **Files:**
-- Modify: `packages/shepherd-pi/extensions/index.js`
-- Modify: `packages/shepherd-pi/package.json`
+- Modify: `packages/herdsman-pi/extensions/index.js`
+- Modify: `packages/herdsman-pi/package.json`
 - Modify: `src/gateway/pi-supervisor.ts`
 - Modify: `test/integration/gateway-rpc.test.ts`
 - Modify: `test/unit/cli.test.ts`
 - Modify: `test/unit/pi-readiness.test.ts`
 - Modify: `test/unit/pi-supervisor.test.ts`
-- Modify: `src/cli/shepherd.ts`, `src/gateway/server.ts`, `src/gateway/pi-readiness.ts` if any Task 1/2 leftovers remain
+- Modify: `src/cli/herdsman.ts`, `src/gateway/server.ts`, `src/gateway/pi-readiness.ts` if any Task 1/2 leftovers remain
 
 **Interfaces:**
 - Consumes: `PiHandshakeRecord.gatewayId` and `piOpenEnvironment({ gatewayId })` from Tasks 1 and 2.
-- Produces: `shepherd-pi` binding entries shaped as `{ gatewayId, sessionId, socketPath }` and env names `SHEPHERD_GATEWAY_ID`, `SHEPHERD_GATEWAY_SOCKET_PATH`.
+- Produces: `herdsman-pi` binding entries shaped as `{ gatewayId, sessionId, socketPath }` and env names `SHEPHERD_GATEWAY_ID`, `SHEPHERD_GATEWAY_SOCKET_PATH`.
 
 - [ ] **Step 1: Write failing Pi bridge assertions**
 
@@ -970,19 +970,19 @@ pnpm test -- test/integration/gateway-rpc.test.ts test/unit/cli.test.ts test/uni
 
 Expected: failures mention missing `gatewayId`, still-present `daemonId`, or the old `SHEPHERD_SOCKET_PATH` in the headless Pi supervisor.
 
-- [ ] **Step 3: Update `packages/shepherd-pi/extensions/index.js`**
+- [ ] **Step 3: Update `packages/herdsman-pi/extensions/index.js`**
 
 Apply these exact rename rules in the extension:
 
 ```text
-ShepherdDaemonClient -> ShepherdGatewayClient
-Shepherd daemon client -> Shepherd Gateway client
-Shepherd daemon socket -> Shepherd Gateway socket
+HerdsmanDaemonClient -> HerdsmanGatewayClient
+Herdsman daemon client -> Herdsman Gateway client
+Herdsman daemon socket -> Herdsman Gateway socket
 SHEPHERD_DAEMON_ID -> SHEPHERD_GATEWAY_ID
 SHEPHERD_SOCKET_PATH -> SHEPHERD_GATEWAY_SOCKET_PATH
 daemonId -> gatewayId
 expectedDaemonId -> expectedGatewayId
-DEFAULT_SOCKET_PATH remains /tmp/shepherd.sock unless Task 2 changed the default socket path.
+DEFAULT_SOCKET_PATH remains /tmp/herdsman.sock unless Task 2 changed the default socket path.
 ```
 
 The environment binding helper must become:
@@ -1031,10 +1031,10 @@ state.binding = {
 };
 ```
 
-Update `packages/shepherd-pi/package.json` description to:
+Update `packages/herdsman-pi/package.json` description to:
 
 ```json
-"description": "Pi extension bridge for Shepherd Gateway sessions."
+"description": "Pi extension bridge for Herdsman Gateway sessions."
 ```
 
 - [ ] **Step 4: Update headless Pi supervisor env**
@@ -1067,13 +1067,13 @@ Expected: tests pass and the Pi package syntax/pack dry run succeeds.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add packages/shepherd-pi/extensions/index.js packages/shepherd-pi/package.json src/cli/shepherd.ts src/gateway/server.ts src/gateway/pi-readiness.ts src/gateway/pi-supervisor.ts test/integration/gateway-rpc.test.ts test/unit/cli.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts
+git add packages/herdsman-pi/extensions/index.js packages/herdsman-pi/package.json src/cli/herdsman.ts src/gateway/server.ts src/gateway/pi-readiness.ts src/gateway/pi-supervisor.ts test/integration/gateway-rpc.test.ts test/unit/cli.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts
 git commit -m "refactor: rename pi bridge identity to gateway"
 ```
 
 ### Task 5: Update README and active plans to the Gateway product model
 
-**Objective:** Make public and active planning docs match the new `Shepherd Gateway` command and vocabulary.
+**Objective:** Make public and active planning docs match the new `Herdsman Gateway` command and vocabulary.
 
 **Files:**
 - Modify: `README.md`
@@ -1091,15 +1091,15 @@ git commit -m "refactor: rename pi bridge identity to gateway"
 In `README.md` and `README.ja.md`, replace:
 
 ```bash
-export SHEPHERD_SOCKET_PATH=/tmp/shepherd.sock
-node dist/src/cli/shepherd.js daemon \
+export SHEPHERD_SOCKET_PATH=/tmp/herdsman.sock
+node dist/src/cli/herdsman.js daemon \
 ```
 
 with:
 
 ```bash
-export SHEPHERD_GATEWAY_SOCKET_PATH=/tmp/shepherd.sock
-node dist/src/cli/shepherd.js gateway start \
+export SHEPHERD_GATEWAY_SOCKET_PATH=/tmp/herdsman.sock
+node dist/src/cli/herdsman.js gateway start \
 ```
 
 Change command examples using `--socket "$SHEPHERD_SOCKET_PATH"` to `--socket "$SHEPHERD_GATEWAY_SOCKET_PATH"`.
@@ -1109,7 +1109,7 @@ Change references as follows:
 ```text
 daemon -> Gateway
 running daemon session -> running Gateway session
-`shepherd daemon` starts -> `shepherd gateway start` starts
+`herdsman daemon` starts -> `herdsman gateway start` starts
 starts the daemon -> starts the Gateway
 src/daemon -> src/gateway/server.ts, src/gateway/json-lines.ts, src/gateway/recovery.ts
 src/tui daemon socket client -> src/tui Gateway socket client
@@ -1130,7 +1130,7 @@ Update the parent plan link text from `Daemon Pi supervisor and run queue` to `G
 In active plans under `docs/plans/2026-06-25-pi-runtime-gateway*`, replace product/service wording:
 
 ```text
-shepherd daemon -> shepherd gateway start or shepherd gateway run, depending on whether the text describes managed startup or foreground debug startup
+herdsman daemon -> herdsman gateway start or herdsman gateway run, depending on whether the text describes managed startup or foreground debug startup
 daemon startup -> Gateway startup
 daemon RPC -> Gateway RPC
 daemon socket -> Gateway socket
@@ -1154,9 +1154,9 @@ Expected: no matches. If matches remain, each must be in this newly created plan
 - [ ] **Step 4: Commit**
 
 ```bash
-git add README.md README.ja.md docs/plans/2026-06-25-pi-runtime-gateway.md docs/plans/2026-06-25-pi-runtime-gateway packages/shepherd-pi/package.json
+git add README.md README.ja.md docs/plans/2026-06-25-pi-runtime-gateway.md docs/plans/2026-06-25-pi-runtime-gateway packages/herdsman-pi/package.json
 git add -u docs/plans/2026-06-25-pi-runtime-gateway/2026-06-25-daemon-pi-supervisor-run-queue.md
-git commit -m "docs: describe shepherd as gateway"
+git commit -m "docs: describe herdsman as gateway"
 ```
 
 ### Task 6: Run final rename and behavior validation
@@ -1175,7 +1175,7 @@ git commit -m "docs: describe shepherd as gateway"
 Run:
 
 ```bash
-pnpm test -- test/unit/cli.test.ts test/unit/shepherd-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/gateway-identity.test.ts test/integration/gateway-rpc.test.ts test/integration/gateway-recovery.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts test/integration/tui-client.test.ts
+pnpm test -- test/unit/cli.test.ts test/unit/herdsman-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/gateway-identity.test.ts test/integration/gateway-rpc.test.ts test/integration/gateway-recovery.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts test/integration/tui-client.test.ts
 ```
 
 Expected: all listed tests pass.
@@ -1196,13 +1196,13 @@ Expected: both commands exit 0.
 Run:
 
 ```bash
-node dist/src/cli/shepherd.js --help
-node dist/src/cli/shepherd.js gateway status --db /tmp/shepherd-final-smoke.sqlite --socket /tmp/shepherd-final-smoke.sock
-node dist/src/cli/shepherd.js daemon
+node dist/src/cli/herdsman.js --help
+node dist/src/cli/herdsman.js gateway status --db /tmp/herdsman-final-smoke.sqlite --socket /tmp/herdsman-final-smoke.sock
+node dist/src/cli/herdsman.js daemon
 ```
 
 Expected:
-- Help includes `shepherd gateway start`, `shepherd gateway stop`, `shepherd gateway restart`, `shepherd gateway status`, and `shepherd gateway run`.
+- Help includes `herdsman gateway start`, `herdsman gateway stop`, `herdsman gateway restart`, `herdsman gateway status`, and `herdsman gateway run`.
 - `gateway status` prints stopped JSON and exits 0.
 - `daemon` exits non-zero with `Unknown command: daemon`.
 
@@ -1211,7 +1211,7 @@ Expected:
 Run:
 
 ```bash
-rg -n "daemon|Daemon|SHEPHERD_DAEMON|daemonId|src/daemon|shepherd daemon" src test packages README.md README.ja.md docs/plans/2026-06-25-pi-runtime-gateway.md docs/plans/2026-06-25-pi-runtime-gateway -S
+rg -n "daemon|Daemon|SHEPHERD_DAEMON|daemonId|src/daemon|herdsman daemon" src test packages README.md README.ja.md docs/plans/2026-06-25-pi-runtime-gateway.md docs/plans/2026-06-25-pi-runtime-gateway -S
 ```
 
 Expected: no output.
@@ -1237,16 +1237,16 @@ If Step 4 had no misses, do not create an empty commit.
 
 ## Validation
 
-- `pnpm test -- test/unit/cli.test.ts test/unit/shepherd-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/gateway-identity.test.ts test/integration/gateway-rpc.test.ts test/integration/gateway-recovery.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts test/integration/tui-client.test.ts` — focused behavior and rename tests pass.
+- `pnpm test -- test/unit/cli.test.ts test/unit/herdsman-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/gateway-identity.test.ts test/integration/gateway-rpc.test.ts test/integration/gateway-recovery.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts test/integration/tui-client.test.ts` — focused behavior and rename tests pass.
 - `pnpm check` — typecheck, Vitest, Biome, Drizzle check, and Pi package check pass.
 - `pnpm build` — dist output builds and `tsc-alias` resolves imports.
-- `node dist/src/cli/shepherd.js gateway status --db /tmp/shepherd-final-smoke.sqlite --socket /tmp/shepherd-final-smoke.sock` — prints stopped Gateway status JSON.
-- `node dist/src/cli/shepherd.js daemon` — exits non-zero with `Unknown command: daemon`.
-- `rg -n "daemon|Daemon|SHEPHERD_DAEMON|daemonId|src/daemon|shepherd daemon" src test packages README.md README.ja.md docs/plans/2026-06-25-pi-runtime-gateway.md docs/plans/2026-06-25-pi-runtime-gateway -S` — no output.
+- `node dist/src/cli/herdsman.js gateway status --db /tmp/herdsman-final-smoke.sqlite --socket /tmp/herdsman-final-smoke.sock` — prints stopped Gateway status JSON.
+- `node dist/src/cli/herdsman.js daemon` — exits non-zero with `Unknown command: daemon`.
+- `rg -n "daemon|Daemon|SHEPHERD_DAEMON|daemonId|src/daemon|herdsman daemon" src test packages README.md README.ja.md docs/plans/2026-06-25-pi-runtime-gateway.md docs/plans/2026-06-25-pi-runtime-gateway -S` — no output.
 
 ## Risks, Tradeoffs, and Open Questions
 
-- Renaming `SHEPHERD_SOCKET_PATH` to `SHEPHERD_GATEWAY_SOCKET_PATH` breaks local shell snippets and Pi bindings, but this is acceptable because Shepherd is unreleased and the user explicitly allowed ignoring compatibility.
+- Renaming `SHEPHERD_SOCKET_PATH` to `SHEPHERD_GATEWAY_SOCKET_PATH` breaks local shell snippets and Pi bindings, but this is acceptable because Herdsman is unreleased and the user explicitly allowed ignoring compatibility.
 - `gateway start` writes a pid file immediately after spawning. If Pi readiness fails quickly, `gateway status` may briefly report a live pid before the child exits; the next status call will mark the pid stale. Waiting for full readiness in `start` would require a readiness RPC or log protocol and is outside this rename.
 - The process manager uses POSIX-style pid files and signals. That matches the current Unix socket/Pi/macOS development target. If Windows support becomes a requirement later, the process manager needs a separate implementation.
 - Archived plans can keep `daemon` as historical wording. Do not rewrite archived docs as part of this change.
@@ -1254,7 +1254,7 @@ If Step 4 had no misses, do not create an empty commit.
 
 ## Self Review
 
-- Requirement coverage: The plan covers `shepherd gateway start/stop/restart/status`, removes `shepherd daemon`, and renames internal service concepts to Gateway.
+- Requirement coverage: The plan covers `herdsman gateway start/stop/restart/status`, removes `herdsman daemon`, and renames internal service concepts to Gateway.
 - Specificity: Each step names concrete files, commands, expected results, and required names.
 - Naming consistency: The plan consistently uses `Gateway`, `gatewayId`, `SHEPHERD_GATEWAY_ID`, and `SHEPHERD_GATEWAY_SOCKET_PATH` for the service surface.
 - Testability: Each task has a failing-test step, pass command, and final validation command.

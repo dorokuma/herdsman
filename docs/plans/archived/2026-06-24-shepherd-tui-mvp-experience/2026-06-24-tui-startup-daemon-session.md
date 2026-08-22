@@ -2,16 +2,16 @@
 
 Date: 2026-06-24
 
-Parent: [Shepherd TUI MVP Experience Plan](../2026-06-24-shepherd-tui-mvp-experience.md)
+Parent: [Herdsman TUI MVP Experience Plan](../2026-06-24-herdsman-tui-mvp-experience.md)
 
 ## Status
 
-Archived. Superseded. See [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md) for the later Pi runtime direction.
+Archived. Superseded. See [Herdsman Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md) for the later Pi runtime direction.
 
 ## Progress
 
 - **Done** — Historical startup, daemon autostart, and local session lifecycle requirements were captured.
-- **Superseded** — Custom Shepherd TUI startup should be replaced by Pi runtime and `shepherd open` behavior.
+- **Superseded** — Custom Herdsman TUI startup should be replaced by Pi runtime and `herdsman open` behavior.
 
 ## Next steps
 
@@ -19,21 +19,21 @@ Archived. Superseded. See [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-ru
 
 ## Goal
 
-Specify how the `shepherd` command opens a TUI, starts or connects to the daemon, creates or resumes sessions, and binds the current working directory as a working context.
+Specify how the `herdsman` command opens a TUI, starts or connects to the daemon, creates or resumes sessions, and binds the current working directory as a working context.
 
 ## Current state
 
 Implemented today:
 
-- `shepherd daemon` starts the local daemon.
-- `shepherd send --session <id> --text <text>` appends a TUI-originated message.
-- `shepherd watch --session <id>` subscribes to a known session.
+- `herdsman daemon` starts the local daemon.
+- `herdsman send --session <id> --text <text>` appends a TUI-originated message.
+- `herdsman watch --session <id>` subscribes to a known session.
 - `src/tui/client.ts` has a typed daemon socket client for creating sessions, send, subscribe, rename, approval, and logical tools.
 
 Missing today:
 
 - Full-screen TUI command.
-- Default `shepherd` command behavior.
+- Default `herdsman` command behavior.
 - Daemon autostart.
 - Session listing over daemon RPC.
 - Local cwd to working-context creation from TUI startup.
@@ -44,26 +44,26 @@ Missing today:
 ### Default
 
 ```bash
-shepherd
+herdsman
 ```
 
-Starts the TUI in the current working directory and creates a new Shepherd session bound to that directory.
+Starts the TUI in the current working directory and creates a new Herdsman session bound to that directory.
 
 ### Explicit attach
 
 ```bash
-shepherd --session <session-id>
-shepherd tui --session <session-id>
+herdsman --session <session-id>
+herdsman tui --session <session-id>
 ```
 
-Both forms are acceptable. `shepherd tui` can exist as an explicit alias, but the no-subcommand form should be the normal path.
+Both forms are acceptable. `herdsman tui` can exist as an explicit alias, but the no-subcommand form should be the normal path.
 
 ### Resume
 
 ```bash
-shepherd -r
-shepherd --resume
-shepherd tui --resume
+herdsman -r
+herdsman --resume
+herdsman tui --resume
 ```
 
 Shows a session selector. It should prefer sessions for the current working context but allow expanding to all recent sessions.
@@ -71,9 +71,9 @@ Shows a session selector. It should prefer sessions for the current working cont
 ### Continue
 
 ```bash
-shepherd -c
-shepherd --continue
-shepherd tui --continue
+herdsman -c
+herdsman --continue
+herdsman tui --continue
 ```
 
 Attaches to the latest active session for the current working context. If none exists, creates a new one.
@@ -83,11 +83,11 @@ Attaches to the latest active session for the current working context. If none e
 Existing subcommands should keep their current behavior. This keeps automation and tests stable.
 
 ```bash
-shepherd daemon
-shepherd send ...
-shepherd watch ...
-shepherd rename ...
-shepherd audit ...
+herdsman daemon
+herdsman send ...
+herdsman watch ...
+herdsman rename ...
+herdsman audit ...
 ```
 
 ## CLI parsing changes
@@ -111,7 +111,7 @@ The exact type can differ, but the parsed intent should be explicit. Avoid overl
 
 ### Requirements
 
-- The user should not need to run `shepherd daemon` manually before using the TUI.
+- The user should not need to run `herdsman daemon` manually before using the TUI.
 - The daemon should outlive the TUI.
 - Autostart should use the same config, DB path, and socket path that the TUI client uses.
 - Duplicate daemon processes should be avoided.
@@ -120,13 +120,13 @@ The exact type can differ, but the parsed intent should be explicit. Avoid overl
 ### Proposed flow
 
 ```text
-run shepherd TUI command
+run herdsman TUI command
   resolve runtime paths
-  try ShepherdSessionClient.connect(socket)
+  try HerdsmanSessionClient.connect(socket)
   if connected:
     continue
   if connection failed with missing/refused socket:
-    spawn detached shepherd daemon with resolved paths
+    spawn detached herdsman daemon with resolved paths
     poll socket until connectable or timeout
   if still failed:
     print startup error and daemon log path
@@ -140,7 +140,7 @@ The daemon should be spawned with the same executable entrypoint as the current 
 Example shape:
 
 ```bash
-shepherd daemon --socket <socket> --db <db> --config <config>
+herdsman daemon --socket <socket> --db <db> --config <config>
 ```
 
 Implementation should avoid shell interpolation. Use `spawn(process.execPath, [entrypoint, "daemon", ...])` or equivalent argv-based process spawning.
@@ -170,10 +170,10 @@ If the socket path exists but no daemon responds:
 
 Current defaults:
 
-- socket: `/tmp/shepherd.sock`
-- DB: `shepherd.sqlite` relative to cwd
+- socket: `/tmp/herdsman.sock`
+- DB: `herdsman.sqlite` relative to cwd
 
-These defaults are weak for `cd && shepherd` because each project directory would get a separate DB unless the user configures `SHEPHERD_DB_PATH`. A shared daemon also needs one stable DB by default.
+These defaults are weak for `cd && herdsman` because each project directory would get a separate DB unless the user configures `SHEPHERD_DB_PATH`. A shared daemon also needs one stable DB by default.
 
 ### Reference behavior
 
@@ -184,22 +184,22 @@ Hermes, Pi, OpenCode, and Herdr use two broad patterns:
 - OpenCode uses XDG-style separated roots through `xdg-basedir`: data, cache, config, state, and tmp. Its SQLite DB lives in the data root, config in the config root, locks in the state root, and logs under the data root.
 - Herdr uses XDG-style config/state paths: `XDG_CONFIG_HOME/herdr` or `~/.config/herdr`, and `XDG_STATE_HOME/herdr` or `~/.local/state/herdr`. Its named sessions live under the config root at `sessions/<name>/`, with `herdr.sock` and `herdr-client.sock` inside each session directory. It also supports explicit socket env overrides.
 
-Implications for Shepherd:
+Implications for Herdsman:
 
 - A cwd-relative DB should not be the default for the TUI/daemon experience.
-- Shepherd needs one per-user DB so Slack, TUI, and daemon restart recovery see the same event stream.
-- Shepherd should expose one root override like `SHEPHERD_HOME` for Hermes/Pi-style simplicity.
-- The default should be `~/.shepherd`, not split XDG directories. OpenCode and Herdr remain useful references for path separation and socket hygiene, but Shepherd should prioritize a single inspectable gateway home.
-- Socket path should be stable per user and protected with owner-only permissions. For MVP it should live under the Shepherd home as `daemon.sock`.
+- Herdsman needs one per-user DB so Slack, TUI, and daemon restart recovery see the same event stream.
+- Herdsman should expose one root override like `SHEPHERD_HOME` for Hermes/Pi-style simplicity.
+- The default should be `~/.herdsman`, not split XDG directories. OpenCode and Herdr remain useful references for path separation and socket hygiene, but Herdsman should prioritize a single inspectable gateway home.
+- Socket path should be stable per user and protected with owner-only permissions. For MVP it should live under the Herdsman home as `daemon.sock`.
 
 ### Decided target defaults
 
-Use a single Shepherd home directory by default, following the Hermes/Pi style rather than splitting files across XDG data/config/state directories.
+Use a single Herdsman home directory by default, following the Hermes/Pi style rather than splitting files across XDG data/config/state directories.
 
 Default:
 
 ```text
-SHEPHERD_HOME=${SHEPHERD_HOME:-~/.shepherd}
+SHEPHERD_HOME=${SHEPHERD_HOME:-~/.herdsman}
 ```
 
 Managed paths:
@@ -215,7 +215,7 @@ Log:     $SHEPHERD_HOME/logs/daemon.log
 Example layout:
 
 ```text
-~/.shepherd/
+~/.herdsman/
 ├── config.yaml
 ├── .env
 ├── state.db
@@ -226,10 +226,10 @@ Example layout:
 
 Rationale:
 
-- Matches Shepherd's personal gateway/agent-home character better than fully separated XDG paths.
+- Matches Herdsman's personal gateway/agent-home character better than fully separated XDG paths.
 - Keeps config, DB, socket, logs, and future auth/session support easy to inspect, back up, and move.
 - Avoids cwd-relative state while keeping the path model easy to explain.
-- `state.db` and `daemon.sock` avoid the awkward repetition of `~/.shepherd/shepherd.sqlite` and `~/.shepherd/shepherd.sock`.
+- `state.db` and `daemon.sock` avoid the awkward repetition of `~/.herdsman/herdsman.sqlite` and `~/.herdsman/herdsman.sock`.
 - `SHEPHERD_HOME` gives tests, sandboxes, and alternate installs one simple override.
 
 Existing explicit overrides still win:
@@ -251,7 +251,7 @@ Security and lifecycle requirements:
 
 ### TUI local rule
 
-When the user runs `shepherd` from a shell, cwd is an explicit user choice. It should be accepted as a working context even if no `allowed_roots` are configured.
+When the user runs `herdsman` from a shell, cwd is an explicit user choice. It should be accepted as a working context even if no `allowed_roots` are configured.
 
 Rule:
 
@@ -282,7 +282,7 @@ This may require a DB migration if path uniqueness is enforced.
 
 ### Default new session
 
-Default `shepherd` creates a new session for cwd.
+Default `herdsman` creates a new session for cwd.
 
 Rationale:
 
@@ -338,9 +338,9 @@ Rules:
 
 Only newly created sessions from default TUI startup are eligible for automatic Slack binding:
 
-- `shepherd` with no subcommand: eligible if `tui_default_channel` is configured.
-- `shepherd --continue`: eligible only when it does not find an existing session and creates a new one.
-- `shepherd --session <id>` and `--resume`: not eligible unless the selected session already has a Slack binding.
+- `herdsman` with no subcommand: eligible if `tui_default_channel` is configured.
+- `herdsman --continue`: eligible only when it does not find an existing session and creates a new one.
+- `herdsman --session <id>` and `--resume`: not eligible unless the selected session already has a Slack binding.
 - Existing TUI-only sessions should not become Slack-published just because they are later attached.
 
 Persist eligibility in session metadata so daemon restarts and reconnects do not change behavior. Add a session metadata field, for example:
@@ -405,12 +405,12 @@ A future `/retry-bind slack` command can explicitly reset or retry failed bindin
 
 ### Inbound behavior for auto-created threads
 
-After automatic binding succeeds, the Slack thread is a normal bidirectional Shepherd surface:
+After automatic binding succeeds, the Slack thread is a normal bidirectional Herdsman surface:
 
 - Human replies in the thread are accepted only if they pass `allowed_users`, `allowed_channels`, and `allowed_teams`.
-- Accepted replies append `user.message` events to the same Shepherd session.
+- Accepted replies append `user.message` events to the same Herdsman session.
 - Accepted replies wake the gateway just like other Slack-originated user messages.
-- Bot messages and Shepherd's own Slack posts remain ignored by the existing Slack inbound filters.
+- Bot messages and Herdsman's own Slack posts remain ignored by the existing Slack inbound filters.
 
 ## Session list and resume
 
@@ -549,7 +549,7 @@ Add tests near existing daemon/client tests:
 - Slack parent post failure records `platform.binding_failed`, marks metadata failed, and still runs the TUI/gateway flow.
 - Repeated idempotency keys do not create duplicate Slack parents.
 - Slack replies in auto-created threads pass allowlists, append to the same session, and wake the gateway.
-- `ShepherdSessionClient` wraps new RPC methods.
+- `HerdsmanSessionClient` wraps new RPC methods.
 - CLI parser treats no args as TUI new session.
 - CLI parser supports `--session`, `--resume`, and `--continue`.
 
@@ -559,5 +559,5 @@ Autostart can be tested at a thinner unit level by injecting a fake connector/sp
 
 1. Should empty auto-created sessions be pruned automatically?
 2. Should `session.create` emit a session-level event or only create the DB row?
-3. Should cwd registration bypass allowed roots only for interactive TUI, or also for `shepherd send` when run locally?
+3. Should cwd registration bypass allowed roots only for interactive TUI, or also for `herdsman send` when run locally?
 4. What should the exact `platform.binding_failed` payload shape be?

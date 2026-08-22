@@ -42,7 +42,7 @@ describe("HerdrSocketClient", () => {
 
     expect(requests).toEqual([
       {
-        id: "shepherd-1",
+        id: "herdsman-1",
         method: "pane.get",
         params: { pane_id: "w1:p2" },
       },
@@ -222,7 +222,7 @@ describe("HerdrSocketClient", () => {
 async function openFakeHerdrServer(
   onRequest: (socket: Socket, request: Record<string, unknown>) => void,
 ): Promise<{ requests: Record<string, unknown>[]; socketPath: string }> {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-herdr-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-herdr-"));
   tempDirs.push(dir);
   const socketPath = join(dir, "herdr.sock");
   if (existsSync(socketPath)) {

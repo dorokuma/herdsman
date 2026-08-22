@@ -2,7 +2,7 @@
 
 Date: 2026-06-24
 
-Parent: [Shepherd Herdr Orchestration Plan](../2026-06-24-shepherd-herdr-orchestration.md)
+Parent: [Herdsman Herdr Orchestration Plan](../2026-06-24-herdsman-herdr-orchestration.md)
 
 ## Status
 
@@ -19,9 +19,9 @@ Archived. Slack access scope MVP is implemented and tested.
 
 ## Goal
 
-Slack から Shepherd を操作できる範囲を、チーム、チャンネル、ユーザー ID で明示的に制御できるようにする。
+Slack から Herdsman を操作できる範囲を、チーム、チャンネル、ユーザー ID で明示的に制御できるようにする。
 
-Shepherd は Herdr 上の agent や terminal を動かす control-plane なので、Slack workspace 全体に開いた bot として扱ってはいけない。MVP では Slack だけを対象にし、Discord / Telegram などは後で同じ考え方を adapter ごとに拡張できる余地を残す。
+Herdsman は Herdr 上の agent や terminal を動かす control-plane なので、Slack workspace 全体に開いた bot として扱ってはいけない。MVP では Slack だけを対象にし、Discord / Telegram などは後で同じ考え方を adapter ごとに拡張できる余地を残す。
 
 ## Implementation status
 
@@ -34,7 +34,7 @@ Implemented:
 - bot, edit, delete, and non-message events are ignored before storage.
 - `platforms.slack` without `allowed_users` emits a startup warning.
 - denied Slack inbound events emit debug logs with reason and IDs, without message text.
-- denied inbound events are not stored in the Shepherd DB.
+- denied inbound events are not stored in the Herdsman DB.
 - README Slack setup example includes `allowed_users` and `allowed_channels`, and uses env var names for tokens.
 
 ## 現状
@@ -69,7 +69,7 @@ MVP では Slack だけを実装対象にする。
 - `allowed_users` は DM / channel / thread すべてで sender 制限に使う。
 - `allowed_teams` は Slack workspace 境界の制限に使う。
 
-Hermes Agent の複雑な admin tier や pairing flow はコピーしない。Shepherd MVP は静的 YAML と `/reload-config` に絞る。
+Hermes Agent の複雑な admin tier や pairing flow はコピーしない。Herdsman MVP は静的 YAML と `/reload-config` に絞る。
 
 ## Access Policy Semantics
 
@@ -79,7 +79,7 @@ Slack inbound message は次の順で判定する。
 2. `allowed_teams` が設定されている場合、`teamId` が含まれない message は拒否する。
 3. `allowed_channels` が設定されている場合、対象 channel が含まれない channel/thread message は拒否する。
 4. `allowed_users` が設定されている場合、sender user ID が含まれない message は拒否する。
-5. すべて通過した message だけを Shepherd session に保存し、gateway turn を起こす。
+5. すべて通過した message だけを Herdsman session に保存し、gateway turn を起こす。
 
 未設定 allowlist は「その軸では制限しない」を意味する。ただし安全な運用のため、Slack platform を有効にする設定例では `allowed_users` を必須扱いにする。
 
@@ -211,5 +211,5 @@ Discord の role 認可や Telegram の group / forum topic は、Slack MVP に�
 ## Open Questions
 
 - `allowed_users` なしの Slack config を将来的に hard error にするか、警告に留めるか。
-- `allowed_channels` を DM に適用しない仕様を Shepherd でも明示するか。現状 Slack channel ID ベースのため、DM channel を allowlist に入れれば制限できるが、Hermes は DM を channel allowlist の対象外としている。
+- `allowed_channels` を DM に適用しない仕様を Herdsman でも明示するか。現状 Slack channel ID ベースのため、DM channel を allowlist に入れれば制限できるが、Hermes は DM を channel allowlist の対象外としている。
 - `/reload-config` 後、既存 Slack binding への outbound delivery も新 policy で止めるべきか。

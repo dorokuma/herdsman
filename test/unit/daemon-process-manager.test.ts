@@ -22,7 +22,7 @@ afterEach(() => {
 });
 
 function tempDir(): string {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-daemon-process-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-daemon-process-"));
   tempDirs.push(dir);
   return dir;
 }
@@ -31,10 +31,10 @@ describe("daemon process manager", () => {
   test("reports stopped when the pid file does not exist", async () => {
     const dir = tempDir();
     await expect(
-      getDaemonStatus({ pidPath: join(dir, "missing.pid"), socketPath: "/tmp/shepherd.sock" }),
+      getDaemonStatus({ pidPath: join(dir, "missing.pid"), socketPath: "/tmp/herdsman.sock" }),
     ).resolves.toEqual({
       pidPath: join(dir, "missing.pid"),
-      socketPath: "/tmp/shepherd.sock",
+      socketPath: "/tmp/herdsman.sock",
       state: "stopped",
     });
   });
@@ -47,11 +47,11 @@ describe("daemon process manager", () => {
       getDaemonStatus({
         deps: { connectSocket: async () => true },
         pidPath,
-        socketPath: "/tmp/shepherd.sock",
+        socketPath: "/tmp/herdsman.sock",
       }),
     ).resolves.toEqual({
       pidPath,
-      socketPath: "/tmp/shepherd.sock",
+      socketPath: "/tmp/herdsman.sock",
       socketReachable: true,
       state: "orphaned",
     });
@@ -75,7 +75,7 @@ describe("daemon process manager", () => {
 
   test("reports running when the pid file contains a live process", async () => {
     const dir = tempDir();
-    const pidPath = join(dir, "shepherd.pid");
+    const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
 
     await expect(
@@ -85,12 +85,12 @@ describe("daemon process manager", () => {
           isProcessRunning: (pid) => pid === 1234,
         },
         pidPath,
-        socketPath: "/tmp/shepherd.sock",
+        socketPath: "/tmp/herdsman.sock",
       }),
     ).resolves.toEqual({
       pid: 1234,
       pidPath,
-      socketPath: "/tmp/shepherd.sock",
+      socketPath: "/tmp/herdsman.sock",
       socketReachable: true,
       state: "running",
     });
@@ -98,7 +98,7 @@ describe("daemon process manager", () => {
 
   test("reports orphaned when the pid is stale but the daemon socket is reachable", async () => {
     const dir = tempDir();
-    const pidPath = join(dir, "shepherd.pid");
+    const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
 
     await expect(
@@ -108,11 +108,11 @@ describe("daemon process manager", () => {
           isProcessRunning: () => false,
         },
         pidPath,
-        socketPath: "/tmp/shepherd.sock",
+        socketPath: "/tmp/herdsman.sock",
       }),
     ).resolves.toEqual({
       pidPath,
-      socketPath: "/tmp/shepherd.sock",
+      socketPath: "/tmp/herdsman.sock",
       socketReachable: true,
       stalePid: 1234,
       state: "orphaned",
@@ -141,7 +141,7 @@ describe("daemon process manager", () => {
 
   test("refuses to remove a reachable daemon socket", async () => {
     const dir = tempDir();
-    const socketPath = join(dir, "shepherd.sock");
+    const socketPath = join(dir, "herdsman.sock");
     writeFileSync(socketPath, "socket-placeholder");
 
     await expect(
@@ -149,13 +149,13 @@ describe("daemon process manager", () => {
         deps: { connectSocket: async () => true },
         socketPath,
       }),
-    ).rejects.toThrow("Shepherd daemon socket is already reachable");
+    ).rejects.toThrow("Herdsman daemon socket is already reachable");
     expect(existsSync(socketPath)).toBe(true);
   });
 
   test("removes an unreachable stale daemon socket", async () => {
     const dir = tempDir();
-    const socketPath = join(dir, "shepherd.sock");
+    const socketPath = join(dir, "herdsman.sock");
     writeFileSync(socketPath, "socket-placeholder");
 
     await prepareDaemonSocketPath({
@@ -168,7 +168,7 @@ describe("daemon process manager", () => {
 
   test("refuses to start when the daemon is already running", async () => {
     const dir = tempDir();
-    const pidPath = join(dir, "shepherd.pid");
+    const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
 
     await expect(
@@ -178,21 +178,21 @@ describe("daemon process manager", () => {
           isProcessRunning: (pid) => pid === 1234,
           spawnProcess: () => ({ pid: 5678, unref() {} }),
         },
-        entrypointPath: "/repo/dist/src/cli/shepherd-daemon.js",
+        entrypointPath: "/repo/dist/src/cli/herdsman-daemon.js",
         env: {},
-        logPath: join(dir, "shepherd.log"),
+        logPath: join(dir, "herdsman.log"),
         nodePath: "/usr/bin/node",
         pidPath,
         runtimeRecord: runtimeRecord(dir),
         runtimeRecordPath: join(dir, "runtime.json"),
-        socketPath: "/tmp/shepherd.sock",
+        socketPath: "/tmp/herdsman.sock",
       }),
-    ).rejects.toThrow("Shepherd daemon is already running with pid 1234");
+    ).rejects.toThrow("Herdsman daemon is already running with pid 1234");
   });
 
   test("refuses to start when an orphaned daemon socket is reachable", async () => {
     const dir = tempDir();
-    const pidPath = join(dir, "shepherd.pid");
+    const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
     let spawned = false;
 
@@ -206,23 +206,23 @@ describe("daemon process manager", () => {
             return { pid: 5678, unref() {} };
           },
         },
-        entrypointPath: "/repo/dist/src/cli/shepherd-daemon.js",
+        entrypointPath: "/repo/dist/src/cli/herdsman-daemon.js",
         env: {},
-        logPath: join(dir, "shepherd.log"),
+        logPath: join(dir, "herdsman.log"),
         nodePath: "/usr/bin/node",
         pidPath,
         runtimeRecord: runtimeRecord(dir),
         runtimeRecordPath: join(dir, "runtime.json"),
-        socketPath: "/tmp/shepherd.sock",
+        socketPath: "/tmp/herdsman.sock",
       }),
-    ).rejects.toThrow("Shepherd daemon socket is reachable but its PID is stale");
+    ).rejects.toThrow("Herdsman daemon socket is reachable but its PID is stale");
     expect(spawned).toBe(false);
   });
 
   test("starts a detached daemon process and writes its pid and runtime record", async () => {
     const dir = tempDir();
-    const pidPath = join(dir, "shepherd.pid");
-    const logPath = join(dir, "shepherd.log");
+    const pidPath = join(dir, "herdsman.pid");
+    const logPath = join(dir, "herdsman.log");
     const runtimeRecordPath = join(dir, "runtime.json");
     const spawned: unknown[] = [];
 
@@ -233,14 +233,14 @@ describe("daemon process manager", () => {
           return { pid: 5678, unref() {} };
         },
       },
-      entrypointPath: "/repo/dist/src/cli/shepherd-daemon.js",
+      entrypointPath: "/repo/dist/src/cli/herdsman-daemon.js",
       env: { PATH: "/bin" },
       logPath,
       nodePath: "/usr/bin/node",
       pidPath,
       runtimeRecord: runtimeRecord(dir),
       runtimeRecordPath,
-      socketPath: "/tmp/shepherd.sock",
+      socketPath: "/tmp/herdsman.sock",
     });
 
     expect(result).toEqual({ pid: 5678 });
@@ -251,12 +251,12 @@ describe("daemon process manager", () => {
       logPath,
       pid: 5678,
       pidPath,
-      socketPath: "/tmp/shepherd.sock",
+      socketPath: "/tmp/herdsman.sock",
       version: 1,
     });
     expect(spawned).toMatchObject([
       {
-        args: ["/repo/dist/src/cli/shepherd-daemon.js"],
+        args: ["/repo/dist/src/cli/herdsman-daemon.js"],
         command: "/usr/bin/node",
         options: { detached: true, env: { PATH: "/bin" } },
       },
@@ -270,7 +270,7 @@ describe("daemon process manager", () => {
 
   test("sends SIGTERM and removes the pid file after the process disappears", async () => {
     const dir = tempDir();
-    const pidPath = join(dir, "shepherd.pid");
+    const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
     const signals: Array<{ pid: number; signal: NodeJS.Signals }> = [];
     let running = true;
@@ -286,7 +286,7 @@ describe("daemon process manager", () => {
         waitMs: async () => undefined,
       },
       pidPath,
-      socketPath: "/tmp/shepherd.sock",
+      socketPath: "/tmp/herdsman.sock",
       timeoutMs: 100,
     });
 
@@ -300,10 +300,10 @@ function runtimeRecord(dir: string): DaemonRuntimeRecord {
   return {
     dbPath: join(dir, "state.db"),
     homeDir: dir,
-    logPath: join(dir, "shepherd.log"),
+    logPath: join(dir, "herdsman.log"),
     pid: 1234,
-    pidPath: join(dir, "shepherd.pid"),
-    socketPath: "/tmp/shepherd.sock",
+    pidPath: join(dir, "herdsman.pid"),
+    socketPath: "/tmp/herdsman.sock",
     startedAt: "2026-06-29T00:00:00.000Z",
     version: 1,
   };

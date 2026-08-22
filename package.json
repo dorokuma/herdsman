@@ -1,7 +1,7 @@
 {
-  "name": "@ryonakae/shepherd",
-  "version": "0.5.1",
-  "description": "Agent history daemon and runtime bridges for Herdr-managed coding agents.",
+  "name": "@dorokuma/herdsman",
+  "version": "0.6.0",
+  "description": "Agent history daemon and runtime bridges for Herdr-managed coding agents. Forked from @ryonakae/shepherd.",
   "type": "module",
   "files": [
     "dist",
@@ -11,7 +11,7 @@
     "access": "public"
   },
   "bin": {
-    "shepherd": "dist/src/cli/shepherd.js"
+    "herdsman": "dist/src/cli/herdsman.js"
   },
   "keywords": [
     "herdr",
@@ -22,12 +22,12 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ryonakae/shepherd.git"
+    "url": "git+https://github.com/dorokuma/herdsman.git"
   },
   "bugs": {
-    "url": "https://github.com/ryonakae/shepherd/issues"
+    "url": "https://github.com/dorokuma/herdsman/issues"
   },
-  "homepage": "https://github.com/ryonakae/shepherd#readme",
+  "homepage": "https://github.com/dorokuma/herdsman#readme",
   "packageManager": "pnpm@11.9.0",
   "engines": {
     "node": ">=24.18.0",
@@ -42,11 +42,11 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "herdr-plugin:check": "pnpm --dir packages/shepherd-herdr-plugin typecheck && pnpm --dir packages/shepherd-herdr-plugin package:check",
+    "herdr-plugin:check": "pnpm --dir packages/herdsman-herdr-plugin typecheck && pnpm --dir packages/herdsman-herdr-plugin package:check",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "package:check": "node scripts/check-root-package.mjs",
-    "pi-package:check": "pnpm --dir packages/shepherd-pi typecheck && (cd packages/shepherd-pi && npm pack --dry-run --json > /dev/null)",
+    "pi-package:check": "pnpm --dir packages/herdsman-pi typecheck && (cd packages/herdsman-pi && npm pack --dry-run --json > /dev/null)",
     "pnpm:devPreinstall": "husky",
     "prepack": "pnpm build",
     "test": "vitest run",
@@ -74,5 +74,9 @@
   },
   "lint-staged": {
     "*.{js,jsx,ts,tsx,json,jsonc}": "biome check --write --no-errors-on-unmatched"
-  }
+  },
+  "author": "dorokuma",
+  "contributors": [
+    "Ryo Nakae (https://github.com/ryonakae)"
+  ]
 }

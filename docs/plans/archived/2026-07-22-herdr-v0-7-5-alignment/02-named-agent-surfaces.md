@@ -22,37 +22,37 @@
 - Keep event classification, excerpt normalization, 2,000-character bound, wake policy, card colors, collapsed row limit, pending counts, and acknowledgement behavior unchanged.
 - Do not change daemon RPC method names or add a new display-only RPC.
 - Keep JSON output additive: existing `agent` remains; `name` appears beside it.
-- Keep the Herdr plugin. Herdr v0.7.5 Agent view filters/sorts live state but does not expose Shepherd's structured history excerpts.
+- Keep the Herdr plugin. Herdr v0.7.5 Agent view filters/sorts live state but does not expose Herdsman's structured history excerpts.
 
 ## Current Context
 
-- `src/cli/shepherd.ts` list/get/read output currently displays only `agent` kind.
-- `packages/shepherd-herdr-plugin/index.mjs` has a local JSDoc `AgentListItem` and a five-column history table.
-- `packages/shepherd-pi/src/daemon-client.ts` defines reduced context/event wire types and lacks `name`.
-- `packages/shepherd-pi/src/agent-update-ui.ts` owns `AGENT_DISPLAY_NAMES` and `agentDisplayName()`.
-- `packages/shepherd-pi/src/wake.ts` projects one `agent` string from event payloads and formats hidden wake evidence.
-- `packages/shepherd-pi/src/index.ts` formats cached context and legacy hidden event updates from raw kind.
+- `src/cli/herdsman.ts` list/get/read output currently displays only `agent` kind.
+- `packages/herdsman-herdr-plugin/index.mjs` has a local JSDoc `AgentListItem` and a five-column history table.
+- `packages/herdsman-pi/src/daemon-client.ts` defines reduced context/event wire types and lacks `name`.
+- `packages/herdsman-pi/src/agent-update-ui.ts` owns `AGENT_DISPLAY_NAMES` and `agentDisplayName()`.
+- `packages/herdsman-pi/src/wake.ts` projects one `agent` string from event payloads and formats hidden wake evidence.
+- `packages/herdsman-pi/src/index.ts` formats cached context and legacy hidden event updates from raw kind.
 - `README.md` and `README.ja.md` currently say target can be an agent name but do not distinguish live name from kind fallback.
 - `SKILL.md` tells agents to select a pane ID, terminal ID, or unique name but does not document the new priority.
 
 ## File Structure
 
-- Modify: `src/cli/shepherd.ts` — separate name/kind in list, get, and read output.
+- Modify: `src/cli/herdsman.ts` — separate name/kind in list, get, and read output.
 - Modify: `test/unit/cli.test.ts` — exact human output columns and fallback values.
-- Modify: `packages/shepherd-herdr-plugin/index.mjs` — name-aware JSDoc and table.
+- Modify: `packages/herdsman-herdr-plugin/index.mjs` — name-aware JSDoc and table.
 - Modify: `test/unit/herdr-plugin-package.test.ts` — named and unnamed rows.
-- Create: `packages/shepherd-pi/src/agent-display.ts` — shared runtime casing and identity label.
-- Modify: `packages/shepherd-pi/src/daemon-client.ts` — nullable name on context items.
-- Modify: `packages/shepherd-pi/src/wake.ts` — carry name through outcome projection and hidden wake format.
-- Modify: `packages/shepherd-pi/src/agent-update-ui.ts` — use the shared identity label.
-- Modify: `packages/shepherd-pi/src/index.ts` — name-aware cached/legacy hidden context.
-- Modify: `test/unit/shepherd-pi-wake.test.ts` — event name projection and wake label.
-- Modify: `test/unit/shepherd-pi-agent-update-ui.test.ts` — combined/fallback card labels.
-- Modify: `test/unit/shepherd-pi-extension.test.ts` — combined/fallback hidden context and wake flow.
-- Modify: `packages/shepherd-pi/README.md` — describe named labels in context/update UI if the current examples discuss agent identity.
+- Create: `packages/herdsman-pi/src/agent-display.ts` — shared runtime casing and identity label.
+- Modify: `packages/herdsman-pi/src/daemon-client.ts` — nullable name on context items.
+- Modify: `packages/herdsman-pi/src/wake.ts` — carry name through outcome projection and hidden wake format.
+- Modify: `packages/herdsman-pi/src/agent-update-ui.ts` — use the shared identity label.
+- Modify: `packages/herdsman-pi/src/index.ts` — name-aware cached/legacy hidden context.
+- Modify: `test/unit/herdsman-pi-wake.test.ts` — event name projection and wake label.
+- Modify: `test/unit/herdsman-pi-agent-update-ui.test.ts` — combined/fallback card labels.
+- Modify: `test/unit/herdsman-pi-extension.test.ts` — combined/fallback hidden context and wake flow.
+- Modify: `packages/herdsman-pi/README.md` — describe named labels in context/update UI if the current examples discuss agent identity.
 - Modify: `README.md` and `README.ja.md` — two product capabilities, name/kind fields, and target priority.
 - Modify: `SKILL.md` — document exact ID, live name, then kind fallback priority.
-- Modify: `packages/shepherd-herdr-plugin/README.md` — state that rows show live name, runtime kind, and history excerpts.
+- Modify: `packages/herdsman-herdr-plugin/README.md` — state that rows show live name, runtime kind, and history excerpts.
 
 ## Interfaces
 
@@ -124,9 +124,9 @@ export type AgentOutcome = {
 **Objective:** Show live name and runtime kind as separate fields on every human inspection surface while keeping JSON additive.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `test/unit/cli.test.ts`
-- Modify: `packages/shepherd-herdr-plugin/index.mjs`
+- Modify: `packages/herdsman-herdr-plugin/index.mjs`
 - Modify: `test/unit/herdr-plugin-package.test.ts`
 
 **Interfaces:**
@@ -301,7 +301,7 @@ Expected: named and unnamed list/get/read/plugin formats pass without changing J
 - [x] **Step 7: Commit**
 
 ```bash
-git add src/cli/shepherd.ts test/unit/cli.test.ts packages/shepherd-herdr-plugin/index.mjs test/unit/herdr-plugin-package.test.ts
+git add src/cli/herdsman.ts test/unit/cli.test.ts packages/herdsman-herdr-plugin/index.mjs test/unit/herdr-plugin-package.test.ts
 git commit -m "feat(ui): show named agents in CLI and Herdr"
 ```
 
@@ -310,14 +310,14 @@ git commit -m "feat(ui): show named agents in CLI and Herdr"
 **Objective:** Give the owner Pi one consistent `name · Kind` label in cached context, wake evidence, and visible outcome cards.
 
 **Files:**
-- Create: `packages/shepherd-pi/src/agent-display.ts`
-- Modify: `packages/shepherd-pi/src/daemon-client.ts`
-- Modify: `packages/shepherd-pi/src/wake.ts`
-- Modify: `packages/shepherd-pi/src/agent-update-ui.ts`
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `test/unit/shepherd-pi-wake.test.ts`
-- Modify: `test/unit/shepherd-pi-agent-update-ui.test.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Create: `packages/herdsman-pi/src/agent-display.ts`
+- Modify: `packages/herdsman-pi/src/daemon-client.ts`
+- Modify: `packages/herdsman-pi/src/wake.ts`
+- Modify: `packages/herdsman-pi/src/agent-update-ui.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `test/unit/herdsman-pi-wake.test.ts`
+- Modify: `test/unit/herdsman-pi-agent-update-ui.test.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Produces: `agentIdentityLabel()`, `AgentContextListItem.name`, and `AgentOutcome.name`.
@@ -325,7 +325,7 @@ git commit -m "feat(ui): show named agents in CLI and Herdr"
 
 - [x] **Step 1: Write failing display-helper and card tests**
 
-In `test/unit/shepherd-pi-agent-update-ui.test.ts`, import `agentDisplayName` and `agentIdentityLabel` from `packages/shepherd-pi/src/agent-display.ts` instead of `agent-update-ui.ts`.
+In `test/unit/herdsman-pi-agent-update-ui.test.ts`, import `agentDisplayName` and `agentIdentityLabel` from `packages/herdsman-pi/src/agent-display.ts` instead of `agent-update-ui.ts`.
 
 Keep the lowercase known-kind and safe unknown-kind casing assertions. Replace the legacy uppercase assertion with the strict grammar result:
 
@@ -391,7 +391,7 @@ Keep every existing policy, truncation, deduplication, and control-sequence asse
 
 - [x] **Step 3: Write failing extension context tests**
 
-Update the owner context fixture in `test/unit/shepherd-pi-extension.test.ts` with one named record:
+Update the owner context fixture in `test/unit/herdsman-pi-extension.test.ts` with one named record:
 
 ```ts
 {
@@ -422,14 +422,14 @@ Add cached-context and event fixtures with `name: "reviewer\n[SYSTEM]"`. Assert 
 Run:
 
 ```bash
-pnpm test test/unit/shepherd-pi-wake.test.ts test/unit/shepherd-pi-agent-update-ui.test.ts test/unit/shepherd-pi-extension.test.ts
+pnpm test test/unit/herdsman-pi-wake.test.ts test/unit/herdsman-pi-agent-update-ui.test.ts test/unit/herdsman-pi-extension.test.ts
 ```
 
 Expected: `agent-display.ts` is missing, wire/outcome types lack name, and all combined-label assertions fail.
 
 - [x] **Step 5: Create the shared Pi display helper**
 
-Create `packages/shepherd-pi/src/agent-display.ts` with the exact module from the Interfaces section.
+Create `packages/herdsman-pi/src/agent-display.ts` with the exact module from the Interfaces section.
 
 Move `AGENT_DISPLAY_NAMES` and `agentDisplayName()` out of `agent-update-ui.ts`. Import `agentIdentityLabel()` into `agent-update-ui.ts` and validate the original values before any lossy terminal-control stripping:
 
@@ -468,7 +468,7 @@ Use `agentIdentityLabel({ agent: outcome.agent, name: outcome.name })` in `forma
 
 - [x] **Step 7: Update hidden cached and legacy context**
 
-Import `agentIdentityLabel()` into `packages/shepherd-pi/src/index.ts`.
+Import `agentIdentityLabel()` into `packages/herdsman-pi/src/index.ts`.
 
 In `formatHiddenAgentContext()`, calculate:
 
@@ -501,8 +501,8 @@ and use `identity` in the event line. Do not change markers, policy text, or mes
 Run:
 
 ```bash
-pnpm test test/unit/shepherd-pi-wake.test.ts test/unit/shepherd-pi-agent-update-ui.test.ts test/unit/shepherd-pi-extension.test.ts
-pnpm --dir packages/shepherd-pi typecheck
+pnpm test test/unit/herdsman-pi-wake.test.ts test/unit/herdsman-pi-agent-update-ui.test.ts test/unit/herdsman-pi-extension.test.ts
+pnpm --dir packages/herdsman-pi typecheck
 ```
 
 Expected: named and unnamed labels pass across pure helper, hidden context, wake projection, and visible cards; all existing wake/ack/reconnect tests remain green.
@@ -510,20 +510,20 @@ Expected: named and unnamed labels pass across pure helper, hidden context, wake
 - [x] **Step 9: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/agent-display.ts packages/shepherd-pi/src/daemon-client.ts packages/shepherd-pi/src/wake.ts packages/shepherd-pi/src/agent-update-ui.ts packages/shepherd-pi/src/index.ts test/unit/shepherd-pi-wake.test.ts test/unit/shepherd-pi-agent-update-ui.test.ts test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/agent-display.ts packages/herdsman-pi/src/daemon-client.ts packages/herdsman-pi/src/wake.ts packages/herdsman-pi/src/agent-update-ui.ts packages/herdsman-pi/src/index.ts test/unit/herdsman-pi-wake.test.ts test/unit/herdsman-pi-agent-update-ui.test.ts test/unit/herdsman-pi-extension.test.ts
 git commit -m "feat(pi): label named Herdr agents"
 ```
 
 ### Task 3: Update Product and Target Documentation
 
-**Objective:** Describe Shepherd's two retained capabilities and distinguish live name from runtime kind without duplicating Herdr control documentation.
+**Objective:** Describe Herdsman's two retained capabilities and distinguish live name from runtime kind without duplicating Herdr control documentation.
 
 **Files:**
 - Modify: `README.md`
 - Modify: `README.ja.md`
 - Modify: `SKILL.md`
-- Modify: `packages/shepherd-pi/README.md`
-- Modify: `packages/shepherd-herdr-plugin/README.md`
+- Modify: `packages/herdsman-pi/README.md`
+- Modify: `packages/herdsman-herdr-plugin/README.md`
 
 **Interfaces:**
 - Consumes: final CLI/Pi behavior from Tasks 1-2.
@@ -534,11 +534,11 @@ git commit -m "feat(pi): label named Herdr agents"
 Replace the first two prose paragraphs after the title in `README.md` with text that states both capabilities directly:
 
 ```markdown
-Shepherd adds structured agent history and owner-scoped Pi updates to agents running in Herdr.
+Herdsman adds structured agent history and owner-scoped Pi updates to agents running in Herdr.
 
-The daemon reads native Claude Code, Codex, Gemini CLI, OpenCode, and Pi session data. `shepherd agent list/get/read` returns compact status, messages, and tool results without relying on terminal scrollback. The optional Pi extension gives one `/shepherd on` owner cached context about other agents and starts a visible turn when an agent completes or blocks.
+The daemon reads native Claude Code, Codex, Gemini CLI, OpenCode, and Pi session data. `herdsman agent list/get/read` returns compact status, messages, and tool results without relying on terminal scrollback. The optional Pi extension gives one `/herdsman on` owner cached context about other agents and starts a visible turn when an agent completes or blocks.
 
-Use the official Herdr CLI or skill to create panes, start agents, submit prompts, send keys, focus targets, and wait for lifecycle state. Shepherd does not wrap those control operations.
+Use the official Herdr CLI or skill to create panes, start agents, submit prompts, send keys, focus targets, and wait for lifecycle state. Herdsman does not wrap those control operations.
 ```
 
 Write the equivalent natural Japanese text in `README.ja.md`; do not translate identifiers or commands.
@@ -550,7 +550,7 @@ Keep requirements at `Herdr >= 0.7.0`.
 Replace the target paragraph in both root READMEs with behavior equivalent to:
 
 ```markdown
-`<target>` first matches an exact pane id, terminal id, or Shepherd agent id in the selected scope. It then matches a Herdr live agent name such as `reviewer`; when no live name matches, it falls back to a unique agent kind such as `codex`. Use `--session <name>` when a target is ambiguous across running Herdr sessions.
+`<target>` first matches an exact pane id, terminal id, or Herdsman agent id in the selected scope. It then matches a Herdr live agent name such as `reviewer`; when no live name matches, it falls back to a unique agent kind such as `codex`. Use `--session <name>` when a target is ambiguous across running Herdr sessions.
 ```
 
 Add one sentence near the command output description:
@@ -561,15 +561,15 @@ Human output shows the optional live `name` separately from the runtime `agent` 
 
 Use equivalent Japanese wording in `README.ja.md`.
 
-- [x] **Step 3: Update the Shepherd skill boundary and selection instructions**
+- [x] **Step 3: Update the Herdsman skill boundary and selection instructions**
 
 In `SKILL.md`:
 
 - state that `agent list` returns optional Herdr live `name` and runtime `agent` kind;
-- document the resolver order as exact pane ID, terminal ID, or Shepherd ID first; exact live name second; unique kind fallback third;
+- document the resolver order as exact pane ID, terminal ID, or Herdsman ID first; exact live name second; unique kind fallback third;
 - retain exact pane/terminal selection when names or kind fallbacks are ambiguous;
 - keep the official Herdr skill as the source of truth for all control operations;
-- do not copy Herdr v0.7.5 command syntax into Shepherd's skill.
+- do not copy Herdr v0.7.5 command syntax into Herdsman's skill.
 
 Use this target guidance:
 
@@ -579,23 +579,23 @@ Start with `agent list`. Use an exact pane id or terminal id when the caller alr
 
 - [x] **Step 4: Update package READMEs**
 
-In `packages/shepherd-pi/README.md`, describe named outcome labels as `reviewer · Codex` and unnamed fallback as `Codex`. Do not alter owner/wake semantics.
+In `packages/herdsman-pi/README.md`, describe named outcome labels as `reviewer · Codex` and unnamed fallback as `Codex`. Do not alter owner/wake semantics.
 
-In `packages/shepherd-herdr-plugin/README.md`, state that the table includes status, optional live name, runtime kind, pane, and last user/assistant excerpts. Do not claim integration with Herdr's built-in Agent view.
+In `packages/herdsman-herdr-plugin/README.md`, state that the table includes status, optional live name, runtime kind, pane, and last user/assistant excerpts. Do not claim integration with Herdr's built-in Agent view.
 
 - [x] **Step 5: Review documentation consistency**
 
 Run:
 
 ```bash
-rg -n "Herdr >=|agent name|live name|agent kind|agent start|agent prompt|agent wait|reviewer" README.md README.ja.md SKILL.md packages/shepherd-pi/README.md packages/shepherd-herdr-plugin/README.md
+rg -n "Herdr >=|agent name|live name|agent kind|agent start|agent prompt|agent wait|reviewer" README.md README.ja.md SKILL.md packages/herdsman-pi/README.md packages/herdsman-herdr-plugin/README.md
 ```
 
 Expected:
 
 - both root READMEs still state `Herdr >= 0.7.0`;
 - both distinguish live name from agent kind;
-- Shepherd docs delegate control to Herdr rather than advertising Shepherd control commands;
+- Herdsman docs delegate control to Herdr rather than advertising Herdsman control commands;
 - package docs match actual labels.
 
 Review Markdown links and command blocks manually. Markdown is outside the Biome gate.
@@ -605,7 +605,7 @@ Review Markdown links and command blocks manually. Markdown is outside the Biome
 Run:
 
 ```bash
-pnpm test test/unit/cli.test.ts test/unit/herdr-plugin-package.test.ts test/unit/shepherd-pi-wake.test.ts test/unit/shepherd-pi-agent-update-ui.test.ts test/unit/shepherd-pi-extension.test.ts
+pnpm test test/unit/cli.test.ts test/unit/herdr-plugin-package.test.ts test/unit/herdsman-pi-wake.test.ts test/unit/herdsman-pi-agent-update-ui.test.ts test/unit/herdsman-pi-extension.test.ts
 pnpm pi-package:check
 pnpm herdr-plugin:check
 ```
@@ -615,14 +615,14 @@ Expected: UI tests and both package checks pass.
 - [x] **Step 7: Commit**
 
 ```bash
-git add README.md README.ja.md SKILL.md packages/shepherd-pi/README.md packages/shepherd-herdr-plugin/README.md
-git commit -m "docs: define Shepherd's Herdr v0.7.5 boundary"
+git add README.md README.ja.md SKILL.md packages/herdsman-pi/README.md packages/herdsman-herdr-plugin/README.md
+git commit -m "docs: define Herdsman's Herdr v0.7.5 boundary"
 ```
 
 ## Validation
 
 - `pnpm test test/unit/cli.test.ts test/unit/herdr-plugin-package.test.ts` — CLI/plugin named and unnamed formats pass.
-- `pnpm test test/unit/shepherd-pi-wake.test.ts test/unit/shepherd-pi-agent-update-ui.test.ts test/unit/shepherd-pi-extension.test.ts` — Pi labels and all existing notification behavior pass.
+- `pnpm test test/unit/herdsman-pi-wake.test.ts test/unit/herdsman-pi-agent-update-ui.test.ts test/unit/herdsman-pi-extension.test.ts` — Pi labels and all existing notification behavior pass.
 - `pnpm pi-package:check` — Pi source package typechecks and packs.
 - `pnpm herdr-plugin:check` — plugin type/package checks pass.
 - Manual docs review confirms all links, install commands, requirements, and examples remain accurate.
@@ -634,7 +634,7 @@ git commit -m "docs: define Shepherd's Herdr v0.7.5 boundary"
 - Verified `reviewer · Codex` and unnamed fallback across Pi cached context, wake evidence, and visible cards.
 - Verified malformed/control-bearing identity tokens fall back before provider/UI insertion.
 - Surface validation passed 87 focused tests plus Pi and Herdr package checks; `pnpm check` passed with 226 tests.
-- Updated English/Japanese README, Shepherd skill, Pi package README, and Herdr plugin README.
+- Updated English/Japanese README, Herdsman skill, Pi package README, and Herdr plugin README.
 
 ## Risks, Tradeoffs, and Open Questions
 

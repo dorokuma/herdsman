@@ -24,7 +24,7 @@ Task 3 and Task 4.
 
 ### Task 3: Correct Herdr Socket Client and Add Snapshot Support
 
-**Objective:** Make Shepherd's Herdr client match current Herdr raw API and support `session.snapshot`.
+**Objective:** Make Herdsman's Herdr client match current Herdr raw API and support `session.snapshot`.
 
 **Files:**
 - Modify: `src/herdr/socket-client.ts`

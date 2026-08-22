@@ -1,8 +1,8 @@
 # Herdr Worker Observability Rewrite Plan
 
-**Goal:** Rewrite Shepherd as a Herdr-centered worker observability and orchestration layer that produces structured worker snapshots, enriched worker events, and push notifications for orchestrator runtimes.
+**Goal:** Rewrite Herdsman as a Herdr-centered worker observability and orchestration layer that produces structured worker snapshots, enriched worker events, and push notifications for orchestrator runtimes.
 
-**Architecture:** Shepherd owns observed-workspace registry, worker identity mapping, runtime-neutral telemetry ingestion, transcript adapters, `WorkerStatePipeline`, notification delivery, and JSONL/CLI orchestration APIs. Herdr remains the low-level terminal/workspace/pane/agent control surface. Pi is the first runtime adapter; Hermes/OpenClaw can later implement the same telemetry/transcript contracts.
+**Architecture:** Herdsman owns observed-workspace registry, worker identity mapping, runtime-neutral telemetry ingestion, transcript adapters, `WorkerStatePipeline`, notification delivery, and JSONL/CLI orchestration APIs. Herdr remains the low-level terminal/workspace/pane/agent control surface. Pi is the first runtime adapter; Hermes/OpenClaw can later implement the same telemetry/transcript contracts.
 
 ## Status
 
@@ -19,12 +19,12 @@ Done.
 ## Decisions Carried Forward
 
 - Existing Gateway behavior can be discarded. No compatibility with old DB files, old session events, Slack delivery, `pi_turns`, logical tools, or queue behavior is required.
-- Shepherd must not become a thin Herdr wrapper. Low-level Herdr pane/tab/workspace operations stay in Herdr CLI/socket/skill/plugin unless Shepherd adds worker-observability value.
+- Herdsman must not become a thin Herdr wrapper. Low-level Herdr pane/tab/workspace operations stay in Herdr CLI/socket/skill/plugin unless Herdsman adds worker-observability value.
 - The core value is structured worker snapshots, enriched worker events, and push notifications to orchestrators.
 - The MVP domain model is observed Herdr workspace + discovered workers. Do not introduce `task` as the core domain unit.
 - Workers are auto-discovered from Herdr `agent.list` for the observed workspace. Manual worker promotion is not required in the MVP.
 - Worker identity prefers `agent_session.source/agent/kind/value`; fallback identity is scoped to `herdrSessionName/socketPath + workspaceId + paneId`.
-- Shepherd issues stable `observedWorkspaceId`; Herdr live ids are internal and may change. Use Herdr move/open/close/status events and `session.snapshot` re-resolution.
+- Herdsman issues stable `observedWorkspaceId`; Herdr live ids are internal and may change. Use Herdr move/open/close/status events and `session.snapshot` re-resolution.
 - Herdr daemon `events.subscribe` is the primary event stream. Herdr Plugin is a companion for observe action, dashboard pane, and install/config UX.
 - Enriched public events are worker-level only in the MVP: `worker.completed`, `worker.blocked`, `worker.needs_input`, `worker.tool.failed`, `worker.summary.updated`, and `worker.status.changed`. Do not add workspace-level ready/initialized events.
 - Snapshot inference uses facts plus deterministic light rules. Do not add a daemon-owned LLM summarizer.
@@ -32,7 +32,7 @@ Done.
 - Notification delivery uses durable daemon cursors plus subscriber-local cursors; `notification.ack` finalizes delivery.
 - Pi live telemetry uses bounded structured payloads with redacted excerpts, `sessionRef`, and `artifactRefs`. Do not store full tool results or hidden thinking.
 - Persistence is append-only worker events plus current worker snapshots. MVP retention is simple/permanent for sanitized excerpts; future retention settings can add pruning.
-- External MVP entrypoints are Pi extension and CLI JSON/JSONL. Delete `shepherd-tools`; do not preserve the old logical-tool bridge.
+- External MVP entrypoints are Pi extension and CLI JSON/JSONL. Delete `herdsman-tools`; do not preserve the old logical-tool bridge.
 - Use TypeBox/Ajv for RPC schemas and Drizzle for SQLite schema. Write tests first for each implementation task.
 
 ## Child Plans

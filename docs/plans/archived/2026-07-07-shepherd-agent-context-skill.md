@@ -1,4 +1,4 @@
-# Shepherd Agent Context and Skill Implementation Plan
+# Herdsman Agent Context and Skill Implementation Plan
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step and run the listed validation. Do not commit, push, or move tags unless the user explicitly asks for that step.
 
@@ -8,18 +8,18 @@
 
 **Next steps:** None. This plan is archived after implementation.
 
-**Goal:** Add a simple agent-facing `shepherd context` command, align the Herdr plugin and Agent Skill around that command, update README guidance, and force-move `v0.1.0` only after validation.
+**Goal:** Add a simple agent-facing `herdsman context` command, align the Herdr plugin and Agent Skill around that command, update README guidance, and force-move `v0.1.0` only after validation.
 
-**Architecture:** Keep Shepherd daemon as the source of truth. The CLI should compose existing daemon RPC methods into a single `context` view; it should not add a new daemon RPC method. The Herdr plugin should call the daemon socket directly as it does now, but expose `context` instead of `observe-workspace`. The official Agent Skill should teach agents to run one command first: `shepherd context --json`.
+**Architecture:** Keep Herdsman daemon as the source of truth. The CLI should compose existing daemon RPC methods into a single `context` view; it should not add a new daemon RPC method. The Herdr plugin should call the daemon socket directly as it does now, but expose `context` instead of `observe-workspace`. The official Agent Skill should teach agents to run one command first: `herdsman context --json`.
 
 **Tech Stack:** TypeScript ESM (`NodeNext`), Node.js 24.18.0+, pnpm 11.9.0+, Vitest, Biome, Drizzle, Pi package skills, Herdr plugin manifest and Node `.mjs` runtime.
 
 ## Global Constraints
 
-- Do not auto-start the Shepherd daemon from `context`. If the daemon socket is unavailable, fail and tell the user to run `shepherd daemon start`.
-- Add `shepherd context [--json] [--subscriber <id>] [--observed-workspace <id>]`.
-- Add `shepherd observe --current [--json]`.
-- Remove `shepherd observe-current` from CLI parsing, help, README, and tests.
+- Do not auto-start the Herdsman daemon from `context`. If the daemon socket is unavailable, fail and tell the user to run `herdsman daemon start`.
+- Add `herdsman context [--json] [--subscriber <id>] [--observed-workspace <id>]`.
+- Add `herdsman observe --current [--json]`.
+- Remove `herdsman observe-current` from CLI parsing, help, README, and tests.
 - `context` without `--observed-workspace` requires `HERDR_ENV=1`, `HERDR_SOCKET_PATH`, and `HERDR_WORKSPACE_ID`.
 - The exact error text for missing Herdr context is: `--current requires HERDR_ENV=1, HERDR_SOCKET_PATH, and HERDR_WORKSPACE_ID. Run it inside a Herdr-managed pane or plugin command.`
 - `context --observed-workspace <id>` must work outside Herdr and must not call `workspace.observe`.
@@ -62,41 +62,41 @@ done	pi	wk_1	completed	review
 ```
 
 - Herdr plugin manifest should replace `observe-workspace` with `context`; no backwards compatibility is required before release.
-- Root `SKILL.md` and `packages/shepherd-pi/skills/shepherd/SKILL.md` should use the same Herdr-style, agent-facing guidance.
-- In the Skill, if `HERDR_ENV=1`, tell the agent to run `shepherd context --json`. If not in Herdr, only use `shepherd context --observed-workspace <id> --json` when the user supplied an observed workspace id. Otherwise stop and explain the missing context.
-- README should use `shepherd context --json` as the main agent-facing command and mention the Herdr plugin `context` action as a human/UI helper.
+- Root `SKILL.md` and `packages/herdsman-pi/skills/herdsman/SKILL.md` should use the same Herdr-style, agent-facing guidance.
+- In the Skill, if `HERDR_ENV=1`, tell the agent to run `herdsman context --json`. If not in Herdr, only use `herdsman context --observed-workspace <id> --json` when the user supplied an observed workspace id. Otherwise stop and explain the missing context.
+- README should use `herdsman context --json` as the main agent-facing command and mention the Herdr plugin `context` action as a human/UI helper.
 - Use stop-slop for English README/SKILL prose and stop-slop-ja for Japanese README prose.
 - Existing `v0.1.0` has already been pushed. After all changes and smoke checks pass, force-move the annotated `v0.1.0` tag to the final commit and push it with force only when the user confirms the release/tag step.
 
 ## Current Context
 
-- `src/cli/shepherd.ts` currently has separate `observe` and `observe-current` commands.
+- `src/cli/herdsman.ts` currently has separate `observe` and `observe-current` commands.
 - `runCliCommand` already composes daemon RPC requests through `ObservabilityRpcClient`.
 - Existing RPC methods are enough for `context`: `workspace.observe`, `workspace.snapshot`, and `notification.subscribe`.
-- `packages/shepherd-herdr-plugin/index.mjs` already connects directly to the Shepherd daemon socket and reads `$SHEPHERD_HOME/runtime.json` to find the socket path.
-- `packages/shepherd-herdr-plugin/herdr-plugin.toml` currently exposes `observe-workspace` and `dashboard`.
-- `packages/shepherd-pi/skills/shepherd/SKILL.md` currently describes Pi bridge behavior and has `disable-model-invocation: true`; it is not yet an agent workflow skill.
+- `packages/herdsman-herdr-plugin/index.mjs` already connects directly to the Herdsman daemon socket and reads `$SHEPHERD_HOME/runtime.json` to find the socket path.
+- `packages/herdsman-herdr-plugin/herdr-plugin.toml` currently exposes `observe-workspace` and `dashboard`.
+- `packages/herdsman-pi/skills/herdsman/SKILL.md` currently describes Pi bridge behavior and has `disable-model-invocation: true`; it is not yet an agent workflow skill.
 - `README.md` and `README.ja.md` currently mention `observe-current`; both must move to `context`.
 - The project already has public GitHub metadata, public repository visibility, and pushed commits through `a1d6b50` plus later work. Verify the current HEAD before moving the tag.
 
 ## File Structure
 
-- Modify: `src/cli/shepherd.ts` — add `context`, add `observe --current`, remove `observe-current`, format context output.
+- Modify: `src/cli/herdsman.ts` — add `context`, add `observe --current`, remove `observe-current`, format context output.
 - Modify: `test/unit/cli.test.ts` — cover parsing, RPC composition, JSON output, human output, and error text.
-- Modify: `packages/shepherd-herdr-plugin/index.mjs` — replace `observe-workspace` command with `context` command and compose context output through daemon RPC.
-- Modify: `packages/shepherd-herdr-plugin/herdr-plugin.toml` — replace action `observe-workspace` with action `context`.
+- Modify: `packages/herdsman-herdr-plugin/index.mjs` — replace `observe-workspace` command with `context` command and compose context output through daemon RPC.
+- Modify: `packages/herdsman-herdr-plugin/herdr-plugin.toml` — replace action `observe-workspace` with action `context`.
 - Modify: `test/unit/herdr-plugin-package.test.ts` — update manifest expectations and plugin runtime tests for `context`.
-- Create: `SKILL.md` — official Shepherd Agent Skill at repo root.
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md` — align package skill with root skill and keep Pi-specific notes short.
-- Modify: `README.md` — document daemon startup, `shepherd context --json`, and Herdr plugin `context` action.
+- Create: `SKILL.md` — official Herdsman Agent Skill at repo root.
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md` — align package skill with root skill and keep Pi-specific notes short.
+- Modify: `README.md` — document daemon startup, `herdsman context --json`, and Herdr plugin `context` action.
 - Modify: `README.ja.md` — same content in Japanese, with natural wording.
-- Verify: `package.json`, `packages/shepherd-pi/package.json`, `packages/shepherd-herdr-plugin/package.json` — only change if package checks require manifest paths or metadata updates.
+- Verify: `package.json`, `packages/herdsman-pi/package.json`, `packages/herdsman-herdr-plugin/package.json` — only change if package checks require manifest paths or metadata updates.
 
 ## Interfaces
 
 ### CLI command type additions
 
-Add these `CliCommand` variants in `src/cli/shepherd.ts`:
+Add these `CliCommand` variants in `src/cli/herdsman.ts`:
 
 ```ts
 | {
@@ -124,7 +124,7 @@ Change the existing observe command shape to include current mode:
 
 ### Context result shape
 
-Create local types in `src/cli/shepherd.ts`:
+Create local types in `src/cli/herdsman.ts`:
 
 ```ts
 type ContextResult = {
@@ -168,7 +168,7 @@ Implement `buildContext(command, client): Promise<ContextResult>` with this beha
 **Objective:** Make the CLI accept the new command names and reject the old name.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `test/unit/cli.test.ts`
 
 **Interfaces:**
@@ -205,11 +205,11 @@ expect(parseCliArgs(["context", "--json"], {
   workspaceId: "w1",
 });
 
-expect(parseCliArgs(["context", "--observed-workspace", "ow_1", "--subscriber", "shepherd-agent", "--json"], {})).toEqual({
+expect(parseCliArgs(["context", "--observed-workspace", "ow_1", "--subscriber", "herdsman-agent", "--json"], {})).toEqual({
   command: "context",
   json: true,
   observedWorkspaceId: "ow_1",
-  subscriberId: "shepherd-agent",
+  subscriberId: "herdsman-agent",
 });
 
 expect(() => parseCliArgs(["observe-current"], {})).toThrow("Unknown command: observe-current");
@@ -229,7 +229,7 @@ Expected: failures showing `context` and `observe --current` are unknown or not 
 
 - [ ] **Step 3: Implement parser changes**
 
-In `src/cli/shepherd.ts`:
+In `src/cli/herdsman.ts`:
 
 1. Add constant:
 
@@ -288,14 +288,14 @@ Expected: parser assertions pass or only runtime dispatch tests fail because imp
 
 - [ ] **Step 5: Checkpoint files**
 
-Files expected to change in this task: `src/cli/shepherd.ts`, `test/unit/cli.test.ts`. Do not commit unless the user explicitly asks for a commit.
+Files expected to change in this task: `src/cli/herdsman.ts`, `test/unit/cli.test.ts`. Do not commit unless the user explicitly asks for a commit.
 
 ### Task 2: Compose `context` output in the CLI
 
-**Objective:** Make `shepherd context` call existing daemon RPC methods and return stable JSON/human output.
+**Objective:** Make `herdsman context` call existing daemon RPC methods and return stable JSON/human output.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `test/unit/cli.test.ts`
 
 **Interfaces:**
@@ -312,7 +312,7 @@ await runCliCommand(
   {
     connect: async () => client,
     output: (line) => output.push(line),
-    socketPath: "/tmp/shepherd.sock",
+    socketPath: "/tmp/herdsman.sock",
   },
 );
 ```
@@ -345,14 +345,14 @@ expect(JSON.parse(output[0])).toEqual({
 
 Do not compare raw JSON strings in this test.
 
-Add a second test for `context --observed-workspace ow_1 --subscriber shepherd-agent --json` by passing the `CliCommand` object directly to `runCliCommand`:
+Add a second test for `context --observed-workspace ow_1 --subscriber herdsman-agent --json` by passing the `CliCommand` object directly to `runCliCommand`:
 
 ```ts
 {
   command: "context",
   json: true,
   observedWorkspaceId: "ow_1",
-  subscriberId: "shepherd-agent",
+  subscriberId: "herdsman-agent",
 }
 ```
 
@@ -364,7 +364,7 @@ Expected RPC calls:
   ["notification.subscribe", {
     autoResume: false,
     observedWorkspaceId: "ow_1",
-    subscriberId: "shepherd-agent",
+    subscriberId: "herdsman-agent",
     subscriberKind: "cli",
   }],
   ["close"],
@@ -392,7 +392,7 @@ Expected: failures for missing context dispatch or output formatting.
 
 In `dispatchRpcCommand`, add `case "context": return buildContext(command, client);`.
 
-Add this implementation in `src/cli/shepherd.ts`:
+Add this implementation in `src/cli/herdsman.ts`:
 
 ```ts
 async function buildContext(
@@ -484,14 +484,14 @@ function formatContextResult(result: ContextResult): string {
 Change help text to include:
 
 ```text
-  shepherd context [--observed-workspace <id>] [--subscriber <id>] [--json]
-  shepherd observe --current [--json]
+  herdsman context [--observed-workspace <id>] [--subscriber <id>] [--json]
+  herdsman observe --current [--json]
 ```
 
 Remove:
 
 ```text
-  shepherd observe-current [--json]
+  herdsman observe-current [--json]
 ```
 
 - [ ] **Step 5: Run CLI tests and verify success**
@@ -502,15 +502,15 @@ Expected: all CLI unit tests pass.
 
 - [ ] **Step 6: Checkpoint files**
 
-Files expected to change in this task: `src/cli/shepherd.ts`, `test/unit/cli.test.ts`. Do not commit unless the user explicitly asks for a commit.
+Files expected to change in this task: `src/cli/herdsman.ts`, `test/unit/cli.test.ts`. Do not commit unless the user explicitly asks for a commit.
 
 ### Task 3: Replace Herdr plugin `observe-workspace` action with `context`
 
 **Objective:** Make the Herdr plugin expose one short `context` action and share the CLI context output style.
 
 **Files:**
-- Modify: `packages/shepherd-herdr-plugin/herdr-plugin.toml`
-- Modify: `packages/shepherd-herdr-plugin/index.mjs`
+- Modify: `packages/herdsman-herdr-plugin/herdr-plugin.toml`
+- Modify: `packages/herdsman-herdr-plugin/index.mjs`
 - Modify: `test/unit/herdr-plugin-package.test.ts`
 
 **Interfaces:**
@@ -527,7 +527,7 @@ expect(manifest).toContain('command = ["node", "index.mjs", "context"]');
 expect(manifest).not.toContain('id = "observe-workspace"');
 ```
 
-Replace `observes Herdr context over Shepherd daemon RPC` with a `context` test:
+Replace `observes Herdr context over Herdsman daemon RPC` with a `context` test:
 
 ```ts
 await expect(
@@ -549,11 +549,11 @@ expect(output.join("\n")).toContain("done\tpi\twk_1\tcompleted\treview");
 Add a subscriber test:
 
 ```ts
-await runPluginCommand(["context", "--subscriber", "shepherd-agent"], ...);
+await runPluginCommand(["context", "--subscriber", "herdsman-agent"], ...);
 expect(client.calls).toContainEqual(["notification.subscribe", {
   autoResume: false,
   observedWorkspaceId: "ow_1",
-  subscriberId: "shepherd-agent",
+  subscriberId: "herdsman-agent",
   subscriberKind: "cli",
 }]);
 ```
@@ -566,12 +566,12 @@ Expected: failures for manifest/action name and missing `context` command.
 
 - [ ] **Step 3: Update Herdr manifest**
 
-Change `packages/shepherd-herdr-plugin/herdr-plugin.toml`:
+Change `packages/herdsman-herdr-plugin/herdr-plugin.toml`:
 
 ```toml
 [[actions]]
 id = "context"
-title = "Show Shepherd context"
+title = "Show Herdsman context"
 contexts = ["workspace"]
 command = ["node", "index.mjs", "context"]
 ```
@@ -580,7 +580,7 @@ Remove the `observe-workspace` action block.
 
 - [ ] **Step 4: Update plugin runtime**
 
-In `packages/shepherd-herdr-plugin/index.mjs`:
+In `packages/herdsman-herdr-plugin/index.mjs`:
 
 1. Replace the `observe-workspace` branch with `context`.
 2. Add option parsing for `--subscriber <id>` only. If any other argument remains, print `context accepts only --subscriber <id>` and return `2`.
@@ -598,7 +598,7 @@ In `packages/shepherd-herdr-plugin/index.mjs`:
 Run:
 
 ```bash
-PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH" pnpm --dir packages/shepherd-herdr-plugin typecheck
+PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH" pnpm --dir packages/herdsman-herdr-plugin typecheck
 PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH" pnpm vitest run test/unit/herdr-plugin-package.test.ts
 PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH" pnpm herdr-plugin:check
 ```
@@ -607,19 +607,19 @@ Expected: all pass, package dry-run still contains `index.mjs` and `herdr-plugin
 
 - [ ] **Step 6: Checkpoint files**
 
-Files expected to change in this task: `packages/shepherd-herdr-plugin/herdr-plugin.toml`, `packages/shepherd-herdr-plugin/index.mjs`, `test/unit/herdr-plugin-package.test.ts`. Do not commit unless the user explicitly asks for a commit.
+Files expected to change in this task: `packages/herdsman-herdr-plugin/herdr-plugin.toml`, `packages/herdsman-herdr-plugin/index.mjs`, `test/unit/herdr-plugin-package.test.ts`. Do not commit unless the user explicitly asks for a commit.
 
 ### Task 4: Add official Agent Skill files
 
-**Objective:** Provide a Herdr-style official Shepherd Agent Skill at repo root and in the Pi package.
+**Objective:** Provide a Herdr-style official Herdsman Agent Skill at repo root and in the Pi package.
 
 **Files:**
 - Create: `SKILL.md`
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md`
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md`
 
 **Interfaces:**
-- Consumes: `shepherd context --json`, `shepherd context --observed-workspace <id> --json`, optional `--subscriber shepherd-agent`.
-- Produces: Agent-facing instructions for Shepherd usage.
+- Consumes: `herdsman context --json`, `herdsman context --observed-workspace <id> --json`, optional `--subscriber herdsman-agent`.
+- Produces: Agent-facing instructions for Herdsman usage.
 
 - [ ] **Step 1: Write root `SKILL.md`**
 
@@ -627,36 +627,36 @@ Create `SKILL.md` with this complete content:
 
 ````markdown
 ---
-name: shepherd
-description: "Use Shepherd inside Herdr to read worker snapshots, worker events, and notifications for coding agents. Use when HERDR_ENV=1 or when the user gives you an observed workspace id."
+name: herdsman
+description: "Use Herdsman inside Herdr to read worker snapshots, worker events, and notifications for coding agents. Use when HERDR_ENV=1 or when the user gives you an observed workspace id."
 ---
 
-# shepherd — agent skill
+# herdsman — agent skill
 
 before using this skill, check whether `HERDR_ENV=1`.
 
 if `HERDR_ENV=1`, run:
 
 ```bash
-shepherd context --json
+herdsman context --json
 ```
 
-if `HERDR_ENV` is not `1`, only use Shepherd when the user gives you an observed workspace id. then run:
+if `HERDR_ENV` is not `1`, only use Herdsman when the user gives you an observed workspace id. then run:
 
 ```bash
-shepherd context --observed-workspace ow_123 --json
+herdsman context --observed-workspace ow_123 --json
 ```
 
-if you are not inside Herdr and the user did not give an observed workspace id, say Shepherd needs a Herdr-managed pane or an observed workspace id. stop there. do not guess a workspace.
+if you are not inside Herdr and the user did not give an observed workspace id, say Herdsman needs a Herdr-managed pane or an observed workspace id. stop there. do not guess a workspace.
 
-Shepherd stores worker state for coding agents that run in Herdr. It does not control panes, tabs, or agents. Use Herdr for terminal control. Use Shepherd for worker snapshots, worker events, and notification context.
+Herdsman stores worker state for coding agents that run in Herdr. It does not control panes, tabs, or agents. Use Herdr for terminal control. Use Herdsman for worker snapshots, worker events, and notification context.
 
 ## daemon requirement
 
-Shepherd commands talk to the Shepherd daemon. if `shepherd context --json` cannot connect to the daemon, ask the user to start it:
+Herdsman commands talk to the Herdsman daemon. if `herdsman context --json` cannot connect to the daemon, ask the user to start it:
 
 ```bash
-shepherd daemon start
+herdsman daemon start
 ```
 
 Do not start the daemon yourself unless the user asks.
@@ -666,7 +666,7 @@ Do not start the daemon yourself unless the user asks.
 Inside Herdr, start with:
 
 ```bash
-shepherd context --json
+herdsman context --json
 ```
 
 The result has this shape:
@@ -686,7 +686,7 @@ Use `workers` to see current worker status, summaries, blocked reasons, recommen
 Do not create a notification subscription unless you need unread worker notifications. When you need them, use a separate subscriber id for agent reads:
 
 ```bash
-shepherd context --json --subscriber shepherd-agent
+herdsman context --json --subscriber herdsman-agent
 ```
 
 This reads pending events. It does not ack them.
@@ -696,40 +696,40 @@ This reads pending events. It does not ack them.
 Outside Herdr, use an id the user gave you:
 
 ```bash
-shepherd context --observed-workspace ow_123 --json
+herdsman context --observed-workspace ow_123 --json
 ```
 
-Add `--subscriber shepherd-agent` only when you need pending notifications for that workspace.
+Add `--subscriber herdsman-agent` only when you need pending notifications for that workspace.
 
 ## boundaries
 
-- use Shepherd for durable worker state, snapshots, worker events, and notifications
+- use Herdsman for durable worker state, snapshots, worker events, and notifications
 - use Herdr for workspace, tab, pane, output, wait, and agent control
-- do not send hidden thinking, full transcripts, or full tool outputs to Shepherd
+- do not send hidden thinking, full transcripts, or full tool outputs to Herdsman
 - do not ack notifications unless the user asks you to ack a specific event
-- do not assume worker ids or observed workspace ids; read them from Shepherd output
+- do not assume worker ids or observed workspace ids; read them from Herdsman output
 ````
 
 - [ ] **Step 2: Update Pi package skill**
 
-Replace `packages/shepherd-pi/skills/shepherd/SKILL.md` with the same workflow. Keep Pi-specific notes after the boundaries section:
+Replace `packages/herdsman-pi/skills/herdsman/SKILL.md` with the same workflow. Keep Pi-specific notes after the boundaries section:
 
 ````markdown
 ## pi extension notes
 
-When the `shepherd-pi` extension is active, Pi sends bounded, redacted tool and final message excerpts to Shepherd. Pi also receives worker notifications and may inject them into the next turn as hidden context.
+When the `herdsman-pi` extension is active, Pi sends bounded, redacted tool and final message excerpts to Herdsman. Pi also receives worker notifications and may inject them into the next turn as hidden context.
 
 This skill does not grant access to hidden thinking, full tool results, or full transcripts.
 ````
 
-Remove `disable-model-invocation: true` so Pi can offer the skill when the task matches. Keep the frontmatter name `shepherd` and description within 1024 characters.
+Remove `disable-model-invocation: true` so Pi can offer the skill when the task matches. Keep the frontmatter name `herdsman` and description within 1024 characters.
 
 - [ ] **Step 3: Validate skill files**
 
 Run:
 
 ```bash
-rg -n "disable-model-invocation|TODO|TBD" SKILL.md packages/shepherd-pi/skills/shepherd/SKILL.md
+rg -n "disable-model-invocation|TODO|TBD" SKILL.md packages/herdsman-pi/skills/herdsman/SKILL.md
 PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH" pnpm pi-package:check
 ```
 
@@ -737,7 +737,7 @@ Expected: `rg` should not find `disable-model-invocation`, `TODO`, or `TBD`; `pn
 
 - [ ] **Step 4: Checkpoint files**
 
-Files expected to change in this task: `SKILL.md`, `packages/shepherd-pi/skills/shepherd/SKILL.md`. Do not commit unless the user explicitly asks for a commit.
+Files expected to change in this task: `SKILL.md`, `packages/herdsman-pi/skills/herdsman/SKILL.md`. Do not commit unless the user explicitly asks for a commit.
 
 ### Task 5: Update README for `context` and the Skill
 
@@ -759,27 +759,27 @@ In `README.md`:
 2. Use this command as the main agent-facing command:
 
 ```bash
-node dist/src/cli/shepherd.js context --json
+node dist/src/cli/herdsman.js context --json
 ```
 
 3. If using source checkout path is too long, include both:
 
 ```bash
-node dist/src/cli/shepherd.js context --json
-# or, if shepherd is on PATH:
-shepherd context --json
+node dist/src/cli/herdsman.js context --json
+# or, if herdsman is on PATH:
+herdsman context --json
 ```
 
 4. Add Herdr plugin action as a human/UI helper:
 
 ```bash
-herdr plugin action invoke context --plugin shepherd.observability
+herdr plugin action invoke context --plugin herdsman.observability
 ```
 
 5. Add a short "Agent Skill" paragraph:
 
 ```md
-Agents should read [`SKILL.md`](SKILL.md). The skill tells agents to use `shepherd context --json` inside Herdr and to avoid guessing workspace ids outside Herdr.
+Agents should read [`SKILL.md`](SKILL.md). The skill tells agents to use `herdsman context --json` inside Herdr and to avoid guessing workspace ids outside Herdr.
 ```
 
 6. Replace help wording to mention `context` and `observe --current`, not `observe-current`.
@@ -833,10 +833,10 @@ This smoke must run inside a Herdr-managed pane so `HERDR_SOCKET_PATH` points to
 Run inside Herdr:
 
 ```bash
-rm -rf /tmp/shepherd-context-smoke
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon start
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js context --json
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon stop
+rm -rf /tmp/herdsman-context-smoke
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js context --json
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
 ```
 
 Expected: `context --json` prints JSON with `observedWorkspace`, `workers`, and `notifications`; daemon stops after the test. If the implementer is not currently inside Herdr, skip this manual smoke and rely on Task 6 Step 3 plus unit/integration tests until a Herdr pane is available.
@@ -848,12 +848,12 @@ This runtime smoke must run inside a Herdr-managed pane so the plugin receives r
 Run inside Herdr:
 
 ```bash
-herdr plugin link ./packages/shepherd-herdr-plugin
-rm -rf /tmp/shepherd-context-smoke
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon start
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node packages/shepherd-herdr-plugin/index.mjs context
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon stop
-herdr plugin list --plugin shepherd.observability --json
+herdr plugin link ./packages/herdsman-herdr-plugin
+rm -rf /tmp/herdsman-context-smoke
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node packages/herdsman-herdr-plugin/index.mjs context
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
+herdr plugin list --plugin herdsman.observability --json
 ```
 
 Expected: direct plugin runtime output contains `Observed workspace:`. `herdr plugin list` shows action `context` and no action `observe-workspace`.
@@ -863,7 +863,7 @@ Expected: direct plugin runtime output contains `Observed workspace:`. `herdr pl
 Run:
 
 ```bash
-PI_OFFLINE=1 pi -e ./packages/shepherd-pi --list-models __no_such_model__
+PI_OFFLINE=1 pi -e ./packages/herdsman-pi --list-models __no_such_model__
 ```
 
 Expected: command exits 0 and prints `No models matching "__no_such_model__"`.
@@ -920,8 +920,8 @@ Expected: remote tag updates successfully.
 Run:
 
 ```bash
-herdr plugin install ryonakae/shepherd/packages/shepherd-herdr-plugin --ref v0.1.0 --yes
-herdr plugin list --plugin shepherd.observability --json
+herdr plugin install ryonakae/herdsman/packages/herdsman-herdr-plugin --ref v0.1.0 --yes
+herdr plugin list --plugin herdsman.observability --json
 ```
 
 Expected: install succeeds; plugin source shows `requested_ref: "v0.1.0"`; action list includes `context`; action list does not include `observe-workspace`.
@@ -931,11 +931,11 @@ Expected: install succeeds; plugin source shows `requested_ref: "v0.1.0"`; actio
 Run inside a Herdr-managed pane:
 
 ```bash
-PLUGIN_ROOT=$(herdr plugin list --plugin shepherd.observability --json | node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const j = JSON.parse(s); console.log(j.result.plugins[0].plugin_root); });')
-rm -rf /tmp/shepherd-context-smoke
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon start
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node "$PLUGIN_ROOT/index.mjs" context
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon stop
+PLUGIN_ROOT=$(herdr plugin list --plugin herdsman.observability --json | node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const j = JSON.parse(s); console.log(j.result.plugins[0].plugin_root); });')
+rm -rf /tmp/herdsman-context-smoke
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node "$PLUGIN_ROOT/index.mjs" context
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
 ```
 
 Expected: installed plugin runtime output contains `Observed workspace:` and exits 0. Daemon stops.
@@ -958,16 +958,16 @@ Manual smoke required before tag movement:
 From a Herdr-managed pane:
 
 ```bash
-rm -rf /tmp/shepherd-context-smoke
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon start
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js context --json
-SHEPHERD_HOME=/tmp/shepherd-context-smoke node dist/src/cli/shepherd.js daemon stop
+rm -rf /tmp/herdsman-context-smoke
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js context --json
+SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
 ```
 
 From any shell:
 
 ```bash
-PI_OFFLINE=1 pi -e ./packages/shepherd-pi --list-models __no_such_model__
+PI_OFFLINE=1 pi -e ./packages/herdsman-pi --list-models __no_such_model__
 ```
 
 Expected: the Herdr-pane context command prints JSON containing `observedWorkspace`, `workers`, `notifications`; Pi command reports no matching model and exits 0.

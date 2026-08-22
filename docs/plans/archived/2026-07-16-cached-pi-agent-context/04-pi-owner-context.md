@@ -6,7 +6,7 @@
 
 **Goal:** Replace prompt-time daemon pulls with an owner-only local context mirror that Pi injects synchronously and ephemerally, while preserving independent auto-wake and acknowledgement behavior.
 
-**Architecture:** The reconnecting daemon client receives context in owner connection-state responses and `agent.context.changed` streams. The extension clears context on role/scope loss, pins the latest local snapshot once at agent-run start, and uses Pi's `context` hook to filter legacy persisted Shepherd context and append one ephemeral current message. Normal user runs never consume pending outcomes; Shepherd-triggered wake runs use only their existing wake context.
+**Architecture:** The reconnecting daemon client receives context in owner connection-state responses and `agent.context.changed` streams. The extension clears context on role/scope loss, pins the latest local snapshot once at agent-run start, and uses Pi's `context` hook to filter legacy persisted Herdsman context and append one ephemeral current message. Normal user runs never consume pending outcomes; Herdsman-triggered wake runs use only their existing wake context.
 
 **Tech Stack:** TypeScript Pi extension, Pi >= 0.80.6 event API, Node Unix-socket JSON Lines client, Vitest fake client/fake timers.
 
@@ -20,10 +20,10 @@
 - Ignore context streams whose `(herdrSessionName, workspaceId)` do not match current scope or when this Pi is not owner.
 - `agent_start` pins at most once until `agent_settled`; repeated low-level starts/retries do not replace the pin.
 - The `context` hook is synchronous and performs only in-memory filtering/formatting.
-- Legacy persisted messages with `customType === "shepherd-agent-context"` or marker `[SHEPHERD AGENT CONTEXT]` are removed from provider context before appending the current ephemeral message.
-- Do not filter `shepherd-wake-context`, visible `shepherd-wake`, or prior assistant wake responses.
+- Legacy persisted messages with `customType === "herdsman-agent-context"` or marker `[SHEPHERD AGENT CONTEXT]` are removed from provider context before appending the current ephemeral message.
+- Do not filter `herdsman-wake-context`, visible `herdsman-wake`, or prior assistant wake responses.
 - If the pinned snapshot is absent, return only the legacy-filtered messages.
-- If a delivered batch is Shepherd-triggered, do not pin normal context for that run.
+- If a delivered batch is Herdsman-triggered, do not pin normal context for that run.
 - Pending outcomes arriving before/during a normal run stay pending. Busy deferral starts one independent wake after normal `agent_settled`.
 - Keep wake settle, outcome projection, failure suppression, owner replacement, self-event filtering, ack-after-successful-settle, and visible renderer behavior unchanged.
 - The normal context formatter remains bounded and keeps the existing marker/fields. It now receives daemon-cached agents and is not itself responsible for freshness.
@@ -31,7 +31,7 @@
 ## Current Context
 
 - `ReconnectingDaemonClient` handles `agent.event` and `agent.orchestrator.changed` stream methods only.
-- `packages/shepherd-pi/src/index.ts` stores connection/role/pending/wake state in one extension-local object.
+- `packages/herdsman-pi/src/index.ts` stores connection/role/pending/wake state in one extension-local object.
 - `applyConnectionStateResponse()` is the central owner/non-owner transition path used by register/get/set/reconnect.
 - `before_agent_start` currently refreshes owner state, calls `agent.list`, creates a delivered batch for a normal user turn, formats normal/update context, and cancels a scheduled wake.
 - `agent_settled` owns wake acknowledgement and later-wake scheduling.
@@ -40,15 +40,15 @@
 
 ## File Structure
 
-- Modify: `packages/shepherd-pi/src/daemon-client.ts` — context snapshot types and stream union.
-- Modify: `test/integration/shepherd-pi-daemon-client.test.ts` — decode `agent.context.changed` alongside existing streams.
-- Modify: `packages/shepherd-pi/src/index.ts` — registration session ref, local/pinned context state, owner gating, context hook, removal of prompt pull, wake separation.
-- Modify: `test/unit/shepherd-pi-extension.test.ts` — fake context event support, owner/off behavior, pinning, cache miss, scope/reconnect clearing, wake separation, zero prompt RPC.
-- Modify: `test/unit/shepherd-pi-agent-update-ui.test.ts` only if message detail types move; visual card behavior must not change.
+- Modify: `packages/herdsman-pi/src/daemon-client.ts` — context snapshot types and stream union.
+- Modify: `test/integration/herdsman-pi-daemon-client.test.ts` — decode `agent.context.changed` alongside existing streams.
+- Modify: `packages/herdsman-pi/src/index.ts` — registration session ref, local/pinned context state, owner gating, context hook, removal of prompt pull, wake separation.
+- Modify: `test/unit/herdsman-pi-extension.test.ts` — fake context event support, owner/off behavior, pinning, cache miss, scope/reconnect clearing, wake separation, zero prompt RPC.
+- Modify: `test/unit/herdsman-pi-agent-update-ui.test.ts` only if message detail types move; visual card behavior must not change.
 
 ## Interfaces
 
-Add to `packages/shepherd-pi/src/daemon-client.ts`:
+Add to `packages/herdsman-pi/src/daemon-client.ts`:
 
 ```ts
 export type AgentContextListItem = {
@@ -118,10 +118,10 @@ runActive: boolean;
 **Objective:** Keep the latest daemon snapshot only while this Pi owns the current scope and restore it through claim/reconnect/movement responses.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/daemon-client.ts`
-- Modify: `test/integration/shepherd-pi-daemon-client.test.ts`
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/daemon-client.ts`
+- Modify: `test/integration/herdsman-pi-daemon-client.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: child 03 response/stream protocol.
@@ -178,7 +178,7 @@ Extend `connectionResponse()` with `context?: AgentWorkspaceContextSnapshot | nu
 4. Matching non-null `agent.context.changed` replaces owner latest context.
 5. Matching `context: null` clears owner latest context; an already pinned active run remains stable until settle, and the next run injects nothing.
 6. Off Pi ignores stream context.
-7. `/shepherd on` stores context from set response; `/shepherd off` clears it immediately.
+7. `/herdsman on` stores context from set response; `/herdsman off` clears it immediately.
 8. Owner replacement/disconnect/scope move/session shutdown clear latest and pinned context.
 9. Reconnect registration restores current owner context.
 
@@ -186,7 +186,7 @@ Expose latest context only through context-hook behavior in tests; do not add a 
 
 - [x] **Step 3: Run client/extension tests to verify red**
 
-Run: `pnpm test test/integration/shepherd-pi-daemon-client.test.ts test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/integration/herdsman-pi-daemon-client.test.ts test/unit/herdsman-pi-extension.test.ts`
 
 Expected: context stream is ignored and registration lacks `sessionRef`.
 
@@ -212,14 +212,14 @@ Call `clearAgentContext()` from role loss, scope reset, disconnect, and shutdown
 
 - [x] **Step 5: Run tests to verify green**
 
-Run: `pnpm test test/integration/shepherd-pi-daemon-client.test.ts test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/integration/herdsman-pi-daemon-client.test.ts test/unit/herdsman-pi-extension.test.ts`
 
 Expected: stream, registration, owner gating, and clearing tests pass.
 
 - [x] **Step 6: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/daemon-client.ts packages/shepherd-pi/src/index.ts test/integration/shepherd-pi-daemon-client.test.ts test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/daemon-client.ts packages/herdsman-pi/src/index.ts test/integration/herdsman-pi-daemon-client.test.ts test/unit/herdsman-pi-extension.test.ts
 git commit -m "feat(pi): mirror owner agent context from daemon"
 ```
 
@@ -228,8 +228,8 @@ git commit -m "feat(pi): mirror owner agent context from daemon"
 **Objective:** Give normal owner runs a stable cached snapshot without persistent duplicate messages or prompt-time I/O.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: Task 1 `latestContext`.
@@ -255,23 +255,23 @@ Keep the generic `emit()` helper for lifecycle events.
 
 Cover:
 
-1. Off Pi returns messages unchanged except removal of legacy Shepherd context.
+1. Off Pi returns messages unchanged except removal of legacy Herdsman context.
 2. Owner with `context: null` injects nothing and makes zero client calls.
 3. Owner with a snapshot receives one final custom message with:
 
 ```ts
 {
   role: "custom",
-  customType: "shepherd-agent-context",
+  customType: "herdsman-agent-context",
   content: expect.stringContaining("[SHEPHERD AGENT CONTEXT]"),
   display: false,
   timestamp: expect.any(Number),
 }
 ```
 
-4. Existing messages with `customType: "shepherd-agent-context"` are removed.
+4. Existing messages with `customType: "herdsman-agent-context"` are removed.
 5. Legacy user/custom content containing `[SHEPHERD AGENT CONTEXT]` is removed defensively.
-6. `shepherd-wake-context` and unrelated custom messages remain.
+6. `herdsman-wake-context` and unrelated custom messages remain.
 7. A snapshot stream update after `agent_start` does not change the pinned context on later context calls in the same run.
 8. A repeated `agent_start` before `agent_settled` does not repin.
 9. After `agent_settled`, the next `agent_start` pins the newer snapshot.
@@ -281,7 +281,7 @@ Cover:
 
 - [x] **Step 3: Run extension tests to verify red**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: no context hook/pinning behavior exists.
 
@@ -294,7 +294,7 @@ pi.on("agent_start", () => {
   if (state.runActive) return;
   state.runActive = true;
   state.pinnedContext =
-    state.isOrchestrator && !state.deliveredBatch?.shepherdTriggered
+    state.isOrchestrator && !state.deliveredBatch?.herdsmanTriggered
       ? state.latestContext
       : undefined;
 });
@@ -308,7 +308,7 @@ Use a non-async handler:
 
 ```ts
 pi.on("context", (event: { messages: PiAgentMessage[] }) => {
-  const messages = event.messages.filter((message) => !isNormalShepherdContext(message));
+  const messages = event.messages.filter((message) => !isNormalHerdsmanContext(message));
   const snapshot = state.pinnedContext;
   if (!snapshot || snapshot.agents.length === 0) return { messages };
   return {
@@ -316,7 +316,7 @@ pi.on("context", (event: { messages: PiAgentMessage[] }) => {
       ...messages,
       {
         role: "custom",
-        customType: "shepherd-agent-context",
+        customType: "herdsman-agent-context",
         content: formatHiddenAgentContext({
           agents: snapshot.agents,
           workspaceId: snapshot.workspaceId,
@@ -329,7 +329,7 @@ pi.on("context", (event: { messages: PiAgentMessage[] }) => {
 });
 ```
 
-`isNormalShepherdContext()` matches `customType` first and the stable marker as a fallback across string/block content. It must not match `shepherd-wake-context` merely because both start with “SHEPHERD”.
+`isNormalHerdsmanContext()` matches `customType` first and the stable marker as a fallback across string/block content. It must not match `herdsman-wake-context` merely because both start with “SHEPHERD”.
 
 - [x] **Step 6: Remove prompt-time pull and persistent normal context**
 
@@ -340,20 +340,20 @@ Delete the entire `before_agent_start` handler, including:
 - normal-turn delivered-batch creation
 - normal-turn pending outcome formatting
 - timer cancellation caused by normal prompt start
-- returned persistent `shepherd-agent-context` message
+- returned persistent `herdsman-agent-context` message
 
 Keep `formatHiddenAgentContext()` because the `context` hook now uses it.
 
 - [x] **Step 7: Run extension tests to verify green**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: local ephemeral context, pinning, legacy filtering, and zero-RPC assertions pass.
 
 - [x] **Step 8: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/index.ts test/unit/herdsman-pi-extension.test.ts
 git commit -m "perf(pi): inject cached context without prompt RPC"
 ```
 
@@ -362,8 +362,8 @@ git commit -m "perf(pi): inject cached context without prompt RPC"
 **Objective:** Replace “normal turn consumes pending updates” with independent post-settle wake behavior.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts` only if wake scheduling needs a small adjustment
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts` only if wake scheduling needs a small adjustment
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: existing `scheduleWake()`, `wakeDeferredUntilSettled`, and `agent_settled` behavior.
@@ -398,7 +398,7 @@ await pi.emit("agent_settled", {}, ctx);
 await vi.advanceTimersByTimeAsync(500);
 ```
 
-Assert one independent wake appears. Simulate its `agent_start`, verify provider context contains the persisted `shepherd-wake-context` but no normal `[SHEPHERD AGENT CONTEXT]`, finish with successful assistant/settled events, and only then expect `agent.notifications.ack` for event 101.
+Assert one independent wake appears. Simulate its `agent_start`, verify provider context contains the persisted `herdsman-wake-context` but no normal `[SHEPHERD AGENT CONTEXT]`, finish with successful assistant/settled events, and only then expect `agent.notifications.ack` for event 101.
 
 - [x] **Step 2: Update wake tests that manually emitted `before_agent_start`**
 
@@ -411,11 +411,11 @@ Keep coverage for:
 - partial/full ack failure;
 - sent-but-not-started reconnect;
 - replacement owner wake;
-- role loss aborting only Shepherd-triggered work.
+- role loss aborting only Herdsman-triggered work.
 
 - [x] **Step 3: Run the focused wake suite to verify red/green**
 
-Run before any implementation adjustment: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run before any implementation adjustment: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected red condition: normal-turn timer behavior may schedule too early in the fake harness or tests still reference `before_agent_start`.
 
@@ -426,7 +426,7 @@ Expected green condition: pending outcomes wake independently after normal settl
 - [x] **Step 4: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/index.ts test/unit/herdsman-pi-extension.test.ts
 git commit -m "fix(pi): defer pending updates past normal user runs"
 ```
 
@@ -435,8 +435,8 @@ git commit -m "fix(pi): defer pending updates past normal user runs"
 **Objective:** Prove cached context follows the same stable terminal ownership lifecycle as wake routing.
 
 **Files:**
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
-- Modify: `test/integration/shepherd-pi-daemon-client.test.ts` only if an additional reconnect stream assertion is needed
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
+- Modify: `test/integration/herdsman-pi-daemon-client.test.ts` only if an additional reconnect stream assertion is needed
 
 **Interfaces:**
 - Consumes: completed owner mirror and context hook.
@@ -447,9 +447,9 @@ git commit -m "fix(pi): defer pending updates past normal user runs"
 Prove:
 
 1. Non-owner/off Pi receives no normal context even when another owner exists in the same workspace.
-2. Claiming with `/shepherd on` makes context available on the next run without restart.
+2. Claiming with `/herdsman on` makes context available on the next run without restart.
 3. Direct replacement clears the previous owner's local/pinned context before its next provider context call.
-4. `/shepherd off` clears context but keeps the socket usable for a later `/shepherd on`.
+4. `/herdsman off` clears context but keeps the socket usable for a later `/herdsman on`.
 5. Same-terminal `/reload`/new extension instance restores owner context from registration.
 6. Cross-workspace move clears the old snapshot, injects nothing during the gap, then uses destination snapshot after `agent.orchestrator.get` response.
 7. Disconnect clears context and shows reconnecting UI; reconnect restores context only if the daemon still reports this terminal as owner.
@@ -458,20 +458,20 @@ Prove:
 
 - [x] **Step 2: Run owner lifecycle tests**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts test/integration/shepherd-pi-daemon-client.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts test/integration/herdsman-pi-daemon-client.test.ts`
 
 Expected: all owner/context/wake/reconnect tests pass.
 
 - [x] **Step 3: Run Pi package type/package checks**
 
-Run: `pnpm --dir packages/shepherd-pi typecheck && pnpm pi-package:check`
+Run: `pnpm --dir packages/herdsman-pi typecheck && pnpm pi-package:check`
 
 Expected: extension types compile and npm dry-run includes only declared source/package files.
 
 - [x] **Step 4: Commit**
 
 ```bash
-git add test/unit/shepherd-pi-extension.test.ts test/integration/shepherd-pi-daemon-client.test.ts
+git add test/unit/herdsman-pi-extension.test.ts test/integration/herdsman-pi-daemon-client.test.ts
 git commit -m "test(pi): cover cached context ownership lifecycle"
 ```
 
@@ -492,17 +492,17 @@ No implementation work remains.
 
 ## Validation
 
-- `pnpm test test/integration/shepherd-pi-daemon-client.test.ts` — context stream and reconnect decoding pass.
-- `pnpm test test/unit/shepherd-pi-extension.test.ts` — owner mirror, ephemeral injection, pinning, cache miss, wake separation, and lifecycle pass.
-- `pnpm test test/unit/shepherd-pi-agent-update-ui.test.ts test/unit/shepherd-pi-wake.test.ts` — visual outcome projection is unchanged.
-- `pnpm --dir packages/shepherd-pi typecheck` — final extension event/wire types compile.
+- `pnpm test test/integration/herdsman-pi-daemon-client.test.ts` — context stream and reconnect decoding pass.
+- `pnpm test test/unit/herdsman-pi-extension.test.ts` — owner mirror, ephemeral injection, pinning, cache miss, wake separation, and lifecycle pass.
+- `pnpm test test/unit/herdsman-pi-agent-update-ui.test.ts test/unit/herdsman-pi-wake.test.ts` — visual outcome projection is unchanged.
+- `pnpm --dir packages/herdsman-pi typecheck` — final extension event/wire types compile.
 - `pnpm pi-package:check` — package contents remain valid.
 
 ## Risks, Tradeoffs, and Open Questions
 
 - **Pi event granularity:** repeated low-level `agent_start` events can occur during retries. `runActive` prevents repinning until `agent_settled`.
 - **Asynchronous cache updates:** stream updates during a run replace only `latestContext`; `pinnedContext` remains immutable until settle.
-- **Legacy session history:** the context hook strips previously persisted normal Shepherd context so upgrading does not duplicate stale snapshots. Wake history remains intentionally visible to later turns.
+- **Legacy session history:** the context hook strips previously persisted normal Herdsman context so upgrading does not duplicate stale snapshots. Wake history remains intentionally visible to later turns.
 - **Cache gaps:** owner claim/move/reconnect can briefly have no snapshot. The context hook injects nothing rather than waiting.
 - **Normal-turn pending events:** separating wake can produce a visible follow-up after the user's run. This is the accepted `/dig` decision and preserves prompt responsiveness/scope separation.
 - **No unresolved questions remain in this child.**

@@ -22,7 +22,7 @@ async function tempHome(name: string) {
 
 describe("CodexHistoryReader", () => {
   test("reads user, assistant, and tool output messages", async () => {
-    const homeDir = await tempHome("shepherd-codex-reader-");
+    const homeDir = await tempHome("herdsman-codex-reader-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(
@@ -75,7 +75,7 @@ describe("CodexHistoryReader", () => {
   });
 
   test("is registered in the default agent history service", async () => {
-    const homeDir = await tempHome("shepherd-codex-service-");
+    const homeDir = await tempHome("herdsman-codex-service-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(
@@ -102,7 +102,7 @@ describe("CodexHistoryReader", () => {
 
 describe("OpenCodeHistoryReader", () => {
   test("reads text and tool parts from an OpenCode SQLite session", async () => {
-    const homeDir = await tempHome("shepherd-opencode-reader-");
+    const homeDir = await tempHome("herdsman-opencode-reader-");
     const dbPath = join(homeDir, "opencode.db");
     const sqlite = new DatabaseSync(dbPath);
     sqlite.exec(`
@@ -164,7 +164,7 @@ describe("OpenCodeHistoryReader", () => {
   });
 
   test("returns empty history when the OpenCode DB schema is unreadable", async () => {
-    const homeDir = await tempHome("shepherd-opencode-bad-db-");
+    const homeDir = await tempHome("herdsman-opencode-bad-db-");
     const dbPath = join(homeDir, "opencode.db");
     const sqlite = new DatabaseSync(dbPath);
     sqlite.exec("create table unrelated (id text primary key)");
@@ -181,7 +181,7 @@ describe("OpenCodeHistoryReader", () => {
 
 describe("GeminiHistoryReader", () => {
   test("reads user and gemini assistant messages from object-shaped session JSON", async () => {
-    const homeDir = await tempHome("shepherd-gemini-reader-");
+    const homeDir = await tempHome("herdsman-gemini-reader-");
     const projectDir = join(homeDir, ".gemini", "tmp", "repo-project");
     const chatsDir = join(projectDir, "chats");
     await mkdir(chatsDir, { recursive: true });
@@ -223,7 +223,7 @@ describe("GeminiHistoryReader", () => {
   });
 
   test("reads tool result messages when Gemini session records tool output", async () => {
-    const homeDir = await tempHome("shepherd-gemini-tool-");
+    const homeDir = await tempHome("herdsman-gemini-tool-");
     const sessionPath = join(homeDir, "session.json");
     await writeFile(
       sessionPath,
@@ -250,7 +250,7 @@ describe("GeminiHistoryReader", () => {
   });
 
   test("returns empty history when Gemini session JSON is malformed", async () => {
-    const homeDir = await tempHome("shepherd-gemini-bad-json-");
+    const homeDir = await tempHome("herdsman-gemini-bad-json-");
     const sessionPath = join(homeDir, "session.json");
     await writeFile(sessionPath, "{not-json");
 

@@ -553,7 +553,7 @@ async function openServerWithoutClient(
     }>;
   } = {},
 ) {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-agent-rpc-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-agent-rpc-"));
   tempDirs.push(dir);
   const socketPath = join(dir, "rpc.sock");
   if (existsSync(socketPath)) unlinkSync(socketPath);

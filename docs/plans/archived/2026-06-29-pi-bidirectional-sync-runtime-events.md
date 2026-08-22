@@ -8,11 +8,11 @@ This plan captured the first `pi.*` runtime event design, but the target archite
 
 > **For implementers:** Historical reference only. Do not execute this plan task-by-task.
 
-**Goal:** Make Shepherd synchronize Pi TUI/RPC input, Pi assistant output, and Pi tool activity bidirectionally with Slack and the Shepherd event stream without waking duplicate Gateway runs for Pi-originated input.
+**Goal:** Make Herdsman synchronize Pi TUI/RPC input, Pi assistant output, and Pi tool activity bidirectionally with Slack and the Herdsman event stream without waking duplicate Gateway runs for Pi-originated input.
 
-**Architecture:** Pi runtime-originated facts enter Shepherd through `pi.*` RPC methods, not through `session.user_message` or legacy `gateway.stream_*` completion RPCs. `piTurnId` is the stable correlation id for every Pi agent turn, while `gatewayRunId` remains an optional link when the turn was triggered by an existing Gateway queued run. Slack assistant streaming and tool progress use transient delivery state keyed by `piTurnId`; final user/assistant/tool/lifecycle facts are stored as compact Shepherd events.
+**Architecture:** Pi runtime-originated facts enter Herdsman through `pi.*` RPC methods, not through `session.user_message` or legacy `gateway.stream_*` completion RPCs. `piTurnId` is the stable correlation id for every Pi agent turn, while `gatewayRunId` remains an optional link when the turn was triggered by an existing Gateway queued run. Slack assistant streaming and tool progress use transient delivery state keyed by `piTurnId`; final user/assistant/tool/lifecycle facts are stored as compact Herdsman events.
 
-**Tech Stack:** TypeScript ESM with NodeNext, Node.js `node:net` JSON Lines RPC, SQLite through existing stores, Slack Web API `chat.postMessage`/`chat.update`, JavaScript/TypeScript `packages/shepherd-pi` Pi extension, Vitest integration/unit tests, Biome via `pnpm check`.
+**Tech Stack:** TypeScript ESM with NodeNext, Node.js `node:net` JSON Lines RPC, SQLite through existing stores, Slack Web API `chat.postMessage`/`chat.update`, JavaScript/TypeScript `packages/herdsman-pi` Pi extension, Vitest integration/unit tests, Biome via `pnpm check`.
 
 ## Global Constraints
 
@@ -25,7 +25,7 @@ This plan captured the first `pi.*` runtime event design, but the target archite
 - `tool_progress: verbose` still uses sanitized preview/text only; no raw result output.
 - Slack progress cleanup/deletion is not implemented in this plan; do not add Slack `chat.delete` or new delete scopes.
 - `pi.tool.started`, `pi.tool.finished`, and `pi.tool.failed` are persistent events, but only finished/failed compact text enters Gateway context/summary.
-- `source === "extension"` Pi input is Shepherd-injected and must not create another `user.message`.
+- `source === "extension"` Pi input is Herdsman-injected and must not create another `user.message`.
 - Pi-originated user messages are mirror-only: store, publish, and deliver, but never queue/wake a Gateway run.
 - Final assistant text is still stored as `gateway.message`; payload metadata identifies `sourceRuntime: "pi"`.
 - Event writes are append-only. Do not update prior `user.message` events to add `piTurnId`.
@@ -40,7 +40,7 @@ This plan captured the first `pi.*` runtime event design, but the target archite
 - `src/platforms/slack/delivery.ts` has `SlackStreamDelivery` keyed by `gatewayRunId`; it supports `postMessage` and `update` but not progress bubbles or delete.
 - `src/delivery/fanout.ts` only fanouts `approval.requested`, `approval.responded`, `gateway.message`, and `user.message`; keep `pi.tool.*` and `pi.turn.*` out of normal fanout.
 - `src/gateway/context.ts` currently treats all `user.message` as user text and all `gateway.message` as assistant text; it needs Pi source/delivery aware formatting.
-- `packages/shepherd-pi/src/index.ts` currently claims `gateway.run.queued`, calls `gateway.start_run`, streams via `gateway.stream_delta/finish`, and finalizes via `gateway.complete_run`.
+- `packages/herdsman-pi/src/index.ts` currently claims `gateway.run.queued`, calls `gateway.start_run`, streams via `gateway.stream_delta/finish`, and finalizes via `gateway.complete_run`.
 - Pi extension hooks available from Pi docs: `input`, `agent_start`, `agent_end`, `message_update`, `message_end`, `tool_execution_start`, `tool_execution_update`, `tool_execution_end`.
 - Existing tests to extend include `test/integration/gateway-rpc.test.ts`, `test/unit/slack-delivery.test.ts`, `test/integration/delivery-fanout.test.ts`, and `test/unit/gateway-context.test.ts`.
 
@@ -55,7 +55,7 @@ This plan captured the first `pi.*` runtime event design, but the target archite
 - Modify: `src/platforms/runtime.ts` — rename/genericize stream delivery to Pi runtime streams, export the platform runtime property as `runtimeDelivery`, and wire Slack tool progress service.
 - Modify: `src/platforms/slack/delivery.ts` — genericize stream keys from `gatewayRunId` to `streamId`, render user-message delivery prefixes for Slack, and keep `deliveredByStream` skip behavior.
 - Modify: `src/delivery/fanout.ts` — keep fanout allowlist unchanged for normal persisted delivery and add/verify echo behavior for `sourcePlatform: "pi"` and `"pi-rpc"`.
-- Modify: `packages/shepherd-pi/src/index.ts` — generate/manage `piTurnId`, mirror input, stream assistant deltas, record tool lifecycle, and complete/fail turns through new `pi.*` RPCs.
+- Modify: `packages/herdsman-pi/src/index.ts` — generate/manage `piTurnId`, mirror input, stream assistant deltas, record tool lifecycle, and complete/fail turns through new `pi.*` RPCs.
 - Test: `test/integration/gateway-rpc.test.ts` — Pi RPC contracts, idempotency, first-terminal-wins, no duplicate Gateway wake.
 - Test: `test/unit/slack-delivery.test.ts` — generic stream key and Slack user-message prefix rendering.
 - Test: `test/unit/gateway-context.test.ts` — Pi source/delivery context formatting and Pi tool context inclusion.
@@ -512,7 +512,7 @@ git commit -m "slack: support pi runtime streams and progress"
 
 ### Task 3: Replace Gateway Completion/Stream RPCs with Pi Runtime RPCs
 
-**Objective:** Add `pi.*` RPC methods to `ShepherdGatewayServer`, remove legacy Gateway stream/complete/fail RPCs, and persist compact Pi lifecycle/tool events.
+**Objective:** Add `pi.*` RPC methods to `HerdsmanGatewayServer`, remove legacy Gateway stream/complete/fail RPCs, and persist compact Pi lifecycle/tool events.
 
 **Files:**
 - Modify: `src/gateway/server.ts`
@@ -551,7 +551,7 @@ In `src/gateway/server.ts`:
 - Replace `GatewayStreamDeliveryService` with `PiRuntimeDeliveryService` matching Task 2.
 - Rename field `#streamDelivery` to `#runtimeDelivery`.
 - Update constructor option from `streamDelivery` to `runtimeDelivery`.
-- Update `src/gateway/service.ts` to pass `platformRuntime.runtimeDelivery` into `ShepherdGatewayServer` as `runtimeDelivery`.
+- Update `src/gateway/service.ts` to pass `platformRuntime.runtimeDelivery` into `HerdsmanGatewayServer` as `runtimeDelivery`.
 
 - [ ] **Step 4: Remove legacy RPC dispatch**
 
@@ -804,12 +804,12 @@ git add src/gateway/context.ts src/delivery/fanout.ts test/unit/gateway-context.
 git commit -m "gateway: format pi mirrored events in context"
 ```
 
-### Task 5: Update Shepherd Pi Extension to Mirror Input, Stream, Tools, and Turns
+### Task 5: Update Herdsman Pi Extension to Mirror Input, Stream, Tools, and Turns
 
-**Objective:** Make `packages/shepherd-pi` emit the new `pi.*` RPCs for all Pi agent turns and remove legacy completion/stream calls.
+**Objective:** Make `packages/herdsman-pi` emit the new `pi.*` RPCs for all Pi agent turns and remove legacy completion/stream calls.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
 - Test: package syntax and pack checks through existing `pnpm pi-package:check` or root `pnpm check`.
 
 **Interfaces:**
@@ -818,10 +818,10 @@ git commit -m "gateway: format pi mirrored events in context"
 
 - [ ] **Step 1: Add extension state fields and RPC response map entries**
 
-In `packages/shepherd-pi/src/index.ts`, update types:
+In `packages/herdsman-pi/src/index.ts`, update types:
 
 ```ts
-type ShepherdRun = {
+type HerdsmanRun = {
   actorId?: string | null;
   id: string;
   presentation?: unknown;
@@ -829,7 +829,7 @@ type ShepherdRun = {
   userText: string;
 };
 
-type ShepherdState = {
+type HerdsmanState = {
   activeInputEventIds: number[];
   activePiTurnId: string | undefined;
   activeSource: "extension" | "interactive" | "rpc" | undefined;
@@ -977,7 +977,7 @@ Expected: TypeScript/package check passes. If `pnpm pi-package:check` is not ava
 - [ ] **Step 11: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts
+git add packages/herdsman-pi/src/index.ts
 git commit -m "pi: mirror turns and tools through runtime rpc"
 ```
 
@@ -1072,7 +1072,7 @@ git commit -m "test: cover pi bidirectional runtime sync"
 **Objective:** Remove references to deleted legacy RPCs from code/tests/plans that are active, keep archived docs as history unless touched by active code docs, and run repository validation.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
 - Modify: `src/gateway/server.ts`
 - Modify: tests updated above
 - Modify docs only if README or active instructions mention removed RPC names
@@ -1135,7 +1135,7 @@ git commit -m "chore: validate pi runtime sync migration"
 - `pnpm test test/unit/gateway-context.test.ts` — Pi source/delivery context formatting tests pass.
 - `pnpm test test/integration/delivery-fanout.test.ts` — Pi user messages fanout to Slack and Slack user messages do not echo.
 - `pnpm test test/integration/gateway-rpc.test.ts` — Pi runtime RPC contract, idempotency, terminal conflict, and no duplicate wake tests pass.
-- `pnpm pi-package:check` — Shepherd Pi extension package validation passes.
+- `pnpm pi-package:check` — Herdsman Pi extension package validation passes.
 - `pnpm check` — repository typecheck, tests, Biome, and Drizzle check pass.
 - `pnpm build` — run because this plan changes import/export surfaces in `src/gateway` and `src/platforms`; expected to pass.
 
@@ -1145,6 +1145,6 @@ git commit -m "chore: validate pi runtime sync migration"
 - `#existingPiTerminal()` uses idempotency-key lookups instead of paginated event scans. A dedicated turn table is unnecessary for MVP unless future query patterns need indexed turn listings.
 - Slack progress bubbles remain in the thread by design. This preserves breadcrumbs and avoids adding Slack delete scopes.
 - `pi.stream_segment_break` may initially be a no-op if generic segment support is not added to Slack streaming in the same task. It must still return a clear `{ streamed: false, reason: "segment_break_not_supported" }` response rather than pretending success.
-- `tool_progress: verbose` intentionally remains sanitized and does not show raw args/result. This differs from Hermes' more detailed raw-args verbose behavior but matches Shepherd's Slack safety requirements.
+- `tool_progress: verbose` intentionally remains sanitized and does not show raw args/result. This differs from Hermes' more detailed raw-args verbose behavior but matches Herdsman's Slack safety requirements.
 - The Pi extension cannot update prior events if a later hook discovers better metadata. Keep later metadata in subsequent lifecycle events.
 - Archived plans may mention old `gateway.stream_*` and `gateway.complete_run` RPCs. Leave archived docs unchanged unless the user asks for historical cleanup.

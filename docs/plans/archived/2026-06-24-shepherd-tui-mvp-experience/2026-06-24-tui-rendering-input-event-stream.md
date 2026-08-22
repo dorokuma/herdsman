@@ -2,16 +2,16 @@
 
 Date: 2026-06-24
 
-Parent: [Shepherd TUI MVP Experience Plan](../2026-06-24-shepherd-tui-mvp-experience.md)
+Parent: [Herdsman TUI MVP Experience Plan](../2026-06-24-herdsman-tui-mvp-experience.md)
 
 ## Status
 
-Archived. Superseded. See [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md) for the later Pi runtime direction.
+Archived. Superseded. See [Herdsman Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md) for the later Pi runtime direction.
 
 ## Progress
 
 - **Done** — Historical event rendering, input, and stream UX requirements were captured.
-- **Superseded** — Custom Shepherd TUI rendering components should not be implemented from this plan.
+- **Superseded** — Custom Herdsman TUI rendering components should not be implemented from this plan.
 
 ## Next steps
 
@@ -19,9 +19,9 @@ Archived. Superseded. See [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-ru
 
 ## Goal
 
-Specify the first full-screen TUI surface for Shepherd using Pi's TUI package as the implementation reference.
+Specify the first full-screen TUI surface for Herdsman using Pi's TUI package as the implementation reference.
 
-The TUI should be light, stable, and event-stream native. It should not become a second gateway implementation. It renders Shepherd events and sends user messages to the daemon.
+The TUI should be light, stable, and event-stream native. It should not become a second gateway implementation. It renders Herdsman events and sends user messages to the daemon.
 
 ## Reference
 
@@ -64,7 +64,7 @@ src/tui/components/chat.ts     # message stream component
 src/tui/components/header.ts   # header/status component
 src/tui/components/footer.ts   # footer/status component
 src/tui/event-format.ts        # EventRecord -> display blocks
-src/tui/theme.ts               # minimal Shepherd TUI theme
+src/tui/theme.ts               # minimal Herdsman TUI theme
 src/tui/session-selector.ts    # resume selector
 ```
 
@@ -77,7 +77,7 @@ The TUI app should depend on daemon RPC and event records, not SQLite stores dir
 Initial layout:
 
 ```text
-┌ Shepherd ─ session title/id ─ working context ─ daemon status ┐
+┌ Herdsman ─ session title/id ─ working context ─ daemon status ┐
 │ message stream                                                 │
 │                                                                │
 │ user / gateway / progress / approval events                    │
@@ -93,7 +93,7 @@ The exact border style can be simple. The main requirement is stability and read
 
 Show:
 
-- `Shepherd`
+- `Herdsman`
 - session title or short id
 - working context label/path
 - connection state: connected, reconnecting, offline
@@ -153,7 +153,7 @@ Use Markdown rendering for text if stable. If Markdown rendering causes layout i
 Display compact status:
 
 ```text
-Shepherd started a gateway turn
+Herdsman started a gateway turn
 ```
 
 May update footer working indicator.
@@ -187,7 +187,7 @@ Examples:
 
 ```text
 Herdr agent.status status=idle agent=claude-impl
-Herdr workspace.created workspace=shepherd-task-abc123
+Herdr workspace.created workspace=herdsman-task-abc123
 ```
 
 The payload already contains compact `text`; prefer that when available.
@@ -202,7 +202,7 @@ Approval requested by codex: codex-tool-1
 [a] approve  [d] deny
 ```
 
-MVP can start with display-only if provider callback routing is deferred, but Shepherd already records `approval.respond`. TUI should support approval/deny if the daemon method exists.
+MVP can start with display-only if provider callback routing is deferred, but Herdsman already records `approval.respond`. TUI should support approval/deny if the daemon method exists.
 
 ### `approval.responded`
 
@@ -268,7 +268,7 @@ Item label should include:
 Example:
 
 ```text
-Review Slack sync              shepherd        10m ago   slack:C123
+Review Slack sync              herdsman        10m ago   slack:C123
 session-abcdef                 mog-app         2h ago
 ```
 
@@ -325,7 +325,7 @@ Start with a minimal internal theme:
 - error: red
 - border/status: muted
 
-Avoid large theme infrastructure in the first implementation. If Shepherd later supports themes, use the same component boundaries.
+Avoid large theme infrastructure in the first implementation. If Herdsman later supports themes, use the same component boundaries.
 
 ## Performance rules
 
@@ -364,7 +364,7 @@ Component tests can use a fake terminal if practical, but pure formatting tests 
 
 Manual smoke tests are required because raw-mode terminal behavior is hard to cover fully:
 
-1. Start from cwd with `shepherd`.
+1. Start from cwd with `herdsman`.
 2. Verify header shows cwd working context.
 3. Send single-line message.
 4. Send multiline message.

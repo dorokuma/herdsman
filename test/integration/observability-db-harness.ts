@@ -14,7 +14,7 @@ import { HerdrWorkspaceStore } from "@/db/herdr-workspaces.js";
 export const tempDirs: string[] = [];
 
 export function openObservabilityDbHarness() {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-agent-db-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-agent-db-"));
   tempDirs.push(dir);
   const { sqlite } = openSqlite(join(dir, "test.sqlite"));
   applyMigrations(sqlite, { migrationsFolder: "drizzle" });

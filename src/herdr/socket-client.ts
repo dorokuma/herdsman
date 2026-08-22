@@ -48,7 +48,7 @@ export class HerdrSocketClient {
   }
 
   #request(method: string, params: unknown = {}): Promise<unknown> {
-    const id = `shepherd-${this.#nextId}`;
+    const id = `herdsman-${this.#nextId}`;
     this.#nextId += 1;
 
     return new Promise((resolve, reject) => {
@@ -141,7 +141,7 @@ export class HerdrSocketClient {
   }
 
   #requestOnce(method: string, params: unknown = {}): Promise<unknown> {
-    const id = `shepherd-${this.#nextId}`;
+    const id = `herdsman-${this.#nextId}`;
     this.#nextId += 1;
 
     return new Promise((resolve, reject) => {

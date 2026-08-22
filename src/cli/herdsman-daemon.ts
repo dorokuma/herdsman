@@ -6,7 +6,7 @@ import { runObservabilityDaemonService } from "@/daemon/service.js";
 
 async function main(): Promise<void> {
   if (argv.length > 2) {
-    throw new Error("shepherd-daemon does not accept CLI arguments");
+    throw new Error("herdsman-daemon does not accept CLI arguments");
   }
   await runObservabilityDaemonService();
 }

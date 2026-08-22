@@ -8,12 +8,12 @@ type FakeClient = {
   request: (method: string, params: unknown) => Promise<unknown>;
 };
 
-describe("shepherd Herdr plugin package", () => {
+describe("herdsman Herdr plugin package", () => {
   test("declares agent actions", () => {
-    const manifest = readFileSync("packages/shepherd-herdr-plugin/herdr-plugin.toml", "utf8");
+    const manifest = readFileSync("packages/herdsman-herdr-plugin/herdr-plugin.toml", "utf8");
     expect(manifest).toContain('id = "agent-list"');
-    expect(manifest).toContain('title = "Show Shepherd agents"');
-    expect(manifest).toContain('title = "Shepherd Agents"');
+    expect(manifest).toContain('title = "Show Herdsman agents"');
+    expect(manifest).toContain('title = "Herdsman Agents"');
     expect(manifest).toContain('id = "agents"');
     expect(manifest).not.toContain('id = "legacy"');
   });
@@ -54,13 +54,13 @@ describe("shepherd Herdr plugin package", () => {
 
   test("renders empty agents", async () => {
     const { renderAgents } = await importPlugin();
-    expect(renderAgents({ agents: [] })).toBe("No Shepherd agents indexed.");
+    expect(renderAgents({ agents: [] })).toBe("No Herdsman agents indexed.");
   });
 
   test("packages the runtime entrypoint without build output", () => {
     const pack = JSON.parse(
       execFileSync("npm", ["pack", "--dry-run", "--json"], {
-        cwd: "packages/shepherd-herdr-plugin",
+        cwd: "packages/herdsman-herdr-plugin",
         encoding: "utf8",
       }),
     ) as Array<{ files: Array<{ path: string }> }>;
@@ -73,7 +73,7 @@ describe("shepherd Herdr plugin package", () => {
 });
 
 async function importPlugin() {
-  const pluginModuleUrl = new URL("../../packages/shepherd-herdr-plugin/index.mjs", import.meta.url)
+  const pluginModuleUrl = new URL("../../packages/herdsman-herdr-plugin/index.mjs", import.meta.url)
     .href;
   return import(pluginModuleUrl) as Promise<{
     renderAgents(input: unknown): string;

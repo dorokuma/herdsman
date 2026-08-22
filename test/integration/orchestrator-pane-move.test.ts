@@ -187,7 +187,7 @@ describe("orchestrator pane movement", () => {
 });
 
 async function openServer() {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-pane-move-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-pane-move-"));
   tempDirs.push(dir);
   const socketPath = join(dir, "rpc.sock");
   if (existsSync(socketPath)) unlinkSync(socketPath);

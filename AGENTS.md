@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Shepherd は Herdr 管理の coding agent から agent snapshot、`agent.*` event、orchestrator notification を作る TypeScript daemon / CLI です。まず `README.md` で使い方を確認し、仕様判断が必要なときだけ `docs/plans/` を見てください。
+Herdsman は Herdr 管理の coding agent から agent snapshot、`agent.*` event、orchestrator notification を作る TypeScript daemon / CLI です。まず `README.md` で使い方を確認し、仕様判断が必要なときだけ `docs/plans/` を見てください。
 
 ## よく使うコマンド
 
@@ -13,7 +13,7 @@ Shepherd は Herdr 管理の coding agent から agent snapshot、`agent.*` even
 - `pnpm package:check`: root npm packageをbuildし、tarballのfile allowlistを検証する。
 - `pnpm lint:fix`: Biome の lint/import/format fix を適用する。
 - `pnpm db:generate`: `src/db/schema.ts` から SQL migration を生成する。
-- `SHEPHERD_HOME=/tmp/shepherd pnpm db:migrate`: 指定した Shepherd home の SQLite DB に migration を適用する。
+- `SHEPHERD_HOME=/tmp/herdsman pnpm db:migrate`: 指定した Herdsman home の SQLite DB に migration を適用する。
 
 ## 検証手順
 
@@ -30,13 +30,13 @@ PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/
 
 - `src/observability/`: agent contract、cached agent context、agent index、orchestrator service。
 - `src/daemon/`: daemon JSON Lines RPC、process manager、service startup。
-- `src/cli/`: `shepherd` CLI entrypoint。
+- `src/cli/`: `herdsman` CLI entrypoint。
 - `src/config/`: runtime config schema と path/env 解決。
 - `src/db/`: SQLite connection、Drizzle schema、migration runner、observability store。
 - `src/herdr/`: Herdr socket client、managed session client、session snapshot、workspace resolver。
 - `src/shared/`: JSON Lines framing などの共有 utility。
-- `packages/shepherd-pi/`: npmで公開するPi extension package。
-- `packages/shepherd-herdr-plugin/`: GitHub経由で配布するprivate Herdr integration。npmには公開しない。
+- `packages/herdsman-pi/`: npmで公開するPi extension package。
+- `packages/herdsman-herdr-plugin/`: GitHub経由で配布するprivate Herdr integration。npmには公開しない。
 - `test/unit/`: pure logic / contract tests。
 - `test/integration/`: SQLite / JSON Lines RPC など実体を使う tests。
 - `docs/plans/`: active plan。完了済み plan は `docs/plans/archived/` に置く。
@@ -52,7 +52,7 @@ PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/
 
 ## Plan / docs 運用
 
-- npmとGitHubのrelease手順は`docs/releasing.md`を正とする。公開するnpm packageはrootと`packages/shepherd-pi`の2つだけ。
+- npmとGitHubのrelease手順は`docs/releasing.md`を正とする。公開するnpm packageはrootと`packages/herdsman-pi`の2つだけ。
 - Active plan は `docs/plans/` 配下に置く。完了済み plan は `docs/plans/archived/` 配下に移す。
 - 大きな plan は親 plan と子 plan に分ける。親は目的、方針、進捗、子 plan link に絞る。
 - 子 plan ディレクトリ名は親 plan ファイル名から `.md` を除いた名前と一致させる。

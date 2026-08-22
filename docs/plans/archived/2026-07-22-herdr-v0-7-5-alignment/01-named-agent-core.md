@@ -4,7 +4,7 @@
 
 **Status:** Completed
 
-**Goal:** Persist Herdr v0.7.5 live agent names as mutable metadata, resolve named targets before kind fallbacks, and snapshot the observed name into Shepherd events without changing stable identity.
+**Goal:** Persist Herdr v0.7.5 live agent names as mutable metadata, resolve named targets before kind fallbacks, and snapshot the observed name into Herdsman events without changing stable identity.
 
 **Architecture:** `AgentStore` maps optional Herdr `AgentInfo.name` into a nullable `agents.name` column and the additive `AgentIndexRecord.name` field. Terminal-first row matching remains unchanged; name changes update the existing row and owner context but do not invalidate history. `AgentStore.resolveTarget()` evaluates exact identifier, live-name, and kind candidate groups in order. `AgentIndexService` includes name in context metadata and event payloads while excluding it from `sameIdentity()`.
 
@@ -25,7 +25,7 @@
 
 - `src/db/schema.ts` defines four migrations through `0003` and has no `agents.name` column.
 - `AgentStore.replaceForSession()` already matches a non-null terminal ID before pane fallback and updates stable rows in place.
-- `AgentStore.resolveTarget()` currently combines pane ID, terminal ID, agent kind, and Shepherd ID into one candidate set.
+- `AgentStore.resolveTarget()` currently combines pane ID, terminal ID, agent kind, and Herdsman ID into one candidate set.
 - `AgentIndexService.sameIdentity()` controls history invalidation and must not include name.
 - `AgentIndexService.sameContextMetadata()` controls owner context publication and must include name.
 - `AgentIndexService.payload()` creates persisted status/outcome event payloads.

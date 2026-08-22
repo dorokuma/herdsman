@@ -2,7 +2,7 @@
 
 Date: 2026-06-25
 
-Parent: [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
+Parent: [Herdsman Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
 
 ## Status
 
@@ -11,7 +11,7 @@ Done.
 ## Progress
 
 - **Done** — Headless Pi should run as `pi --mode rpc --session <piSessionFile>` subprocesses.
-- **Done** — One Shepherd session maps to one Pi session file.
+- **Done** — One Herdsman session maps to one Pi session file.
 - **Done** — Existing `gateway_runs` remains the durable queue/recovery table.
 - **Done** — `gateway.run.queued` is a persistent event.
 - **Done** — Pi session metadata assignment, lazy headless Pi subprocess startup, `pi.attach`, `pi.heartbeat`, and TUI-over-headless claim priority are implemented.
@@ -27,7 +27,7 @@ The Gateway owns a Pi runtime supervisor.
 
 Responsibilities:
 
-- Maintain one lazy headless Pi RPC subprocess per active Shepherd session.
+- Maintain one lazy headless Pi RPC subprocess per active Herdsman session.
 - Start subprocesses with the session's `piSessionFile`.
 - Stop idle subprocesses after `gateway.pi.idle_timeout_ms`.
 - Track extension handshakes.
@@ -40,14 +40,14 @@ Headless launch shape:
 pi --mode rpc --session <piSessionFile>
 ```
 
-The `shepherd-pi` extension is expected to be installed in the user's Pi environment. The Gateway does not pass `-e` in normal operation.
+The `herdsman-pi` extension is expected to be installed in the user's Pi environment. The Gateway does not pass `-e` in normal operation.
 
 ## Owner model
 
 Owner kinds:
 
 - `headless_pi`: Gateway-spawned Pi RPC process.
-- `tui_pi`: user-facing Pi TUI process with `shepherd-pi` extension.
+- `tui_pi`: user-facing Pi TUI process with `herdsman-pi` extension.
 
 Priority:
 
@@ -56,7 +56,7 @@ Priority:
 
 If a TUI Pi is attached and healthy, it claims runs before headless Pi. Headless Pi must pause claim attempts for that session while a TUI owner is active.
 
-A TUI owner must heartbeat. If it disconnects while idle, ownership falls back to headless Pi after timeout. If it disconnects while running a claimed run, that run becomes `recovery_required`; Shepherd does not auto-replay it.
+A TUI owner must heartbeat. If it disconnects while idle, ownership falls back to headless Pi after timeout. If it disconnects while running a claimed run, that run becomes `recovery_required`; Herdsman does not auto-replay it.
 
 ## Gateway run queue
 
@@ -117,7 +117,7 @@ This event is not delivered to Slack. It is visible to Pi extension, audit, and 
 
 ### `pi.handshake`
 
-Called by `shepherd-pi` on `session_start`.
+Called by `herdsman-pi` on `session_start`.
 
 Input:
 
@@ -149,7 +149,7 @@ Output:
 
 ### `pi.attach`
 
-Attach a Pi session to a Shepherd session and create/update the Pi binding entry.
+Attach a Pi session to a Herdsman session and create/update the Pi binding entry.
 
 Input:
 
@@ -163,7 +163,7 @@ Input:
 }
 ```
 
-Output includes `gatewayId`, `socketPath`, `ownerId`, and the Shepherd session record.
+Output includes `gatewayId`, `socketPath`, `ownerId`, and the Herdsman session record.
 
 ### `pi.heartbeat`
 
@@ -270,7 +270,7 @@ A dedicated table can be added later if querying by Pi session becomes common.
 
 ### Gateway identity
 
-Store a stable Gateway identity in Shepherd home/state. Options:
+Store a stable Gateway identity in Herdsman home/state. Options:
 
 - A small file under `SHEPHERD_HOME`, for example `gateway-id`.
 - A DB metadata table if one is added.

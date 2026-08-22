@@ -428,7 +428,7 @@ findByTerminal(input: {
 
 In `replaceForSession()`, choose an existing row by non-null terminal id first and pane id second. When terminal identity exists, update that row by stable `id`, including pane/workspace/tab fields, instead of inserting a second row that conflicts with `agents_session_terminal_idx`. Keep pane fallback only for Herdr records without terminal identity. Remove rows not represented by the refreshed snapshot after all stable updates complete.
 
-Wrap the refresh in a DB transaction and add a temporary-pane update phase for any stable terminal whose destination pane currently conflicts, so multi-agent moves cannot violate `agents_session_pane_idx`. Temporary values must use an internal prefix such as `__shepherd_moving__:<agent-id>` and never escape the transaction.
+Wrap the refresh in a DB transaction and add a temporary-pane update phase for any stable terminal whose destination pane currently conflicts, so multi-agent moves cannot violate `agents_session_pane_idx`. Temporary values must use an internal prefix such as `__herdsman_moving__:<agent-id>` and never escape the transaction.
 
 - [x] **Step 5: Verify migration still matches the implemented event store**
 

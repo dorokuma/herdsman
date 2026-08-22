@@ -1,8 +1,8 @@
-# Shepherd Implementation Foundation and Quality Gates
+# Herdsman Implementation Foundation and Quality Gates
 
 Date: 2026-06-24
 
-Parent: [Shepherd Herdr Orchestration Plan](../2026-06-24-shepherd-herdr-orchestration.md)
+Parent: [Herdsman Herdr Orchestration Plan](../2026-06-24-herdsman-herdr-orchestration.md)
 
 ## Status
 
@@ -39,7 +39,7 @@ Implemented:
 
 ## Runtime and package management
 
-Shepherd starts as a single TypeScript package.
+Herdsman starts as a single TypeScript package.
 
 - Use TypeScript on Node.js.
 - Use Node.js latest LTS through `mise`.
@@ -80,7 +80,7 @@ Initial tests should use two layers:
 
 The first implementation scaffold should include at least one real utility and test rather than a placeholder test. Good first targets:
 
-- Herdr/Shepherd name slug validation
+- Herdr/Herdsman name slug validation
 - newline-delimited JSON-RPC/JSON Lines framing
 - config schema validation
 
@@ -121,7 +121,7 @@ TypeBox/Ajv is the schema source for:
 
 Rationale:
 
-- Shepherd logical tools are exposed to gateway providers as JSON Schema.
+- Herdsman logical tools are exposed to gateway providers as JSON Schema.
 - The same schema source should validate runtime input and provide provider-facing tool schemas.
 - JSON Schema should be treated as a first-class contract, not as an export artifact from another schema system.
 
@@ -177,7 +177,7 @@ Pre-commit flow:
 4. Run full Biome check.
 5. Run Drizzle migration/schema consistency check.
 
-This is intentionally stricter than a staged-only hook. Shepherd has cross-module contracts where staged-only checks can miss breakage.
+This is intentionally stricter than a staged-only hook. Herdsman has cross-module contracts where staged-only checks can miss breakage.
 
 ## Scripts
 

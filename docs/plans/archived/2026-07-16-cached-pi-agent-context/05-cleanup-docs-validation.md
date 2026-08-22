@@ -6,7 +6,7 @@
 
 **Goal:** Remove unused per-turn telemetry, document the final owner-only cached-context behavior, prove regressions through deterministic tests, and validate the no-hitch user path in a real Herdr/Pi workspace.
 
-**Architecture:** Cleanup removes the dormant excerpt-telemetry surface after exact Pi session identity has moved to presence registration. Public docs describe `/shepherd on` as the single switch for cached context plus notifications/wake, explain cached `agent.list` versus live detail reads, and avoid promising context while off or disconnected. Automated validation proves absence of prompt-path RPC by call counts rather than timing; dogfood validates the human-visible send experience and cache lifecycle.
+**Architecture:** Cleanup removes the dormant excerpt-telemetry surface after exact Pi session identity has moved to presence registration. Public docs describe `/herdsman on` as the single switch for cached context plus notifications/wake, explain cached `agent.list` versus live detail reads, and avoid promising context while off or disconnected. Automated validation proves absence of prompt-path RPC by call counts rather than timing; dogfood validates the human-visible send experience and cache lifecycle.
 
 **Tech Stack:** TypeScript, TypeBox/Ajv, Vitest, pnpm quality gates, Herdr >= 0.7.0, Pi >= 0.80.6, Markdown.
 
@@ -20,7 +20,7 @@
 - Public docs remain bilingual at root (`README.md`, `README.ja.md`) and English in the published Pi package README.
 - Do not edit archived plans. Update the still-active dogfood plan because its pending phases currently assert context for non-owner/off Pi.
 - Automated performance regressions use call/read counts and exact scheduler constants. Do not add flaky wall-clock upper-bound assertions to Vitest.
-- Manual dogfood may record durations and screen behavior, but must not mutate the normal Shepherd database for destructive reconnect/owner-transfer scenarios.
+- Manual dogfood may record durations and screen behavior, but must not mutate the normal Herdsman database for destructive reconnect/owner-transfer scenarios.
 - Run the closest focused tests before full `pnpm check`, then `pnpm build` and `pnpm package:check`.
 
 ## Current Context
@@ -29,9 +29,9 @@
 - `src/observability/schemas.ts` validates tool/final excerpt payloads.
 - `src/daemon/observability-server.ts` accepts `agent.telemetry` and returns `{ accepted: true }` without storage or processing.
 - `src/observability/pi-telemetry.ts` and `test/unit/pi-telemetry.test.ts` are disconnected from the daemon pipeline.
-- `packages/shepherd-pi/src/index.ts` tracks tool start data, sanitizes output, and sends tool/final RPCs even for non-owner Pi.
+- `packages/herdsman-pi/src/index.ts` tracks tool start data, sanitizes output, and sends tool/final RPCs even for non-owner Pi.
 - Root/package READMEs currently promise normal hidden context to every connected Pi and say context remains active while off.
-- `docs/plans/2026-07-14-shepherd-test-dogfooding.md` is active and has extended routing/lifecycle phases pending; it assumes non-owner context.
+- `docs/plans/2026-07-14-herdsman-test-dogfooding.md` is active and has extended routing/lifecycle phases pending; it assumes non-owner context.
 
 ## File Structure
 
@@ -40,14 +40,14 @@
 - Modify: `src/observability/contracts.ts` — remove `AgentTelemetryEvent`.
 - Modify: `src/observability/schemas.ts` — remove `agentTelemetryInputSchema` and private telemetry schemas.
 - Modify: `src/daemon/observability-server.ts` — remove `agent.telemetry` dispatch.
-- Modify: `packages/shepherd-pi/src/index.ts` — remove per-tool/final telemetry state/hooks/helpers while retaining wake completion logic.
+- Modify: `packages/herdsman-pi/src/index.ts` — remove per-tool/final telemetry state/hooks/helpers while retaining wake completion logic.
 - Modify: `test/unit/observability-contracts.test.ts` — remove telemetry acceptance and add RPC-schema absence coverage where practical.
-- Modify: `test/unit/shepherd-pi-extension.test.ts` — remove telemetry expectations and retain presence/context/wake tests.
+- Modify: `test/unit/herdsman-pi-extension.test.ts` — remove telemetry expectations and retain presence/context/wake tests.
 - Modify: `README.md` — owner-only cached context and cached list semantics.
 - Modify: `README.ja.md` — matching Japanese behavior.
-- Modify: `packages/shepherd-pi/README.md` — published extension semantics.
+- Modify: `packages/herdsman-pi/README.md` — published extension semantics.
 - Modify: `SKILL.md` — clarify cached list discovery versus live get/read details without changing commands.
-- Modify: `docs/plans/2026-07-14-shepherd-test-dogfooding.md` — pending owner/non-owner/context and latency checks.
+- Modify: `docs/plans/2026-07-14-herdsman-test-dogfooding.md` — pending owner/non-owner/context and latency checks.
 - Modify: parent/child plan files at completion — status/progress/completion evidence.
 
 ## Tasks
@@ -62,9 +62,9 @@
 - Modify: `src/observability/contracts.ts`
 - Modify: `src/observability/schemas.ts`
 - Modify: `src/daemon/observability-server.ts`
-- Modify: `packages/shepherd-pi/src/index.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
 - Modify: `test/unit/observability-contracts.test.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: child 01 presence `sessionRef`.
@@ -83,7 +83,7 @@ await expect(
 ).rejects.toThrow("Unknown method: agent.telemetry");
 ```
 
-In shepherd-pi tests:
+In herdsman-pi tests:
 
 1. Rename `registers presence, adopts daemon location, reconnects, and sends telemetry` to cover only presence/location/reconnect.
 2. Emit `tool_execution_start`, `tool_result`, and a non-wake assistant `message_end`; assert `client.calls` contains no `agent.telemetry`.
@@ -91,7 +91,7 @@ In shepherd-pi tests:
 
 - [x] **Step 2: Run focused tests to verify red**
 
-Run: `pnpm test test/unit/observability-contracts.test.ts test/integration/observability-rpc.test.ts test/unit/shepherd-pi-extension.test.ts test/unit/pi-telemetry.test.ts`
+Run: `pnpm test test/unit/observability-contracts.test.ts test/integration/observability-rpc.test.ts test/unit/herdsman-pi-extension.test.ts test/unit/pi-telemetry.test.ts`
 
 Expected: old RPC still succeeds and the old telemetry test file still exists.
 
@@ -133,7 +133,7 @@ if (state.deliveredBatch) {
 Run:
 
 ```bash
-pnpm test test/unit/observability-contracts.test.ts test/integration/observability-rpc.test.ts test/unit/shepherd-pi-extension.test.ts
+pnpm test test/unit/observability-contracts.test.ts test/integration/observability-rpc.test.ts test/unit/herdsman-pi-extension.test.ts
 rg "agent\.telemetry|AgentTelemetryEvent|normalizePi|piTelemetry|toolStartTimes|sanitizeTelemetry" src packages test
 ```
 
@@ -142,7 +142,7 @@ Expected: tests pass; `rg` exits 1 with no matches.
 - [x] **Step 6: Commit**
 
 ```bash
-git add -A src/observability src/daemon/observability-server.ts packages/shepherd-pi/src/index.ts test/unit/observability-contracts.test.ts test/integration/observability-rpc.test.ts test/unit/shepherd-pi-extension.test.ts test/unit/pi-telemetry.test.ts
+git add -A src/observability src/daemon/observability-server.ts packages/herdsman-pi/src/index.ts test/unit/observability-contracts.test.ts test/integration/observability-rpc.test.ts test/unit/herdsman-pi-extension.test.ts test/unit/pi-telemetry.test.ts
 git commit -m "refactor(observability): remove unused Pi telemetry"
 ```
 
@@ -153,9 +153,9 @@ git commit -m "refactor(observability): remove unused Pi telemetry"
 **Files:**
 - Modify: `README.md`
 - Modify: `README.ja.md`
-- Modify: `packages/shepherd-pi/README.md`
+- Modify: `packages/herdsman-pi/README.md`
 - Modify: `SKILL.md`
-- Modify: `docs/plans/2026-07-14-shepherd-test-dogfooding.md`
+- Modify: `docs/plans/2026-07-14-herdsman-test-dogfooding.md`
 
 **Interfaces:**
 - Consumes: final behavior from all implementation children.
@@ -165,11 +165,11 @@ git commit -m "refactor(observability): remove unused Pi telemetry"
 
 Replace “every connected Pi receives context” and “context remains active while off” with the exact semantics:
 
-- `/shepherd on` makes this terminal the sole Shepherd owner for the current Herdr session/workspace.
+- `/herdsman on` makes this terminal the sole Herdsman owner for the current Herdr session/workspace.
 - Only the owner receives cached current-workspace agent context, pending counts, updates, and auto-wake.
 - Context excludes the owner Pi itself but includes other Pi terminals.
 - Normal context is daemon-cached and injected without waiting for history reads; it can be temporarily absent after startup/reconnect/scope movement until a snapshot arrives.
-- `/shepherd off` releases owner behavior for this Pi; another owner's role is unaffected.
+- `/herdsman off` releases owner behavior for this Pi; another owner's role is unaffected.
 - Completed/blocked outcomes still start one visible wake and continue only the existing user request.
 - If a normal user run is active, wake waits until that run settles.
 
@@ -191,7 +191,7 @@ Use concise English matching root README. Explicitly state:
 
 Do not document internal table names, pane polling, or source fingerprints in package docs.
 
-- [x] **Step 3: Update the Shepherd Skill freshness guidance**
+- [x] **Step 3: Update the Herdsman Skill freshness guidance**
 
 Keep the same commands and selection rules. Add two bounded statements:
 
@@ -216,8 +216,8 @@ Do not rewrite completed Phase 1 evidence as if it were produced by the new impl
 Run:
 
 ```bash
-rg "every connected Pi|all connected Pi|context remains active while wake is off|Hidden agent context remains active" README.md README.ja.md packages/shepherd-pi/README.md docs/plans/2026-07-14-shepherd-test-dogfooding.md
-rg "agent list|agent get|agent read|/shepherd on|/shepherd off" README.md README.ja.md packages/shepherd-pi/README.md SKILL.md
+rg "every connected Pi|all connected Pi|context remains active while wake is off|Hidden agent context remains active" README.md README.ja.md packages/herdsman-pi/README.md docs/plans/2026-07-14-herdsman-test-dogfooding.md
+rg "agent list|agent get|agent read|/herdsman on|/herdsman off" README.md README.ja.md packages/herdsman-pi/README.md SKILL.md
 ```
 
 Expected: obsolete claims return no matches; current commands appear in every expected document.
@@ -225,7 +225,7 @@ Expected: obsolete claims return no matches; current commands appear in every ex
 - [x] **Step 6: Commit**
 
 ```bash
-git add README.md README.ja.md packages/shepherd-pi/README.md SKILL.md docs/plans/2026-07-14-shepherd-test-dogfooding.md
+git add README.md README.ja.md packages/herdsman-pi/README.md SKILL.md docs/plans/2026-07-14-herdsman-test-dogfooding.md
 git commit -m "docs: explain owner-only cached Pi context"
 ```
 
@@ -246,8 +246,8 @@ Run:
 
 ```bash
 pnpm test \
-  test/unit/shepherd-pi-extension.test.ts \
-  test/integration/shepherd-pi-daemon-client.test.ts \
+  test/unit/herdsman-pi-extension.test.ts \
+  test/integration/herdsman-pi-daemon-client.test.ts \
   test/integration/observability-rpc.test.ts
 ```
 
@@ -284,8 +284,8 @@ pnpm test \
   test/integration/agent-orchestrator-service.test.ts \
   test/integration/orchestrator-disconnect-grace.test.ts \
   test/integration/orchestrator-pane-move.test.ts \
-  test/unit/shepherd-pi-wake.test.ts \
-  test/unit/shepherd-pi-agent-update-ui.test.ts
+  test/unit/herdsman-pi-wake.test.ts \
+  test/unit/herdsman-pi-agent-update-ui.test.ts
 ```
 
 Expected: cursor, owner transfer, move, reconnect grace, wake projection, and card rendering remain unchanged.
@@ -319,40 +319,40 @@ Expected: no generated runtime DB/dist/node_modules files, no whitespace errors,
 **Objective:** Verify the user-visible behavior that motivated the change using the local package and an isolated destructive-test runtime.
 
 **Files:**
-- Evidence updates: `docs/plans/2026-07-14-shepherd-test-dogfooding.md`
+- Evidence updates: `docs/plans/2026-07-14-herdsman-test-dogfooding.md`
 
 **Interfaces:**
-- Consumes: built CLI, local shepherd-pi package, running Herdr workspace.
+- Consumes: built CLI, local herdsman-pi package, running Herdr workspace.
 - Produces: real latency/context/wake/owner evidence.
 
 - [x] **Step 1: Prepare a safe topology**
 
-Use `/Users/ryo.nakae/Dev/_sandbox/shepherd-test` with local `.pi/settings.json`, one owner Pi A, one off Pi B, Claude, Codex, and a shell observer. Re-read current workspace/pane ids. Use normal `~/.shepherd` only for non-destructive read/interaction checks; use a disposable `SHEPHERD_HOME` for daemon restart/grace tests.
+Use `/Users/ryo.nakae/Dev/_sandbox/herdsman-test` with local `.pi/settings.json`, one owner Pi A, one off Pi B, Claude, Codex, and a shell observer. Re-read current workspace/pane ids. Use normal `~/.herdsman` only for non-destructive read/interaction checks; use a disposable `SHEPHERD_HOME` for daemon restart/grace tests.
 
 - [x] **Step 2: Capture cached CLI and background-refresh evidence**
 
 Verify:
 
-1. `shepherd agent list --workspace <id> --json` returns cached rows and `updatedAt` without the prior multi-second discovery delay; record five `/usr/bin/time -p` real values as evidence, not as an automated threshold.
+1. `herdsman agent list --workspace <id> --json` returns cached rows and `updatedAt` without the prior multi-second discovery delay; record five `/usr/bin/time -p` real values as evidence, not as an automated threshold.
 2. While one agent remains `working`, produce new output, wait no more than 15 seconds, then confirm the owner Pi's next normal run sees the updated cached excerpt without CLI/tool inspection.
 3. With all agents idle, allow one 60-second recovery interval and verify a missed/manual history change appears.
 4. Confirm daemon logs/process behavior does not show overlapping repeated refreshes for the same session.
 
 - [x] **Step 3: Verify prompt responsiveness and owner-only context**
 
-In Pi A after `/shepherd on`:
+In Pi A after `/herdsman on`:
 
 1. Submit five short prompts while the daemon has large Pi/Claude/Codex history roots. Confirm the Pi working indicator begins without the prior visible ~1-second-or-more pause.
-2. Ask Pi A, without Shepherd CLI/tool calls, to identify the other agents' last request/result. Confirm owner Pi A is absent from its own summary and Pi B remains visible as another agent.
-3. In Pi B while off, submit the same no-tool prompt and confirm no hidden Shepherd context is available.
+2. Ask Pi A, without Herdsman CLI/tool calls, to identify the other agents' last request/result. Confirm owner Pi A is absent from its own summary and Pi B remains visible as another agent.
+3. In Pi B while off, submit the same no-tool prompt and confirm no hidden Herdsman context is available.
 4. Claim from Pi B. Confirm Pi B receives cached context on its next run and Pi A no longer does.
 5. Turn the owner off and confirm neither Pi receives context or wake until a new claim.
 
 - [x] **Step 4: Verify cache gaps, reconnect, and movement**
 
-Using the disposable Shepherd home where restart is required:
+Using the disposable Herdsman home where restart is required:
 
-1. Start a Pi before initial cache delivery and submit immediately; confirm the turn proceeds with no hitch and no Shepherd context rather than waiting.
+1. Start a Pi before initial cache delivery and submit immediately; confirm the turn proceeds with no hitch and no Herdsman context rather than waiting.
 2. Reconnect/restart daemon within grace; confirm the same owner restores cached context through registration.
 3. Move the owner pane to another workspace; confirm old context is cleared during the gap and destination context arrives after role reconciliation.
 4. Confirm a same-terminal new Pi session path replaces the old path and subsequent cached list/context reflects the new session.
@@ -362,7 +362,7 @@ Using the disposable Shepherd home where restart is required:
 Start a normal long-running Pi A turn, complete Claude while Pi is busy, and confirm:
 
 1. the normal turn is not interrupted and does not incorporate `[SHEPHERD AGENT UPDATES]`;
-2. after normal settle, one visible Shepherd wake starts;
+2. after normal settle, one visible Herdsman wake starts;
 3. the wake context contains the bounded final Claude result but not the normal all-agent context;
 4. ack/footer clearing occurs only after the wake produces a successful final response and settles;
 5. existing failed-wake/retry suppression still behaves as documented.
@@ -374,7 +374,7 @@ Add measured values, exact commands, observed workspace/pane roles, and pass/fai
 - [x] **Step 7: Commit dogfood evidence**
 
 ```bash
-git add docs/plans/2026-07-14-shepherd-test-dogfooding.md
+git add docs/plans/2026-07-14-herdsman-test-dogfooding.md
 git commit -m "test(dogfood): verify cached Pi context responsiveness"
 ```
 
@@ -439,7 +439,7 @@ No implementation work remains.
 
 - **Subjective hitch validation:** automated tests prove zero prompt-path RPC; dogfood verifies the visual experience. Do not convert human timing into a flaky CI threshold.
 - **Cached freshness:** working refresh can be up to 10 seconds behind and idle recovery up to 60 seconds. Docs expose `updatedAt` rather than implying synchronous freshness.
-- **Off Pi behavior:** off Pi deliberately has no passive context. Explicit Shepherd Skill/CLI inspection remains available.
+- **Off Pi behavior:** off Pi deliberately has no passive context. Explicit Herdsman Skill/CLI inspection remains available.
 - **Telemetry removal:** tool failure excerpts no longer have a dormant wire contract. Current product behavior does not consume them; history readers remain the data source.
 - **Dogfood safety:** an `Operation not permitted` sandbox denial must be reported, not bypassed. Leave affected checks unverified rather than weakening policy.
 - **No unresolved questions remain in this child.**

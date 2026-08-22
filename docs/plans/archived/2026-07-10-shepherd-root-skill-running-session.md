@@ -1,12 +1,12 @@
-# Shepherd Root Skill and Running-Session Contract Implementation Plan
+# Herdsman Root Skill and Running-Session Contract Implementation Plan
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task. Use the named skills where required; do not replace those reviews with an informal prose pass.
 
 **Status:** Completed
 
-**Goal:** Make Shepherd expose agents only from running Herdr sessions, focus the root Agent Skill on structured agent status/history and cross-agent understanding, delegate Herdr control to the official `herdr` skill, and document the bilingual installation flow without changing the existing README structure.
+**Goal:** Make Herdsman expose agents only from running Herdr sessions, focus the root Agent Skill on structured agent status/history and cross-agent understanding, delegate Herdr control to the official `herdr` skill, and document the bilingual installation flow without changing the existing README structure.
 
-**Architecture:** `AgentStore.list()` becomes the public running-session boundary by joining `agents` to `herdr_sessions` and filtering `running = 1`; stored agent rows remain available for identity reuse when a session returns. The root `SKILL.md` teaches Shepherd inspection only and routes mixed coordination tasks to the independently installed official Herdr skill instead of duplicating Herdr commands. README changes add one Agent Skill section to the existing English structure, then synchronize the Japanese sibling through the required README and anti-slop skills.
+**Architecture:** `AgentStore.list()` becomes the public running-session boundary by joining `agents` to `herdr_sessions` and filtering `running = 1`; stored agent rows remain available for identity reuse when a session returns. The root `SKILL.md` teaches Herdsman inspection only and routes mixed coordination tasks to the independently installed official Herdr skill instead of duplicating Herdr commands. README changes add one Agent Skill section to the existing English structure, then synchronize the Japanese sibling through the required README and anti-slop skills.
 
 **Tech Stack:** TypeScript ESM + NodeNext, Node.js >= 24.18.0, pnpm 11.9.0, SQLite via `node:sqlite`, Vitest, Agent Skills frontmatter, Claude Code 2.1.206, Codex CLI 0.142.5, skill-creator evaluation scripts, Markdown.
 
@@ -14,17 +14,17 @@
 
 - Follow TDD for the running-session fix: Red, Green, then refactor only if the focused tests remain green.
 - Public repository code, docs, skill instructions, and commit messages remain in English. Chat updates remain in Japanese.
-- Modify the root `SKILL.md`; do not modify `packages/shepherd-pi/skills/shepherd/SKILL.md` in this plan.
-- Shepherd remains useful without the official Herdr skill. It provides structured agent status, compact history, and recent compact tool results.
-- Pure workspace, tab, pane, terminal input/output, spawn, focus, and wait operations belong to the official `herdr` skill. Do not duplicate Herdr CLI recipes in the root Shepherd skill.
-- The Shepherd skill triggers for understanding another Herdr-managed coding agent and for mixed coordination tasks that require that understanding. Pure Herdr control requests must rely on the `herdr` skill alone.
+- Modify the root `SKILL.md`; do not modify `packages/herdsman-pi/skills/herdsman/SKILL.md` in this plan.
+- Herdsman remains useful without the official Herdr skill. It provides structured agent status, compact history, and recent compact tool results.
+- Pure workspace, tab, pane, terminal input/output, spawn, focus, and wait operations belong to the official `herdr` skill. Do not duplicate Herdr CLI recipes in the root Herdsman skill.
+- The Herdsman skill triggers for understanding another Herdr-managed coding agent and for mixed coordination tasks that require that understanding. Pure Herdr control requests must rely on the `herdr` skill alone.
 - If a mixed task needs Herdr control and the `herdr` skill is unavailable, stop that control portion and ask the user to install the official skill with `npx skills add ogulcancelik/herdr --skill herdr -g`. Do not fetch, vendor, or auto-install it.
-- Support explicit Shepherd `--workspace` and `--session` scopes outside Herdr.
+- Support explicit Herdsman `--workspace` and `--session` scopes outside Herdr.
 - Current-workspace inference requires both `HERDR_ENV=1` and `HERDR_WORKSPACE_ID`. Do not fall back to `--all`, another workspace, or Herdr topology inference when either value is absent.
-- Before Shepherd inspection, run `shepherd daemon status`; start the daemon only when it reports `state: "stopped"`. Do not automatically restart or stop it.
-- Treat the Shepherd CLI itself as a compatibility requirement. Do not add CLI clone/build/global-install recovery instructions to `SKILL.md`; README owns CLI installation.
-- Keep the skill description positive and Herdr-specific. Do not add negative keyword lists for tmux, Zellij, Shepherd.js, generic subagents, or unrelated products.
-- Keep all skill eval prompts, fixtures, transcripts, timing, benchmark data, HTML viewers, and Codex smoke artifacts under the sibling `../shepherd-workspace/`; do not add `evals/`, generated reports, or runner scripts to this repository or npm package.
+- Before Herdsman inspection, run `herdsman daemon status`; start the daemon only when it reports `state: "stopped"`. Do not automatically restart or stop it.
+- Treat the Herdsman CLI itself as a compatibility requirement. Do not add CLI clone/build/global-install recovery instructions to `SKILL.md`; README owns CLI installation.
+- Keep the skill description positive and Herdr-specific. Do not add negative keyword lists for tmux, Zellij, Herdsman.js, generic subagents, or unrelated products.
+- Keep all skill eval prompts, fixtures, transcripts, timing, benchmark data, HTML viewers, and Codex smoke artifacts under the sibling `../herdsman-workspace/`; do not add `evals/`, generated reports, or runner scripts to this repository or npm package.
 - Use `/skill-creator` for behavioral comparison, grading, viewer generation, description trigger evaluation, and iteration. Static review alone is not sufficient.
 - Update README content with `/readme-creator` and `/readme-i18n`. Apply `/stop-slop` to changed English prose and `/stop-slop-ja` to changed Japanese prose.
 - Preserve the current README layout: cover image, H1, existing `README-I18N` selector, introduction, section order, examples, Pi section, Herdr plugin section, packages table, development section, and license. Insert one new Agent Skill section after Main commands; do not rewrite or reorder the rest of the file and do not add a table of contents.
@@ -34,13 +34,13 @@
 
 ## Current Context
 
-- `README.md`, `README.ja.md`, the archived agent-history redesign plan, and the current root skill all state that Shepherd indexes running Herdr sessions only.
+- `README.md`, `README.ja.md`, the archived agent-history redesign plan, and the current root skill all state that Herdsman indexes running Herdr sessions only.
 - `HerdrSessionWatchManager.rescanNow()` marks missing sessions `running = false`, but `AgentStore.list()` currently selects directly from `agents`; stale rows can therefore appear in `agent.list`, `agent.get`, and `agent.read`.
 - `ObservabilityRpcServer` implements `agent.get` and `agent.read` through `AgentStore.resolveTarget()`, which already calls `AgentStore.list()`. A single query-boundary fix covers all three public methods.
 - `AgentStore.replaceForSession()` calls `listForHerdrSession()` while refreshing. `HerdrSessionWatchManager` and `AgentIndexService` upsert the session as running before replacing rows, so the running-session join preserves the existing refresh path.
-- `SKILL.md` has an uncommitted broad draft that contains Herdr workspace/tab/pane commands. The implementation should replace that draft with the final Shepherd-focused content below. Preserve the committed `HEAD:SKILL.md` as the skill-creator baseline before rewriting the file.
+- `SKILL.md` has an uncommitted broad draft that contains Herdr workspace/tab/pane commands. The implementation should replace that draft with the final Herdsman-focused content below. Preserve the committed `HEAD:SKILL.md` as the skill-creator baseline before rewriting the file.
 - The root README files are both 101 lines and have matching structure and one existing `README-I18N` selector. The user explicitly requires preserving that structure, so the README Creator table-of-contents checklist item is overridden for this constrained update.
-- The project is consumed primarily as a CLI (`package.json#bin` points to `dist/src/cli/shepherd.js`) with optional Pi and Herdr plugin packages.
+- The project is consumed primarily as a CLI (`package.json#bin` points to `dist/src/cli/herdsman.js`) with optional Pi and Herdr plugin packages.
 - `skill-creator/scripts/run_eval.py` evaluates Claude Code triggering by creating transient command files. Run it from the sibling evaluation workspace so `.claude/commands` never appears in this repository.
 - `skill-creator/scripts/quick_validate.py` imports PyYAML, which is not installed in the project environment. Run it through `uv run --with pyyaml`.
 - `pnpm check` is the repository-wide validation gate. Run `pnpm build` as a final CLI/package smoke test even though this change does not alter entrypoint imports.
@@ -49,15 +49,15 @@
 
 - Modify: `src/db/agents.ts` — restrict `AgentStore.list()` and `resolveTarget()` candidates to running Herdr sessions while retaining stored rows.
 - Modify: `test/integration/observability-rpc.test.ts` — prove stopped-session agents are hidden from `agent.list/get/read` but remain stored.
-- Modify: `SKILL.md` — replace the broad Herdr wrapper draft with the Shepherd inspection and delegation workflow.
+- Modify: `SKILL.md` — replace the broad Herdr wrapper draft with the Herdsman inspection and delegation workflow.
 - Modify: `README.md` — add the English Agent Skill installation and companion-skill section without reordering existing sections.
 - Modify: `README.ja.md` — synchronize the new section and preserve the established bilingual structure.
-- Create during implementation, outside the repository: `../shepherd-workspace/skill-snapshot/SKILL.md` — committed baseline from `HEAD`.
-- Create during implementation, outside the repository: `../shepherd-workspace/candidate/SKILL.md` — candidate used by skill-creator and Codex.
-- Create during implementation, outside the repository: `../shepherd-workspace/trigger-eval.json` — 20 reviewed trigger cases.
-- Create during implementation, outside the repository: `../shepherd-workspace/behavior-evals/evals.json` and fixture scripts — four fake-CLI workflow cases.
-- Create during implementation, outside the repository: `../shepherd-workspace/iteration-*/` — skill-creator transcripts, outputs, grades, timings, benchmarks, and viewer data.
-- Modify during implementation: `docs/plans/2026-07-10-shepherd-root-skill-running-session.md` — update Progress and Next Steps; archive it only after all automated and human review gates pass.
+- Create during implementation, outside the repository: `../herdsman-workspace/skill-snapshot/SKILL.md` — committed baseline from `HEAD`.
+- Create during implementation, outside the repository: `../herdsman-workspace/candidate/SKILL.md` — candidate used by skill-creator and Codex.
+- Create during implementation, outside the repository: `../herdsman-workspace/trigger-eval.json` — 20 reviewed trigger cases.
+- Create during implementation, outside the repository: `../herdsman-workspace/behavior-evals/evals.json` and fixture scripts — four fake-CLI workflow cases.
+- Create during implementation, outside the repository: `../herdsman-workspace/iteration-*/` — skill-creator transcripts, outputs, grades, timings, benchmarks, and viewer data.
+- Modify during implementation: `docs/plans/2026-07-10-herdsman-root-skill-running-session.md` — update Progress and Next Steps; archive it only after all automated and human review gates pass.
 
 ## Tasks
 
@@ -173,14 +173,14 @@ git add src/db/agents.ts test/integration/observability-rpc.test.ts
 git commit -m "fix(observability): hide agents from stopped sessions"
 ```
 
-### Task 2: Rewrite the Root Shepherd Skill Around Structured Inspection
+### Task 2: Rewrite the Root Herdsman Skill Around Structured Inspection
 
-**Objective:** Produce a concise root skill that triggers for understanding other Herdr-managed agents, supports explicit outside scopes, auto-starts the Shepherd daemon when stopped, and delegates all Herdr control to the official skill.
+**Objective:** Produce a concise root skill that triggers for understanding other Herdr-managed agents, supports explicit outside scopes, auto-starts the Herdsman daemon when stopped, and delegates all Herdr control to the official skill.
 
 **Files:**
 - Modify: `SKILL.md`
-- Create outside repo: `../shepherd-workspace/skill-snapshot/SKILL.md`
-- Create outside repo: `../shepherd-workspace/candidate/SKILL.md`
+- Create outside repo: `../herdsman-workspace/skill-snapshot/SKILL.md`
+- Create outside repo: `../herdsman-workspace/candidate/SKILL.md`
 
 **Interfaces:**
 - Consumes: the running-only contract from Task 1 and the official `herdr` skill installation command
@@ -191,8 +191,8 @@ git commit -m "fix(observability): hide agents from stopped sessions"
 Run from the repository root:
 
 ```bash
-mkdir -p ../shepherd-workspace/skill-snapshot ../shepherd-workspace/candidate
-git show HEAD:SKILL.md > ../shepherd-workspace/skill-snapshot/SKILL.md
+mkdir -p ../herdsman-workspace/skill-snapshot ../herdsman-workspace/candidate
+git show HEAD:SKILL.md > ../herdsman-workspace/skill-snapshot/SKILL.md
 ```
 
 Expected: the baseline file contains the committed pre-change skill, not the current uncommitted broad draft. `git status --short` must not show `evals/`, `.claude/`, or any generated evaluation file.
@@ -203,27 +203,27 @@ Write exactly this initial candidate, then let `/skill-creator` adjust the descr
 
 ```markdown
 ---
-name: shepherd
-description: "Inspect the status, progress, latest messages, compact structured history, and recent tool results of coding agents managed by Herdr using Shepherd. Use whenever the user asks what another Herdr-managed coding agent is doing, whether it is working, blocked, idle, or done, what it recently reported or changed, or needs structured context before coordinating with that agent. Also use outside Herdr when the user provides an explicit Herdr workspace or session scope for agent inspection."
-compatibility: "Requires the Shepherd CLI and daemon. Current-workspace lookup requires HERDR_ENV=1 and HERDR_WORKSPACE_ID. Explicit Shepherd workspace or session scopes work outside Herdr."
+name: herdsman
+description: "Inspect the status, progress, latest messages, compact structured history, and recent tool results of coding agents managed by Herdr using Herdsman. Use whenever the user asks what another Herdr-managed coding agent is doing, whether it is working, blocked, idle, or done, what it recently reported or changed, or needs structured context before coordinating with that agent. Also use outside Herdr when the user provides an explicit Herdr workspace or session scope for agent inspection."
+compatibility: "Requires the Herdsman CLI and daemon. Current-workspace lookup requires HERDR_ENV=1 and HERDR_WORKSPACE_ID. Explicit Herdsman workspace or session scopes work outside Herdr."
 ---
 
-# Shepherd agent inspection
+# Herdsman agent inspection
 
-Use Shepherd for structured coding-agent status, compact message history, and recent compact tool results. Use the official `herdr` skill for live workspace, tab, pane, terminal input/output, focus, spawn, and wait operations.
+Use Herdsman for structured coding-agent status, compact message history, and recent compact tool results. Use the official `herdr` skill for live workspace, tab, pane, terminal input/output, focus, spawn, and wait operations.
 
 ## Ensure the daemon is running
 
-Check the daemon before the first Shepherd query:
+Check the daemon before the first Herdsman query:
 
 ```bash
-shepherd daemon status
+herdsman daemon status
 ```
 
 If the JSON response has `state: "stopped"`, start it once:
 
 ```bash
-shepherd daemon start
+herdsman daemon start
 ```
 
 Do not restart or stop a running daemon unless the user asks.
@@ -233,7 +233,7 @@ Do not restart or stop a running daemon unless the user asks.
 Use the current workspace only when both `HERDR_ENV=1` and `HERDR_WORKSPACE_ID` are set:
 
 ```bash
-shepherd agent list --json
+herdsman agent list --json
 ```
 
 If either value is missing, do not guess the workspace or fall back to `--all`. Ask for an explicit scope.
@@ -241,8 +241,8 @@ If either value is missing, do not guess the workspace or fall back to `--all`. 
 Outside Herdr, or when the user names a scope, pass it explicitly:
 
 ```bash
-shepherd agent list --workspace <workspace-id> --json
-shepherd agent list --all --json
+herdsman agent list --workspace <workspace-id> --json
+herdsman agent list --all --json
 ```
 
 Use `--session <name>` when workspace ids or agent names are ambiguous across running Herdr sessions.
@@ -252,8 +252,8 @@ Use `--session <name>` when workspace ids or agent names are ambiguous across ru
 Start with `agent list` and select the exact pane id, terminal id, or unique agent name from its result. Do not assume names such as `claude` or `codex` are unique.
 
 ```bash
-shepherd agent get <target> --json
-shepherd agent read <target> --limit 20 --json
+herdsman agent get <target> --json
+herdsman agent read <target> --limit 20 --json
 ```
 
 Add the same `--workspace` and `--session` scope used for `agent list` when operating outside the current Herdr workspace.
@@ -278,8 +278,8 @@ Do not copy or guess Herdr CLI commands in this skill.
 
 ## Boundaries
 
-- Shepherd returns agents from running Herdr sessions only.
-- Use Shepherd for structured semantic history, not raw terminal fidelity.
+- Herdsman returns agents from running Herdr sessions only.
+- Use Herdsman for structured semantic history, not raw terminal fidelity.
 - Use the official `herdr` skill for live terminal state and control.
 ```
 
@@ -297,7 +297,7 @@ Expected: `Skill is valid!`
 Run:
 
 ```bash
-rg -n "HERDR_ENV=1|HERDR_WORKSPACE_ID|shepherd daemon status|shepherd agent list|shepherd agent get|shepherd agent read|ogulcancelik/herdr" SKILL.md
+rg -n "HERDR_ENV=1|HERDR_WORKSPACE_ID|herdsman daemon status|herdsman agent list|herdsman agent get|herdsman agent read|ogulcancelik/herdr" SKILL.md
 rg -n "herdr workspace|herdr tab|herdr pane|herdr wait" SKILL.md
 ```
 
@@ -306,7 +306,7 @@ Expected: the first command finds every required contract. The second command re
 - [ ] **Step 4: Copy the candidate into the external evaluation workspace**
 
 ```bash
-cp SKILL.md ../shepherd-workspace/candidate/SKILL.md
+cp SKILL.md ../herdsman-workspace/candidate/SKILL.md
 git diff --check -- SKILL.md
 git status --short
 ```
@@ -320,7 +320,7 @@ Expected: only planned repository files are modified; no evaluation artifact app
 **Files:**
 - Read: `SKILL.md`
 - Modify when evidence requires: `SKILL.md` description or instructions
-- Create only outside repo: `../shepherd-workspace/**`
+- Create only outside repo: `../herdsman-workspace/**`
 
 **Interfaces:**
 - Consumes: Task 2 candidate and `HEAD:SKILL.md` baseline snapshot
@@ -334,10 +334,10 @@ Create four temporary evals with these exact prompts and expectations:
 | --- | --- | --- |
 | 1 | `You are inside Herdr. Find which coding agent in the current workspace is blocked, read its latest structured history, and summarize why it needs input.` | Calls daemon status; uses `agent list` before selecting a target; uses `agent get` or `agent read`; does not invoke `herdr`; reports fixture evidence. |
 | 2 | `From outside Herdr, inspect agent codex in workspace wB and session nightly. Return its latest 20 structured messages.` | Uses explicit `--workspace wB --session nightly` consistently; never falls back to `--all`; uses `agent list` before `agent read`; does not invoke `herdr`. |
-| 3 | `Check the current Herdr workspace agents. Shepherd's daemon is stopped right now.` | Executes `daemon status`, observes stopped state, executes `daemon start` once, then retries inspection; never uses restart or stop. |
-| 4 | `Check what codex is doing, wait until it finishes, then send it a follow-up request. The official herdr skill is not installed.` | Uses Shepherd for the structured inspection; does not guess or execute Herdr commands; stops the wait/input portion; asks the user to install `ogulcancelik/herdr`. |
+| 3 | `Check the current Herdr workspace agents. Herdsman's daemon is stopped right now.` | Executes `daemon status`, observes stopped state, executes `daemon start` once, then retries inspection; never uses restart or stop. |
+| 4 | `Check what codex is doing, wait until it finishes, then send it a follow-up request. The official herdr skill is not installed.` | Uses Herdsman for the structured inspection; does not guess or execute Herdr commands; stops the wait/input portion; asks the user to install `ogulcancelik/herdr`. |
 
-Create `../shepherd-workspace/behavior-evals/bin/shepherd` with this deterministic adapter:
+Create `../herdsman-workspace/behavior-evals/bin/herdsman` with this deterministic adapter:
 
 ```python
 #!/usr/bin/env python3
@@ -351,14 +351,14 @@ log_path = Path(os.environ["SHEPHERD_FAKE_LOG"])
 state_path = Path(os.environ["SHEPHERD_FAKE_STATE"])
 log_path.parent.mkdir(parents=True, exist_ok=True)
 with log_path.open("a") as log:
-    log.write(json.dumps({"command": "shepherd", "args": args}) + "\n")
+    log.write(json.dumps({"command": "herdsman", "args": args}) + "\n")
 
 if args == ["daemon", "status"]:
     state = state_path.read_text().strip() if state_path.exists() else "running"
     print(json.dumps({"state": state}))
 elif args == ["daemon", "start"]:
     state_path.write_text("running\n")
-    print(json.dumps({"pid": 4242, "socketPath": "/tmp/fake-shepherd.sock"}))
+    print(json.dumps({"pid": 4242, "socketPath": "/tmp/fake-herdsman.sock"}))
 elif args[:2] == ["agent", "list"]:
     print(
         json.dumps(
@@ -427,7 +427,7 @@ else:
     raise SystemExit(2)
 ```
 
-Create `../shepherd-workspace/behavior-evals/bin/herdr` as a guard so no run can reach a real Herdr session:
+Create `../herdsman-workspace/behavior-evals/bin/herdr` as a guard so no run can reach a real Herdr session:
 
 ```bash
 #!/usr/bin/env bash
@@ -445,21 +445,21 @@ SHEPHERD_FAKE_STATE=<run-directory>/daemon-state
 
 Before launching each executor, create its `outputs/` directory, truncate its log, and write `stopped` to its state only for eval 3; write `running` for every other eval. Candidate and baseline never share a state or log file.
 
-Each executor prompt must require every shell command to set `PATH=/Users/ryo.nakae/Dev/private/shepherd-workspace/behavior-evals/bin:$PATH`, `SHEPHERD_FAKE_LOG`, and `SHEPHERD_FAKE_STATE` inline. This PATH shadows both real binaries with the fake Shepherd adapter and Herdr guard. For evals 1, 3, and 4, each command also sets `HERDR_ENV=1 HERDR_WORKSPACE_ID=wB`; for eval 2, use `env -u HERDR_ENV -u HERDR_WORKSPACE_ID` and require `--workspace wB --session nightly`.
+Each executor prompt must require every shell command to set `PATH=/Users/ryo.nakae/Dev/private/herdsman-workspace/behavior-evals/bin:$PATH`, `SHEPHERD_FAKE_LOG`, and `SHEPHERD_FAKE_STATE` inline. This PATH shadows both real binaries with the fake Herdsman adapter and Herdr guard. For evals 1, 3, and 4, each command also sets `HERDR_ENV=1 HERDR_WORKSPACE_ID=wB`; for eval 2, use `env -u HERDR_ENV -u HERDR_WORKSPACE_ID` and require `--workspace wB --session nightly`.
 
-Retrieve every executor with full tool-call history (`get_subagent_result` with `verbose: true`) and save that structured conversation as `transcript.md`. The grader must fail the run if any executed shell tool input lacks the fake-bin PATH prefix when invoking Shepherd/Herdr, invokes a real absolute Shepherd/Herdr path, or contains a Shepherd/Herdr command absent from that run's unique command log. This transcript-to-log audit is required evidence that no real binary ran.
+Retrieve every executor with full tool-call history (`get_subagent_result` with `verbose: true`) and save that structured conversation as `transcript.md`. The grader must fail the run if any executed shell tool input lacks the fake-bin PATH prefix when invoking Herdsman/Herdr, invokes a real absolute Herdsman/Herdr path, or contains a Herdsman/Herdr command absent from that run's unique command log. This transcript-to-log audit is required evidence that no real binary ran.
 
 - [ ] **Step 1: Invoke `/skill-creator` and prepare iteration 1**
 
 Follow `/skill-creator` and the aggregator's required directory layout:
 
-1. Save the four evals to `../shepherd-workspace/behavior-evals/evals.json` using the skill-creator schema.
+1. Save the four evals to `../herdsman-workspace/behavior-evals/evals.json` using the skill-creator schema.
 2. Create these eval directories: `eval-1-current-blocked`, `eval-2-explicit-scope`, `eval-3-daemon-start`, and `eval-4-missing-herdr-skill`.
 3. Put `eval_metadata.json` in each eval directory with the numeric id, descriptive name, exact prompt, and listed expectations.
-4. Under every eval directory, create `with_skill/run-1/` and `without_skill/run-1/`. `with_skill` uses `../shepherd-workspace/candidate`; `without_skill` uses the committed `../shepherd-workspace/skill-snapshot` baseline. Record that baseline mapping in `eval_metadata.json`.
+4. Under every eval directory, create `with_skill/run-1/` and `without_skill/run-1/`. `with_skill` uses `../herdsman-workspace/candidate`; `without_skill` uses the committed `../herdsman-workspace/skill-snapshot` baseline. Record that baseline mapping in `eval_metadata.json`.
 5. Initialize a unique `outputs/command-log.jsonl` and `daemon-state` in every run directory as specified above.
 6. Launch all eight executor subagents in the same turn. Give each executor the skill path, exact task, run-specific inline environment prefix, scenario values, and output path. Require it to save `outputs/final.md`; the adapter writes directly to that run's `outputs/command-log.jsonl`.
-7. Retrieve each completed subagent with `verbose: true`, save the full tool-call conversation as `transcript.md`, and audit every Shepherd/Herdr shell invocation against the run-specific log. Capture `total_tokens`, `duration_ms`, and `total_duration_seconds` in the sibling `timing.json` as completion notifications arrive.
+7. Retrieve each completed subagent with `verbose: true`, save the full tool-call conversation as `transcript.md`, and audit every Herdsman/Herdr shell invocation against the run-specific log. Capture `total_tokens`, `duration_ms`, and `total_duration_seconds` in the sibling `timing.json` as completion notifications arrive.
 
 Expected layout for every paired run:
 
@@ -481,7 +481,7 @@ iteration-1/
             └── timing.json
 ```
 
-Expected: eight runs exist with paired candidate/baseline outputs, transcripts, fake command logs, and timings. No executor invokes the real `shepherd` or `herdr` binary.
+Expected: eight runs exist with paired candidate/baseline outputs, transcripts, fake command logs, and timings. No executor invokes the real `herdsman` or `herdr` binary.
 
 - [ ] **Step 2: Grade and generate the human viewer**
 
@@ -490,14 +490,14 @@ Use the skill-creator grader instructions and exact `grading.json` keys `text`, 
 ```bash
 cd /Users/ryo.nakae/.agents/skills/skill-creator
 uv run python -m scripts.aggregate_benchmark \
-  /Users/ryo.nakae/Dev/private/shepherd-workspace/iteration-1 \
-  --skill-name shepherd
+  /Users/ryo.nakae/Dev/private/herdsman-workspace/iteration-1 \
+  --skill-name herdsman
 
 nohup uv run python eval-viewer/generate_review.py \
-  /Users/ryo.nakae/Dev/private/shepherd-workspace/iteration-1 \
-  --skill-name shepherd \
-  --benchmark /Users/ryo.nakae/Dev/private/shepherd-workspace/iteration-1/benchmark.json \
-  > /Users/ryo.nakae/Dev/private/shepherd-workspace/iteration-1/viewer.log 2>&1 &
+  /Users/ryo.nakae/Dev/private/herdsman-workspace/iteration-1 \
+  --skill-name herdsman \
+  --benchmark /Users/ryo.nakae/Dev/private/herdsman-workspace/iteration-1/benchmark.json \
+  > /Users/ryo.nakae/Dev/private/herdsman-workspace/iteration-1/viewer.log 2>&1 &
 ```
 
 Validate that aggregation discovered all eight runs:
@@ -511,7 +511,7 @@ if (!configurations.has("with_skill") || !configurations.has("without_skill")) {
   throw new Error(`missing configurations: ${[...configurations].join(", ")}`);
 }
 console.log("behavior benchmark runs: 8");
-' /Users/ryo.nakae/Dev/private/shepherd-workspace/iteration-1/benchmark.json
+' /Users/ryo.nakae/Dev/private/herdsman-workspace/iteration-1/benchmark.json
 ```
 
 Expected: the validation prints `behavior benchmark runs: 8`; candidate behavior passes all four evals; `benchmark.json` and the viewer show candidate before baseline. Ask the user to review Outputs and Benchmark and submit feedback before changing the skill again.
@@ -521,7 +521,7 @@ Expected: the validation prints `behavior benchmark runs: 8`; candidate behavior
 If any candidate behavior eval fails or user feedback identifies a defect:
 
 1. Update only the general instruction that caused the failure.
-2. Copy the revised skill to `../shepherd-workspace/candidate/SKILL.md`.
+2. Copy the revised skill to `../herdsman-workspace/candidate/SKILL.md`.
 3. Run all four candidate and baseline evals into `iteration-2` or the next iteration.
 4. Generate the viewer with `--previous-workspace` pointing to the prior iteration.
 5. Stop when all four candidate evals pass and user feedback is empty, or when another iteration no longer makes meaningful progress.
@@ -536,7 +536,7 @@ Create exactly 20 cases: 10 should-trigger and 10 should-not-trigger. Before run
 | --- | --- | --- |
 | 1 | yes | `Herdrの今のworkspaceにいるagentを一覧して、blockedのagentだけ理由と最後のメッセージを教えて。` |
 | 2 | yes | `Codexは今どこまで進んでる？直近のstructured historyと最新tool resultを確認して。` |
-| 3 | yes | `worker-2がdoneか確認して、終わっていたら何を変更したのかShepherdの履歴からまとめて。` |
+| 3 | yes | `worker-2がdoneか確認して、終わっていたら何を変更したのかHerdsmanの履歴からまとめて。` |
 | 4 | yes | `Herdrの外からworkspace wBにいるclaudeの状態と直近20メッセージを読みたい。` |
 | 5 | yes | `session nightlyのrelease-checkerが最後に何を報告したか確認して。` |
 | 6 | yes | `このHerdr workspaceのClaude CodeとCodexの進捗を比較して、どちらが入力待ちか調べて。` |
@@ -544,56 +544,56 @@ Create exactly 20 cases: 10 should-trigger and 10 should-not-trigger. Before run
 | 8 | yes | `migration担当agentがどこまで作業したか、last user/assistant messageとstatusを取得して。` |
 | 9 | yes | `pane名は分からないけど、このworkspaceでidleになったcoding agentの直近の作業を確認して。` |
 | 10 | yes | `別のHerdr agentに指示を送る前に、いま何をしているかstructured contextを取って。` |
-| 11 | no | `packages/shepherd-herdr-plugin/srcのevent payload型を修正してunit testを追加して。Herdr操作は不要。` |
+| 11 | no | `packages/herdsman-herdr-plugin/srcのevent payload型を修正してunit testを追加して。Herdr操作は不要。` |
 | 12 | no | `Herdr workspaceの名前をapi-serverに変更して。` |
 | 13 | no | `右側にHerdr paneをsplitしてClaude Codeを起動して。` |
 | 14 | no | `tmuxのdev sessionでpane %4のログを読んでnpm testが終わったか確認して。` |
 | 15 | no | `Zellijのpaneで動く2つのagentを監視するlayoutを作って。` |
 | 16 | no | `このリファクタを3つのCodex subagentへ分担する計画を作って。terminal multiplexerは使わない。` |
-| 17 | no | `ReactのShepherd.js tourを初回ユーザーだけに表示して。` |
-| 18 | no | `社内CRM製品Shepherdのworkspace別sales agent dashboardを実装して。Herdr連携はない。` |
+| 17 | no | `ReactのHerdsman.js tourを初回ユーザーだけに表示して。` |
+| 18 | no | `社内CRM製品Herdsmanのworkspace別sales agent dashboardを実装して。Herdr連携はない。` |
 | 19 | no | `別terminalで起動したViteの出力を追ってhot reload失敗を直して。` |
 | 20 | no | `Herdrのキーバインドを変更する方法とconfig.tomlの設定項目を教えて。` |
 
 - [ ] **Step 4: Review and run Claude Code trigger optimization**
 
-1. Build `/Users/ryo.nakae/Dev/private/shepherd-workspace/trigger-eval-review.html` from `/Users/ryo.nakae/.agents/skills/skill-creator/assets/eval_review.html` with the candidate name, description, and 20-case JSON. Open that external-workspace file.
-2. Wait for the user to export `~/Downloads/eval_set.json`, then copy the latest exported file to `../shepherd-workspace/trigger-eval.json`.
+1. Build `/Users/ryo.nakae/Dev/private/herdsman-workspace/trigger-eval-review.html` from `/Users/ryo.nakae/.agents/skills/skill-creator/assets/eval_review.html` with the candidate name, description, and 20-case JSON. Open that external-workspace file.
+2. Wait for the user to export `~/Downloads/eval_set.json`, then copy the latest exported file to `../herdsman-workspace/trigger-eval.json`.
 3. Run the optimization loop with Claude Code Sonnet, three runs per query, a 0.5 threshold, 40% held-out test, and no more than five iterations. Make the skill-creator package importable through `PYTHONPATH`; do not copy it into the repository.
 
 `run_loop.py` stops when its training split passes, so do not treat its exit as the 20/20 gate. Capture its stdout and re-evaluate the selected description across the full approved set:
 
 ```bash
-cd /Users/ryo.nakae/Dev/private/shepherd-workspace
+cd /Users/ryo.nakae/Dev/private/herdsman-workspace
 export PYTHONPATH=/Users/ryo.nakae/.agents/skills/skill-creator
-mkdir -p /Users/ryo.nakae/Dev/private/shepherd-workspace/trigger-results
+mkdir -p /Users/ryo.nakae/Dev/private/herdsman-workspace/trigger-results
 
 uv run --with pyyaml python -m scripts.run_loop \
-  --eval-set /Users/ryo.nakae/Dev/private/shepherd-workspace/trigger-eval.json \
-  --skill-path /Users/ryo.nakae/Dev/private/shepherd-workspace/candidate \
+  --eval-set /Users/ryo.nakae/Dev/private/herdsman-workspace/trigger-eval.json \
+  --skill-path /Users/ryo.nakae/Dev/private/herdsman-workspace/candidate \
   --model sonnet \
   --runs-per-query 3 \
   --trigger-threshold 0.5 \
   --holdout 0.4 \
   --max-iterations 5 \
-  --report /Users/ryo.nakae/Dev/private/shepherd-workspace/trigger-results/live-report.html \
-  --results-dir /Users/ryo.nakae/Dev/private/shepherd-workspace/trigger-results \
+  --report /Users/ryo.nakae/Dev/private/herdsman-workspace/trigger-results/live-report.html \
+  --results-dir /Users/ryo.nakae/Dev/private/herdsman-workspace/trigger-results \
   --verbose \
-  > /Users/ryo.nakae/Dev/private/shepherd-workspace/run-loop.json
+  > /Users/ryo.nakae/Dev/private/herdsman-workspace/run-loop.json
 
 BEST_DESCRIPTION=$(node -e \
   'const x=require(process.argv[1]); process.stdout.write(x.best_description)' \
-  /Users/ryo.nakae/Dev/private/shepherd-workspace/run-loop.json)
+  /Users/ryo.nakae/Dev/private/herdsman-workspace/run-loop.json)
 
 uv run --with pyyaml python -m scripts.run_eval \
-  --eval-set /Users/ryo.nakae/Dev/private/shepherd-workspace/trigger-eval.json \
-  --skill-path /Users/ryo.nakae/Dev/private/shepherd-workspace/candidate \
+  --eval-set /Users/ryo.nakae/Dev/private/herdsman-workspace/trigger-eval.json \
+  --skill-path /Users/ryo.nakae/Dev/private/herdsman-workspace/candidate \
   --description "$BEST_DESCRIPTION" \
   --model sonnet \
   --runs-per-query 3 \
   --trigger-threshold 0.5 \
   --verbose \
-  > /Users/ryo.nakae/Dev/private/shepherd-workspace/full-trigger-eval.json
+  > /Users/ryo.nakae/Dev/private/herdsman-workspace/full-trigger-eval.json
 
 node -e '
 const x = require(process.argv[1]);
@@ -602,19 +602,19 @@ if (x.summary.total !== 20 || x.summary.passed !== 20) {
   process.exit(1);
 }
 console.log("full trigger eval: 20/20");
-' /Users/ryo.nakae/Dev/private/shepherd-workspace/full-trigger-eval.json
+' /Users/ryo.nakae/Dev/private/herdsman-workspace/full-trigger-eval.json
 ```
 
-Expected: the final command prints `full trigger eval: 20/20`. Apply `best_description` to `../shepherd-workspace/candidate/SKILL.md` only if it obeys every Global Constraint; never accept an optimizer result that broadens the skill to pure Herdr control or adds a negative keyword list. If the full-set gate fails, continue description iteration and rerun this entire 20×3 check.
+Expected: the final command prints `full trigger eval: 20/20`. Apply `best_description` to `../herdsman-workspace/candidate/SKILL.md` only if it obeys every Global Constraint; never accept an optimizer result that broadens the skill to pure Herdr control or adds a negative keyword list. If the full-set gate fails, continue description iteration and rerun this entire 20×3 check.
 
 - [ ] **Step 5: Run the Codex 10-case smoke test**
 
 Create the Codex project skill from the accepted candidate:
 
 ```bash
-mkdir -p /Users/ryo.nakae/Dev/private/shepherd-workspace/codex-smoke/.agents/skills/shepherd
-cp /Users/ryo.nakae/Dev/private/shepherd-workspace/candidate/SKILL.md \
-  /Users/ryo.nakae/Dev/private/shepherd-workspace/codex-smoke/.agents/skills/shepherd/SKILL.md
+mkdir -p /Users/ryo.nakae/Dev/private/herdsman-workspace/codex-smoke/.agents/skills/herdsman
+cp /Users/ryo.nakae/Dev/private/herdsman-workspace/candidate/SKILL.md \
+  /Users/ryo.nakae/Dev/private/herdsman-workspace/codex-smoke/.agents/skills/herdsman/SKILL.md
 ```
 
 Run these trigger IDs once each: positive `1, 2, 4, 7, 10`; negative `11, 12, 14, 17, 20`.
@@ -622,13 +622,13 @@ Run these trigger IDs once each: positive `1, 2, 4, 7, 10`; negative `11, 12, 14
 Copy the 10 approved entries into `codex-smoke/cases.json` as objects with `id`, `query`, and `should_trigger`, then run this external-workspace-only runner:
 
 ```bash
-mkdir -p /Users/ryo.nakae/Dev/private/shepherd-workspace/codex-smoke/results
+mkdir -p /Users/ryo.nakae/Dev/private/herdsman-workspace/codex-smoke/results
 uv run python - <<'PY'
 from pathlib import Path
 import json
 import subprocess
 
-root = Path("/Users/ryo.nakae/Dev/private/shepherd-workspace/codex-smoke")
+root = Path("/Users/ryo.nakae/Dev/private/herdsman-workspace/codex-smoke")
 cases = json.loads((root / "cases.json").read_text())
 results = []
 for case in cases:
@@ -652,9 +652,9 @@ for case in cases:
     output_path = root / "results" / f"{case['id']}.jsonl"
     output_path.write_text(completed.stdout)
     triggered = (
-        ".agents/skills/shepherd/SKILL.md" in completed.stdout
-        or ('"type":"skill"' in completed.stdout and '"name":"shepherd"' in completed.stdout)
-        or ('"type": "skill"' in completed.stdout and '"name": "shepherd"' in completed.stdout)
+        ".agents/skills/herdsman/SKILL.md" in completed.stdout
+        or ('"type":"skill"' in completed.stdout and '"name":"herdsman"' in completed.stdout)
+        or ('"type": "skill"' in completed.stdout and '"name": "herdsman"' in completed.stdout)
     )
     passed = completed.returncode == 0 and triggered == case["should_trigger"]
     results.append(
@@ -679,12 +679,12 @@ raise SystemExit(0 if summary["passed"] >= 9 else 1)
 PY
 ```
 
-Count a positive as triggered only when the JSONL records a skill invocation or read of `.agents/skills/shepherd/SKILL.md`; count a negative as passed only when neither occurs. Expected: the runner exits `0` with at least 9 of 10 matching classifications. If fewer than 9 pass, adjust the description, rerun the full Claude 20×3 gate, then rerun all 10 Codex cases.
+Count a positive as triggered only when the JSONL records a skill invocation or read of `.agents/skills/herdsman/SKILL.md`; count a negative as passed only when neither occurs. Expected: the runner exits `0` with at least 9 of 10 matching classifications. If fewer than 9 pass, adjust the description, rerun the full Claude 20×3 gate, then rerun all 10 Codex cases.
 
 - [ ] **Step 6: Apply the accepted candidate and validate**
 
 ```bash
-cp ../shepherd-workspace/candidate/SKILL.md SKILL.md
+cp ../herdsman-workspace/candidate/SKILL.md SKILL.md
 uv run --with pyyaml python \
   /Users/ryo.nakae/.agents/skills/skill-creator/scripts/quick_validate.py .
 git diff --check -- SKILL.md
@@ -696,7 +696,7 @@ Expected: validation succeeds, behavior eval is 4/4, Claude trigger eval is 20/2
 
 ```bash
 git add SKILL.md
-git commit -m "docs(skill): focus shepherd on agent history"
+git commit -m "docs(skill): focus herdsman on agent history"
 ```
 
 ### Task 4: Add Bilingual Agent Skill Installation Guidance
@@ -715,7 +715,7 @@ git commit -m "docs(skill): focus shepherd on agent history"
 
 Use `/readme-creator` and explicitly provide these constraints in its task prompt:
 
-- Classify Shepherd as a CLI from `package.json#bin`.
+- Classify Herdsman as a CLI from `package.json#bin`.
 - Preserve the current README structure and all existing sections.
 - Do not replace the opening cover/H1/selector cluster with the generic CLI template.
 - Do not add badges, a feature list, a table of contents, an Options section, or an API section.
@@ -727,13 +727,13 @@ Use this as the initial English section content:
 ````markdown
 ## Agent Skill
 
-Install the Shepherd CLI and start its daemon before adding the Agent Skill. Then install Shepherd guidance for supported coding agents:
+Install the Herdsman CLI and start its daemon before adding the Agent Skill. Then install Herdsman guidance for supported coding agents:
 
 ```bash
-npx skills add ryonakae/shepherd --skill shepherd -g
+npx skills add ryonakae/herdsman --skill herdsman -g
 ```
 
-The Shepherd skill reads structured agent status, compact history, and recent tool results. It works on its own for agent inspection.
+The Herdsman skill reads structured agent status, compact history, and recent tool results. It works on its own for agent inspection.
 
 Install the official Herdr skill when an agent also needs to control workspaces, tabs, panes, terminal input/output, or waits:
 
@@ -770,13 +770,13 @@ Use this as the initial Japanese meaning, allowing `/readme-i18n` to make natura
 ````markdown
 ## Agent Skill
 
-Agent Skillを追加する前にShepherd CLIをインストールし、daemonを起動してください。対応するcoding agentには次のコマンドでShepherdのガイダンスを追加できます。
+Agent Skillを追加する前にHerdsman CLIをインストールし、daemonを起動してください。対応するcoding agentには次のコマンドでHerdsmanのガイダンスを追加できます。
 
 ```bash
-npx skills add ryonakae/shepherd --skill shepherd -g
+npx skills add ryonakae/herdsman --skill herdsman -g
 ```
 
-Shepherd skillは、構造化されたagent status、compact history、直近のtool resultを読みます。agentを確認するだけなら単独で使えます。
+Herdsman skillは、構造化されたagent status、compact history、直近のtool resultを読みます。agentを確認するだけなら単独で使えます。
 
 workspace、tab、pane、terminal input/output、waitもagentから操作する場合は、公式Herdr skillを追加してください。
 
@@ -805,7 +805,7 @@ Run:
 rg -c '<!-- README-I18N:START -->' README.md README.ja.md
 rg -c '<!-- README-I18N:END -->' README.md README.ja.md
 rg -n '^## ' README.md README.ja.md
-rg -n 'npx skills add ryonakae/shepherd --skill shepherd -g|npx skills add ogulcancelik/herdr --skill herdr -g' README.md README.ja.md
+rg -n 'npx skills add ryonakae/herdsman --skill herdsman -g|npx skills add ogulcancelik/herdr --skill herdr -g' README.md README.ja.md
 ```
 
 Expected:
@@ -841,7 +841,7 @@ Spot-check links:
 
 ```bash
 for url in \
-  https://github.com/ryonakae/shepherd \
+  https://github.com/ryonakae/herdsman \
   https://github.com/ogulcancelik/herdr/blob/master/SKILL.md \
   https://herdr.dev/agent-guide.md; do
   curl -fsSL -o /dev/null "$url"
@@ -867,7 +867,7 @@ git commit -m "docs: explain agent skill setup"
 - Verify: `SKILL.md`
 - Verify: `README.md`
 - Verify: `README.ja.md`
-- Verify unchanged: `packages/shepherd-pi/skills/shepherd/SKILL.md`
+- Verify unchanged: `packages/herdsman-pi/skills/herdsman/SKILL.md`
 
 **Interfaces:**
 - Consumes: Tasks 1–4
@@ -899,7 +899,7 @@ uv run --with pyyaml python \
 
 git diff --check
 
-git diff --exit-code HEAD -- packages/shepherd-pi/skills/shepherd/SKILL.md
+git diff --exit-code HEAD -- packages/herdsman-pi/skills/herdsman/SKILL.md
 ```
 
 Expected: skill validation and diff check pass; the Pi skill has no diff.
@@ -907,13 +907,13 @@ Expected: skill validation and diff check pass; the Pi skill has no diff.
 - [ ] **Step 4: Audit the root npm dry-run**
 
 ```bash
-npm pack --dry-run --json > /tmp/shepherd-pack.json
+npm pack --dry-run --json > /tmp/herdsman-pack.json
 node --input-type=module <<'NODE'
 import fs from "node:fs";
-const [pack] = JSON.parse(fs.readFileSync("/tmp/shepherd-pack.json", "utf8"));
+const [pack] = JSON.parse(fs.readFileSync("/tmp/herdsman-pack.json", "utf8"));
 const forbidden = pack.files
   .map((file) => file.path)
-  .filter((path) => path.startsWith("evals/") || path.includes("shepherd-workspace") || path.includes("benchmark") || path.includes("feedback.json"));
+  .filter((path) => path.startsWith("evals/") || path.includes("herdsman-workspace") || path.includes("benchmark") || path.includes("feedback.json"));
 if (forbidden.length > 0) throw new Error(`eval artifacts in package: ${forbidden.join(", ")}`);
 console.log(`package files: ${pack.entryCount}; eval artifacts: 0`);
 NODE
@@ -948,8 +948,8 @@ Set `Status` to `Completed`, check every Progress item, replace Next Steps with 
 **Objective:** Follow the repository plan lifecycle after all code, skill, docs, and evaluation work has passed.
 
 **Files:**
-- Move: `docs/plans/2026-07-10-shepherd-root-skill-running-session.md`
-- To: `docs/plans/archived/2026-07-10-shepherd-root-skill-running-session.md`
+- Move: `docs/plans/2026-07-10-herdsman-root-skill-running-session.md`
+- To: `docs/plans/archived/2026-07-10-herdsman-root-skill-running-session.md`
 
 **Interfaces:**
 - Consumes: completed Task 5 evidence
@@ -971,10 +971,10 @@ Expected: implementation, skill, and README commits exist; no required change or
 ```bash
 mkdir -p docs/plans/archived
 mv \
-  docs/plans/2026-07-10-shepherd-root-skill-running-session.md \
-  docs/plans/archived/2026-07-10-shepherd-root-skill-running-session.md
+  docs/plans/2026-07-10-herdsman-root-skill-running-session.md \
+  docs/plans/archived/2026-07-10-herdsman-root-skill-running-session.md
 git add -A docs/plans
-git commit -m "docs(plans): archive shepherd root skill plan"
+git commit -m "docs(plans): archive herdsman root skill plan"
 ```
 
 Expected: `docs/plans/` has no active copy of this plan and the archive commit changes documentation only.
@@ -991,12 +991,12 @@ Expected: `docs/plans/` has no active copy of this plan and the archive commit c
 - Codex trigger proof: at least 9 of 10 smoke cases match labels.
 - README proof: required skills were invoked, selectors remain singular, code fences match, install links resolve, English and Japanese anti-slop scores are at least 35/50, and the Japanese translationese judge has no unresolved high-confidence flags.
 - Packaging proof: root npm dry-run contains no eval artifacts.
-- Scope proof: `packages/shepherd-pi/skills/shepherd/SKILL.md` remains unchanged.
+- Scope proof: `packages/herdsman-pi/skills/herdsman/SKILL.md` remains unchanged.
 
 ## Risks, Tradeoffs, and Open Questions
 
 - Filtering by `sessions.running = 1` retains identity rows as agreed, but a same-name session restart can expose retained rows briefly after `upsertRunning()` and before the first replacement snapshot completes. This plan records that tradeoff and does not introduce an epoch/freshness model.
-- Cross-skill invocation is not standardized by the Agent Skills specification. The Shepherd skill can direct the agent to the installed `herdr` skill, while reliable mixed-task behavior still depends on the harness exposing both skills. The behavior eval verifies the required missing-skill fallback.
+- Cross-skill invocation is not standardized by the Agent Skills specification. The Herdsman skill can direct the agent to the installed `herdr` skill, while reliable mixed-task behavior still depends on the harness exposing both skills. The behavior eval verifies the required missing-skill fallback.
 - The skill-creator trigger optimizer is Claude-specific. Codex receives the agreed 10-case smoke test rather than a 20×3 optimization loop.
 - `run_loop.py` may propose a description that improves its score by overfitting or broadening scope. Apply it only after checking the Global Constraints and held-out results.
 - The README Creator checklist recommends a table of contents above 100 lines, but the user explicitly requires preserving the current structure. Record that one exception instead of changing navigation in this task.
@@ -1006,8 +1006,8 @@ Expected: `docs/plans/` has no active copy of this plan and the archive commit c
 ## Progress
 
 - [x] Task 1: Enforced the running-session agent contract. The new RPC test failed before the join and passed with 29 files / 131 tests after the fix. Retained rows can be briefly queryable after a session is marked running and before its first replacement snapshot completes; generation/epoch freshness remains outside this scope.
-- [x] Task 2: Rewrote and statically validated the root Shepherd skill. The committed 57-line skill was saved as the external baseline; the 80-line candidate passes `quick_validate.py` and contains no duplicated Herdr control recipes.
-- [x] Task 3: Completed skill-creator behavior, Claude trigger, Codex smoke, and viewer review gates. Candidate behavior passed 4/4 with a 100% mean assertion rate versus 62.5% for the committed baseline. Claude passed 20/20 with three runs per query. `run_loop.py` could not create its multiprocessing semaphore under agent-safehouse (`Operation not permitted`), so the same skill-creator `run_single_query` evaluator ran sequentially without bypassing the sandbox. Codex CLI 0.144.1 passed 10/10 after its explicit `Shepherd スキルを使います` JSONL selection was counted as the invocation; safehouse blocked the subsequent file-read tool before a path event was emitted.
+- [x] Task 2: Rewrote and statically validated the root Herdsman skill. The committed 57-line skill was saved as the external baseline; the 80-line candidate passes `quick_validate.py` and contains no duplicated Herdr control recipes.
+- [x] Task 3: Completed skill-creator behavior, Claude trigger, Codex smoke, and viewer review gates. Candidate behavior passed 4/4 with a 100% mean assertion rate versus 62.5% for the committed baseline. Claude passed 20/20 with three runs per query. `run_loop.py` could not create its multiprocessing semaphore under agent-safehouse (`Operation not permitted`), so the same skill-creator `run_single_query` evaluator ran sequentially without bypassing the sandbox. Codex CLI 0.144.1 passed 10/10 after its explicit `Herdsman スキルを使います` JSONL selection was counted as the invocation; safehouse blocked the subsequent file-read tool before a path event was emitted.
 - [x] Task 4: Updated English and Japanese README files through `/readme-creator`, `/stop-slop`, `/readme-i18n`, and `/stop-slop-ja`. The README checklist passed 21/21 applicable checks; the preserved opening selector cluster, prohibited table of contents, and prohibited Options section were recorded as explicit exceptions. English scored 48/50 and Japanese 47/50. The bundled translationese script lacked every supported provider API key, so the same S1-S4 rubric ran through authenticated Claude CLI judge/critic passes and returned `pass` with zero high-confidence flags. Selector counts, eight paired code fences, heading order, commands, and three external links all passed.
 - [x] Task 5: Passed full validation and package audit. Focused tests and `pnpm check` passed 29 files / 131 tests; `pnpm build`, skill validation, diff checks, and Pi-skill byte comparison passed. Root package dry-run contained 395 files and zero eval artifacts. Final gates were behavior 4/4 (100% candidate vs 62.5% baseline), Claude 20/20, Codex 10/10, README checklist 21/21, English 48/50, and Japanese 47/50.
 - [x] Task 6: Archived this completed plan in a docs-only commit; no active dependency or feedback remains.

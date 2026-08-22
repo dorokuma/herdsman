@@ -6,19 +6,19 @@
 
 **Completion notes:** Implemented Codex JSONL, OpenCode SQLite, and Gemini CLI JSON discovery and readers behind the existing AgentHistoryService API. Added unit and RPC integration coverage, updated README source support notes, committed and pushed implementation slices, and verified with `pnpm check` and `pnpm build`.
 
-**Goal:** Extend Shepherd agent history so `shepherd agent list/get/read` can discover and parse Codex, OpenCode, and Gemini CLI sessions in addition to Pi and Claude Code.
+**Goal:** Extend Herdsman agent history so `herdsman agent list/get/read` can discover and parse Codex, OpenCode, and Gemini CLI sessions in addition to Pi and Claude Code.
 
 **Architecture:** Keep the existing `src/agent-history/` layer as the only runtime-specific history reader boundary. Extend discovery to resolve runtime-specific `AgentHistoryRef` records, add one reader per new runtime, and register those readers in `createAgentHistoryService()`. The daemon, RPC, CLI, Pi extension, and Herdr plugin should continue to use the existing `AgentHistoryService` API without runtime-specific branching.
 
-**Tech Stack:** TypeScript ESM with `NodeNext`, Node.js `node:fs/promises`, Node.js `node:sqlite` for OpenCode read-only DB access, Vitest, Biome, existing Shepherd JSON Lines RPC.
+**Tech Stack:** TypeScript ESM with `NodeNext`, Node.js `node:fs/promises`, Node.js `node:sqlite` for OpenCode read-only DB access, Vitest, Biome, existing Herdsman JSON Lines RPC.
 
 ## Global Constraints
 
-- Do not add npm dependencies. Shepherd already uses `node:sqlite`; OpenCode DB access must use `DatabaseSync` from `node:sqlite`.
+- Do not add npm dependencies. Herdsman already uses `node:sqlite`; OpenCode DB access must use `DatabaseSync` from `node:sqlite`.
 - Preserve existing `AgentHistoryService` public methods: `discover()`, `getCompactHistory()`, and `read()`.
-- Preserve CLI/RPC command names and payload shape: `shepherd agent list/get/read` and daemon methods `agent.list`, `agent.get`, `agent.read`.
+- Preserve CLI/RPC command names and payload shape: `herdsman agent list/get/read` and daemon methods `agent.list`, `agent.get`, `agent.read`.
 - Do not return full raw tool output in compact history. Route tool outputs through `compactToolResult()`.
-- Keep source-of-truth reads from original runtime data files/DB, not Shepherd DB cache.
+- Keep source-of-truth reads from original runtime data files/DB, not Herdsman DB cache.
 - Keep discovery bounded:
   - Codex fallback scans `${homeDir}/.codex/sessions` for `*.jsonl`, prefers CWD match, then latest mtime.
   - OpenCode fallback reads one SQLite DB path: `OPENCODE_DB` when set, otherwise `${homeDir}/.local/share/opencode/opencode.db`.
@@ -113,7 +113,7 @@ export type AgentHistoryReader = {
 
 ### Task 1: Extend history source contracts, discovery, and cache keys
 
-**Objective:** Make Shepherd able to resolve Codex, OpenCode, and Gemini history references without reading messages yet, and prevent OpenCode cache collisions.
+**Objective:** Make Herdsman able to resolve Codex, OpenCode, and Gemini history references without reading messages yet, and prevent OpenCode cache collisions.
 
 **Files:**
 - Modify: `src/observability/contracts.ts`
@@ -158,7 +158,7 @@ describe("agent history discovery", () => {
   });
 
   test("discovers Codex JSONL by session_meta cwd", async () => {
-    const homeDir = await tempHome("shepherd-codex-home-");
+    const homeDir = await tempHome("herdsman-codex-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const older = join(dir, "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl");
@@ -175,7 +175,7 @@ describe("agent history discovery", () => {
   });
 
   test("discovers OpenCode DB session by cwd", async () => {
-    const homeDir = await tempHome("shepherd-opencode-home-");
+    const homeDir = await tempHome("herdsman-opencode-home-");
     const dbPath = join(homeDir, ".local", "share", "opencode", "opencode.db");
     await mkdir(join(homeDir, ".local", "share", "opencode"), { recursive: true });
     const sqlite = new DatabaseSync(dbPath);
@@ -193,7 +193,7 @@ describe("agent history discovery", () => {
   });
 
   test("discovers Gemini session JSON through .project_root", async () => {
-    const homeDir = await tempHome("shepherd-gemini-home-");
+    const homeDir = await tempHome("herdsman-gemini-home-");
     const projectDir = join(homeDir, ".gemini", "tmp", "repo-project");
     const chatsDir = join(projectDir, "chats");
     await mkdir(chatsDir, { recursive: true });
@@ -468,7 +468,7 @@ async function tempHome(name: string) {
 
 describe("CodexHistoryReader", () => {
   test("reads user, assistant, and tool output messages", async () => {
-    const homeDir = await tempHome("shepherd-codex-reader-");
+    const homeDir = await tempHome("herdsman-codex-reader-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(dir, "rollout-2026-07-09T12-00-00-cccccccc-cccc-4ccc-8ccc-cccccccccccc.jsonl");
@@ -493,7 +493,7 @@ describe("CodexHistoryReader", () => {
   });
 
   test("is registered in the default agent history service", async () => {
-    const homeDir = await tempHome("shepherd-codex-service-");
+    const homeDir = await tempHome("herdsman-codex-service-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(dir, "rollout-2026-07-09T13-00-00-dddddddd-dddd-4ddd-8ddd-dddddddddddd.jsonl");
@@ -695,7 +695,7 @@ import { OpenCodeHistoryReader } from "@/agent-history/opencode-reader.js";
 
 describe("OpenCodeHistoryReader", () => {
   test("reads text and tool parts from an OpenCode SQLite session", async () => {
-    const homeDir = await tempHome("shepherd-opencode-reader-");
+    const homeDir = await tempHome("herdsman-opencode-reader-");
     const dbPath = join(homeDir, "opencode.db");
     const sqlite = new DatabaseSync(dbPath);
     sqlite.exec(`
@@ -721,7 +721,7 @@ describe("OpenCodeHistoryReader", () => {
   });
 
   test("returns empty history when the OpenCode DB schema is unreadable", async () => {
-    const homeDir = await tempHome("shepherd-opencode-bad-db-");
+    const homeDir = await tempHome("herdsman-opencode-bad-db-");
     const dbPath = join(homeDir, "opencode.db");
     const sqlite = new DatabaseSync(dbPath);
     sqlite.exec("create table unrelated (id text primary key)");
@@ -897,7 +897,7 @@ import { GeminiHistoryReader } from "@/agent-history/gemini-reader.js";
 
 describe("GeminiHistoryReader", () => {
   test("reads user and gemini assistant messages from object-shaped session JSON", async () => {
-    const homeDir = await tempHome("shepherd-gemini-reader-");
+    const homeDir = await tempHome("herdsman-gemini-reader-");
     const projectDir = join(homeDir, ".gemini", "tmp", "repo-project");
     const chatsDir = join(projectDir, "chats");
     await mkdir(chatsDir, { recursive: true });
@@ -923,7 +923,7 @@ describe("GeminiHistoryReader", () => {
   });
 
   test("reads tool result messages when Gemini session records tool output", async () => {
-    const homeDir = await tempHome("shepherd-gemini-tool-");
+    const homeDir = await tempHome("herdsman-gemini-tool-");
     const sessionPath = join(homeDir, "session.json");
     await writeFile(
       sessionPath,
@@ -941,7 +941,7 @@ describe("GeminiHistoryReader", () => {
   });
 
   test("returns empty history when Gemini session JSON is malformed", async () => {
-    const homeDir = await tempHome("shepherd-gemini-bad-json-");
+    const homeDir = await tempHome("herdsman-gemini-bad-json-");
     const sessionPath = join(homeDir, "session.json");
     await writeFile(sessionPath, "{not-json");
 
@@ -1108,7 +1108,7 @@ First update the test helper so the caller can access that temp home directory:
 
 ```ts
 async function openServerWithoutClient() {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-agent-rpc-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-agent-rpc-"));
   tempDirs.push(dir);
   const socketPath = join(dir, "rpc.sock");
   if (existsSync(socketPath)) unlinkSync(socketPath);
@@ -1184,13 +1184,13 @@ Expected: passes if Tasks 1-4 are complete. If it fails, fix the reader/discover
 Update `README.md` near the feature list with one concise sentence:
 
 ```md
-Shepherd currently reads compact history from Pi, Claude Code, Codex, OpenCode, and Gemini CLI sessions when Herdr identifies those agents or their history can be discovered from the workspace directory.
+Herdsman currently reads compact history from Pi, Claude Code, Codex, OpenCode, and Gemini CLI sessions when Herdr identifies those agents or their history can be discovered from the workspace directory.
 ```
 
 Update `README.ja.md` with the matching Japanese sentence:
 
 ```md
-Shepherd は現在、Herdr が agent を識別できる場合、または workspace directory から履歴を発見できる場合に、Pi、Claude Code、Codex、OpenCode、Gemini CLI の短い履歴を読み取れます。
+Herdsman は現在、Herdr が agent を識別できる場合、または workspace directory から履歴を発見できる場合に、Pi、Claude Code、Codex、OpenCode、Gemini CLI の短い履歴を読み取れます。
 ```
 
 Do not update package READMEs unless their current wording claims a narrower supported runtime list. The current package READMEs describe the Pi extension/plugin behavior and do not need runtime-source lists.
@@ -1293,11 +1293,11 @@ Expected:
 Manual smoke check after build, when a real Herdr workspace has these agents:
 
 ```bash
-shepherd daemon start
-shepherd agent list --all --json
-shepherd agent read codex --limit 10 --json
-shepherd agent read opencode --limit 10 --json
-shepherd agent read gemini --limit 10 --json
+herdsman daemon start
+herdsman agent list --all --json
+herdsman agent read codex --limit 10 --json
+herdsman agent read opencode --limit 10 --json
+herdsman agent read gemini --limit 10 --json
 ```
 
 Expected:
@@ -1313,4 +1313,4 @@ Expected:
 - **Gemini JSON shape drift:** Current observed shape is object with `messages`. The reader also accepts an array root. Unsupported message types are ignored.
 - **Codex duplicate assistant text:** Codex can record both `event_msg.agent_message` and `response_item.message` for assistant text. The initial reader keeps both normalized messages if both exist. If real output is too noisy, add a follow-up dedupe rule keyed by same text + close timestamp; do not add it in the first implementation without a failing test.
 - **Discovery ambiguity:** For multiple sessions with the same CWD, discovery picks latest mtime/time_updated. This matches current Pi/Claude fallback style and ZAM behavior. Herdr `agent_session` should be preferred when available.
-- **Task names are out of scope:** ZAM uses Codex `session_index.jsonl` and Gemini title/session detail to display task names. Shepherd history currently exposes messages, not task names. This plan does not add task fields to contracts.
+- **Task names are out of scope:** ZAM uses Codex `session_index.jsonl` and Gemini title/session detail to display task names. Herdsman history currently exposes messages, not task names. This plan does not add task fields to contracts.

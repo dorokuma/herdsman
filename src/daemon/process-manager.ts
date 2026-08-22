@@ -99,7 +99,7 @@ export async function prepareDaemonSocketPath(input: {
 
   const connectSocket = input.deps?.connectSocket ?? defaultConnectSocket;
   if (await connectSocket(input.socketPath)) {
-    throw new Error(`Shepherd daemon socket is already reachable: ${input.socketPath}`);
+    throw new Error(`Herdsman daemon socket is already reachable: ${input.socketPath}`);
   }
 
   rmSync(input.socketPath, { force: true });
@@ -170,11 +170,11 @@ export async function startDaemonProcess(input: {
     socketPath: input.socketPath,
   });
   if (status.state === "running") {
-    throw new Error(`Shepherd daemon is already running with pid ${status.pid}`);
+    throw new Error(`Herdsman daemon is already running with pid ${status.pid}`);
   }
   if (status.state === "orphaned") {
     throw new Error(
-      `Shepherd daemon socket is reachable but its PID is stale: ${status.socketPath}`,
+      `Herdsman daemon socket is reachable but its PID is stale: ${status.socketPath}`,
     );
   }
 
@@ -201,7 +201,7 @@ export async function startDaemonProcess(input: {
   }
 
   if (!child.pid) {
-    throw new Error("Failed to start Shepherd daemon: child pid was not assigned");
+    throw new Error("Failed to start Herdsman daemon: child pid was not assigned");
   }
 
   child.unref();
@@ -233,7 +233,7 @@ export async function stopDaemonProcess(input: {
   }
   if (status.state === "orphaned") {
     throw new Error(
-      `Shepherd daemon socket is reachable but its PID is stale: ${status.socketPath}`,
+      `Herdsman daemon socket is reachable but its PID is stale: ${status.socketPath}`,
     );
   }
 
@@ -251,7 +251,7 @@ export async function stopDaemonProcess(input: {
     await waitMs(50);
   }
 
-  throw new Error(`Timed out waiting for Shepherd daemon pid ${status.pid} to stop`);
+  throw new Error(`Timed out waiting for Herdsman daemon pid ${status.pid} to stop`);
 }
 
 function spawnDaemonProcess(

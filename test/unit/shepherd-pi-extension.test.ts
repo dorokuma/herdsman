@@ -3,9 +3,9 @@ import type {
   AgentEventWireRecord,
   AgentWorkspaceContextSnapshot,
   DaemonStreamMessage,
-} from "../../packages/shepherd-pi/src/daemon-client.js";
+} from "../../packages/herdsman-pi/src/daemon-client.js";
 
-const extensionModuleUrl = new URL("../../packages/shepherd-pi/src/index.ts", import.meta.url).href;
+const extensionModuleUrl = new URL("../../packages/herdsman-pi/src/index.ts", import.meta.url).href;
 
 type Handler = (...args: unknown[]) => unknown;
 type Command = {
@@ -15,7 +15,7 @@ type Command = {
 };
 
 type Module = {
-  createShepherdPiExtension: (options?: {
+  createHerdsmanPiExtension: (options?: {
     clientFactory?: () => FakeClient;
   }) => (pi: FakePi) => void;
   defaultSocketPath: () => string;
@@ -28,13 +28,13 @@ type Module = {
 type FakeClient = ReturnType<typeof createFakeClient>;
 type FakePi = ReturnType<typeof createFakePi>;
 
-describe("shepherd-pi orchestrator bridge", () => {
-  test("defaults to the Shepherd daemon socket", async () => {
+describe("herdsman-pi orchestrator bridge", () => {
+  test("defaults to the Herdsman daemon socket", async () => {
     const { defaultSocketPath } = (await import(extensionModuleUrl)) as Module;
     const previousHome = process.env.SHEPHERD_HOME;
-    process.env.SHEPHERD_HOME = "/tmp/shepherd-home";
+    process.env.SHEPHERD_HOME = "/tmp/herdsman-home";
     try {
-      expect(defaultSocketPath()).toBe("/tmp/shepherd-home/shepherd.sock");
+      expect(defaultSocketPath()).toBe("/tmp/herdsman-home/herdsman.sock");
     } finally {
       process.env.SHEPHERD_HOME = previousHome;
     }
@@ -82,8 +82,8 @@ describe("shepherd-pi orchestrator bridge", () => {
   test("does not connect outside a complete Herdr environment", async () => {
     const pi = createFakePi();
     let clients = 0;
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({
       clientFactory: () => {
         clients += 1;
         return createFakeClient();
@@ -104,9 +104,9 @@ describe("shepherd-pi orchestrator bridge", () => {
     try {
       await pi.emit("session_start", {}, ctx);
       expect(clients).toBe(0);
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
       await pi.command("", ctx);
-      expect(ctx.notifications.at(-1)).toEqual(["Shepherd requires a Herdr workspace", "error"]);
+      expect(ctx.notifications.at(-1)).toEqual(["Herdsman requires a Herdr workspace", "error"]);
     } finally {
       restoreEnv(previous);
     }
@@ -131,8 +131,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv({ paneId: "wB:p1", workspaceId: "wB" });
     try {
       await pi.emit("session_start", {}, ctx);
@@ -153,7 +153,7 @@ describe("shepherd-pi orchestrator bridge", () => {
           workspaceId: "wB",
         },
       ]);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
 
       const callsBeforeTurnEvents = [...client.calls];
       await pi.emit("tool_execution_start", {
@@ -198,8 +198,8 @@ describe("shepherd-pi orchestrator bridge", () => {
       method === "agent.orchestrator.register" ? connectionResponse({ context: first }) : {};
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -210,17 +210,17 @@ describe("shepherd-pi orchestrator bridge", () => {
       const messages = await pi.emitContext(
         [
           { content: "[SHEPHERD AGENT CONTEXT]\nstale", role: "user" },
-          { content: "wake", customType: "shepherd-wake-context", role: "custom" },
+          { content: "wake", customType: "herdsman-wake-context", role: "custom" },
           { content: "keep", customType: "other", role: "custom" },
         ],
         ctx,
       );
       expect(messages).toEqual([
-        { content: "wake", customType: "shepherd-wake-context", role: "custom" },
+        { content: "wake", customType: "herdsman-wake-context", role: "custom" },
         { content: "keep", customType: "other", role: "custom" },
         expect.objectContaining({
           content: expect.stringContaining("first"),
-          customType: "shepherd-agent-context",
+          customType: "herdsman-agent-context",
           display: false,
           role: "custom",
           timestamp: expect.any(Number),
@@ -268,8 +268,8 @@ describe("shepherd-pi orchestrator bridge", () => {
         : {};
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -310,8 +310,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -359,9 +359,9 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
-    const { createShepherdPiExtension, formatHiddenAgentContext, formatHiddenAgentUpdates } =
+    const { createHerdsmanPiExtension, formatHiddenAgentContext, formatHiddenAgentUpdates } =
       (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -370,7 +370,7 @@ describe("shepherd-pi orchestrator bridge", () => {
       client.emitStream({ method: "agent.event", params: { event: event(44, "term_pi") } });
       client.emitStream({ method: "agent.event", params: { event: event(45, null) } });
 
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 3 agent updates");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 3 agent updates");
       expect(ctx.widgets.size).toBe(0);
       expect(formatHiddenAgentContext({ agents: [], workspaceId: "wB" })).toContain(
         "[SHEPHERD AGENT CONTEXT]",
@@ -383,7 +383,7 @@ describe("shepherd-pi orchestrator bridge", () => {
       await pi.emit("agent_start", {}, ctx);
       expect(await pi.emitContext([], ctx)).toEqual([]);
       expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 3 agent updates");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 3 agent updates");
 
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
@@ -394,7 +394,7 @@ describe("shepherd-pi orchestrator bridge", () => {
         ["agent.notifications.ack", { eventId: 42 }],
         ["agent.notifications.ack", { eventId: 43 }],
       ]);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
       expect(ctx.widgets.size).toBe(0);
     } finally {
       vi.clearAllTimers();
@@ -421,8 +421,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -434,9 +434,9 @@ describe("shepherd-pi orchestrator bridge", () => {
       await pi.emit("agent_settled", {}, ctx);
 
       expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 1 agent update");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
       expect(ctx.notifications.at(-1)).toEqual([
-        "Shepherd couldn’t acknowledge agent updates · updates remain pending",
+        "Herdsman couldn’t acknowledge agent updates · updates remain pending",
         "warning",
       ]);
     } finally {
@@ -462,8 +462,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -477,7 +477,7 @@ describe("shepherd-pi orchestrator bridge", () => {
         ["agent.notifications.ack", { eventId: 61 }],
         ["agent.notifications.ack", { eventId: 62 }],
       ]);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 1 agent update");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
       expect(ctx.widgets.size).toBe(0);
     } finally {
       vi.clearAllTimers();
@@ -506,8 +506,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -521,11 +521,11 @@ describe("shepherd-pi orchestrator bridge", () => {
       const settling = pi.emit("agent_settled", {}, ctx);
       for (let index = 0; index < 10; index += 1) await Promise.resolve();
 
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 1 agent update");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
 
       releaseSecondAck?.();
       await settling;
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -547,8 +547,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -561,7 +561,7 @@ describe("shepherd-pi orchestrator bridge", () => {
       expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
         ["agent.notifications.ack", { eventId: 63 }],
       ]);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 2 agent updates");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 2 agent updates");
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -581,8 +581,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -616,8 +616,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -652,53 +652,53 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
       await pi.command("on", ctx);
       expect(ctx.notifications.at(-1)).toEqual([
-        "Shepherd is reconnecting · try again shortly",
+        "Herdsman is reconnecting · try again shortly",
         "warning",
       ]);
       await client.connect();
 
-      expect(pi.commands.get("shepherd")?.description).toBe(
-        "Watch Shepherd agent updates in this Pi",
+      expect(pi.commands.get("herdsman")?.description).toBe(
+        "Watch Herdsman agent updates in this Pi",
       );
-      expect(pi.commands.get("shepherd")?.getArgumentCompletions?.("")).toEqual([
+      expect(pi.commands.get("herdsman")?.getArgumentCompletions?.("")).toEqual([
         { label: "on", value: "on" },
         { label: "off", value: "off" },
         { label: "status", value: "status" },
       ]);
 
       await pi.command("", ctx);
-      expect(ctx.notifications.at(-1)).toEqual(["Shepherd is off", "info"]);
+      expect(ctx.notifications.at(-1)).toEqual(["Herdsman is off", "info"]);
       await pi.command("status", ctx);
-      expect(ctx.notifications.at(-1)).toEqual(["Shepherd is off", "info"]);
+      expect(ctx.notifications.at(-1)).toEqual(["Herdsman is off", "info"]);
 
       await pi.command("  on  ", ctx);
       expect(client.calls).toContainEqual(["agent.orchestrator.set", { enabled: true }]);
       expect(ctx.notifications.at(-1)).toEqual([
-        "Shepherd is watching agent updates · default/wB · wB:p1",
+        "Herdsman is watching agent updates · default/wB · wB:p1",
         "info",
       ]);
       await pi.command("status", ctx);
       expect(ctx.notifications.at(-1)).toEqual([
-        "Shepherd is watching agent updates · default/wB · wB:p1",
+        "Herdsman is watching agent updates · default/wB · wB:p1",
         "info",
       ]);
 
       await pi.command("off", ctx);
-      expect(ctx.notifications.at(-1)).toEqual(["Shepherd is off", "info"]);
+      expect(ctx.notifications.at(-1)).toEqual(["Herdsman is off", "info"]);
 
       current = connectionResponse({ ownerTerminalId: "term_other" });
       await pi.command("status", ctx);
-      expect(ctx.notifications.at(-1)).toEqual(["Shepherd is off", "info"]);
+      expect(ctx.notifications.at(-1)).toEqual(["Herdsman is off", "info"]);
       await pi.command("off", ctx);
       expect(current.state.owner?.terminalId).toBe("term_other");
-      expect(ctx.notifications.at(-1)).toEqual(["Shepherd is off", "info"]);
+      expect(ctx.notifications.at(-1)).toEqual(["Herdsman is off", "info"]);
 
       await pi.command("orchestrator on", ctx);
       expect(ctx.notifications.at(-1)).toEqual([USAGE, "warning"]);
@@ -729,8 +729,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -739,8 +739,8 @@ describe("shepherd-pi orchestrator bridge", () => {
         method: "agent.orchestrator.changed",
         params: { change: roleChange("term_pi", "term_other", "wB:p-other") },
       });
-      expect(ctx.notifications.at(-1)).toEqual(["Shepherd is off · moved to wB:p-other", "info"]);
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      expect(ctx.notifications.at(-1)).toEqual(["Herdsman is off · moved to wB:p-other", "info"]);
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
 
       current = connectionResponse();
       client.emitStream({
@@ -750,10 +750,10 @@ describe("shepherd-pi orchestrator bridge", () => {
       await tick();
       ctx.notifications.length = 0;
       await pi.command("off", ctx);
-      expect(ctx.notifications).toEqual([["Shepherd is off", "info"]]);
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
-      expect(ctx.statuses.has("shepherd-connection")).toBe(false);
-      expect(ctx.statuses.has("shepherd-orchestrator")).toBe(false);
+      expect(ctx.notifications).toEqual([["Herdsman is off", "info"]]);
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
+      expect(ctx.statuses.has("herdsman-connection")).toBe(false);
+      expect(ctx.statuses.has("herdsman-orchestrator")).toBe(false);
     } finally {
       restoreEnv(previous);
     }
@@ -766,15 +766,15 @@ describe("shepherd-pi orchestrator bridge", () => {
     };
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await expect(pi.emit("session_start", {}, ctx)).resolves.toBeUndefined();
       await expect(client.connect()).resolves.toBeUndefined();
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
-      expect(ctx.statuses.has("shepherd-connection")).toBe(false);
-      expect(ctx.statuses.has("shepherd-orchestrator")).toBe(false);
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
+      expect(ctx.statuses.has("herdsman-connection")).toBe(false);
+      expect(ctx.statuses.has("herdsman-orchestrator")).toBe(false);
     } finally {
       restoreEnv(previous);
     }
@@ -787,15 +787,15 @@ describe("shepherd-pi orchestrator bridge", () => {
     const previous = withHerdrEnv();
     try {
       await startExtension(client, pi, ctx);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
 
       client.disconnect();
-      expect(ctx.statuses.get("shepherd")).toBe("◇ Shepherd · reconnecting");
-      expect(ctx.statuses.has("shepherd-connection")).toBe(false);
-      expect(ctx.statuses.has("shepherd-orchestrator")).toBe(false);
+      expect(ctx.statuses.get("herdsman")).toBe("◇ Herdsman · reconnecting");
+      expect(ctx.statuses.has("herdsman-connection")).toBe(false);
+      expect(ctx.statuses.has("herdsman-orchestrator")).toBe(false);
 
       await client.connect();
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
       expect(ctx.notifications).toEqual([]);
     } finally {
       restoreEnv(previous);
@@ -820,11 +820,11 @@ describe("shepherd-pi orchestrator bridge", () => {
     try {
       await startExtension(client, pi, ctx);
       client.disconnect();
-      expect(ctx.statuses.get("shepherd")).toBe("◇ Shepherd · reconnecting");
+      expect(ctx.statuses.get("herdsman")).toBe("◇ Herdsman · reconnecting");
 
       await client.connect();
 
-      expect(ctx.statuses.get("shepherd")).toBe("◇ Shepherd · reconnecting");
+      expect(ctx.statuses.get("herdsman")).toBe("◇ Herdsman · reconnecting");
       expect(ctx.notifications).toEqual([]);
     } finally {
       restoreEnv(previous);
@@ -842,18 +842,18 @@ describe("shepherd-pi orchestrator bridge", () => {
     const previous = withHerdrEnv();
     try {
       await startExtension(client, pi, ctx);
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
 
       client.disconnect();
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
     } finally {
       restoreEnv(previous);
     }
   });
 
   test.each([
-    ["term_other", "Shepherd is off · moved to wB:p-other"],
-    [null, "Shepherd is off"],
+    ["term_other", "Herdsman is off · moved to wB:p-other"],
+    [null, "Herdsman is off"],
   ])("reports ownership loss discovered on reconnect to %s", async (ownerTerminalId, message) => {
     let current = connectionResponse();
     const client = createFakeClient();
@@ -867,12 +867,12 @@ describe("shepherd-pi orchestrator bridge", () => {
     try {
       await startExtension(client, pi, ctx);
       client.disconnect();
-      expect(ctx.statuses.get("shepherd")).toBe("◇ Shepherd · reconnecting");
+      expect(ctx.statuses.get("herdsman")).toBe("◇ Herdsman · reconnecting");
 
       current = connectionResponse({ ownerTerminalId });
       await client.connect();
 
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
       expect(ctx.notifications.at(-1)).toEqual([message, "info"]);
     } finally {
       restoreEnv(previous);
@@ -891,8 +891,8 @@ describe("shepherd-pi orchestrator bridge", () => {
         : connectionResponse();
     const pi = createFakePi();
     const ctx = fakeCtx();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => client })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, ctx);
@@ -912,7 +912,7 @@ describe("shepherd-pi orchestrator bridge", () => {
       await tick();
 
       expect(client.calls).toContainEqual(["agent.orchestrator.get", {}]);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 1 agent update");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
     } finally {
       restoreEnv(previous);
     }
@@ -930,7 +930,7 @@ describe("shepherd-pi orchestrator bridge", () => {
     const previous = withHerdrEnv();
     try {
       await startExtension(client, pi, ctx);
-      expect(pi.messageRenderers.has("shepherd-wake")).toBe(true);
+      expect(pi.messageRenderers.has("herdsman-wake")).toBe(true);
       client.emitStream({
         method: "agent.event",
         params: {
@@ -944,8 +944,8 @@ describe("shepherd-pi orchestrator bridge", () => {
       expect(pi.customMessages).toEqual([
         [
           {
-            content: "Shepherd received 1 agent update.",
-            customType: "shepherd-wake",
+            content: "Herdsman received 1 agent update.",
+            customType: "herdsman-wake",
             details: {
               eventIds: [43],
               outcomes: [
@@ -970,7 +970,7 @@ describe("shepherd-pi orchestrator bridge", () => {
         [
           {
             content: expect.stringContaining("reviewer · Claude"),
-            customType: "shepherd-wake-context",
+            customType: "herdsman-wake-context",
             details: { eventIds: [43] },
             display: false,
           },
@@ -1029,8 +1029,8 @@ describe("shepherd-pi orchestrator bridge", () => {
       expect(pi.customMessages).toMatchObject([
         [
           {
-            content: "Shepherd received 2 agent updates.",
-            customType: "shepherd-wake",
+            content: "Herdsman received 2 agent updates.",
+            customType: "herdsman-wake",
             details: { eventIds: [51, 52], outcomes: [{ eventId: 51 }, { eventId: 52 }] },
             display: true,
           },
@@ -1061,9 +1061,9 @@ describe("shepherd-pi orchestrator bridge", () => {
       await vi.advanceTimersByTimeAsync(500);
 
       expect(pi.customMessages).toEqual([]);
-      expect(ctx.statuses.get("shepherd")).toBe("◆ Shepherd · 1 agent update");
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
       expect(ctx.notifications.at(-1)).toEqual([
-        "Shepherd couldn’t load agent updates · updates remain pending",
+        "Herdsman couldn’t load agent updates · updates remain pending",
         "warning",
       ]);
     } finally {
@@ -1149,7 +1149,7 @@ describe("shepherd-pi orchestrator bridge", () => {
     }
   });
 
-  test("retries acknowledgement failure on the next Shepherd round", async () => {
+  test("retries acknowledgement failure on the next Herdsman round", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const baseResponse = client.response;
@@ -1307,8 +1307,8 @@ describe("shepherd-pi orchestrator bridge", () => {
 
       await pi.emit("agent_start", {}, ctx);
       expect(
-        await pi.emitContext([{ customType: "shepherd-wake-context", role: "custom" }], ctx),
-      ).toEqual([{ customType: "shepherd-wake-context", role: "custom" }]);
+        await pi.emitContext([{ customType: "herdsman-wake-context", role: "custom" }], ctx),
+      ).toEqual([{ customType: "herdsman-wake-context", role: "custom" }]);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       expect(client.calls).toContainEqual(["agent.notifications.ack", { eventId: 101 }]);
@@ -1439,7 +1439,7 @@ describe("shepherd-pi orchestrator bridge", () => {
     }
   });
 
-  test("invalidates and aborts a delivered Shepherd batch on same-terminal workspace move", async () => {
+  test("invalidates and aborts a delivered Herdsman batch on same-terminal workspace move", async () => {
     vi.useFakeTimers();
     const target = event(110, "term_agent", {
       paneId: "wC:p-agent",
@@ -1486,7 +1486,7 @@ describe("shepherd-pi orchestrator bridge", () => {
     }
   });
 
-  test("cancels pending wake and aborts only a Shepherd-triggered turn on role loss", async () => {
+  test("cancels pending wake and aborts only a Herdsman-triggered turn on role loss", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
@@ -1536,11 +1536,11 @@ describe("shepherd-pi orchestrator bridge", () => {
       client.emitStream({ method: "agent.event", params: { event: event(113, "term_agent") } });
       await vi.advanceTimersByTimeAsync(250);
       client.disconnect();
-      expect(ctx.statuses.get("shepherd")).toBe("◇ Shepherd · reconnecting");
+      expect(ctx.statuses.get("herdsman")).toBe("◇ Herdsman · reconnecting");
 
       await pi.emit("session_shutdown");
 
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
       expect(ctx.notifications).toEqual([]);
     } finally {
       vi.clearAllTimers();
@@ -1563,7 +1563,7 @@ describe("shepherd-pi orchestrator bridge", () => {
       await pi.emit("session_shutdown");
       await vi.advanceTimersByTimeAsync(500);
 
-      expect(ctx.statuses.get("shepherd")).toBeUndefined();
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
       expect(pi.customMessages).toEqual([]);
     } finally {
       vi.clearAllTimers();
@@ -1577,8 +1577,8 @@ describe("shepherd-pi orchestrator bridge", () => {
     const second = createFakeClient();
     const clients = [first, second];
     const pi = createFakePi();
-    const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createShepherdPiExtension({ clientFactory: () => clients.shift() as FakeClient })(pi);
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => clients.shift() as FakeClient })(pi);
     const previous = withHerdrEnv();
     try {
       await pi.emit("session_start", {}, fakeCtx({ sessionId: "pi-old" }));
@@ -1598,7 +1598,7 @@ describe("shepherd-pi orchestrator bridge", () => {
   });
 });
 
-const USAGE = "Usage: /shepherd [on|off|status]";
+const USAGE = "Usage: /herdsman [on|off|status]";
 
 function createWakeClient(replayedEvents: AgentEventWireRecord[] = []) {
   const client = createFakeClient();
@@ -1618,8 +1618,8 @@ async function startExtension(
   pi: FakePi,
   ctx: ReturnType<typeof fakeCtx>,
 ): Promise<void> {
-  const { createShepherdPiExtension } = (await import(extensionModuleUrl)) as Module;
-  createShepherdPiExtension({ clientFactory: () => client })(pi);
+  const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+  createHerdsmanPiExtension({ clientFactory: () => client })(pi);
   await pi.emit("session_start", {}, ctx);
   await client.connect();
 }
@@ -1698,7 +1698,7 @@ function createFakePi() {
       this.entries.push([customType, data]);
     },
     async command(args: string, ctx: ReturnType<typeof fakeCtx>) {
-      await commands.get("shepherd")?.handler(args, ctx);
+      await commands.get("herdsman")?.handler(args, ctx);
     },
     emit: async (name: string, ...args: unknown[]) => handlers.get(name)?.(...args),
     async emitContext(messages: unknown[], ctx: ReturnType<typeof fakeCtx>) {

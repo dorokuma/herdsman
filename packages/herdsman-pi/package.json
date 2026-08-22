@@ -1,0 +1,43 @@
+{
+  "name": "@dorokuma/herdsman-pi",
+  "version": "0.6.0",
+  "description": "Pi extension bridge for Herdsman agent history. Forked from @ryonakae/shepherd.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "herdsman",
+    "pi-extension"
+  ],
+  "license": "MIT",
+  "files": [
+    "src"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dorokuma/herdsman.git",
+    "directory": "packages/herdsman-pi"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": ">=0.80.6",
+    "@earendil-works/pi-tui": ">=0.80.6"
+  },
+  "author": "dorokuma",
+  "contributors": [
+    "Ryo Nakae (https://github.com/ryonakae)"
+  ],
+  "bugs": {
+    "url": "https://github.com/dorokuma/herdsman/issues"
+  },
+  "homepage": "https://github.com/dorokuma/herdsman#readme"
+}

@@ -10,7 +10,7 @@ export type AgentUpdateMessageDetails = {
   outcomes: AgentOutcome[];
 };
 
-export type ShepherdFooterState =
+export type HerdsmanFooterState =
   | { kind: "off" }
   | { kind: "on"; updateCount: number }
   | { kind: "reconnecting" };
@@ -71,13 +71,13 @@ function updateCountLabel(count: number): string {
   return `${count} agent update${count === 1 ? "" : "s"}`;
 }
 
-export function formatShepherdFooterStatus(
-  state: ShepherdFooterState,
+export function formatHerdsmanFooterStatus(
+  state: HerdsmanFooterState,
 ): string | undefined {
   if (state.kind === "off") return undefined;
-  if (state.kind === "reconnecting") return "◇ Shepherd · reconnecting";
+  if (state.kind === "reconnecting") return "◇ Herdsman · reconnecting";
 
-  const label = "◆ Shepherd";
+  const label = "◆ Herdsman";
   if (state.updateCount === 0) return label;
   return `${label} · ${updateCountLabel(state.updateCount)}`;
 }
@@ -90,7 +90,7 @@ export function renderAgentUpdateMessage(
   const details = messageDetails(message.details);
   const count = details.outcomes.length > 0 ? details.outcomes.length : details.eventIds.length;
   const heading =
-    theme.fg("customMessageLabel", `◆ ${theme.bold("Shepherd")}`) +
+    theme.fg("customMessageLabel", `◆ ${theme.bold("Herdsman")}`) +
     theme.fg("muted", ` ${updateCountLabel(count)}`);
   const visibleOutcomes = options.expanded
     ? details.outcomes

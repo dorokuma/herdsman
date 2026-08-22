@@ -152,7 +152,7 @@ async function openServer(scheduler: ManualScheduler) {
 }
 
 function createHarness() {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-grace-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-grace-"));
   tempDirs.push(dir);
   const socketPath = join(dir, "rpc.sock");
   if (existsSync(socketPath)) unlinkSync(socketPath);

@@ -24,7 +24,7 @@ Task 14 through Task 16 plus final validation and risk review.
 
 ### Task 14: Remove Old Gateway, Session, Slack, and Thin Herdr Tool Paths
 
-**Objective:** Delete obsolete session/Gateway orchestration code so Shepherd cannot regress into an LLM gateway or Herdr proxy.
+**Objective:** Delete obsolete session/Gateway orchestration code so Herdsman cannot regress into an LLM gateway or Herdr proxy.
 
 **Files:**
 - Delete: `src/gateway/server.ts`
@@ -79,9 +79,9 @@ MVP config should include only:
 ```yaml
 runtime:
   db_path: state.db
-  socket_path: shepherd.sock
-  pid_path: shepherd.pid
-  log_path: logs/shepherd.log
+  socket_path: herdsman.sock
+  pid_path: herdsman.pid
+  log_path: logs/herdsman.log
 observability:
   telemetry:
     max_excerpt_bytes: 4096
@@ -104,13 +104,13 @@ git commit -m "refactor: remove legacy gateway surfaces"
 
 ### Task 15: Update Documentation and Package Metadata
 
-**Objective:** Document Shepherd's new purpose, install flow, CLI, Pi extension, Herdr plugin, and validation commands.
+**Objective:** Document Herdsman's new purpose, install flow, CLI, Pi extension, Herdr plugin, and validation commands.
 
 **Files:**
 - Modify: `README.md`
 - Modify: `AGENTS.md` if commands or important paths change
-- Modify: `packages/shepherd-pi/package.json`
-- Modify: `packages/shepherd-herdr-plugin/package.json`
+- Modify: `packages/herdsman-pi/package.json`
+- Modify: `packages/herdsman-herdr-plugin/package.json`
 - Modify: `package.json`
 - Test: docs reviewed manually
 
@@ -122,9 +122,9 @@ git commit -m "refactor: remove legacy gateway surfaces"
 
 README must state:
 
-- Shepherd is a Herdr worker observability/orchestration layer.
-- Shepherd is not an LLM gateway.
-- Shepherd is not a thin Herdr wrapper.
+- Herdsman is a Herdr worker observability/orchestration layer.
+- Herdsman is not an LLM gateway.
+- Herdsman is not a thin Herdr wrapper.
 - Core value:
   - structured worker snapshots
   - enriched worker events
@@ -133,9 +133,9 @@ README must state:
   - `pnpm install`
   - `pnpm check`
   - `pnpm build`
-  - `shepherd daemon start`
-  - `pi install ./packages/shepherd-pi`
-  - `herdr plugin link ./packages/shepherd-herdr-plugin`
+  - `herdsman daemon start`
+  - `pi install ./packages/herdsman-pi`
+  - `herdr plugin link ./packages/herdsman-herdr-plugin`
 - CLI examples for `observe`, `snapshot`, `events`, `notifications`, and `ack`.
 
 - [x] **Step 2: Update AGENTS.md if needed**
@@ -149,7 +149,7 @@ Update root `package.json` scripts so `pnpm check` validates the Herdr plugin pa
 ```json
 {
   "scripts": {
-    "herdr-plugin:check": "pnpm --dir packages/shepherd-herdr-plugin typecheck && (cd packages/shepherd-herdr-plugin && npm pack --dry-run --json > /dev/null)",
+    "herdr-plugin:check": "pnpm --dir packages/herdsman-herdr-plugin typecheck && (cd packages/herdsman-herdr-plugin && npm pack --dry-run --json > /dev/null)",
     "check": "pnpm typecheck && pnpm test && pnpm lint && pnpm format:check && pnpm db:check && pnpm pi-package:check && pnpm herdr-plugin:check"
   }
 }
@@ -164,7 +164,7 @@ Expected: formatting check passes for files covered by Biome, and the Herdr plug
 - [x] **Step 5: Commit**
 
 ```bash
-git add README.md AGENTS.md package.json packages/shepherd-pi/package.json packages/shepherd-herdr-plugin/package.json
+git add README.md AGENTS.md package.json packages/herdsman-pi/package.json packages/herdsman-herdr-plugin/package.json
 git commit -m "docs: describe worker observability rewrite"
 ```
 
@@ -195,12 +195,12 @@ Expected:
 
 - [x] **Step 2: Manual smoke test with Herdr and Pi**
 
-In a Herdr pane with Pi and the Shepherd Pi extension installed:
+In a Herdr pane with Pi and the Herdsman Pi extension installed:
 
 ```bash
-shepherd daemon start
-shepherd observe-current --json
-shepherd snapshot <observedWorkspaceId> --json
+herdsman daemon start
+herdsman observe-current --json
+herdsman snapshot <observedWorkspaceId> --json
 ```
 
 Expected:
@@ -209,14 +209,14 @@ Expected:
 - `snapshot` returns workers auto-discovered from the current Herdr workspace.
 - A Pi tool result updates the worker snapshot with `lastTool`.
 - A worker completion emits `worker.completed` and appears as an unread notification.
-- Next Pi turn receives hidden Shepherd worker notification context.
+- Next Pi turn receives hidden Herdsman worker notification context.
 
 - [x] **Step 3: Manual smoke test with Herdr plugin**
 
 ```bash
-herdr plugin link ./packages/shepherd-herdr-plugin
-herdr plugin action invoke observe-workspace --plugin shepherd.observability
-herdr plugin pane open --plugin shepherd.observability --entrypoint dashboard
+herdr plugin link ./packages/herdsman-herdr-plugin
+herdr plugin action invoke observe-workspace --plugin herdsman.observability
+herdr plugin pane open --plugin herdsman.observability --entrypoint dashboard
 ```
 
 Expected:
@@ -255,10 +255,10 @@ Expected final result:
 
 Manual validation:
 
-- `shepherd daemon start` starts the daemon and creates the configured socket.
-- `shepherd observe-current --json` works only inside Herdr and returns a stable `observedWorkspaceId`.
-- `shepherd snapshot <observedWorkspaceId> --json` returns orchestration-oriented worker snapshots, not pane dumps.
-- `shepherd events <observedWorkspaceId> --json` streams `worker.*` events.
+- `herdsman daemon start` starts the daemon and creates the configured socket.
+- `herdsman observe-current --json` works only inside Herdr and returns a stable `observedWorkspaceId`.
+- `herdsman snapshot <observedWorkspaceId> --json` returns orchestration-oriented worker snapshots, not pane dumps.
+- `herdsman events <observedWorkspaceId> --json` streams `worker.*` events.
 - Pi extension sends bounded telemetry and receives non-invasive notifications.
 - Herdr plugin observe action and dashboard pane work against the daemon through CLI commands.
 
@@ -269,7 +269,7 @@ Manual validation:
 - **Risk: heuristic events.** `worker.completed` and `worker.blocked` are rule-based in MVP. Every enriched event must include confidence and evidence so orchestrators can decide whether to act.
 - **Risk: data retention.** MVP keeps sanitized excerpts indefinitely. This is accepted for MVP. Full tool results are not stored; future retention settings can prune worker events and snapshots.
 - **Risk: deleting old Slack/session behavior.** This is intended. The rewrite goal explicitly drops old Gateway/session/Slack compatibility.
-- **Tradeoff: no daemon LLM summarizer.** Snapshot quality is bounded by structured telemetry, transcript adapters, Herdr status, and deterministic rules. This avoids making Shepherd an LLM gateway again.
+- **Tradeoff: no daemon LLM summarizer.** Snapshot quality is bounded by structured telemetry, transcript adapters, Herdr status, and deterministic rules. This avoids making Herdsman an LLM gateway again.
 - **Tradeoff: Herdr Plugin is companion only.** Plugin hooks are not used as the main event stream because they spawn commands per event and have in-flight limits. Daemon socket subscription remains the primary event path.
 - **No blocking open questions.** The MVP decisions in this plan are sufficient for implementation.
 

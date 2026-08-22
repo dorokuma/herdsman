@@ -1,8 +1,8 @@
-# Shepherd Session Event Stream and Messaging Sync
+# Herdsman Session Event Stream and Messaging Sync
 
 Date: 2026-06-24
 
-Parent: [Shepherd Herdr Orchestration Plan](../2026-06-24-shepherd-herdr-orchestration.md)
+Parent: [Herdsman Herdr Orchestration Plan](../2026-06-24-herdsman-herdr-orchestration.md)
 
 ## Status
 
@@ -37,35 +37,35 @@ Implemented:
 - side-effect idempotency for delivery receipts, event appends, summary updates, and logical tool calls.
 - approval request/response events delivered to subscribed TUI clients and platform fanout.
 - Herdr progress events recorded through `herdr.progress` and delivered to subscribed TUI clients and platform fanout.
-- automatic Herdr progress subscription lifecycle for Shepherd-bound workspaces created or attached by gateway orchestration.
+- automatic Herdr progress subscription lifecycle for Herdsman-bound workspaces created or attached by gateway orchestration.
 
 MVP limits:
 
-- Approval responses are recorded and delivered in Shepherd, but provider/worker-agent-specific callback routing is deferred.
+- Approval responses are recorded and delivered in Herdsman, but provider/worker-agent-specific callback routing is deferred.
 - TUI reconnect behavior is supported by replay cursors, but there is no full-screen TUI application yet.
 
 ## Source of truth
 
-Shepherd DB is the source of truth, not Slack and not Herdr.
+Herdsman DB is the source of truth, not Slack and not Herdr.
 
 Initial tables:
 
 - `sessions`
-  - Shepherd session id, title, status, working context id, timestamps
+  - Herdsman session id, title, status, working context id, timestamps
 - `session_bindings`
   - session id, platform, channel/chat id, thread/topic id, message ids, TUI client bindings
 - `events`
   - ordered event stream, including stable event ids and idempotency keys for externally visible actions
 - `gateway_runs`
-  - one gateway turn/run per Shepherd session at a time, with status, triggering event ids, and recovery metadata
+  - one gateway turn/run per Herdsman session at a time, with status, triggering event ids, and recovery metadata
 - `actors`
-  - user, Shepherd bot, gateway LLM, Herdr agent, system
+  - user, Herdsman bot, gateway LLM, Herdr agent, system
 - `delivery_receipts`
   - event id, platform, target, remote message id, status
 - `working_contexts`
   - slug, label, path, detection metadata, Herdr named session name
 - `herdr_bindings`
-  - Shepherd session id, Herdr session name, workspace id, created/attached metadata
+  - Herdsman session id, Herdr session name, workspace id, created/attached metadata
 
 ## Event stream
 
@@ -82,11 +82,11 @@ The event stream records:
 - summary updates
 - errors and recovery notes
 
-All user-visible messages are stored as Shepherd events first, then delivered to subscribed surfaces.
+All user-visible messages are stored as Herdsman events first, then delivered to subscribed surfaces.
 
 ## Gateway turn concurrency
 
-MVP allows only one active gateway turn per Shepherd session.
+MVP allows only one active gateway turn per Herdsman session.
 
 - Incoming user messages are always persisted to the event stream first.
 - If no gateway turn is active for the session, the message wakes a new gateway turn.
@@ -95,7 +95,7 @@ MVP allows only one active gateway turn per Shepherd session.
 - MVP does not support mid-turn steer or interrupt for user messages.
 - TUI and Slack should show that a message was queued instead of silently dropping or merging it.
 
-Different Shepherd sessions may run concurrently.
+Different Herdsman sessions may run concurrently.
 
 ## Messaging and TUI sync
 
@@ -106,8 +106,8 @@ MVP surfaces:
 
 Behavior:
 
-- A new Slack thread creates a Shepherd session.
-- A TUI `/resume` selects an existing Shepherd session and replays its event stream.
+- A new Slack thread creates a Herdsman session.
+- A TUI `/resume` selects an existing Herdsman session and replays its event stream.
 - While TUI is attached, new Slack messages appear in TUI automatically.
 - TUI-originated user messages are stored in the same event stream and delivered to Slack.
 - Slack-originated user messages are stored in the same event stream and delivered to attached TUI clients.
@@ -124,7 +124,7 @@ Core events should store platform-neutral actor presentation metadata:
 
 ## TUI daemon transport
 
-The TUI connects to the local Shepherd daemon over a Unix domain socket.
+The TUI connects to the local Herdsman daemon over a Unix domain socket.
 
 - Use newline-delimited JSON-RPC/JSON Lines framing.
 - The same connection carries request/response commands and subscribed event stream notifications.
@@ -142,11 +142,11 @@ MVP uses Slack Socket Mode.
 Slack details:
 
 - Socket Mode avoids public webhook setup.
-- A Slack thread maps to one Shepherd session.
+- A Slack thread maps to one Herdsman session.
 - Platform identity must not leak into Herdr workspace names.
 - v1 should use `chat:write.customize` for authorship mirroring when the Slack app has the scope and the message is clearly user-initiated.
 - TUI-originated user messages should be posted into Slack with the user's configured display name and avatar, so the Slack thread feels synchronized rather than bot-relayed.
-- Gateway and worker-agent narration may also use distinct display names/icons, such as `Shepherd`, `Herdr Claude`, or `Herdr Codex`, while still retaining the canonical actor in Shepherd DB.
+- Gateway and worker-agent narration may also use distinct display names/icons, such as `Herdsman`, `Herdr Claude`, or `Herdr Codex`, while still retaining the canonical actor in Herdsman DB.
 - If a workspace has not granted `chat:write.customize`, fall back to bot posting with explicit actor labels.
 - Do not use authorship mirroring for surprise/background messages that are not tied to an inciting user action.
 
@@ -168,10 +168,10 @@ Design messaging adapters so Discord and Telegram can be added later.
 Adapter responsibilities:
 
 - receive platform events
-- decide whether the event should enter Shepherd
+- decide whether the event should enter Herdsman
 - normalize platform identifiers
 - pass normalized inbound messages to core routing
-- deliver outbound Shepherd events to the platform
+- deliver outbound Herdsman events to the platform
 
 Core responsibilities:
 
@@ -180,11 +180,11 @@ Core responsibilities:
 - gateway wake-up
 - per-session gateway turn queueing
 - delivery receipts
-- dedupe and retry policy where it belongs in Shepherd rather than a platform SDK
+- dedupe and retry policy where it belongs in Herdsman rather than a platform SDK
 
 ## Restart, retry, and idempotency
 
-Shepherd DB is the recovery source of truth after daemon restart.
+Herdsman DB is the recovery source of truth after daemon restart.
 
 - On startup, inspect `gateway_runs`, logical tool call events, Herdr bindings, and `delivery_receipts`.
 - Active gateway runs from a previous daemon process move to a recovery state before any new work starts.
@@ -204,8 +204,8 @@ Shepherd DB is the recovery source of truth after daemon restart.
 
 Initial behavior:
 
-- Slack thread -> Shepherd session
-- TUI client -> attaches to an existing Shepherd session or starts a new one
+- Slack thread -> Herdsman session
+- TUI client -> attaches to an existing Herdsman session or starts a new one
 
 Future options can add channel-level or user-level grouping, but MVP should avoid Hermes-style complex admin tiers.
 
@@ -251,9 +251,9 @@ Policy should cover:
 
 MVP approval behavior:
 
-- Shepherd policy performs deterministic allow/deny checks before logical tool execution.
-- Provider-native approval requests can enter Shepherd through the approval event surface and are delivered to TUI/Slack when recorded.
-- Approval responses are recorded and delivered as Shepherd events. Routing those responses back into provider/agent-specific approval APIs is deferred.
-- Shepherd does not implement smart approval or adaptive risk scoring in MVP.
+- Herdsman policy performs deterministic allow/deny checks before logical tool execution.
+- Provider-native approval requests can enter Herdsman through the approval event surface and are delivered to TUI/Slack when recorded.
+- Approval responses are recorded and delivered as Herdsman events. Routing those responses back into provider/agent-specific approval APIs is deferred.
+- Herdsman does not implement smart approval or adaptive risk scoring in MVP.
 
 Slack access control should be explicit. Do not let arbitrary workspaces/users create sessions unless configured.

@@ -1,8 +1,8 @@
-# `shepherd-pi` Extension
+# `herdsman-pi` Extension
 
 Date: 2026-06-25
 
-Parent: [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
+Parent: [Herdsman Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
 
 ## Status
 
@@ -10,11 +10,11 @@ Done.
 
 ## Progress
 
-- **Done** — Extension is the bridge between Pi and Shepherd Gateway.
+- **Done** — Extension is the bridge between Pi and Herdsman Gateway.
 - **Done** — Message injection uses extension `pi.sendUserMessage()`, not Gateway Pi RPC `prompt`.
-- **Done** — Shepherd tools are registered by the extension from Gateway `tool.list`.
-- **Done** — Visible user text remains natural; Shepherd metadata is injected through hidden context hooks.
-- **Done** — npm package skeleton exists under `packages/shepherd-pi` with extension and skill resources, and root `pnpm check` validates its syntax and pack manifest.
+- **Done** — Herdsman tools are registered by the extension from Gateway `tool.list`.
+- **Done** — Visible user text remains natural; Herdsman metadata is injected through hidden context hooks.
+- **Done** — npm package skeleton exists under `packages/herdsman-pi` with extension and skill resources, and root `pnpm check` validates its syntax and pack manifest.
 - **Done** — Gateway-side `pi.handshake`, `pi.attach`, heartbeat, and run claim/complete/fail RPC exist; extension Gateway client, attach command, tool registration, claim loop, streaming, and final completion path are implemented.
 
 ## Next steps
@@ -26,26 +26,26 @@ Complete. Package syntax/pack validation is part of `pnpm check`; Gateway-side e
 The Pi package should include:
 
 - Extension entry point.
-- Skill describing Shepherd/Herdr orchestration usage.
+- Skill describing Herdsman/Herdr orchestration usage.
 - Prompt templates for attach/open/debug if useful.
 
 Install command:
 
 ```bash
-pi install npm:shepherd-pi
+pi install npm:herdsman-pi
 ```
 
 ## Extension startup
 
 On `session_start`:
 
-1. Read Shepherd binding custom entry from the Pi session branch/history.
+1. Read Herdsman binding custom entry from the Pi session branch/history.
 2. Resolve Gateway socket path and Gateway identity.
 3. Connect to the Gateway socket.
 4. Call `pi.handshake`.
 5. If binding is present and valid, auto-attach.
-6. Subscribe to the Shepherd session event stream.
-7. Register Shepherd tools from Gateway `tool.list`.
+6. Subscribe to the Herdsman session event stream.
+7. Register Herdsman tools from Gateway `tool.list`.
 8. Set Pi status/footer/widgets when in TUI mode.
 
 ## Attach commands
@@ -53,12 +53,12 @@ On `session_start`:
 Provide Pi commands:
 
 ```text
-/shepherd attach <session-id>
-/shepherd detach
-/shepherd status
+/herdsman attach <session-id>
+/herdsman detach
+/herdsman status
 ```
 
-`/shepherd attach <session-id>` calls `pi.attach`, writes the Pi custom binding entry, subscribes to events, and claims owner priority based on Pi mode.
+`/herdsman attach <session-id>` calls `pi.attach`, writes the Pi custom binding entry, subscribes to events, and claims owner priority based on Pi mode.
 
 ## Tool registration
 
@@ -67,7 +67,7 @@ Use Gateway `tool.list` as the source of truth.
 For each tool:
 
 - Register a Pi custom tool with the Gateway-provided `name`, `description`, and `inputSchema`.
-- Execute by calling Gateway `tool.run` with the current Shepherd `sessionId`.
+- Execute by calling Gateway `tool.run` with the current Herdsman `sessionId`.
 - Preserve Gateway policy and idempotency behavior.
 
 MVP can pass schemas through as JSON Schema-compatible TypeBox objects. If model/provider schema issues appear, normalize in the extension, not in the Gateway.
@@ -85,7 +85,7 @@ Visible user messages should remain natural.
 Do not wrap Slack text like this:
 
 ```text
-Shepherd session: ...
+Herdsman session: ...
 Slack thread: ...
 User message: ...
 ```
@@ -93,8 +93,8 @@ User message: ...
 Instead:
 
 - `pi.sendUserMessage(userText)` for visible input.
-- Use `before_agent_start` or `context` hook to inject Shepherd metadata:
-  - Shepherd session id.
+- Use `before_agent_start` or `context` hook to inject Herdsman metadata:
+  - Herdsman session id.
   - Slack binding/channel/thread.
   - working context.
   - Herdr agent profiles and `default_agent`.
@@ -144,7 +144,7 @@ On error/abort:
 
 In TUI mode, set concise status indicators:
 
-- Attached Shepherd session id/title.
+- Attached Herdsman session id/title.
 - Gateway connected/reconnecting state.
 - Owner kind (`tui_pi`).
 - Current run status if any.

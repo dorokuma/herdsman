@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts.js";
 
-// A pane agent's authoritative session ref (herdr detection or shepherd-pi
+// A pane agent's authoritative session ref (herdr detection or herdsman-pi
 // registration) may not have landed when the agent is first observed, so
 // discovery falls back to cwd-based guessing. A session file untouched since
 // before the agent was first seen cannot be that agent's live session.

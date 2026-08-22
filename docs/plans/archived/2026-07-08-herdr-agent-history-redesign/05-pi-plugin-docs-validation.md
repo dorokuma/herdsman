@@ -2,9 +2,9 @@
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task.
 
-**Goal:** Update runtime integrations and docs to the new agent history surface, remove old worker/context/snapshot commands, and verify Shepherd in a real Herdr workspace.
+**Goal:** Update runtime integrations and docs to the new agent history surface, remove old worker/context/snapshot commands, and verify Herdsman in a real Herdr workspace.
 
-**Architecture:** Pi extension uses daemon agent RPCs for current-workspace pull hidden context and unread push agent events. Herdr plugin exposes agent list/read actions instead of context/dashboard worker views. Documentation points agents to `shepherd agent list/get/read` and daemon requirement.
+**Architecture:** Pi extension uses daemon agent RPCs for current-workspace pull hidden context and unread push agent events. Herdr plugin exposes agent list/read actions instead of context/dashboard worker views. Documentation points agents to `herdsman agent list/get/read` and daemon requirement.
 
 **Tech Stack:** TypeScript, Pi extension package, Herdr plugin package, Vitest, npm pack dry-run, Herdr CLI.
 
@@ -12,30 +12,30 @@
 
 - Pi hidden context is current workspace only.
 - Push hidden context contains event + compact history.
-- Pull hidden context uses same compact contract as `shepherd agent list`.
+- Pull hidden context uses same compact contract as `herdsman agent list`.
 - Remove old `worker`, `context`, `snapshot` wording from non-plan docs/code/tests.
-- Do not mention `shepherd context` or `shepherd snapshot` as normal user commands.
-- `shepherd-pi` should use `agent.notifications.subscribe`, `agent.notifications.ack`, and `agent.telemetry`.
+- Do not mention `herdsman context` or `herdsman snapshot` as normal user commands.
+- `herdsman-pi` should use `agent.notifications.subscribe`, `agent.notifications.ack`, and `agent.telemetry`.
 - Herdr plugin should not expose old `context` action or `Workers` dashboard.
 - Full validation must include `pnpm check` and `pnpm build`.
 
 ## Current Context
 
-- `packages/shepherd-pi/src/index.ts` currently sends `workspace.observe`, `notification.subscribe`, and `runtime.telemetry`, listens for `worker.event`, and formats `[SHEPHERD WORKER NOTIFICATIONS]`.
-- `packages/shepherd-pi/skills/shepherd/SKILL.md` currently instructs agents to run `shepherd context --json`.
-- `packages/shepherd-herdr-plugin/index.mjs` currently exposes `context` and `dashboard` using `workspace.snapshot` and worker rows.
-- `packages/shepherd-herdr-plugin/herdr-plugin.toml` currently has action id `context` and pane id `dashboard` titled `Shepherd Workers`.
+- `packages/herdsman-pi/src/index.ts` currently sends `workspace.observe`, `notification.subscribe`, and `runtime.telemetry`, listens for `worker.event`, and formats `[SHEPHERD WORKER NOTIFICATIONS]`.
+- `packages/herdsman-pi/skills/herdsman/SKILL.md` currently instructs agents to run `herdsman context --json`.
+- `packages/herdsman-herdr-plugin/index.mjs` currently exposes `context` and `dashboard` using `workspace.snapshot` and worker rows.
+- `packages/herdsman-herdr-plugin/herdr-plugin.toml` currently has action id `context` and pane id `dashboard` titled `Herdsman Workers`.
 - README/package descriptions still describe worker observability.
 
 ## File Structure
 
-- Modify: `packages/shepherd-pi/src/index.ts` — agent notifications and hidden context.
-- Modify: `test/unit/shepherd-pi-extension.test.ts` — new event names/context text.
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md` — agent list/get/read instructions.
-- Modify: `packages/shepherd-pi/README.md` — new behavior.
-- Modify: `packages/shepherd-herdr-plugin/index.mjs` — agent actions/pane output.
-- Modify: `packages/shepherd-herdr-plugin/herdr-plugin.toml` — action/pane ids/titles.
-- Modify: `packages/shepherd-herdr-plugin/README.md` — new plugin docs.
+- Modify: `packages/herdsman-pi/src/index.ts` — agent notifications and hidden context.
+- Modify: `test/unit/herdsman-pi-extension.test.ts` — new event names/context text.
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md` — agent list/get/read instructions.
+- Modify: `packages/herdsman-pi/README.md` — new behavior.
+- Modify: `packages/herdsman-herdr-plugin/index.mjs` — agent actions/pane output.
+- Modify: `packages/herdsman-herdr-plugin/herdr-plugin.toml` — action/pane ids/titles.
+- Modify: `packages/herdsman-herdr-plugin/README.md` — new plugin docs.
 - Modify: `test/unit/herdr-plugin-package.test.ts` — new plugin behavior.
 - Modify: `README.md`, `README.ja.md`, `SKILL.md`, `package.json`, package descriptions — new public messaging.
 - Delete or update tests that mention old worker/context/snapshot commands.
@@ -92,8 +92,8 @@ Current Herdr workspace: wB
 **Objective:** Make Pi receive current workspace compact agent context and unread agent updates without old worker events.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: `agent.list`, `agent.notifications.subscribe`, `agent.notifications.ack`, `agent.telemetry`, streamed `agent.event`.
@@ -107,14 +107,14 @@ Update tests:
 2. On `before_agent_start`, extension calls `agent.list` for current workspace and returns `[SHEPHERD AGENT CONTEXT]` even when there are no unread events.
 3. When pending agent events exist, hidden context includes `[SHEPHERD AGENT UPDATES]` and each event's compact history.
 4. `before_agent_start` acks pending events via `agent.notifications.ack` after preparing hidden context.
-5. Streamed `agent.event` increments UI status/widget and appends `shepherd.agent_event` entry.
+5. Streamed `agent.event` increments UI status/widget and appends `herdsman.agent_event` entry.
 6. Tool result telemetry sends `agent.telemetry` with type `agent.tool.completed` and compact/redacted excerpt fields.
 7. Final message telemetry sends `agent.telemetry` with type `agent.message.final`.
 8. No output string contains `worker`, `snapshot`, or `[SHEPHERD WORKER NOTIFICATIONS]`.
 
 - [x] **Step 2: Run test to verify it fails**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: Tests fail because extension still uses worker methods and worker text.
 
@@ -134,14 +134,14 @@ Implementation rules:
 
 - [x] **Step 4: Run test to verify it passes**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: Pi extension tests pass.
 
 - [x] **Step 5: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/index.ts test/unit/herdsman-pi-extension.test.ts
 git commit -m "pi: inject agent history context"
 ```
 
@@ -150,8 +150,8 @@ git commit -m "pi: inject agent history context"
 **Objective:** Replace old context/dashboard plugin surface with agent list/read views.
 
 **Files:**
-- Modify: `packages/shepherd-herdr-plugin/index.mjs`
-- Modify: `packages/shepherd-herdr-plugin/herdr-plugin.toml`
+- Modify: `packages/herdsman-herdr-plugin/index.mjs`
+- Modify: `packages/herdsman-herdr-plugin/herdr-plugin.toml`
 - Modify: `test/unit/herdr-plugin-package.test.ts`
 
 **Interfaces:**
@@ -162,8 +162,8 @@ git commit -m "pi: inject agent history context"
 
 Update plugin package tests:
 
-1. Manifest contains action id `agent-list`, title `Show Shepherd agents`, and no action id `context`.
-2. Manifest pane title is `Shepherd Agents`, not `Shepherd Workers`.
+1. Manifest contains action id `agent-list`, title `Show Herdsman agents`, and no action id `context`.
+2. Manifest pane title is `Herdsman Agents`, not `Herdsman Workers`.
 3. Plugin `agent-list` command calls `agent.list` with current `HERDR_WORKSPACE_ID` from env.
 4. Plugin pane renders rows with `status`, `agent`, `pane`, `last user`, and `last assistant`.
 5. Invalid old command `context` returns usage error.
@@ -192,8 +192,8 @@ Expected: Plugin tests pass.
 - [x] **Step 5: Commit**
 
 ```bash
-git add packages/shepherd-herdr-plugin/index.mjs packages/shepherd-herdr-plugin/herdr-plugin.toml test/unit/herdr-plugin-package.test.ts
-git commit -m "plugin: show shepherd agents"
+git add packages/herdsman-herdr-plugin/index.mjs packages/herdsman-herdr-plugin/herdr-plugin.toml test/unit/herdr-plugin-package.test.ts
+git commit -m "plugin: show herdsman agents"
 ```
 
 ### Task 3: Remove old worker/context/snapshot files and references
@@ -229,8 +229,8 @@ Rules:
 - Replace `notification.subscribe` with `agent.notifications.subscribe` in active code.
 - Replace `worker.event` stream with `agent.event`.
 - Replace package descriptions that say worker observability.
-- Keep the term `context` only when it refers to Pi/Herdr API types or general hidden context, not as a Shepherd command or API surface.
-- Keep the term `snapshot` only for Herdr official `session.snapshot`, not Shepherd user-facing snapshot command.
+- Keep the term `context` only when it refers to Pi/Herdr API types or general hidden context, not as a Herdsman command or API surface.
+- Keep the term `snapshot` only for Herdr official `session.snapshot`, not Herdsman user-facing snapshot command.
 
 - [x] **Step 3: Run targeted compile/test check**
 
@@ -238,7 +238,7 @@ Run:
 
 ```bash
 pnpm typecheck
-pnpm test test/unit/cli.test.ts test/unit/shepherd-pi-extension.test.ts test/unit/herdr-plugin-package.test.ts
+pnpm test test/unit/cli.test.ts test/unit/herdsman-pi-extension.test.ts test/unit/herdr-plugin-package.test.ts
 ```
 
 Expected: Typecheck passes and targeted tests pass.
@@ -248,7 +248,7 @@ Expected: Typecheck passes and targeted tests pass.
 Run:
 
 ```bash
-rg "message-worker|wait-worker|shepherd context|shepherd snapshot|workspace\.snapshot|worker\.events|worker\.event|WorkerStatePipeline|WorkerStore|WorkerSnapshot|worker_" src packages test README.md README.ja.md SKILL.md -n
+rg "message-worker|wait-worker|herdsman context|herdsman snapshot|workspace\.snapshot|worker\.events|worker\.event|WorkerStatePipeline|WorkerStore|WorkerSnapshot|worker_" src packages test README.md README.ja.md SKILL.md -n
 ```
 
 Expected: No matches. If matches remain in quoted test fixtures for old rejection behavior, change tests to avoid old command strings or move the assertion to a focused parser test without documenting old names in user docs.
@@ -269,12 +269,12 @@ git commit -m "cleanup: remove worker observability surface"
 - Modify: `README.md`
 - Modify: `README.ja.md`
 - Modify: `SKILL.md`
-- Modify: `packages/shepherd-pi/README.md`
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md`
-- Modify: `packages/shepherd-herdr-plugin/README.md`
+- Modify: `packages/herdsman-pi/README.md`
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md`
+- Modify: `packages/herdsman-herdr-plugin/README.md`
 - Modify: `package.json`
-- Modify: `packages/shepherd-pi/package.json`
-- Modify: `packages/shepherd-herdr-plugin/package.json`
+- Modify: `packages/herdsman-pi/package.json`
+- Modify: `packages/herdsman-herdr-plugin/package.json`
 
 **Interfaces:**
 - Consumes: final CLI/RPC behavior.
@@ -284,27 +284,27 @@ git commit -m "cleanup: remove worker observability surface"
 
 Docs must state:
 
-- Shepherd indexes Herdr agents and their agent history.
+- Herdsman indexes Herdr agents and their agent history.
 - Start daemon explicitly:
 
 ```bash
-shepherd daemon start
+herdsman daemon start
 ```
 
 - Main commands:
 
 ```bash
-shepherd agent list --json
-shepherd agent get claude --json
-shepherd agent read claude --limit 20 --json
-shepherd agent list --all --json
+herdsman agent list --json
+herdsman agent get claude --json
+herdsman agent read claude --limit 20 --json
+herdsman agent list --all --json
 ```
 
 - `agent list` is current workspace by default inside Herdr.
 - Daemon watches all running Herdr sessions and all workspaces in them.
 - Stopped Herdr sessions are not indexed.
 - Pi extension can inject current workspace agent context automatically.
-- Use Herdr for pane/tab/terminal control; use Shepherd for compact agent history.
+- Use Herdr for pane/tab/terminal control; use Herdsman for compact agent history.
 
 Docs must not present `context`, `snapshot`, or worker commands.
 
@@ -313,7 +313,7 @@ Docs must not present `context`, `snapshot`, or worker commands.
 Run:
 
 ```bash
-rg "worker|Worker|shepherd context|shepherd snapshot|message-worker|wait-worker" README.md README.ja.md SKILL.md packages/shepherd-pi packages/shepherd-herdr-plugin -n
+rg "worker|Worker|herdsman context|herdsman snapshot|message-worker|wait-worker" README.md README.ja.md SKILL.md packages/herdsman-pi packages/herdsman-herdr-plugin -n
 ```
 
 Expected: No matches except package changelog/history text if present. If matches remain in package lock or generated artifacts, do not edit generated artifacts for wording.
@@ -321,7 +321,7 @@ Expected: No matches except package changelog/history text if present. If matche
 - [x] **Step 3: Commit**
 
 ```bash
-git add README.md README.ja.md SKILL.md packages/shepherd-pi/README.md packages/shepherd-pi/skills/shepherd/SKILL.md packages/shepherd-herdr-plugin/README.md package.json packages/shepherd-pi/package.json packages/shepherd-herdr-plugin/package.json
+git add README.md README.ja.md SKILL.md packages/herdsman-pi/README.md packages/herdsman-pi/skills/herdsman/SKILL.md packages/herdsman-herdr-plugin/README.md package.json packages/herdsman-pi/package.json packages/herdsman-herdr-plugin/package.json
 git commit -m "docs: describe agent history workflow"
 ```
 
@@ -362,12 +362,12 @@ PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/
 Run:
 
 ```bash
-rm -rf /tmp/shepherd-agent-history-dogfood
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood pnpm build
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js daemon start
+rm -rf /tmp/herdsman-agent-history-dogfood
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood pnpm build
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js daemon start
 ```
 
-Expected: daemon starts and writes socket under `/tmp/shepherd-agent-history-dogfood`.
+Expected: daemon starts and writes socket under `/tmp/herdsman-agent-history-dogfood`.
 
 - [x] **Step 3: Verify Herdr sessions are indexed**
 
@@ -375,22 +375,22 @@ Run:
 
 ```bash
 herdr session list --json
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent list --all --json
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all --json
 ```
 
 Expected:
 
 - Herdr reports at least the running `default` session.
-- Shepherd returns agents from running Herdr sessions.
+- Herdsman returns agents from running Herdr sessions.
 
 - [x] **Step 4: Verify workspace `wB`**
 
 From any shell, run:
 
 ```bash
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent list --workspace wB --json
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent get claude --workspace wB --json
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent read claude --workspace wB --limit 10 --json
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --workspace wB --json
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent get claude --workspace wB --json
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent read claude --workspace wB --limit 10 --json
 ```
 
 Expected:
@@ -404,11 +404,11 @@ Expected:
 Run with daemon stopped:
 
 ```bash
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js daemon stop
-SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent list --all
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js daemon stop
+SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all
 ```
 
-Expected: command fails with guidance to run `shepherd daemon start`; it does not auto-start.
+Expected: command fails with guidance to run `herdsman daemon start`; it does not auto-start.
 
 - [x] **Step 6: Commit validation fixes only if needed**
 
@@ -418,10 +418,10 @@ If validation required fixes, commit them with a targeted message. If no fixes, 
 
 - `pnpm check`
 - `pnpm build`
-- `SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent list --all --json`
-- `SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent list --workspace wB --json`
-- `SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent get claude --workspace wB --json`
-- `SHEPHERD_HOME=/tmp/shepherd-agent-history-dogfood node dist/src/cli/shepherd.js agent read claude --workspace wB --limit 10 --json`
+- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all --json`
+- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --workspace wB --json`
+- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent get claude --workspace wB --json`
+- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent read claude --workspace wB --limit 10 --json`
 
 ## Risks, Tradeoffs, and Open Questions
 

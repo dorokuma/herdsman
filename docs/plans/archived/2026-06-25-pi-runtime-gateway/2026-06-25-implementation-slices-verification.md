@@ -2,7 +2,7 @@
 
 Date: 2026-06-25
 
-Parent: [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
+Parent: [Herdsman Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
 
 ## Status
 
@@ -13,7 +13,7 @@ Done.
 - **Done** — Implementation should start with a vertical final-only path.
 - **Done** — Streaming and TUI takeover are in MVP but come after the final-only path.
 - **Done** — Slice 1 implementation: `gateway.pi` config parsing, Gateway readiness handshake, Pi session metadata assignment, lazy headless Pi startup, and external Gateway run queue RPC are in place.
-- **Done** — Test harnesses cover fake Pi extension lifecycle through Gateway RPC, `shepherd-pi` package syntax/pack manifest, Slack streaming delivery, CLI open, Gateway identity, owner priority, and stale-owner recovery.
+- **Done** — Test harnesses cover fake Pi extension lifecycle through Gateway RPC, `herdsman-pi` package syntax/pack manifest, Slack streaming delivery, CLI open, Gateway identity, owner priority, and stale-owner recovery.
 
 ## Next steps
 
@@ -24,7 +24,7 @@ Complete. Automated verification is `pnpm check`; manual real Slack/Pi smoke req
 Goal:
 
 ```text
-Slack -> Shepherd Gateway -> headless Pi + shepherd-pi -> final response -> Slack
+Slack -> Herdsman Gateway -> headless Pi + herdsman-pi -> final response -> Slack
 ```
 
 No streaming, no TUI takeover, no tool progress.
@@ -38,13 +38,13 @@ Steps:
    - Add migration/test fixtures for the new config shape.
 
 2. Pi readiness
-   - Add startup check in `shepherd gateway start`.
+   - Add startup check in `herdsman gateway start`.
    - Launch `pi --mode rpc --no-session`.
    - Require extension handshake.
    - Call `get_available_models`.
    - Fail Gateway startup with actionable errors.
 
-3. Minimal `shepherd-pi` extension package
+3. Minimal `herdsman-pi` extension package
    - Handshake.
    - Gateway attach.
    - `gateway.run.queued` subscription and claim.
@@ -52,16 +52,16 @@ Steps:
    - Assistant final -> `gateway.complete_run`.
 
 4. Session Pi metadata
-   - Create or assign Pi session file for new Slack-created Shepherd sessions.
+   - Create or assign Pi session file for new Slack-created Herdsman sessions.
    - Store `metadata.pi.sessionFile` and `metadata.pi.sessionId`.
 
 5. External run queue RPC
    - Add `gateway.run.queued` event.
    - Add `gateway.claim_next_run`, `gateway.start_run`, `gateway.complete_run`, `gateway.fail_run`.
-   - Keep one running run per Shepherd session.
+   - Keep one running run per Herdsman session.
 
 6. Headless Pi supervisor
-   - Lazy-start Pi RPC process per Shepherd session.
+   - Lazy-start Pi RPC process per Herdsman session.
    - Ensure extension auto-attaches to the session.
    - Stop after idle timeout.
 
@@ -80,15 +80,15 @@ Verification:
 - Integration tests for Slack inbound -> queued run -> complete -> delivery with fake extension.
 - Manual smoke with real Pi and Slack.
 
-## Slice 2: dynamic Shepherd tools in Pi
+## Slice 2: dynamic Herdsman tools in Pi
 
-Goal: Pi can call Shepherd/Herdr logical tools through the extension.
+Goal: Pi can call Herdsman/Herdr logical tools through the extension.
 
 Steps:
 
 1. Extension calls Gateway `tool.list` after attach.
 2. Extension registers Pi tools dynamically.
-3. Each tool delegates to `tool.run` with current Shepherd session id.
+3. Each tool delegates to `tool.run` with current Herdsman session id.
 4. Add extension metadata overrides for critical Herdr tools:
    - clear prompt guidance.
    - compact rendering where useful.
@@ -125,7 +125,7 @@ Goal: open the same Pi session interactively and let it own future runs.
 
 Steps:
 
-1. Add `shepherd open --session <id>`.
+1. Add `herdsman open --session <id>`.
 2. Ensure Pi session binding custom entry is written.
 3. Extension auto-attaches on Pi `/resume` when binding matches Gateway identity.
 4. Add owner priority and heartbeat.
@@ -137,7 +137,7 @@ Verification:
 - Integration tests for owner priority and heartbeat timeout.
 - Manual smoke:
   - Slack creates session.
-  - `shepherd open --session <id>` opens Pi.
+  - `herdsman open --session <id>` opens Pi.
   - Slack message appears in Pi TUI and is answered by TUI Pi.
   - Close Pi while idle; next Slack message uses headless Pi.
   - Close Pi while running; run becomes recovery_required.
@@ -192,22 +192,22 @@ Steps:
 
 1. Install:
    ```bash
-   brew install shepherd
-   pi install npm:shepherd-pi
+   brew install herdsman
+   pi install npm:herdsman-pi
    ```
 2. Start Gateway:
    ```bash
-   shepherd gateway start --config ~/.shepherd/config.yaml
+   herdsman gateway start --config ~/.herdsman/config.yaml
    ```
 3. Send Slack message in an allowed channel/thread.
 4. Confirm:
-   - Shepherd session created/bound.
+   - Herdsman session created/bound.
    - Pi session file created.
    - Slack receives final reply.
 5. Enable streaming and confirm Slack message updates live.
 6. Open session:
    ```bash
-   shepherd open --session <id>
+   herdsman open --session <id>
    ```
 7. Send Slack message and confirm it appears in Pi TUI and TUI owner responds.
 8. Resume same Pi session through Pi `/resume`; confirm auto attach.

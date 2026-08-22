@@ -1,4 +1,4 @@
-# Shepherd Herdr Orchestration Plan
+# Herdsman Herdr Orchestration Plan
 
 Date: 2026-06-24
 
@@ -13,13 +13,13 @@ Archived. Core MVP implementation was completed and verified on 2026-06-24. Keep
 
 ## Next steps
 
-- Use this plan only as reference. The later Pi runtime work is captured in [Shepherd Pi Runtime Gateway Plan](2026-06-25-pi-runtime-gateway.md).
+- Use this plan only as reference. The later Pi runtime work is captured in [Herdsman Pi Runtime Gateway Plan](2026-06-25-pi-runtime-gateway.md).
 
 ## Goal
 
-Shepherd is a lightweight orchestration gateway for Herdr-managed agents.
+Herdsman is a lightweight orchestration gateway for Herdr-managed agents.
 
-Users talk to Shepherd from a TUI or messaging platforms such as Slack. Shepherd stores the conversation and orchestration state, then controls Herdr sessions, workspaces, tabs, panes, and agents. The gateway LLM acts as a Herdr control-plane operator. It should not become a general coding agent; implementation work is delegated to agents and terminals running inside Herdr panes.
+Users talk to Herdsman from a TUI or messaging platforms such as Slack. Herdsman stores the conversation and orchestration state, then controls Herdr sessions, workspaces, tabs, panes, and agents. The gateway LLM acts as a Herdr control-plane operator. It should not become a general coding agent; implementation work is delegated to agents and terminals running inside Herdr panes.
 
 ## Implementation status
 
@@ -33,7 +33,7 @@ Implemented:
 - gateway provider registry for Codex app-server, OpenAI, Anthropic, and OpenRouter through the AI SDK adapter layer
 - message-level `providerOverride` plus configured session/channel gateway provider overrides
 - provider-independent logical tool registry with policy gates, event logging, and idempotent side-effect tool records
-- daemon `tool.list`/`tool.run` logical tool RPC plus standalone `shepherd-tools` stdio JSON Lines helper over the same Shepherd logical tools
+- daemon `tool.list`/`tool.run` logical tool RPC plus standalone `herdsman-tools` stdio JSON Lines helper over the same Herdsman logical tools
 - Herdr named-session lifecycle, socket wrapper, resource inspection, workspace/tab/pane/agent orchestration, waits, pane text send, and explicit attach
 - session summaries, recent-context gateway turns, per-session gateway turn queueing, and conservative daemon restart recovery
 - approval request/response event recording and delivery surface
@@ -41,9 +41,9 @@ Implemented:
 
 Important MVP limits:
 
-- Provider-specific approval callbacks are not fully bridged back into Codex app-server or worker agents yet. Shepherd records and delivers approval request/response events; provider-specific response plumbing is deferred.
-- The Codex gateway uses the AI SDK tool bridge around Shepherd logical tools by default. A standalone Hermes-style `shepherd-tools` stdio helper is available over the daemon logical tool RPC for callback-style integrations.
-- Long-running Herdr progress narration is implemented as gateway prompt guidance plus structured tool/session events. Shepherd starts daemon-managed Herdr progress subscriptions when gateway orchestration binds a workspace, then records and delivers compact `herdr.progress` signals.
+- Provider-specific approval callbacks are not fully bridged back into Codex app-server or worker agents yet. Herdsman records and delivers approval request/response events; provider-specific response plumbing is deferred.
+- The Codex gateway uses the AI SDK tool bridge around Herdsman logical tools by default. A standalone Hermes-style `herdsman-tools` stdio helper is available over the daemon logical tool RPC for callback-style integrations.
+- Long-running Herdr progress narration is implemented as gateway prompt guidance plus structured tool/session events. Herdsman starts daemon-managed Herdr progress subscriptions when gateway orchestration binds a workspace, then records and delivers compact `herdr.progress` signals.
 
 ## First implementation step
 
@@ -61,36 +61,36 @@ The first code change should establish:
 - TypeBox/Ajv runtime schema validation foundation
 - at least one real tested utility, not a placeholder test
 
-Detailed decisions are in [Implementation foundation and quality gates](2026-06-24-shepherd-herdr-orchestration/2026-06-24-implementation-foundation-quality-gates.md).
+Detailed decisions are in [Implementation foundation and quality gates](2026-06-24-herdsman-herdr-orchestration/2026-06-24-implementation-foundation-quality-gates.md).
 
 ## Product direction
 
-Shepherd differs from Hermes Agent in two ways:
+Herdsman differs from Hermes Agent in two ways:
 
-1. Herdr is the execution surface. Shepherd orchestrates real terminal panes, coding agents, logs, tests, and shells inside Herdr.
-2. TUI and messaging platforms share the same live Shepherd session event stream. A user can move between Slack and TUI without manual continuation, and messages/events appear in both surfaces in real time.
+1. Herdr is the execution surface. Herdsman orchestrates real terminal panes, coding agents, logs, tests, and shells inside Herdr.
+2. TUI and messaging platforms share the same live Herdsman session event stream. A user can move between Slack and TUI without manual continuation, and messages/events appear in both surfaces in real time.
 
-The local TUI talks to the Shepherd daemon over a Unix domain socket using newline-delimited JSON-RPC/JSON Lines. TUI clients attach with a last seen event id so the daemon can replay missed SQLite events before live streaming.
+The local TUI talks to the Herdsman daemon over a Unix domain socket using newline-delimited JSON-RPC/JSON Lines. TUI clients attach with a last seen event id so the daemon can replay missed SQLite events before live streaming.
 
-Hermes, Pi, OpenCode, NanoClaw, and NemoClaw are implementation references. Shepherd should keep the implementation smaller and focused on Herdr orchestration.
+Hermes, Pi, OpenCode, NanoClaw, and NemoClaw are implementation references. Herdsman should keep the implementation smaller and focused on Herdr orchestration.
 
 ## Plan structure
 
 This file is the parent plan. Detailed decisions live in child plans:
 
-- [Herdr control-plane mapping](2026-06-24-shepherd-herdr-orchestration/2026-06-24-herdr-control-plane.md)
-- [Gateway providers, Herdr agents, and context](2026-06-24-shepherd-herdr-orchestration/2026-06-24-gateway-providers-agents-context.md)
-- [Session event stream and messaging sync](2026-06-24-shepherd-herdr-orchestration/2026-06-24-session-event-stream-and-messaging.md)
-- [Slack access scope](2026-06-24-shepherd-herdr-orchestration/2026-06-24-slack-access-scope.md)
-- [Architecture references](2026-06-24-shepherd-herdr-orchestration/2026-06-24-architecture-references.md)
-- [Implementation foundation and quality gates](2026-06-24-shepherd-herdr-orchestration/2026-06-24-implementation-foundation-quality-gates.md)
-- [MVP implementation roadmap](2026-06-24-shepherd-herdr-orchestration/2026-06-24-implementation-roadmap.md)
+- [Herdr control-plane mapping](2026-06-24-herdsman-herdr-orchestration/2026-06-24-herdr-control-plane.md)
+- [Gateway providers, Herdr agents, and context](2026-06-24-herdsman-herdr-orchestration/2026-06-24-gateway-providers-agents-context.md)
+- [Session event stream and messaging sync](2026-06-24-herdsman-herdr-orchestration/2026-06-24-session-event-stream-and-messaging.md)
+- [Slack access scope](2026-06-24-herdsman-herdr-orchestration/2026-06-24-slack-access-scope.md)
+- [Architecture references](2026-06-24-herdsman-herdr-orchestration/2026-06-24-architecture-references.md)
+- [Implementation foundation and quality gates](2026-06-24-herdsman-herdr-orchestration/2026-06-24-implementation-foundation-quality-gates.md)
+- [MVP implementation roadmap](2026-06-24-herdsman-herdr-orchestration/2026-06-24-implementation-roadmap.md)
 
 ## Core decisions
 
 ### Source of truth
 
-Shepherd DB is the source of truth, not Slack and not Herdr.
+Herdsman DB is the source of truth, not Slack and not Herdr.
 
 Initial tables:
 
@@ -105,9 +105,9 @@ Initial tables:
 
 The `events` table is the ordered event stream for user messages, assistant messages, gateway logical tool calls/results, Herdr state events, approval requests, and delivery events.
 
-MVP runs at most one gateway turn per Shepherd session. New user messages arriving while a turn is active are persisted and queued in event order; they are handled after the active turn reaches a safe terminal state. Different Shepherd sessions may run concurrently.
+MVP runs at most one gateway turn per Herdsman session. New user messages arriving while a turn is active are persisted and queued in event order; they are handled after the active turn reaches a safe terminal state. Different Herdsman sessions may run concurrently.
 
-Daemon restart recovery is conservative. Shepherd inspects DB state on startup, does not automatically replay gateway/tool work that may have produced external side effects, uses idempotency keys for deliveries and Herdr-affecting logical tools, and emits recovery note events when user or gateway judgment is needed.
+Daemon restart recovery is conservative. Herdsman inspects DB state on startup, does not automatically replay gateway/tool work that may have produced external side effects, uses idempotency keys for deliveries and Herdr-affecting logical tools, and emits recovery note events when user or gateway judgment is needed.
 
 ### Working context
 
@@ -116,20 +116,20 @@ A working context is the filesystem or project area where work should happen. It
 Resolution order:
 
 1. explicit configured catalog
-2. previous Shepherd DB bindings and recent working contexts
+2. previous Herdsman DB bindings and recent working contexts
 3. allowed roots scan
 4. user clarification when ambiguous
 
-Allowed root scanning must be opt-in. Shepherd must not scan the whole home directory by default.
+Allowed root scanning must be opt-in. Herdsman must not scan the whole home directory by default.
 
 ### Herdr mapping
 
 ```text
 working context
-  -> Herdr named session: shepherd-<working-context-slug>
+  -> Herdr named session: herdsman-<working-context-slug>
 
-Shepherd session
-  -> Herdr workspace: shepherd-<task-slug>-<short-id>
+Herdsman session
+  -> Herdr workspace: herdsman-<task-slug>-<short-id>
 
 Herdr tabs
   -> agents / tests / logs / review / scratch
@@ -138,9 +138,9 @@ Herdr panes
   -> actual terminals, coding agents, test runners, dev servers
 ```
 
-One working context gets one Herdr named session. Multiple Shepherd sessions for the same working context become separate Herdr workspaces inside that named session.
+One working context gets one Herdr named session. Multiple Herdsman sessions for the same working context become separate Herdr workspaces inside that named session.
 
-Shepherd uses Herdr's named-session CLI lifecycle to ensure/create the `shepherd-<working-context-slug>` session, then uses the Herdr socket API for normal workspace, tab, pane, agent, and event operations. Shepherd should not directly manage `herdr server` processes in MVP.
+Herdsman uses Herdr's named-session CLI lifecycle to ensure/create the `herdsman-<working-context-slug>` session, then uses the Herdr socket API for normal workspace, tab, pane, agent, and event operations. Herdsman should not directly manage `herdr server` processes in MVP.
 
 ### Gateway LLM role
 
@@ -150,7 +150,7 @@ It may:
 
 - resolve working contexts
 - inspect Herdr sessions, workspaces, tabs, panes, and agents
-- create Shepherd-managed Herdr sessions/workspaces/tabs/panes
+- create Herdsman-managed Herdr sessions/workspaces/tabs/panes
 - start agents in panes
 - send prompts/input to agents or panes
 - wait for Herdr agent status changes
@@ -162,11 +162,11 @@ It should not:
 - directly edit project files outside Herdr
 - directly run implementation commands outside Herdr
 - act as the main coding agent
-- attach to existing non-Shepherd Herdr sessions/workspaces unless the user explicitly asks
+- attach to existing non-Herdsman Herdr sessions/workspaces unless the user explicitly asks
 
 ### Gateway providers
 
-Shepherd should support multiple gateway LLM providers. The provider registry/config/auth policy is owned by Shepherd. The actual LLM request implementation can use AI SDK provider packages as replaceable internals.
+Herdsman should support multiple gateway LLM providers. The provider registry/config/auth policy is owned by Herdsman. The actual LLM request implementation can use AI SDK provider packages as replaceable internals.
 
 MVP providers:
 
@@ -175,11 +175,11 @@ MVP providers:
 - `openai`
 - `anthropic`
 
-Shepherd must not depend on Vercel AI Gateway or a Vercel account.
+Herdsman must not depend on Vercel AI Gateway or a Vercel account.
 
-For the MVP Codex gateway, Shepherd exposes curated Shepherd/Herdr orchestration tools through the AI SDK executable tool bridge around the Codex app-server provider. Shepherd also provides a Hermes-style internal `shepherd-tools` stdio callback over daemon `tool.list`/`tool.run`; it uses the same logical tool definitions and is not a user-facing MCP integration surface.
+For the MVP Codex gateway, Herdsman exposes curated Herdsman/Herdr orchestration tools through the AI SDK executable tool bridge around the Codex app-server provider. Herdsman also provides a Hermes-style internal `herdsman-tools` stdio callback over daemon `tool.list`/`tool.run`; it uses the same logical tool definitions and is not a user-facing MCP integration surface.
 
-Gateway tools are provider-independent Shepherd logical tools. Shepherd owns the tool registry, policy checks, execution, event logging, and result projection; each provider adapter only translates those tools to its own transport.
+Gateway tools are provider-independent Herdsman logical tools. Herdsman owns the tool registry, policy checks, execution, event logging, and result projection; each provider adapter only translates those tools to its own transport.
 
 Provider override precedence is:
 
@@ -192,7 +192,7 @@ Channel override keys use `platform:spaceId` or the more specific `platform:spac
 
 ### Herdr agents
 
-Herdr agents are user-environment command profiles, not provider abstractions. Shepherd starts them through Herdr and sends task messages; the agent runtime owns its own auth, local config, and tool behavior.
+Herdr agents are user-environment command profiles, not provider abstractions. Herdsman starts them through Herdr and sends task messages; the agent runtime owns its own auth, local config, and tool behavior.
 
 `default_agent` is required. `agents` is a map keyed by agent name.
 
@@ -215,7 +215,7 @@ agents:
 
 ### Context management
 
-Shepherd DB stores the full session history. Gateway turns receive a compact active context:
+Herdsman DB stores the full session history. Gateway turns receive a compact active context:
 
 - stable system prompt
 - session metadata
@@ -251,6 +251,6 @@ Policy combines:
 - working context allowed roots
 - gateway logical toolset visibility
 
-MVP approval handling is limited to deterministic policy gates plus provider-native approval event forwarding. Shepherd records approval requests/responses and delivers them to TUI/Slack, but it does not make smart approval decisions. Provider-specific response routing back into Codex app-server or worker-agent approval APIs is deferred.
+MVP approval handling is limited to deterministic policy gates plus provider-native approval event forwarding. Herdsman records approval requests/responses and delivers them to TUI/Slack, but it does not make smart approval decisions. Provider-specific response routing back into Codex app-server or worker-agent approval APIs is deferred.
 
 Avoid Hermes-style plugin hooks, smart approval, and complex admin tiers in the first version.

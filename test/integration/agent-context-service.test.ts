@@ -23,7 +23,7 @@ afterEach(async () => {
 async function source(
   name: string,
 ): Promise<{ fingerprint: AgentHistorySourceFingerprint; ref: AgentHistoryRef }> {
-  const dir = await mkdtemp(join(tmpdir(), "shepherd-agent-context-"));
+  const dir = await mkdtemp(join(tmpdir(), "herdsman-agent-context-"));
   sourceDirs.push(dir);
   const path = join(dir, name);
   await writeFile(path, "history\n");

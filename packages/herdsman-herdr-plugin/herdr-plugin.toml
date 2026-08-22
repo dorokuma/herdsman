@@ -1,18 +1,18 @@
-id = "shepherd.agents"
-name = "Shepherd Agents"
-version = "0.5.1"
+id = "herdsman.agents"
+name = "Herdsman Agents"
+version = "0.6.0"
 min_herdr_version = "0.7.0"
-description = "Read compact Herdr agent history through Shepherd."
+description = "Read compact Herdr agent history through Herdsman."
 platforms = ["linux", "macos", "windows"]
 
 [[actions]]
 id = "agent-list"
-title = "Show Shepherd agents"
+title = "Show Herdsman agents"
 contexts = ["workspace"]
 command = ["node", "index.mjs", "agent-list"]
 
 [[panes]]
 id = "agents"
-title = "Shepherd Agents"
+title = "Herdsman Agents"
 placement = "split"
 command = ["node", "index.mjs", "agents"]

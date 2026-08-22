@@ -1,16 +1,16 @@
-# Shepherd TUI MVP Experience Plan
+# Herdsman TUI MVP Experience Plan
 
 Date: 2026-06-24
 
 ## Status
 
-Archived. Superseded by [Shepherd Pi Runtime Gateway Plan](2026-06-25-pi-runtime-gateway.md). Shepherd should use Pi as the user-facing TUI/runtime instead of implementing a custom full-screen TUI. Keep this plan as historical context for event-stream UX and local session requirements.
+Archived. Superseded by [Herdsman Pi Runtime Gateway Plan](2026-06-25-pi-runtime-gateway.md). Herdsman should use Pi as the user-facing TUI/runtime instead of implementing a custom full-screen TUI. Keep this plan as historical context for event-stream UX and local session requirements.
 
 ## Progress
 
 - **Done** — Historical TUI requirements and event-stream UX were captured.
-- **Superseded** — Custom Shepherd full-screen TUI implementation should not proceed under this plan.
-- **Superseded** — Child plans in `2026-06-24-shepherd-tui-mvp-experience/` remain reference material only.
+- **Superseded** — Custom Herdsman full-screen TUI implementation should not proceed under this plan.
+- **Superseded** — Child plans in `2026-06-24-herdsman-tui-mvp-experience/` remain reference material only.
 
 ## Next steps
 
@@ -19,42 +19,42 @@ Archived. Superseded by [Shepherd Pi Runtime Gateway Plan](2026-06-25-pi-runtime
 
 ## Goal
 
-Add the missing full-screen local TUI experience to Shepherd's MVP while preserving the existing daemon-centered architecture.
+Add the missing full-screen local TUI experience to Herdsman's MVP while preserving the existing daemon-centered architecture.
 
 The target user experience is close to Claude Code, Codex, and Pi:
 
 ```bash
 cd /path/to/work
-shepherd
+herdsman
 ```
 
-That command opens the Shepherd TUI, creates a new Shepherd session, and binds the current working directory as the session's working context. The TUI talks to the local Shepherd daemon. If the daemon is not running, the CLI starts it automatically before opening the TUI.
+That command opens the Herdsman TUI, creates a new Herdsman session, and binds the current working directory as the session's working context. The TUI talks to the local Herdsman daemon. If the daemon is not running, the CLI starts it automatically before opening the TUI.
 
-This plan fills gaps left by the archived Shepherd Herdr orchestration plans. Those plans already specify the shared event stream, daemon JSON Lines RPC, Slack sync, and Herdr mapping, but they do not describe the default `shepherd` TUI startup flow in enough detail.
+This plan fills gaps left by the archived Herdsman Herdr orchestration plans. Those plans already specify the shared event stream, daemon JSON Lines RPC, Slack sync, and Herdr mapping, but they do not describe the default `herdsman` TUI startup flow in enough detail.
 
 ## Recovered prior decisions
 
 These decisions were made in an earlier Pi session but were only partially captured in the archived plans:
 
-- TUI and messaging platforms are peers over the same Shepherd session event stream.
+- TUI and messaging platforms are peers over the same Herdsman session event stream.
 - Users should be able to switch between TUI and messaging platforms without manual continuation at the event-stream level. A TUI still needs a way to attach to an existing session, but once attached it receives replayed and live events.
-- The default TUI experience should match terminal coding agents: `cd` to a directory and run `shepherd`.
+- The default TUI experience should match terminal coding agents: `cd` to a directory and run `herdsman`.
 - For TUI-created sessions, the current working directory is the working context.
-- Shepherd should use a daemon + clients architecture. The TUI is a local client; the daemon owns DB, gateway turns, Slack, Herdr progress subscriptions, and delivery fanout.
-- If the daemon is not running, `shepherd` should start it automatically for the local user.
+- Herdsman should use a daemon + clients architecture. The TUI is a local client; the daemon owns DB, gateway turns, Slack, Herdr progress subscriptions, and delivery fanout.
+- If the daemon is not running, `herdsman` should start it automatically for the local user.
 - Hermes Agent is a gateway architecture reference, but Hermes TUI is not the target UX. Pi's TUI package is the preferred implementation reference.
 - One working context maps to one Herdr named session.
-- One Shepherd session maps to one Herdr workspace inside that named session.
-- Herdr resource names should use a `shepherd-` prefix, but should not include platform prefixes such as `slack-` or `tui-`.
-- Existing non-Shepherd Herdr resources should only be attached when the user explicitly asks.
+- One Herdsman session maps to one Herdr workspace inside that named session.
+- Herdr resource names should use a `herdsman-` prefix, but should not include platform prefixes such as `slack-` or `tui-`.
+- Existing non-Herdsman Herdr resources should only be attached when the user explicitly asks.
 
 ## Relationship to existing plans
 
 Archived plans that remain authoritative:
 
-- `docs/plans/archived/2026-06-24-shepherd-herdr-orchestration.md`
-- `docs/plans/archived/2026-06-24-shepherd-herdr-orchestration/2026-06-24-session-event-stream-and-messaging.md`
-- `docs/plans/archived/2026-06-24-shepherd-herdr-orchestration/2026-06-24-herdr-control-plane.md`
+- `docs/plans/archived/2026-06-24-herdsman-herdr-orchestration.md`
+- `docs/plans/archived/2026-06-24-herdsman-herdr-orchestration/2026-06-24-session-event-stream-and-messaging.md`
+- `docs/plans/archived/2026-06-24-herdsman-herdr-orchestration/2026-06-24-herdr-control-plane.md`
 
 This plan adds the missing TUI-specific user journey and implementation steps. It should not reopen the completed core MVP unless the TUI requires small RPC/store additions.
 
@@ -62,7 +62,7 @@ This plan adds the missing TUI-specific user journey and implementation steps. I
 
 ### Default command
 
-`shepherd` with no subcommand starts the full-screen TUI.
+`herdsman` with no subcommand starts the full-screen TUI.
 
 Expected flow:
 
@@ -71,14 +71,14 @@ Expected flow:
 3. If connection fails because the daemon is not running, start the daemon in the background.
 4. Connect again once the socket is ready.
 5. Resolve or create a working context from `process.cwd()`.
-6. Create a new Shepherd session bound to that working context.
+6. Create a new Herdsman session bound to that working context.
 7. Subscribe to the session event stream with `afterEventId = 0`.
 8. Render replayed events and live updates.
 9. Submit editor input as `session.user_message` with TUI actor presentation.
 
 ### Explicit session attach
 
-`shepherd --session <id>` opens the TUI attached to an existing Shepherd session.
+`herdsman --session <id>` opens the TUI attached to an existing Herdsman session.
 
 Behavior:
 
@@ -89,11 +89,11 @@ Behavior:
 
 ### Resume flow
 
-`shepherd -r` / `shepherd --resume` opens a session selector.
+`herdsman -r` / `herdsman --resume` opens a session selector.
 
 Behavior:
 
-- List recent Shepherd sessions, ideally scoped first to the current working context.
+- List recent Herdsman sessions, ideally scoped first to the current working context.
 - Allow filtering by title, working context label/path, platform binding, and recent message text if supported by the RPC.
 - Selecting a session attaches the TUI to that session.
 - New Slack messages, gateway messages, Herdr progress, and approval events appear after replay.
@@ -102,21 +102,21 @@ The first implementation can ship the selector after `--session` and default new
 
 ### Continue latest
 
-`shepherd -c` / `shepherd --continue` attaches to the latest active session for the current working context. If none exists, it creates a new session.
+`herdsman -c` / `herdsman --continue` attaches to the latest active session for the current working context. If none exists, it creates a new session.
 
-Default `shepherd` should create a new session rather than silently continuing the latest session. This avoids mixing unrelated work. Continuation should be explicit.
+Default `herdsman` should create a new session rather than silently continuing the latest session. This avoids mixing unrelated work. Continuation should be explicit.
 
 ### Existing commands
 
 Keep existing subcommands:
 
-- `shepherd daemon`
-- `shepherd send`
-- `shepherd watch`
-- `shepherd rename`
-- `shepherd audit`
+- `herdsman daemon`
+- `herdsman send`
+- `herdsman watch`
+- `herdsman rename`
+- `herdsman audit`
 
-The default command changes from help/error to TUI startup. `shepherd help` and `shepherd --help` still show CLI help.
+The default command changes from help/error to TUI startup. `herdsman help` and `herdsman --help` still show CLI help.
 
 ## TUI surface
 
@@ -124,7 +124,7 @@ The MVP TUI should use `@earendil-works/pi-tui` unless implementation testing sh
 
 Initial layout:
 
-- Header: Shepherd name, session title/id, working context, daemon status.
+- Header: Herdsman name, session title/id, working context, daemon status.
 - Message stream: user messages, gateway messages, tool/progress summaries, approval events.
 - Editor: multiline input using Pi TUI `Editor`.
 - Footer/status: socket status, gateway running/queued state, last event id, key hints.
@@ -147,7 +147,7 @@ Slash commands can be implemented after the base editor and message stream are s
 
 ## Event rendering requirements
 
-The TUI displays the Shepherd event stream, not direct provider-specific messages.
+The TUI displays the Herdsman event stream, not direct provider-specific messages.
 
 MVP rendering should cover:
 
@@ -169,13 +169,13 @@ Rendering should be compact by default. Raw JSON should be available later throu
 
 ## Cross-platform sync semantics
 
-Shepherd DB remains the source of truth.
+Herdsman DB remains the source of truth.
 
 - TUI-originated messages are appended to the event stream first, then delivered to bound messaging platforms through existing delivery fanout.
 - Slack-originated messages are appended to the same event stream first, then delivered to attached TUI clients through live subscription.
 - If Slack `tui_default_channel` is configured, a default TUI-created session is eligible for automatic Slack binding on its first user message.
-- That first user message becomes the Slack thread parent. Shepherd records the Slack binding and a sent delivery receipt for the same event/target before publishing the event and waking the gateway.
-- If Slack parent posting fails, Shepherd keeps the TUI message, records `platform.binding_failed`, marks the session auto-bind state as failed, and continues as TUI-only.
+- That first user message becomes the Slack thread parent. Herdsman records the Slack binding and a sent delivery receipt for the same event/target before publishing the event and waking the gateway.
+- If Slack parent posting fails, Herdsman keeps the TUI message, records `platform.binding_failed`, marks the session auto-bind state as failed, and continues as TUI-only.
 - Slack replies in an auto-created thread are normal session user messages and wake the gateway, subject to Slack allowlists.
 - Slack `allowed_users` is required whenever Slack is configured.
 - The TUI keeps the latest seen event id in memory while running.
@@ -185,21 +185,21 @@ A TUI session does not need a separate TUI platform binding unless future featur
 
 ## Working context behavior
 
-For default `shepherd` startup:
+For default `herdsman` startup:
 
 - `process.cwd()` is the working context path.
 - The working context label defaults to the basename of the cwd.
 - The working context slug should be generated using the existing Herdr-safe naming rules.
 - A matching existing working context should be reused when the path is already known.
 - A new working context should be inserted when the cwd is new and allowed.
-- The new Shepherd session stores `working_context_id`.
+- The new Herdsman session stores `working_context_id`.
 
-Allowed-root policy needs a TUI-friendly rule. The gateway currently rejects working contexts when no allowed roots are configured. The TUI should not make `cd && shepherd` fail unexpectedly in a trusted local shell.
+Allowed-root policy needs a TUI-friendly rule. The gateway currently rejects working contexts when no allowed roots are configured. The TUI should not make `cd && herdsman` fail unexpectedly in a trusted local shell.
 
 Proposed MVP rule:
 
 - If `context.allowed_roots` is configured, cwd must be inside one of those roots.
-- If `context.allowed_roots` is not configured, local TUI startup may create a working context for cwd because the user explicitly ran `shepherd` there.
+- If `context.allowed_roots` is not configured, local TUI startup may create a working context for cwd because the user explicitly ran `herdsman` there.
 - Gateway tools that scan arbitrary roots should still require explicit allowed roots.
 
 This distinction preserves safe Slack-driven discovery while keeping local TUI startup ergonomic.
@@ -211,7 +211,7 @@ The daemon remains the owner of long-running runtime state.
 Autostart flow:
 
 1. TUI command tries to connect to the configured socket.
-2. If it fails with socket-not-found or connection-refused, spawn `shepherd daemon` as a detached background process with the same resolved config, DB path, and socket path.
+2. If it fails with socket-not-found or connection-refused, spawn `herdsman daemon` as a detached background process with the same resolved config, DB path, and socket path.
 3. Wait for the socket to become connectable with a bounded timeout.
 4. If startup fails, show a concise error with the daemon log path.
 
@@ -221,22 +221,22 @@ The plan should avoid starting duplicate daemons. A stale socket should be handl
 
 ## State locations
 
-The current CLI defaults `dbPath` to `shepherd.sqlite` and `socketPath` to `/tmp/shepherd.sock`. That is workable for tests but weak for the default TUI experience.
+The current CLI defaults `dbPath` to `herdsman.sqlite` and `socketPath` to `/tmp/herdsman.sock`. That is workable for tests but weak for the default TUI experience.
 
-TUI MVP should use a stable per-user Shepherd home directory:
+TUI MVP should use a stable per-user Herdsman home directory:
 
 ```text
-SHEPHERD_HOME=${SHEPHERD_HOME:-~/.shepherd}
+SHEPHERD_HOME=${SHEPHERD_HOME:-~/.herdsman}
 ```
 
 Default managed paths:
 
 ```text
-Config:  ~/.shepherd/config.yaml
-Env:     ~/.shepherd/.env
-DB:      ~/.shepherd/state.db
-Socket:  ~/.shepherd/daemon.sock
-Log:     ~/.shepherd/logs/daemon.log
+Config:  ~/.herdsman/config.yaml
+Env:     ~/.herdsman/.env
+DB:      ~/.herdsman/state.db
+Socket:  ~/.herdsman/daemon.sock
+Log:     ~/.herdsman/logs/daemon.log
 ```
 
 Explicit overrides still win:
@@ -274,12 +274,12 @@ These can be collapsed into fewer RPC methods if implementation stays simple, bu
 1. Add tests and store methods for listing sessions, resolving cwd working contexts, and storing session metadata.
 2. Add config validation for Slack `tui_default_channel` and required `allowed_users`.
 3. Add daemon RPC methods for session create/list/get and local working context resolution.
-4. Extend `ShepherdSessionClient` with typed wrappers for those RPC methods.
+4. Extend `HerdsmanSessionClient` with typed wrappers for those RPC methods.
 5. Add Slack auto-bind handling for default TUI-created sessions.
 6. Add `@earendil-works/pi-tui` dependency.
 7. Implement a minimal TUI app that attaches to `--session <id>` and renders events.
 8. Add editor submission via `sendUserMessage()` with per-message idempotency keys.
-9. Add default `shepherd` command that creates a cwd-bound session and opens TUI.
+9. Add default `herdsman` command that creates a cwd-bound session and opens TUI.
 10. Add daemon autostart.
 11. Add `--resume` and `--continue` flows.
 12. Add slash commands and polish.
@@ -295,7 +295,7 @@ Required checks for implementation changes:
 - Integration tests for Slack auto-bind success, failure, receipt de-duplication, and inbound reply wake-up.
 - Component-level tests for event formatting where possible.
 - Manual TUI smoke test in a real terminal:
-  - `shepherd` from a project directory
+  - `herdsman` from a project directory
   - send a message
   - receive gateway response/events
   - with Slack auto-bind configured, verify first message creates a Slack parent and later Slack replies appear in TUI
@@ -310,11 +310,11 @@ These are not blockers for writing the initial plan, but should be resolved befo
 
 1. Should empty auto-created sessions be pruned automatically?
 2. Should `session.create` emit a session-level event or only create the DB row?
-3. Should cwd registration bypass allowed roots only for interactive TUI, or also for `shepherd send` when run locally?
+3. Should cwd registration bypass allowed roots only for interactive TUI, or also for `herdsman send` when run locally?
 4. What should the exact `platform.binding_failed` payload shape be?
 5. Should the MVP TUI render Markdown from `gateway.message`, or use plain wrapped text first?
 
 ## Child plans
 
-- [TUI startup, daemon autostart, and session lifecycle](2026-06-24-shepherd-tui-mvp-experience/2026-06-24-tui-startup-daemon-session.md)
-- [TUI rendering, input, and event stream UX](2026-06-24-shepherd-tui-mvp-experience/2026-06-24-tui-rendering-input-event-stream.md)
+- [TUI startup, daemon autostart, and session lifecycle](2026-06-24-herdsman-tui-mvp-experience/2026-06-24-tui-startup-daemon-session.md)
+- [TUI rendering, input, and event stream UX](2026-06-24-herdsman-tui-mvp-experience/2026-06-24-tui-rendering-input-event-stream.md)

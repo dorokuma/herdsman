@@ -1,4 +1,4 @@
-# shepherd-pi Reconnecting Client, Orchestrator Commands, Notification Context, and UI Plan
+# herdsman-pi Reconnecting Client, Orchestrator Commands, Notification Context, and UI Plan
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task.
 
@@ -6,7 +6,7 @@
 
 **Goal:** Let users control and inspect the current Pi terminal's orchestrator role, survive daemon and Pi session replacement, and keep existing telemetry/hidden context behavior while consuming pushed updates only as owner.
 
-**Architecture:** Extract a reconnecting JSONL daemon client from the extension entrypoint. On every connection, the extension registers current Pi subscriber metadata plus Herdr launch identity; the daemon returns authoritative terminal/scope/role and owner-only pending events. The `/shepherd orchestrator` command uses connection-bound RPC, role stream updates drive footer/transient UI, and every context/telemetry request uses daemon-refreshed in-memory scope rather than immutable launch environment after a pane move.
+**Architecture:** Extract a reconnecting JSONL daemon client from the extension entrypoint. On every connection, the extension registers current Pi subscriber metadata plus Herdr launch identity; the daemon returns authoritative terminal/scope/role and owner-only pending events. The `/herdsman orchestrator` command uses connection-bound RPC, role stream updates drive footer/transient UI, and every context/telemetry request uses daemon-refreshed in-memory scope rather than immutable launch environment after a pane move.
 
 **Tech Stack:** TypeScript, Node `net`, Pi extension lifecycle/command/UI API, Vitest, temporary Unix socket servers.
 
@@ -17,28 +17,28 @@
 - The launch environment seeds the first registration, not permanent truth. After registration/get/change responses, overwrite in-memory `herdrSessionName`, `workspaceId`, `paneId`, and `terminalId` with daemon-authoritative presence; reconnects in the same extension instance send the latest in-memory pane/workspace so a moved terminal does not regress to stale env.
 - Do not persist role state in Pi custom entries or project files. Re-register after every fresh `session_start`.
 - A command must fail visibly when registration has not succeeded; it must not queue an unbound role mutation.
-- Daemon connection/registration failures must not throw from Pi event handlers or block agent turns. Clear the owner footer, set a concise Shepherd connection status, and let the client reconnect.
-- Footer key is `shepherd-orchestrator`; value is exactly `Shepherd: orchestrator` for owner and `undefined` otherwise.
-- Existing unread key remains `shepherd`. Role UI must not overwrite it.
+- Daemon connection/registration failures must not throw from Pi event handlers or block agent turns. Clear the owner footer, set a concise Herdsman connection status, and let the client reconnect.
+- Footer key is `herdsman-orchestrator`; value is exactly `Herdsman: orchestrator` for owner and `undefined` otherwise.
+- Existing unread key remains `herdsman`. Role UI must not overwrite it.
 - Old owner notification text names the new pane when present. Do not notify every non-owner on unrelated claims.
-- Bare `/shepherd` without `orchestrator` and unknown arguments report exact usage: `Usage: /shepherd orchestrator [on|off|status]`.
-- `/shepherd orchestrator` is an alias of status.
+- Bare `/herdsman` without `orchestrator` and unknown arguments report exact usage: `Usage: /herdsman orchestrator [on|off|status]`.
+- `/herdsman orchestrator` is an alias of status.
 - `autoResume` behavior remains controlled by `ExtensionOptions.autoResume`; no new user setting is added.
 
 ## Current Context
 
-- `packages/shepherd-pi/src/index.ts` contains contracts, extension lifecycle, formatting helpers, event handling, and a non-reconnecting socket client in one file.
-- `test/unit/shepherd-pi-extension.test.ts` uses `clientFactory` and a fake client; preserve this seam with the new client interface.
+- `packages/herdsman-pi/src/index.ts` contains contracts, extension lifecycle, formatting helpers, event handling, and a non-reconnecting socket client in one file.
+- `test/unit/herdsman-pi-extension.test.ts` uses `clientFactory` and a fake client; preserve this seam with the new client interface.
 - Pi 0.80.3 command handlers receive `(args, ctx)` and use `ctx.ui.notify()`; session replacement tears down the old extension and starts a fresh instance.
-- Pi package typecheck includes `packages/shepherd-pi/src/**/*.ts`; `npm pack` follows package manifest paths.
+- Pi package typecheck includes `packages/herdsman-pi/src/**/*.ts`; `npm pack` follows package manifest paths.
 
 ## File Structure
 
-- Create: `packages/shepherd-pi/src/daemon-client.ts` — reconnecting JSONL transport and typed stream callbacks.
-- Modify: `packages/shepherd-pi/src/index.ts` — registration, command, role/presence state, telemetry/context integration.
-- Create: `test/integration/shepherd-pi-daemon-client.test.ts` — reconnect/backoff/request/stream behavior with real sockets.
-- Modify: `test/unit/shepherd-pi-extension.test.ts` — registration, commands, role UI, session replacement, owner-only pending context.
-- Modify: `packages/shepherd-pi/package.json` only if dry-run proves source inclusion needs an explicit manifest adjustment; otherwise leave it unchanged.
+- Create: `packages/herdsman-pi/src/daemon-client.ts` — reconnecting JSONL transport and typed stream callbacks.
+- Modify: `packages/herdsman-pi/src/index.ts` — registration, command, role/presence state, telemetry/context integration.
+- Create: `test/integration/herdsman-pi-daemon-client.test.ts` — reconnect/backoff/request/stream behavior with real sockets.
+- Modify: `test/unit/herdsman-pi-extension.test.ts` — registration, commands, role UI, session replacement, owner-only pending context.
+- Modify: `packages/herdsman-pi/package.json` only if dry-run proves source inclusion needs an explicit manifest adjustment; otherwise leave it unchanged.
 
 ## Interfaces
 
@@ -78,8 +78,8 @@ After the final entry, repeat 1,000ms until close. Only explicit `close()` stops
 Extension state must include:
 
 ```ts
-type ShepherdState = {
-  client: ShepherdDaemonClient | undefined;
+type HerdsmanState = {
+  client: HerdsmanDaemonClient | undefined;
   connected: boolean;
   currentScope: {
     herdrSessionName: string;
@@ -104,9 +104,9 @@ type ShepherdState = {
 **Objective:** Recover daemon connectivity automatically without coupling transport retries to Pi lifecycle code.
 
 **Files:**
-- Create: `packages/shepherd-pi/src/daemon-client.ts`
-- Create: `test/integration/shepherd-pi-daemon-client.test.ts`
-- Modify: `packages/shepherd-pi/src/index.ts` imports only enough to keep compilation after extraction.
+- Create: `packages/herdsman-pi/src/daemon-client.ts`
+- Create: `test/integration/herdsman-pi-daemon-client.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts` imports only enough to keep compilation after extraction.
 
 **Interfaces:**
 - Produces: `ReconnectingDaemonClient` API above.
@@ -121,13 +121,13 @@ Use a temporary Unix socket path and real `net.createServer()` to test:
 3. `agent.event` and `agent.orchestrator.changed` invoke `onStreamMessage` and do not consume pending request ids.
 4. Server-side socket close rejects in-flight requests, fires `onDisconnected`, reconnects, and permits a later request.
 5. Backoff sequence uses injected `[1, 2, 3]` delays then repeats 3ms; fake timers avoid sleeps.
-6. Explicit `close()` cancels reconnect and rejects later request with `Shepherd daemon client is closed`.
+6. Explicit `close()` cancels reconnect and rejects later request with `Herdsman daemon client is closed`.
 7. Malformed JSON does not crash the process; it disconnects/retries with a parse error.
 8. Multiple `error`/`close` emissions schedule only one reconnect attempt.
 
 - [x] **Step 2: Run test to verify red**
 
-Run: `pnpm test test/integration/shepherd-pi-daemon-client.test.ts`
+Run: `pnpm test test/integration/herdsman-pi-daemon-client.test.ts`
 
 Expected: module/import failure because the client does not exist.
 
@@ -146,15 +146,15 @@ Implementation requirements:
 
 - [x] **Step 4: Run client tests and package typecheck**
 
-Run: `pnpm test test/integration/shepherd-pi-daemon-client.test.ts && pnpm --dir packages/shepherd-pi typecheck`
+Run: `pnpm test test/integration/herdsman-pi-daemon-client.test.ts && pnpm --dir packages/herdsman-pi typecheck`
 
 Expected: all reconnect tests and package typecheck pass.
 
 - [x] **Step 5: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/daemon-client.ts packages/shepherd-pi/src/index.ts test/integration/shepherd-pi-daemon-client.test.ts
-git commit -m "feat(pi): reconnect shepherd daemon client"
+git add packages/herdsman-pi/src/daemon-client.ts packages/herdsman-pi/src/index.ts test/integration/herdsman-pi-daemon-client.test.ts
+git commit -m "feat(pi): reconnect herdsman daemon client"
 ```
 
 ### Task 2: Register Authoritative Pi Presence on Every Connection
@@ -162,8 +162,8 @@ git commit -m "feat(pi): reconnect shepherd daemon client"
 **Objective:** Rebind the same Herdr terminal after daemon restart and Pi session replacement.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: `agent.orchestrator.register`.
@@ -202,7 +202,7 @@ Update test env helpers to include `HERDR_SOCKET_PATH` and `HERDR_PANE_ID` and r
 
 - [x] **Step 2: Run red test**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: extension still calls `agent.notifications.subscribe` and lacks role UI/state.
 
@@ -216,65 +216,65 @@ On `session_start`:
 - `onConnected` calls one deduplicated `registerPresence(ctx)` promise, using `state.currentScope?.paneId/workspaceId` when available and launch env only before the first authoritative response;
 - apply response presence before state/pending events;
 - set `isOrchestrator` by comparing response owner terminal to response presence terminal;
-- use `setStatus("shepherd-orchestrator", "Shepherd: orchestrator")` only when true;
+- use `setStatus("herdsman-orchestrator", "Herdsman: orchestrator")` only when true;
 - clear connection error status after successful register.
 
 On `session_shutdown`, call explicit client `close()`. The daemon handles terminal grace and replacement matching.
 
 - [x] **Step 4: Run extension tests**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: registration/lifecycle tests pass; command tests may still be absent.
 
 - [x] **Step 5: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/index.ts test/unit/herdsman-pi-extension.test.ts
 git commit -m "feat(pi): register orchestrator presence"
 ```
 
-### Task 3: Add `/shepherd orchestrator` Command and Role UI
+### Task 3: Add `/herdsman orchestrator` Command and Role UI
 
 **Objective:** Provide the exact on/off/status UX decided in the design session.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: `agent.orchestrator.get` and `agent.orchestrator.set`.
-- Produces: Pi command `shepherd`.
+- Produces: Pi command `herdsman`.
 
 - [x] **Step 1: Write failing command tests**
 
-Capture `registerCommand("shepherd", options)` and invoke its handler. Assert:
+Capture `registerCommand("herdsman", options)` and invoke its handler. Assert:
 
 1. `orchestrator`, `orchestrator status`, and whitespace-normalized variants call get.
 2. `orchestrator on` calls set `{ enabled: true }`.
 3. `orchestrator off` calls set `{ enabled: false }`.
 4. Bare/unknown args notify warning with exact usage.
-5. Before successful registration, on/off/status notify error `Shepherd orchestrator is unavailable until this Pi reconnects to the daemon` and make no RPC call.
+5. Before successful registration, on/off/status notify error `Herdsman orchestrator is unavailable until this Pi reconnects to the daemon` and make no RPC call.
 6. On success, response state/presence updates local scope/footer and merges owner-only `events` into local pending state.
-7. Non-owner off response with `changed: false` notifies `This Pi is not the Shepherd orchestrator` and does not clear another owner's displayed status data.
-8. Status with no owner says `No Shepherd orchestrator is set for <session>/<workspace>`.
+7. Non-owner off response with `changed: false` notifies `This Pi is not the Herdsman orchestrator` and does not clear another owner's displayed status data.
+8. Status with no owner says `No Herdsman orchestrator is set for <session>/<workspace>`.
 9. Status with another owner includes its pane id.
-10. Owner status says `This Pi is the Shepherd orchestrator for <session>/<workspace> (<pane>)`.
+10. Owner status says `This Pi is the Herdsman orchestrator for <session>/<workspace> (<pane>)`.
 11. Owner-initiated `off` produces one command completion notification, not a second transient role-change notification.
 
 - [x] **Step 2: Run red test**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
-Expected: no `shepherd` command is registered.
+Expected: no `herdsman` command is registered.
 
 - [x] **Step 3: Implement strict parser and response application**
 
 Register once during extension factory execution:
 
 ```ts
-pi.registerCommand?.("shepherd", {
-  description: "Manage the Shepherd orchestrator for this Herdr workspace",
+pi.registerCommand?.("herdsman", {
+  description: "Manage the Herdsman orchestrator for this Herdr workspace",
   getArgumentCompletions(prefix: string) {
     const values = ["orchestrator", "orchestrator on", "orchestrator off", "orchestrator status"];
     return values
@@ -301,8 +301,8 @@ For `agent.orchestrator.changed`:
 ```ts
 ctx.ui.notify(
   change.current.owner
-    ? `Shepherd orchestrator moved to ${change.current.owner.paneId}`
-    : "Shepherd orchestrator is now off for this workspace",
+    ? `Herdsman orchestrator moved to ${change.current.owner.paneId}`
+    : "Herdsman orchestrator is now off for this workspace",
   "info",
 );
 ```
@@ -311,14 +311,14 @@ Do not notify a Pi that was neither previous nor current owner. Role stream data
 
 - [x] **Step 5: Run command/UI tests**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: all command aliases, no-op off, footer, and transient notification tests pass.
 
 - [x] **Step 6: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/index.ts test/unit/herdsman-pi-extension.test.ts
 git commit -m "feat(pi): manage orchestrator role"
 ```
 
@@ -327,8 +327,8 @@ git commit -m "feat(pi): manage orchestrator role"
 **Objective:** Remove subscriber semantics while preserving all non-notification behavior for every Pi.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes: owner-only `agent.event`, connection-bound `agent.notifications.ack`, authoritative current scope.
@@ -352,7 +352,7 @@ Add tests for:
 
 - [x] **Step 2: Run red test**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: old subscription id ack and unconditional event handling fail the new matrix.
 
@@ -381,37 +381,37 @@ Environment values remain only the initial registration input.
 Run:
 
 ```bash
-rg "currentSubscriptionId|agent\.notifications\.subscribe|subscriptionId" packages/shepherd-pi test/unit/shepherd-pi-extension.test.ts -n
+rg "currentSubscriptionId|agent\.notifications\.subscribe|subscriptionId" packages/herdsman-pi test/unit/herdsman-pi-extension.test.ts -n
 ```
 
 Expected: no matches.
 
 - [x] **Step 6: Run Pi focused tests**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts test/integration/shepherd-pi-daemon-client.test.ts && pnpm --dir packages/shepherd-pi typecheck`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts test/integration/herdsman-pi-daemon-client.test.ts && pnpm --dir packages/herdsman-pi typecheck`
 
 Expected: all tests/typecheck pass.
 
 - [x] **Step 7: Verify package contents**
 
-Run: `(cd packages/shepherd-pi && npm pack --dry-run --json)`
+Run: `(cd packages/herdsman-pi && npm pack --dry-run --json)`
 
-Expected: output includes `src/index.ts`, `src/daemon-client.ts`, `skills/shepherd/SKILL.md`, and excludes `dist/`, `node_modules/`, and SQLite files.
+Expected: output includes `src/index.ts`, `src/daemon-client.ts`, `skills/herdsman/SKILL.md`, and excludes `dist/`, `node_modules/`, and SQLite files.
 
 - [x] **Step 8: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts packages/shepherd-pi/src/daemon-client.ts test/unit/shepherd-pi-extension.test.ts test/integration/shepherd-pi-daemon-client.test.ts
+git add packages/herdsman-pi/src/index.ts packages/herdsman-pi/src/daemon-client.ts test/unit/herdsman-pi-extension.test.ts test/integration/herdsman-pi-daemon-client.test.ts
 git commit -m "fix(pi): deliver updates only to orchestrator"
 ```
 
 ## Validation
 
-- `pnpm test test/integration/shepherd-pi-daemon-client.test.ts`
-- `pnpm test test/unit/shepherd-pi-extension.test.ts`
-- `pnpm --dir packages/shepherd-pi typecheck`
-- `(cd packages/shepherd-pi && npm pack --dry-run --json)`
-- `rg "agent\.notifications\.subscribe|currentSubscriptionId|subscriptionId" packages/shepherd-pi test/unit/shepherd-pi-extension.test.ts -n` returns no matches.
+- `pnpm test test/integration/herdsman-pi-daemon-client.test.ts`
+- `pnpm test test/unit/herdsman-pi-extension.test.ts`
+- `pnpm --dir packages/herdsman-pi typecheck`
+- `(cd packages/herdsman-pi && npm pack --dry-run --json)`
+- `rg "agent\.notifications\.subscribe|currentSubscriptionId|subscriptionId" packages/herdsman-pi test/unit/herdsman-pi-extension.test.ts -n` returns no matches.
 
 ## Risks, Tradeoffs, and Open Questions
 

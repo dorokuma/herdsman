@@ -1,8 +1,8 @@
-# Shepherd MVP Implementation Roadmap
+# Herdsman MVP Implementation Roadmap
 
 Date: 2026-06-24
 
-Parent: [Shepherd Herdr Orchestration Plan](../2026-06-24-shepherd-herdr-orchestration.md)
+Parent: [Herdsman Herdr Orchestration Plan](../2026-06-24-herdsman-herdr-orchestration.md)
 
 ## Status
 
@@ -19,19 +19,19 @@ Archived. Original MVP roadmap is complete.
 
 ## Goal
 
-Break the Shepherd MVP into implementation phases while preserving the design decisions from the parent and child plans.
+Break the Herdsman MVP into implementation phases while preserving the design decisions from the parent and child plans.
 
 ## Overall implementation status
 
 Status as of 2026-06-24 latest `main`: core MVP implementation is complete and verified with `pnpm check` and `pnpm build`.
 
-The implementation covers foundation, DB/event stream, daemon socket RPC, TUI-style CLI attach, Slack MVP, gateway providers, message/session/channel provider overrides, Herdr orchestration, daemon logical tool RPC, `shepherd-tools` stdio helper, session summaries, restart recovery, idempotency, audit, explicit Herdr attach, and approval event recording.
+The implementation covers foundation, DB/event stream, daemon socket RPC, TUI-style CLI attach, Slack MVP, gateway providers, message/session/channel provider overrides, Herdr orchestration, daemon logical tool RPC, `herdsman-tools` stdio helper, session summaries, restart recovery, idempotency, audit, explicit Herdr attach, and approval event recording.
 
 Known MVP limits are tracked in the child plans and Deferred section:
 
 - Provider-specific approval response routing back into Codex app-server or worker-agent approval APIs is deferred.
-- A standalone Hermes-style `shepherd-tools` stdio callback binary is implemented over daemon `tool.list`/`tool.run`; the Codex gateway still uses the AI SDK tool bridge by default.
-- Herdr event wait/progress recording, delivery, and automatic daemon-managed subscription lifecycle are implemented for Shepherd-bound workspaces.
+- A standalone Hermes-style `herdsman-tools` stdio callback binary is implemented over daemon `tool.list`/`tool.run`; the Codex gateway still uses the AI SDK tool bridge by default.
+- Herdr event wait/progress recording, delivery, and automatic daemon-managed subscription lifecycle are implemented for Herdsman-bound workspaces.
 
 Completion audit:
 
@@ -121,21 +121,21 @@ Deliverables:
 - create/list/read/send pane
 - start/list/get/read/send/focus agent
 - event subscription or polling for agent status
-- Shepherd-managed naming
+- Herdsman-managed naming
 - `send_agent_message` high-level tool using Herdr `agent.send`
 
 Rules:
 
 - Use `agent.start` for configured agents.
 - Use `pane` APIs for tests, logs, shells, and servers.
-- Do not attach to non-Shepherd Herdr resources unless the user explicitly asks.
-- Record Herdr bindings in Shepherd DB.
+- Do not attach to non-Herdsman Herdr resources unless the user explicitly asks.
+- Record Herdr bindings in Herdsman DB.
 
 ## Phase 3: Gateway LLM runner
 
 Deliverables:
 
-- Shepherd provider registry
+- Herdsman provider registry
 - AI SDK-backed provider adapters
   - Codex app-server via `ai-sdk-provider-codex-cli`
   - OpenRouter
@@ -144,9 +144,9 @@ Deliverables:
 - provider selection from `gateway.default_provider`
 - env-only API key resolution for API-key providers
 - Codex app-server process lifecycle
-- stateless Codex app-server calls using Shepherd DB history
+- stateless Codex app-server calls using Herdsman DB history
 - AI SDK executable tool bridge for Codex app-server and API-key providers
-- provider-independent Shepherd logical tool registry
+- provider-independent Herdsman logical tool registry
 - provider adapter translation from logical tools to provider wire format
 - policy-based toolset selection
 - layered prompt builder
@@ -226,7 +226,7 @@ Implemented so far:
 - Bolt Socket Mode wrapper for Slack message events
 - Slack platform config schema using environment variable names for tokens
 - CLI daemon wiring for Slack runtime, delivery fanout, and daemon-backed inbound messages
-- local session client plus `shepherd send` / `shepherd watch` for TUI-style attach and resume
+- local session client plus `herdsman send` / `herdsman watch` for TUI-style attach and resume
 - startup recovery notes for queued/running gateway runs without automatic replay
 - API-key backed gateway providers for OpenAI, Anthropic, and OpenRouter
 - recent event context builder for gateway turns
@@ -237,7 +237,7 @@ Implemented so far:
 - allowed-root working context discovery and resolution tools
 - persisted logical tool idempotency records with completed-result reuse
 - session title rename flow through daemon RPC and CLI
-- basic SQLite event audit log through `shepherd audit`
+- basic SQLite event audit log through `herdsman audit`
 - explicit Herdr session/workspace attach through the gateway logical toolset
 - conservative daemon restart recovery for queued/running gateway turns
 - clearer Herdr named-session startup errors with session and socket context
@@ -246,7 +246,7 @@ Implemented so far:
 
 Slack behavior:
 
-- new Slack thread creates a Shepherd session
+- new Slack thread creates a Herdsman session
 - TUI can resume the same session
 - TUI-originated messages are delivered to Slack with mirrored user presentation when possible
 - Slack-originated messages appear in TUI

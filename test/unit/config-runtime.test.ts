@@ -3,8 +3,8 @@ import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import {
-  getShepherdHome,
-  loadShepherdDotEnv,
+  getHerdsmanHome,
+  loadHerdsmanDotEnv,
   resolveRuntime,
   resolveRuntimePath,
   resolveRuntimePaths,
@@ -19,16 +19,16 @@ afterEach(() => {
   }
 });
 
-describe("Shepherd runtime resolver", () => {
-  test("uses ~/.shepherd when SHEPHERD_HOME is absent", () => {
-    expect(getShepherdHome({})).toBe(resolve(homedir(), ".shepherd"));
+describe("Herdsman runtime resolver", () => {
+  test("uses ~/.herdsman when SHEPHERD_HOME is absent", () => {
+    expect(getHerdsmanHome({})).toBe(resolve(homedir(), ".herdsman"));
   });
 
   test("uses explicit SHEPHERD_HOME", () => {
-    expect(getShepherdHome({ SHEPHERD_HOME: "/tmp/shepherd-dev" })).toBe("/tmp/shepherd-dev");
+    expect(getHerdsmanHome({ SHEPHERD_HOME: "/tmp/herdsman-dev" })).toBe("/tmp/herdsman-dev");
   });
 
-  test("resolves default runtime paths under Shepherd home", () => {
+  test("resolves default runtime paths under Herdsman home", () => {
     const homeDir = tempHome();
 
     const runtime = resolveRuntime({ environment: { SHEPHERD_HOME: homeDir } });
@@ -38,15 +38,15 @@ describe("Shepherd runtime resolver", () => {
       dbPath: join(homeDir, "state.db"),
       envPath: join(homeDir, ".env"),
       homeDir,
-      logPath: join(homeDir, "logs/shepherd.log"),
-      pidPath: join(homeDir, "shepherd.pid"),
+      logPath: join(homeDir, "logs/herdsman.log"),
+      pidPath: join(homeDir, "herdsman.pid"),
       piSessionDir: join(homeDir, "pi-sessions"),
       runtimeRecordPath: join(homeDir, "runtime.json"),
-      socketPath: join(homeDir, "shepherd.sock"),
+      socketPath: join(homeDir, "herdsman.sock"),
     });
   });
 
-  test("resolves relative runtime config paths from Shepherd home", () => {
+  test("resolves relative runtime config paths from Herdsman home", () => {
     const homeDir = tempHome();
     writeValidConfig(
       homeDir,
@@ -71,19 +71,19 @@ describe("Shepherd runtime resolver", () => {
     writeValidConfig(
       homeDir,
       `runtime:
-  db_path: /var/tmp/shepherd/state.sqlite
-  socket_path: /var/tmp/shepherd/shepherd.sock
-  pid_path: /var/tmp/shepherd/shepherd.pid
-  log_path: /var/tmp/shepherd/shepherd.log
+  db_path: /var/tmp/herdsman/state.sqlite
+  socket_path: /var/tmp/herdsman/herdsman.sock
+  pid_path: /var/tmp/herdsman/herdsman.pid
+  log_path: /var/tmp/herdsman/herdsman.log
 `,
     );
 
     const runtime = resolveRuntime({ environment: { SHEPHERD_HOME: homeDir } });
 
-    expect(runtime.paths.dbPath).toBe("/var/tmp/shepherd/state.sqlite");
-    expect(runtime.paths.socketPath).toBe("/var/tmp/shepherd/shepherd.sock");
-    expect(runtime.paths.pidPath).toBe("/var/tmp/shepherd/shepherd.pid");
-    expect(runtime.paths.logPath).toBe("/var/tmp/shepherd/shepherd.log");
+    expect(runtime.paths.dbPath).toBe("/var/tmp/herdsman/state.sqlite");
+    expect(runtime.paths.socketPath).toBe("/var/tmp/herdsman/herdsman.sock");
+    expect(runtime.paths.pidPath).toBe("/var/tmp/herdsman/herdsman.pid");
+    expect(runtime.paths.logPath).toBe("/var/tmp/herdsman/herdsman.log");
   });
 
   test("loads .env values over shell values while ignoring SHEPHERD variables", () => {
@@ -98,7 +98,7 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
 `,
     );
 
-    const environment = loadShepherdDotEnv({
+    const environment = loadHerdsmanDotEnv({
       baseEnvironment: {
         EXISTING: "kept",
         OPENAI_API_KEY: "shell-key",
@@ -119,7 +119,7 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
     writeFileSync(join(homeDir, "config.yaml"), "runtime: [");
 
     expect(() => resolveRuntime({ environment: { SHEPHERD_HOME: homeDir } })).toThrow(
-      "Invalid Shepherd config",
+      "Invalid Herdsman config",
     );
 
     const runtime = resolveRuntime({
@@ -172,14 +172,14 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
 
     expect(runtime.configErrors?.length).toBeGreaterThan(0);
     expect(paths.dbPath).toBe(join(homeDir, "state.db"));
-    expect(paths.socketPath).toBe(join(homeDir, "shepherd.sock"));
-    expect(paths.pidPath).toBe(join(homeDir, "shepherd.pid"));
-    expect(paths.logPath).toBe(join(homeDir, "logs/shepherd.log"));
+    expect(paths.socketPath).toBe(join(homeDir, "herdsman.sock"));
+    expect(paths.pidPath).toBe(join(homeDir, "herdsman.pid"));
+    expect(paths.logPath).toBe(join(homeDir, "logs/herdsman.log"));
   });
 
   test("resolves explicit runtime path values", () => {
-    expect(resolveRuntimePath("/home/shepherd", "state.db")).toBe("/home/shepherd/state.db");
-    expect(resolveRuntimePath("/home/shepherd", "/tmp/state.db")).toBe("/tmp/state.db");
+    expect(resolveRuntimePath("/home/herdsman", "state.db")).toBe("/home/herdsman/state.db");
+    expect(resolveRuntimePath("/home/herdsman", "/tmp/state.db")).toBe("/tmp/state.db");
   });
 
   test("resolves paths from an already loaded config", () => {
@@ -187,15 +187,15 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
       config: {
         runtime: { db_path: "data/state.db" },
       },
-      environment: { SHEPHERD_HOME: "/tmp/shepherd-home" },
+      environment: { SHEPHERD_HOME: "/tmp/herdsman-home" },
     });
 
-    expect(paths.dbPath).toBe("/tmp/shepherd-home/data/state.db");
+    expect(paths.dbPath).toBe("/tmp/herdsman-home/data/state.db");
   });
 });
 
 function tempHome(): string {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-runtime-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-runtime-"));
   tempDirs.push(dir);
   mkdirSync(dir, { recursive: true });
   return dir;

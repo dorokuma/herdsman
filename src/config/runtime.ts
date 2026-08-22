@@ -1,8 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { type ConfigLoadError, loadShepherdConfig } from "@/config/load.js";
-import type { ShepherdConfig } from "@/config/schema.js";
+import { type ConfigLoadError, loadHerdsmanConfig } from "@/config/load.js";
+import type { HerdsmanConfig } from "@/config/schema.js";
 import { readDaemonRuntimeRecord } from "@/daemon/process-manager.js";
 
 export type RuntimePaths = {
@@ -18,7 +18,7 @@ export type RuntimePaths = {
 };
 
 export type RuntimeResolution = {
-  config?: ShepherdConfig;
+  config?: HerdsmanConfig;
   configErrors?: ConfigLoadError[];
   configPath: string;
   environment: NodeJS.ProcessEnv;
@@ -26,9 +26,9 @@ export type RuntimeResolution = {
   paths: RuntimePaths;
 };
 
-export function getShepherdHome(environment: NodeJS.ProcessEnv = process.env): string {
+export function getHerdsmanHome(environment: NodeJS.ProcessEnv = process.env): string {
   const explicit = environment.SHEPHERD_HOME?.trim();
-  return resolve(explicit && explicit.length > 0 ? explicit : resolve(homedir(), ".shepherd"));
+  return resolve(explicit && explicit.length > 0 ? explicit : resolve(homedir(), ".herdsman"));
 }
 
 export function resolveRuntimePath(homeDir: string, value: string): string {
@@ -36,9 +36,9 @@ export function resolveRuntimePath(homeDir: string, value: string): string {
 }
 
 export function resolveRuntimePaths(
-  input: { config?: ShepherdConfig | undefined; environment?: NodeJS.ProcessEnv | undefined } = {},
+  input: { config?: HerdsmanConfig | undefined; environment?: NodeJS.ProcessEnv | undefined } = {},
 ): RuntimePaths {
-  const homeDir = getShepherdHome(input.environment);
+  const homeDir = getHerdsmanHome(input.environment);
   const runtime = input.config?.runtime;
 
   return {
@@ -46,15 +46,15 @@ export function resolveRuntimePaths(
     dbPath: resolveRuntimePath(homeDir, runtime?.db_path ?? "state.db"),
     envPath: resolve(homeDir, ".env"),
     homeDir,
-    logPath: resolveRuntimePath(homeDir, runtime?.log_path ?? "logs/shepherd.log"),
-    pidPath: resolveRuntimePath(homeDir, runtime?.pid_path ?? "shepherd.pid"),
+    logPath: resolveRuntimePath(homeDir, runtime?.log_path ?? "logs/herdsman.log"),
+    pidPath: resolveRuntimePath(homeDir, runtime?.pid_path ?? "herdsman.pid"),
     piSessionDir: resolve(homeDir, "pi-sessions"),
     runtimeRecordPath: resolve(homeDir, "runtime.json"),
-    socketPath: resolveRuntimePath(homeDir, runtime?.socket_path ?? "shepherd.sock"),
+    socketPath: resolveRuntimePath(homeDir, runtime?.socket_path ?? "herdsman.sock"),
   };
 }
 
-export function loadShepherdDotEnv(input: {
+export function loadHerdsmanDotEnv(input: {
   baseEnvironment?: NodeJS.ProcessEnv | undefined;
   envPath: string;
 }): NodeJS.ProcessEnv {
@@ -114,7 +114,7 @@ export function resolveRuntime(
   } = {},
 ): RuntimeResolution {
   const initialPaths = resolveRuntimePaths({ environment: input.environment });
-  const environment = loadShepherdDotEnv({
+  const environment = loadHerdsmanDotEnv({
     baseEnvironment: input.environment,
     envPath: initialPaths.envPath,
   });
@@ -129,7 +129,7 @@ export function resolveRuntime(
     };
   }
 
-  const loaded = loadShepherdConfig(basePaths.configPath);
+  const loaded = loadHerdsmanConfig(basePaths.configPath);
   if (!loaded.ok) {
     if (input.allowInvalidConfig) {
       return {
@@ -141,7 +141,7 @@ export function resolveRuntime(
       };
     }
     throw new Error(
-      `Invalid Shepherd config: ${loaded.errors.map((error) => error.message).join("; ")}`,
+      `Invalid Herdsman config: ${loaded.errors.map((error) => error.message).join("; ")}`,
     );
   }
 

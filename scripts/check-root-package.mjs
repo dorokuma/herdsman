@@ -15,8 +15,8 @@ const [packed] = JSON.parse(
 );
 const files = packed?.files?.map(({ path }) => path) ?? [];
 const required = [
-  "dist/src/cli/shepherd.js",
-  "dist/src/cli/shepherd-daemon.js",
+  "dist/src/cli/herdsman.js",
+  "dist/src/cli/herdsman-daemon.js",
   "drizzle/meta/_journal.json",
 ];
 const topLevel = new Set(["LICENSE", "README.md", "README.ja.md", "package.json"]);

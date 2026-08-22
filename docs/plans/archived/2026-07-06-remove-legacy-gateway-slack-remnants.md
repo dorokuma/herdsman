@@ -4,7 +4,7 @@
 
 **Goal:** Remove legacy Gateway/Slack remnants from current implementation, current docs, and current tests while preserving historical archived plans.
 
-**Architecture:** Shepherd remains a Herdr worker observability/orchestration layer. The daemon process manager lives under `src/daemon`, shared JSON Lines framing lives under `src/shared`, and the Pi package talks to the Shepherd daemon through `shepherd.sock`. Historical plan files may retain old terms only under `docs/plans/archived/`.
+**Architecture:** Herdsman remains a Herdr worker observability/orchestration layer. The daemon process manager lives under `src/daemon`, shared JSON Lines framing lives under `src/shared`, and the Pi package talks to the Herdsman daemon through `herdsman.sock`. Historical plan files may retain old terms only under `docs/plans/archived/`.
 
 **Tech Stack:** TypeScript ESM with NodeNext, Vitest, Biome, pnpm 11, Drizzle check, Pi package dry-pack, Herdr plugin dry-pack.
 
@@ -26,7 +26,7 @@ Done.
 - Current implementation, current docs, current tests, package metadata, and lockfile must not contain old Gateway/Slack implementation names after the final cleanup.
 - `docs/plans/archived/` is historical evidence and must not be rewritten to hide past design work.
 - Completed plans currently under `docs/plans/` that contain old names should be moved into `docs/plans/archived/` in docs-only commits.
-- Keep Shepherd centered on worker observability: structured worker snapshots, enriched `worker.*` events, and orchestrator notifications.
+- Keep Herdsman centered on worker observability: structured worker snapshots, enriched `worker.*` events, and orchestrator notifications.
 - Do not add a new compatibility layer, migration path, config aliases, or deprecation warnings for removed surfaces.
 - Use TDD or focused tests for code changes, then run broad validation.
 - Commit after each task. Push after the final validation commit.
@@ -38,10 +38,10 @@ Done.
   - `src/gateway/json-lines.ts`
   - `src/gateway/process-manager.ts`
   - `src/gateway/service.ts`
-  - `src/cli/shepherd-gateway.ts`
+  - `src/cli/herdsman-gateway.ts`
   - imports from `@/gateway/json-lines.js` and `@/gateway/process-manager.js`
-  - `packages/shepherd-pi/src/index.ts` defaulting to `gateway.sock`
-  - `packages/shepherd-pi/skills/shepherd/SKILL.md` describing old control-plane/logical-tool behavior
+  - `packages/herdsman-pi/src/index.ts` defaulting to `gateway.sock`
+  - `packages/herdsman-pi/skills/herdsman/SKILL.md` describing old control-plane/logical-tool behavior
   - root dependencies `@slack/bolt` and `@slack/web-api`
   - current tests named `gateway-*` or using Slack/Gateway examples
   - current docs using old wording in `README.md`, `AGENTS.md`, and completed plans still under `docs/plans/`
@@ -62,16 +62,16 @@ Done.
 - Delete: `src/gateway/process-manager.ts`.
 - Delete: `src/gateway/identity.ts`.
 - Delete: `src/gateway/service.ts`.
-- Create: `src/cli/shepherd-daemon.ts` — internal daemon process entrypoint.
-- Delete: `src/cli/shepherd-gateway.ts`.
-- Modify: `src/cli/shepherd.ts` — use daemon process-manager symbols and `shepherd-daemon.js`.
+- Create: `src/cli/herdsman-daemon.ts` — internal daemon process entrypoint.
+- Delete: `src/cli/herdsman-gateway.ts`.
+- Modify: `src/cli/herdsman.ts` — use daemon process-manager symbols and `herdsman-daemon.js`.
 - Modify: `src/config/runtime.ts` — read daemon runtime records from `src/daemon/process-manager.ts`.
 - Modify: `src/daemon/client.ts` — import JSON Lines from `src/shared/json-lines.ts`.
 - Modify: `src/daemon/observability-server.ts` — import JSON Lines from `src/shared/json-lines.ts`.
 - Modify: `src/herdr/socket-client.ts` — import JSON Lines from `src/shared/json-lines.ts`.
-- Modify: `packages/shepherd-pi/src/index.ts` — default socket path is `shepherd.sock`.
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md` — describe current worker observability behavior.
-- Modify: `packages/shepherd-pi/package.json` — keep or remove `pi.skills` according to the rewritten skill path.
+- Modify: `packages/herdsman-pi/src/index.ts` — default socket path is `herdsman.sock`.
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md` — describe current worker observability behavior.
+- Modify: `packages/herdsman-pi/package.json` — keep or remove `pi.skills` according to the rewritten skill path.
 - Modify: `package.json` and `pnpm-lock.yaml` — remove unused Slack SDK dependencies.
 - Modify: `README.md`, `README.ja.md`, and `AGENTS.md` — replace old wording with worker observability wording.
 - Test: `test/unit/json-lines.test.ts`.
@@ -266,12 +266,12 @@ git commit -m "refactor: move json lines framing to shared module"
 
 **Files:**
 - Create: `src/daemon/process-manager.ts`
-- Create: `src/cli/shepherd-daemon.ts`
+- Create: `src/cli/herdsman-daemon.ts`
 - Delete: `src/gateway/process-manager.ts`
 - Delete: `src/gateway/identity.ts`
 - Delete: `src/gateway/service.ts`
-- Delete: `src/cli/shepherd-gateway.ts`
-- Modify: `src/cli/shepherd.ts`
+- Delete: `src/cli/herdsman-gateway.ts`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `src/config/runtime.ts`
 - Rename: `test/unit/gateway-process-manager.test.ts` -> `test/unit/daemon-process-manager.test.ts`
 - Delete: `test/unit/gateway-identity.test.ts`
@@ -310,9 +310,9 @@ Use these replacements inside the moved file:
 | `stopGatewayProcess` | `stopDaemonProcess` |
 | `writeGatewayRuntimeRecord` | `writeDaemonRuntimeRecord` |
 | `gateway process manager` | `daemon process manager` |
-| `gateway.sock` | `shepherd.sock` |
-| `shepherd-gateway.js` | `shepherd-daemon.js` |
-| `Shepherd Gateway` | `Shepherd daemon` |
+| `gateway.sock` | `herdsman.sock` |
+| `herdsman-gateway.js` | `herdsman-daemon.js` |
+| `Herdsman Gateway` | `Herdsman daemon` |
 
 Delete `test/unit/gateway-identity.test.ts`; daemon identity is intentionally absent.
 
@@ -329,10 +329,10 @@ Move the process-manager implementation to `src/daemon/process-manager.ts` and r
 Use these exact user-facing error messages:
 
 ```ts
-throw new Error(`Shepherd daemon socket is already reachable: ${input.socketPath}`);
-throw new Error(`Shepherd daemon is already running with pid ${status.pid}`);
-throw new Error("Failed to start Shepherd daemon: child pid was not assigned");
-throw new Error(`Timed out waiting for Shepherd daemon pid ${status.pid} to stop`);
+throw new Error(`Herdsman daemon socket is already reachable: ${input.socketPath}`);
+throw new Error(`Herdsman daemon is already running with pid ${status.pid}`);
+throw new Error("Failed to start Herdsman daemon: child pid was not assigned");
+throw new Error(`Timed out waiting for Herdsman daemon pid ${status.pid} to stop`);
 ```
 
 Rename the private spawn helper to `spawnDaemonProcess`.
@@ -341,7 +341,7 @@ Delete `src/gateway/process-manager.ts` after all imports are updated.
 
 - [ ] **Step 4: Replace internal daemon entrypoint**
 
-Create `src/cli/shepherd-daemon.ts`:
+Create `src/cli/herdsman-daemon.ts`:
 
 ```ts
 #!/usr/bin/env node
@@ -352,7 +352,7 @@ import { runObservabilityDaemonService } from "@/daemon/service.js";
 
 async function main(): Promise<void> {
   if (argv.length > 2) {
-    throw new Error("shepherd-daemon does not accept CLI arguments");
+    throw new Error("herdsman-daemon does not accept CLI arguments");
   }
   await runObservabilityDaemonService();
 }
@@ -365,11 +365,11 @@ if (fileURLToPath(import.meta.url) === resolve(argv[1] ?? "")) {
 }
 ```
 
-Delete `src/cli/shepherd-gateway.ts` and `src/gateway/service.ts`. Do not create a shim.
+Delete `src/cli/herdsman-gateway.ts` and `src/gateway/service.ts`. Do not create a shim.
 
 - [ ] **Step 5: Update consumers**
 
-In `src/cli/shepherd.ts`:
+In `src/cli/herdsman.ts`:
 
 ```ts
 import {
@@ -385,7 +385,7 @@ Replace calls and entrypoint:
 await getDaemonStatus(...)
 await stopDaemonProcess(...)
 await startDaemonProcess({
-  entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "shepherd-daemon.js"),
+  entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "herdsman-daemon.js"),
   ...
 })
 ```
@@ -421,85 +421,85 @@ Expected:
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/daemon/process-manager.ts src/cli/shepherd-daemon.ts src/cli/shepherd.ts src/config/runtime.ts test/unit/daemon-process-manager.test.ts test/unit/config-runtime.test.ts test/unit/cli.test.ts
-git rm src/gateway/process-manager.ts src/gateway/identity.ts src/gateway/service.ts src/cli/shepherd-gateway.ts test/unit/gateway-identity.test.ts
+git add src/daemon/process-manager.ts src/cli/herdsman-daemon.ts src/cli/herdsman.ts src/config/runtime.ts test/unit/daemon-process-manager.test.ts test/unit/config-runtime.test.ts test/unit/cli.test.ts
+git rm src/gateway/process-manager.ts src/gateway/identity.ts src/gateway/service.ts src/cli/herdsman-gateway.ts test/unit/gateway-identity.test.ts
 git commit -m "refactor: rename process management to daemon"
 ```
 
 ### Task 4: Clean Pi Package Runtime Naming and Skill Text
 
-**Objective:** Make the Pi package describe and connect to the current Shepherd daemon/worker-observability surface only.
+**Objective:** Make the Pi package describe and connect to the current Herdsman daemon/worker-observability surface only.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md`
-- Modify: `test/unit/shepherd-pi-extension.test.ts` if a default socket test is added.
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md`
+- Modify: `test/unit/herdsman-pi-extension.test.ts` if a default socket test is added.
 
 **Interfaces:**
-- Consumes: daemon socket default `~/.shepherd/shepherd.sock`.
+- Consumes: daemon socket default `~/.herdsman/herdsman.sock`.
 - Produces: Pi extension behavior with no old socket fallback and a current skill document.
 
 - [ ] **Step 1: Add or update a focused test for default socket path**
 
-If `test/unit/shepherd-pi-extension.test.ts` does not currently assert the default socket, add an exported helper from the extension module:
+If `test/unit/herdsman-pi-extension.test.ts` does not currently assert the default socket, add an exported helper from the extension module:
 
 ```ts
 export function defaultSocketPath() {
-  return `${defaultShepherdHome().replace(/\/$/, "")}/shepherd.sock`;
+  return `${defaultHerdsmanHome().replace(/\/$/, "")}/herdsman.sock`;
 }
 ```
 
-Then add a test that imports `defaultSocketPath`, sets `SHEPHERD_HOME` to `/tmp/shepherd-home`, and expects `/tmp/shepherd-home/shepherd.sock`.
+Then add a test that imports `defaultSocketPath`, sets `SHEPHERD_HOME` to `/tmp/herdsman-home`, and expects `/tmp/herdsman-home/herdsman.sock`.
 
 If exporting the helper would expose unnecessary API, instead test by injecting a fake `createConnection` only if the current module structure already supports that. Do not add a compatibility env var.
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `pnpm test test/unit/shepherd-pi-extension.test.ts`
+Run: `pnpm test test/unit/herdsman-pi-extension.test.ts`
 
 Expected: the new default socket test fails because the extension still returns `gateway.sock`.
 
 - [ ] **Step 3: Change default socket path**
 
-In `packages/shepherd-pi/src/index.ts`, change the default from:
+In `packages/herdsman-pi/src/index.ts`, change the default from:
 
 ```ts
-return `${defaultShepherdHome().replace(/\/$/, "")}/gateway.sock`;
+return `${defaultHerdsmanHome().replace(/\/$/, "")}/gateway.sock`;
 ```
 
 to:
 
 ```ts
-return `${defaultShepherdHome().replace(/\/$/, "")}/shepherd.sock`;
+return `${defaultHerdsmanHome().replace(/\/$/, "")}/herdsman.sock`;
 ```
 
 Do not read `SHEPHERD_GATEWAY_SOCKET_PATH`, `SHEPHERD_SOCKET_PATH`, or `SHEPHERD_DAEMON_SOCKET_PATH`.
 
 - [ ] **Step 4: Rewrite the Pi skill**
 
-Replace `packages/shepherd-pi/skills/shepherd/SKILL.md` with current guidance:
+Replace `packages/herdsman-pi/skills/herdsman/SKILL.md` with current guidance:
 
 ```markdown
 ---
-name: shepherd
-description: Guidance for Shepherd worker observability notifications and telemetry in an attached Pi session. Use when you need Shepherd/Herdr/Pi role boundaries or package-level bridge behavior.
+name: herdsman
+description: Guidance for Herdsman worker observability notifications and telemetry in an attached Pi session. Use when you need Herdsman/Herdr/Pi role boundaries or package-level bridge behavior.
 disable-model-invocation: true
 ---
 
-# Shepherd Worker Observability Bridge
+# Herdsman Worker Observability Bridge
 
-Shepherd watches Herdr-managed coding agents and provides worker snapshots, enriched `worker.*` events, and orchestrator notifications. Pi owns the model conversation and provider runtime. Herdr owns terminal workspaces, panes, and low-level agent control.
+Herdsman watches Herdr-managed coding agents and provides worker snapshots, enriched `worker.*` events, and orchestrator notifications. Pi owns the model conversation and provider runtime. Herdr owns terminal workspaces, panes, and low-level agent control.
 
-When the `shepherd-pi` extension is active:
+When the `herdsman-pi` extension is active:
 
 - It observes the current Herdr workspace when Pi runs inside Herdr.
-- It sends bounded, redacted runtime telemetry to Shepherd, including tool result excerpts, final message excerpts, `sessionRef`, and `artifactRefs`.
-- It receives Shepherd worker notifications and surfaces them through Pi status, widgets, session entries, and next-turn hidden context.
+- It sends bounded, redacted runtime telemetry to Herdsman, including tool result excerpts, final message excerpts, `sessionRef`, and `artifactRefs`.
+- It receives Herdsman worker notifications and surfaces them through Pi status, widgets, session entries, and next-turn hidden context.
 - It may auto-resume only when configured by the extension and Pi is idle.
-- It does not send hidden thinking, full tool results, or full transcripts to Shepherd.
+- It does not send hidden thinking, full tool results, or full transcripts to Herdsman.
 - It does not replace Herdr commands for workspace, tab, pane, or agent control.
 
-Use Shepherd data as observability context. Use Herdr directly for low-level terminal or workspace operations when the user asks for those operations.
+Use Herdsman data as observability context. Use Herdr directly for low-level terminal or workspace operations when the user asks for those operations.
 ```
 
 - [ ] **Step 5: Run focused validation**
@@ -507,7 +507,7 @@ Use Shepherd data as observability context. Use Herdr directly for low-level ter
 Run:
 
 ```bash
-pnpm test test/unit/shepherd-pi-extension.test.ts
+pnpm test test/unit/herdsman-pi-extension.test.ts
 pnpm pi-package:check
 ```
 
@@ -516,7 +516,7 @@ Expected: Pi extension unit tests pass, package typecheck passes, and dry pack s
 - [ ] **Step 6: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts packages/shepherd-pi/skills/shepherd/SKILL.md test/unit/shepherd-pi-extension.test.ts
+git add packages/herdsman-pi/src/index.ts packages/herdsman-pi/skills/herdsman/SKILL.md test/unit/herdsman-pi-extension.test.ts
 git commit -m "refactor(pi): remove legacy socket and skill wording"
 ```
 
@@ -548,7 +548,7 @@ test("rejects unknown top-level config surfaces", () => {
     { providers: { example: {} } },
     { orchestration: { queue: {} } },
   ]) {
-    const result = parseShepherdConfig(config);
+    const result = parseHerdsmanConfig(config);
     expect(result.ok).toBe(false);
     if (!result.ok)
       expect(result.errors.some((error) => error.keyword === "additionalProperties")).toBe(true);
@@ -560,7 +560,7 @@ In `test/unit/config-loader.test.ts`, replace the old rejection test with:
 
 ```ts
 test("rejects unknown config fields", () => {
-  const result = parseShepherdConfig({ providers: { example: {} }, workers: { enabled: true } });
+  const result = parseHerdsmanConfig({ providers: { example: {} }, workers: { enabled: true } });
 
   expect(result.ok).toBe(false);
   if (!result.ok)
@@ -582,7 +582,7 @@ In `test/unit/herdr-naming.test.ts`, replace Slack-specific examples:
 
 ```ts
 expect(herdrWorkspaceNameForTask("Review Worker Sync", "abc123")).toBe(
-  "shepherd-review-worker-sync-abc123",
+  "herdsman-review-worker-sync-abc123",
 );
 expect(slugifyHerdrName("Worker thread / deploy")).toBe("worker-thread-deploy");
 expect(() => validateHerdrName("worker/thread")).toThrow("Invalid Herdr name");
@@ -633,10 +633,10 @@ git commit -m "chore: remove unused messaging dependencies and old examples"
 
 - [ ] **Step 1: Update README wording**
 
-In `README.md`, replace wording that says Shepherd is not an LLM gateway with wording that avoids the old name entirely. Use:
+In `README.md`, replace wording that says Herdsman is not an LLM gateway with wording that avoids the old name entirely. Use:
 
 ```markdown
-Shepherd is not an LLM runtime and is not a thin Herdr wrapper.
+Herdsman is not an LLM runtime and is not a thin Herdr wrapper.
 ```
 
 Keep the current value proposition:
@@ -649,11 +649,11 @@ Do not mention removed Slack, old queueing, old logical tools, or old command su
 
 In `README.ja.md`, replace the stale old architecture document with a Japanese version of the current worker observability README. It must describe:
 
-- Shepherd as a Herdr worker observability/orchestration layer.
+- Herdsman as a Herdr worker observability/orchestration layer.
 - Core value: worker snapshots, enriched `worker.*` events, orchestrator notifications.
-- Current quick start: `pnpm install`, `pnpm check`, `pnpm build`, `shepherd daemon start`, Pi extension install, Herdr plugin link.
+- Current quick start: `pnpm install`, `pnpm check`, `pnpm build`, `herdsman daemon start`, Pi extension install, Herdr plugin link.
 - Current CLI examples: `observe`, `observe-current`, `snapshot`, `events`, `notifications`, `ack`, `message-worker`, `wait-worker`.
-- Current important paths: `src/observability`, `src/daemon`, `src/db`, `src/herdr`, `packages/shepherd-pi`, `packages/shepherd-herdr-plugin`.
+- Current important paths: `src/observability`, `src/daemon`, `src/db`, `src/herdr`, `packages/herdsman-pi`, `packages/herdsman-herdr-plugin`.
 
 It must not mention removed messaging platforms, removed queueing, removed old command entrypoints, or removed helper binaries.
 
@@ -662,13 +662,13 @@ It must not mention removed messaging platforms, removed queueing, removed old c
 In root `AGENTS.md`, replace the opening description from an orchestration gateway to an orchestration layer. The first sentence should read:
 
 ```markdown
-Shepherd は、Herdr 管理の coding agent を TUI / Pi / Herdr plugin などのイベントストリームから観測・操作する orchestration layer です。
+Herdsman は、Herdr 管理の coding agent を TUI / Pi / Herdr plugin などのイベントストリームから観測・操作する orchestration layer です。
 ```
 
 If `TUI` is no longer a supported surface in current code, use this instead:
 
 ```markdown
-Shepherd は、Herdr 管理の coding agent を CLI / Pi / Herdr plugin などのイベントストリームから観測・操作する orchestration layer です。
+Herdsman は、Herdr 管理の coding agent を CLI / Pi / Herdr plugin などのイベントストリームから観測・操作する orchestration layer です。
 ```
 
 Choose the second version if no current `src/tui` implementation exists.
@@ -678,7 +678,7 @@ Choose the second version if no current `src/tui` implementation exists.
 Run:
 
 ```bash
-rg 'gateway|Gateway|slack|Slack|SLACK|shepherd-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
+rg 'gateway|Gateway|slack|Slack|SLACK|herdsman-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
   src packages test README.md README.ja.md AGENTS.md package.json pnpm-lock.yaml
 ```
 
@@ -687,7 +687,7 @@ Expected: no matches.
 Then run a docs-scoped check excluding archived plans:
 
 ```bash
-rg 'gateway|Gateway|slack|Slack|SLACK|shepherd-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
+rg 'gateway|Gateway|slack|Slack|SLACK|herdsman-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
   docs/plans -g '!**/archived/**'
 ```
 
@@ -737,15 +737,15 @@ Expected:
 
 - `pnpm check` passes typecheck, tests, Biome, format check, Drizzle check, Pi package check, Herdr plugin package check, and package dry-runs.
 - `pnpm build` emits `dist` without TypeScript or alias resolution errors.
-- `dist/src/cli/shepherd-daemon.js` exists after build.
-- `dist/src/cli/shepherd-gateway.js` does not exist after a clean build. If `dist` contains stale files from a previous build, remove `dist` and rerun `pnpm build`.
+- `dist/src/cli/herdsman-daemon.js` exists after build.
+- `dist/src/cli/herdsman-gateway.js` does not exist after a clean build. If `dist` contains stale files from a previous build, remove `dist` and rerun `pnpm build`.
 
 - [ ] **Step 2: Run CLI smoke outside Herdr**
 
 Run:
 
 ```bash
-node dist/src/cli/shepherd.js observe-current --json
+node dist/src/cli/herdsman.js observe-current --json
 ```
 
 Expected:
@@ -758,7 +758,7 @@ Expected:
 Run:
 
 ```bash
-rg 'gateway|Gateway|slack|Slack|SLACK|shepherd-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
+rg 'gateway|Gateway|slack|Slack|SLACK|herdsman-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
   src packages test README.md README.ja.md AGENTS.md package.json pnpm-lock.yaml
 ```
 
@@ -767,7 +767,7 @@ Expected: no matches.
 Run:
 
 ```bash
-rg 'gateway|Gateway|slack|Slack|SLACK|shepherd-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
+rg 'gateway|Gateway|slack|Slack|SLACK|herdsman-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
   docs/plans -g '!**/archived/**'
 ```
 
@@ -828,7 +828,7 @@ Expected: the cleanup plan now lives under `docs/plans/archived/`.
 Run:
 
 ```bash
-rg 'gateway|Gateway|slack|Slack|SLACK|shepherd-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
+rg 'gateway|Gateway|slack|Slack|SLACK|herdsman-tools|session_bindings|pi_turns|worker_agent_bindings|logical tools|logical-tool' \
   docs/plans -g '!**/archived/**'
 ```
 
@@ -871,14 +871,14 @@ Expected final result:
 - Biome lint and format checks pass.
 - Drizzle check passes.
 - Pi package check and Herdr plugin package check pass.
-- Build succeeds and emits `dist/src/cli/shepherd-daemon.js`.
+- Build succeeds and emits `dist/src/cli/herdsman-daemon.js`.
 - Current implementation, current docs, current tests, `package.json`, and `pnpm-lock.yaml` have no matches for:
   - `gateway`
   - `Gateway`
   - `slack`
   - `Slack`
   - `SLACK`
-  - `shepherd-tools`
+  - `herdsman-tools`
   - `session_bindings`
   - `pi_turns`
   - `worker_agent_bindings`
@@ -889,14 +889,14 @@ Expected final result:
 Manual smoke:
 
 ```bash
-node dist/src/cli/shepherd.js observe-current --json
+node dist/src/cli/herdsman.js observe-current --json
 ```
 
 Expected outside Herdr: exit code `1` and stderr `observe-current requires a Herdr-managed pane`.
 
 ## Risks, Tradeoffs, and Open Questions
 
-- **Risk: stale `dist` files.** TypeScript does not delete old build output. If `dist/src/cli/shepherd-gateway.js` remains after build, remove `dist` and rerun `pnpm build`; do not keep a shim.
+- **Risk: stale `dist` files.** TypeScript does not delete old build output. If `dist/src/cli/herdsman-gateway.js` remains after build, remove `dist` and rerun `pnpm build`; do not keep a shim.
 - **Risk: audit false positives.** `sessionRef`, Herdr `session.snapshot`, `agent_session`, and plugin TOML `platforms` are current concepts and are not part of the forbidden audit list.
 - **Risk: active plan contains old names until archived.** This is accepted only during implementation. Task 8 archives this plan so current plans become clean afterward.
 - **Tradeoff: no old config rejection examples.** Unknown top-level rejection remains tested, but removed product names are not preserved in current tests.
@@ -907,7 +907,7 @@ Expected outside Herdr: exit code `1` and stderr `observe-current requires a Her
 
 - Requirement coverage: user decisions A/A/B/old-compat-none/B/A and the correction about not preserving old names in tests are represented.
 - Placeholder check: no placeholder markers or unspecified cleanup remains.
-- Naming consistency: daemon symbols use `Daemon*`, JSON Lines imports use `@/shared/json-lines.js`, Pi socket uses `shepherd.sock`.
+- Naming consistency: daemon symbols use `Daemon*`, JSON Lines imports use `@/shared/json-lines.js`, Pi socket uses `herdsman.sock`.
 - Testability: each code task has focused tests and expected failures/successes.
 - Scope: archived historical docs are preserved; current implementation/docs/tests are cleaned.
 - DRY: shared JSON Lines framing is defined once in `src/shared`.

@@ -25,7 +25,7 @@ const observabilitySchema = Type.Object(
   { additionalProperties: false },
 );
 
-export const shepherdConfigSchema = Type.Object(
+export const herdsmanConfigSchema = Type.Object(
   {
     observability: Type.Optional(observabilitySchema),
     runtime: Type.Optional(runtimePathsSchema),
@@ -33,17 +33,17 @@ export const shepherdConfigSchema = Type.Object(
   { additionalProperties: false },
 );
 
-export type ShepherdConfig = Static<typeof shepherdConfigSchema>;
+export type HerdsmanConfig = Static<typeof herdsmanConfigSchema>;
 
 export type ValidationResult<T> = { ok: true; value: T } | { errors: ErrorObject[]; ok: false };
 
 const ajv = new Ajv({ allErrors: true, useDefaults: true });
-const validateShepherdConfig = ajv.compile<ShepherdConfig>(shepherdConfigSchema);
+const validateHerdsmanConfig = ajv.compile<HerdsmanConfig>(herdsmanConfigSchema);
 
-export function parseShepherdConfig(value: unknown): ValidationResult<ShepherdConfig> {
-  if (validateShepherdConfig(value)) {
-    return { ok: true, value: value as ShepherdConfig };
+export function parseHerdsmanConfig(value: unknown): ValidationResult<HerdsmanConfig> {
+  if (validateHerdsmanConfig(value)) {
+    return { ok: true, value: value as HerdsmanConfig };
   }
 
-  return { errors: validateShepherdConfig.errors ?? [], ok: false };
+  return { errors: validateHerdsmanConfig.errors ?? [], ok: false };
 }

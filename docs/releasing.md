@@ -1,14 +1,14 @@
-# Releasing Shepherd
+# Releasing Herdsman
 
-Shepherd publishes two npm packages and one GitHub-distributed Herdr integration.
+Herdsman publishes two npm packages and one GitHub-distributed Herdr integration.
 
 | Artifact | Distribution |
 | --- | --- |
-| `@ryonakae/shepherd` | Public npm package and `shepherd` CLI |
-| `@ryonakae/shepherd-pi` | Public npm package installed by Pi |
-| `packages/shepherd-herdr-plugin` | GitHub repository subdirectory installed by Herdr |
+| `@dorokuma/herdsman` | Public npm package and `herdsman` CLI |
+| `@dorokuma/herdsman-pi` | Public npm package installed by Pi |
+| `packages/herdsman-herdr-plugin` | GitHub repository subdirectory installed by Herdr |
 
-Do not run `npm publish` from `packages/shepherd-herdr-plugin`. Its private package manifest supports local validation only.
+Do not run `npm publish` from `packages/herdsman-herdr-plugin`. Its private package manifest supports local validation only.
 
 ## Preconditions
 
@@ -41,8 +41,8 @@ The npm account must have verified email and write 2FA. Never put an npm token o
 Confirm the version does not exist:
 
 ```bash
-npm view "@ryonakae/shepherd@$VERSION" version
-npm view "@ryonakae/shepherd-pi@$VERSION" version
+npm view "@dorokuma/herdsman@$VERSION" version
+npm view "@dorokuma/herdsman-pi@$VERSION" version
 ```
 
 Both commands must return `E404`. Stop if either command prints a version.
@@ -52,9 +52,9 @@ Both commands must return `E404`. Stop if either command prints a version.
 Keep these files synchronized:
 
 - `package.json`
-- `packages/shepherd-pi/package.json`
-- `packages/shepherd-herdr-plugin/package.json`
-- `packages/shepherd-herdr-plugin/herdr-plugin.toml`
+- `packages/herdsman-pi/package.json`
+- `packages/herdsman-herdr-plugin/package.json`
+- `packages/herdsman-herdr-plugin/herdr-plugin.toml`
 
 The following command updates all four:
 
@@ -67,15 +67,15 @@ if (!version) throw new Error("VERSION is required");
 
 for (const path of [
   "package.json",
-  "packages/shepherd-pi/package.json",
-  "packages/shepherd-herdr-plugin/package.json",
+  "packages/herdsman-pi/package.json",
+  "packages/herdsman-herdr-plugin/package.json",
 ]) {
   const manifest = JSON.parse(await readFile(path, "utf8"));
   manifest.version = version;
   await writeFile(path, `${JSON.stringify(manifest, null, 2)}\n`);
 }
 
-const tomlPath = "packages/shepherd-herdr-plugin/herdr-plugin.toml";
+const tomlPath = "packages/herdsman-herdr-plugin/herdr-plugin.toml";
 const toml = await readFile(tomlPath, "utf8");
 const updated = toml.replace(/^version = "[^"]+"$/m, `version = "${version}"`);
 if (updated === toml) throw new Error("Herdr plugin version was not updated");
@@ -101,13 +101,13 @@ Create the two public tarballs outside the repository:
 export RELEASE_TMP="$(mktemp -d)"
 npm pack --pack-destination "$RELEASE_TMP"
 (
-  cd packages/shepherd-pi
+  cd packages/herdsman-pi
   npm pack --pack-destination "$RELEASE_TMP"
 )
 
 EXPECTED_TARBALLS="$(printf '%s\n' \
-  "ryonakae-shepherd-$VERSION.tgz" \
-  "ryonakae-shepherd-pi-$VERSION.tgz")"
+  "ryonakae-herdsman-$VERSION.tgz" \
+  "ryonakae-herdsman-pi-$VERSION.tgz")"
 ACTUAL_TARBALLS="$(find "$RELEASE_TMP" -maxdepth 1 -type f -name '*.tgz' \
   -exec basename {} \; | sort)"
 test "$ACTUAL_TARBALLS" = "$EXPECTED_TARBALLS"
@@ -117,13 +117,13 @@ Install both tarballs in isolated prefixes:
 
 ```bash
 npm install --global --prefix "$RELEASE_TMP/root-prefix" \
-  "$RELEASE_TMP/ryonakae-shepherd-$VERSION.tgz"
-"$RELEASE_TMP/root-prefix/bin/shepherd" help
+  "$RELEASE_TMP/ryonakae-herdsman-$VERSION.tgz"
+"$RELEASE_TMP/root-prefix/bin/herdsman" help
 
 npm install --prefix "$RELEASE_TMP/pi-prefix" --ignore-scripts \
-  "$RELEASE_TMP/ryonakae-shepherd-pi-$VERSION.tgz"
-test -f "$RELEASE_TMP/pi-prefix/node_modules/@ryonakae/shepherd-pi/src/index.ts"
-test ! -f "$RELEASE_TMP/pi-prefix/node_modules/@ryonakae/shepherd-pi/tsconfig.json"
+  "$RELEASE_TMP/ryonakae-herdsman-pi-$VERSION.tgz"
+test -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts"
+test ! -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/tsconfig.json"
 ```
 
 Do not continue unless both installations pass.
@@ -133,9 +133,9 @@ Do not continue unless both installations pass.
 ```bash
 git add \
   package.json \
-  packages/shepherd-pi/package.json \
-  packages/shepherd-herdr-plugin/package.json \
-  packages/shepherd-herdr-plugin/herdr-plugin.toml
+  packages/herdsman-pi/package.json \
+  packages/herdsman-herdr-plugin/package.json \
+  packages/herdsman-herdr-plugin/herdr-plugin.toml
 git commit -m "chore(release): $VERSION"
 test -z "$(git status --porcelain)"
 git push origin main
@@ -159,7 +159,7 @@ npm publish --access public
 After the user confirms completion, verify the exact version:
 
 ```bash
-npm view "@ryonakae/shepherd@$VERSION" \
+npm view "@dorokuma/herdsman@$VERSION" \
   name version dist-tags.latest repository bin --json
 ```
 
@@ -167,7 +167,7 @@ Then ask the user to publish the Pi package in a separate interactive command:
 
 ```bash
 (
-  cd packages/shepherd-pi
+  cd packages/herdsman-pi
   npm publish --access public
 )
 ```
@@ -175,7 +175,7 @@ Then ask the user to publish the Pi package in a separate interactive command:
 After the user confirms completion, verify the exact version:
 
 ```bash
-npm view "@ryonakae/shepherd-pi@$VERSION" \
+npm view "@dorokuma/herdsman-pi@$VERSION" \
   name version dist-tags.latest repository peerDependencies --json
 ```
 
@@ -188,34 +188,34 @@ Use a new directory so this check cannot read the local tarballs:
 ```bash
 export REGISTRY_TMP="$(mktemp -d)"
 npm install --global --prefix "$REGISTRY_TMP/root-prefix" \
-  "@ryonakae/shepherd@$VERSION"
-"$REGISTRY_TMP/root-prefix/bin/shepherd" help
+  "@dorokuma/herdsman@$VERSION"
+"$REGISTRY_TMP/root-prefix/bin/herdsman" help
 
 npm install --prefix "$REGISTRY_TMP/pi-prefix" --ignore-scripts \
-  "@ryonakae/shepherd-pi@$VERSION"
-test -f "$REGISTRY_TMP/pi-prefix/node_modules/@ryonakae/shepherd-pi/src/index.ts"
+  "@dorokuma/herdsman-pi@$VERSION"
+test -f "$REGISTRY_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts"
 ```
 
 ## Publish the tag and GitHub Release
 
-Write release notes to `/tmp/shepherd-$VERSION-release-notes.md`. Include both npm install commands, package-content changes, validation, and the fact that Herdr still installs its plugin from GitHub.
+Write release notes to `/tmp/herdsman-$VERSION-release-notes.md`. Include both npm install commands, package-content changes, validation, and the fact that Herdr still installs its plugin from GitHub.
 
 ```bash
 git push origin "$TAG"
 gh release create "$TAG" \
   --verify-tag \
   --title "$TAG" \
-  --notes-file "/tmp/shepherd-$VERSION-release-notes.md" \
+  --notes-file "/tmp/herdsman-$VERSION-release-notes.md" \
   --latest
 ```
 
 Verify every external artifact:
 
 ```bash
-npm view "@ryonakae/shepherd@$VERSION" version
-npm view "@ryonakae/shepherd-pi@$VERSION" version
+npm view "@dorokuma/herdsman@$VERSION" version
+npm view "@dorokuma/herdsman-pi@$VERSION" version
 gh release view "$TAG" --json tagName,name,isDraft,isPrerelease,url,publishedAt
-gh api repos/ryonakae/shepherd/releases/latest --jq .tag_name
+gh api repos/ryonakae/herdsman/releases/latest --jq .tag_name
 git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
 test -z "$(git status --porcelain)"
 ```
@@ -227,7 +227,7 @@ Two npm publishes cannot be atomic. Use these rules when the root version exists
 1. Confirm the Pi version is absent with `npm view`.
 2. Delete only the local, unpushed tag: `git tag -d "$TAG"`.
 3. Export the next unused patch version: `export VERSION=0.3.2 TAG=v0.3.2`.
-4. Update all four version files and replace the Herdr tag in `README.md`, `README.ja.md`, and `packages/shepherd-herdr-plugin/README.md`.
+4. Update all four version files and replace the Herdr tag in `README.md`, `README.ja.md`, and `packages/herdsman-herdr-plugin/README.md`.
 5. Rebuild and reinstall both tarballs.
 6. Commit the replacement version and documentation, confirm the tree is clean, push `main`, and verify `HEAD` equals `origin/main`.
 7. Create a new local tag from the pushed replacement commit.
@@ -236,7 +236,7 @@ Two npm publishes cannot be atomic. Use these rules when the root version exists
 10. After the complete replacement exists, deprecate the orphaned root version:
 
 ```bash
-npm deprecate @ryonakae/shepherd@0.3.1 \
+npm deprecate @dorokuma/herdsman@0.3.1 \
   "Incomplete paired release; use 0.3.2"
 ```
 

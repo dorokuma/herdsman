@@ -21,8 +21,8 @@
 ## Current Context
 
 - Current `src/observability/pi-transcript-adapter.ts` only returns last assistant and last tool hints. It should be replaced or moved into the new agent history layer.
-- Observed Pi history path example: `~/.pi/agent/sessions/--Users-ryo.nakae-Dev-_sandbox-shepherd-test--/*.jsonl`.
-- Observed Claude history path example: `~/.claude/projects/-Users-ryo-nakae-Dev--sandbox-shepherd-test/*.jsonl`.
+- Observed Pi history path example: `~/.pi/agent/sessions/--Users-ryo.nakae-Dev-_sandbox-herdsman-test--/*.jsonl`.
+- Observed Claude history path example: `~/.claude/projects/-Users-ryo-nakae-Dev--sandbox-herdsman-test/*.jsonl`.
 - Pi JSONL entries use `type: "message"` with `message.role` equal to `user`, `assistant`, or `toolResult`.
 - Claude JSONL entries use top-level `type` values such as `user` and `assistant`, with nested `message.role` and `message.content`.
 - RTK reference: compaction should prefer tool-specific extraction/failure focus and fallback with explicit marker.

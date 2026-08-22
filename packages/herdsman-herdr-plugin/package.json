@@ -1,0 +1,31 @@
+{
+  "name": "herdsman-herdr-plugin",
+  "version": "0.6.0",
+  "description": "Herdr companion plugin for Herdsman agent history. Forked from @ryonakae/shepherd.",
+  "type": "module",
+  "license": "MIT",
+  "files": [
+    "index.mjs",
+    "herdr-plugin.toml"
+  ],
+  "scripts": {
+    "package:check": "node check-package.mjs",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "bin": {
+    "herdsman-herdr-plugin": "./index.mjs"
+  },
+  "author": "dorokuma",
+  "contributors": [
+    "Ryo Nakae (https://github.com/ryonakae)"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/dorokuma/herdsman.git",
+    "directory": "packages/herdsman-herdr-plugin"
+  },
+  "bugs": {
+    "url": "https://github.com/dorokuma/herdsman/issues"
+  },
+  "homepage": "https://github.com/dorokuma/herdsman#readme"
+}

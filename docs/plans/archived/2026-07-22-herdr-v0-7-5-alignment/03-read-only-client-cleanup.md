@@ -4,7 +4,7 @@
 
 **Status:** Completed
 
-**Goal:** Delete Shepherd's unused Herdr control and named-session management code, reduce `HerdrSocketClient` to observability operations, and validate the complete v0.7.5 alignment.
+**Goal:** Delete Herdsman's unused Herdr control and named-session management code, reduce `HerdrSocketClient` to observability operations, and validate the complete v0.7.5 alignment.
 
 **Architecture:** The daemon discovers running sessions through `herdr session list --json`; it never starts or owns Herdr sessions. One small socket client supports live `pane.get`, `session.snapshot` with the existing list fallback, and pane-scoped event subscriptions. The official Herdr CLI/skill owns every mutation and lifecycle wait. Removing internal wrappers does not change the root package's documented CLI or package export contract.
 
@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Inherit every constraint from the parent plan.
-- Delete code that exists only for Shepherd-managed Herdr startup or control. Do not update stale methods to v0.7.5.
+- Delete code that exists only for Herdsman-managed Herdr startup or control. Do not update stale methods to v0.7.5.
 - Keep `HerdrSocketClient.close()`, `getPane()`, `sessionSnapshot()`, and `subscribeEvents()` as the production-facing methods.
 - Keep the `session.snapshot` unknown-variant fallback to `workspace.list`, `pane.list`, `tab.list`, and `agent.list` through private requests.
 - Keep event envelope normalization for Herdr's `event/data`, `method/params`, and subscription response shapes.
@@ -84,7 +84,7 @@ Use it only from `getPane()` and `subscribeEvents()`. Keep `#requestOnce()` for 
 
 ### Task 1: Lock the Required Socket Behavior
 
-**Objective:** Establish a passing baseline for the only Herdr socket behaviors Shepherd will retain.
+**Objective:** Establish a passing baseline for the only Herdr socket behaviors Herdsman will retain.
 
 **Files:**
 - Modify: `test/integration/herdr-socket-client.test.ts`
@@ -145,7 +145,7 @@ git commit -m "test(herdr): narrow socket client contract"
 
 ### Task 2: Delete the Dead Control and Session-Management Layer
 
-**Objective:** Leave one minimal Herdr socket client with no Shepherd-owned control or startup abstraction.
+**Objective:** Leave one minimal Herdr socket client with no Herdsman-owned control or startup abstraction.
 
 **Files:**
 - Delete: `src/herdr/managed-socket-client.ts`
@@ -209,7 +209,7 @@ Rename the current public `request()` method and internal call sites to:
 
 ```ts
 #request(method: string, params: unknown = {}): Promise<unknown> {
-  const id = `shepherd-${this.#nextId}`;
+  const id = `herdsman-${this.#nextId}`;
   this.#nextId += 1;
 
   return new Promise((resolve, reject) => {
@@ -239,7 +239,7 @@ Run:
 rg -n "workspace\.create|tab\.create|pane\.send_input|pane\.wait_for_output|events\.wait|agent\.start|agent\.prompt|agent\.wait" src/herdr packages README.md SKILL.md || true
 ```
 
-Expected: no Shepherd implementation advertises or wraps these methods. A README/SKILL statement that delegates control to official Herdr may mention command concepts in prose, but must not define Shepherd wrappers.
+Expected: no Herdsman implementation advertises or wraps these methods. A README/SKILL statement that delegates control to official Herdr may mention command concepts in prose, but must not define Herdsman wrappers.
 
 - [x] **Step 4: Run focused tests and typecheck**
 
@@ -288,7 +288,7 @@ git commit -m "refactor(herdr): remove unused control layer"
 Run:
 
 ```bash
-pnpm test test/unit/observability-contracts.test.ts test/integration/sqlite-migrations.test.ts test/integration/agent-store-terminal-identity.test.ts test/integration/agent-index-service.test.ts test/integration/agent-context-service.test.ts test/integration/observability-rpc.test.ts test/integration/orchestrator-pane-move.test.ts test/unit/cli.test.ts test/unit/herdr-plugin-package.test.ts test/unit/shepherd-pi-wake.test.ts test/unit/shepherd-pi-agent-update-ui.test.ts test/unit/shepherd-pi-extension.test.ts test/integration/herdr-socket-client.test.ts test/integration/herdr-pane-identity-resolver.test.ts test/unit/herdr-session-watch-manager.test.ts
+pnpm test test/unit/observability-contracts.test.ts test/integration/sqlite-migrations.test.ts test/integration/agent-store-terminal-identity.test.ts test/integration/agent-index-service.test.ts test/integration/agent-context-service.test.ts test/integration/observability-rpc.test.ts test/integration/orchestrator-pane-move.test.ts test/unit/cli.test.ts test/unit/herdr-plugin-package.test.ts test/unit/herdsman-pi-wake.test.ts test/unit/herdsman-pi-agent-update-ui.test.ts test/unit/herdsman-pi-extension.test.ts test/integration/herdr-socket-client.test.ts test/integration/herdr-pane-identity-resolver.test.ts test/unit/herdr-session-watch-manager.test.ts
 ```
 
 Expected: every named/unnamed, target-priority, event, UI, notification, socket, and migration test passes.

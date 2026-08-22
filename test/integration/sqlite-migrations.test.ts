@@ -13,7 +13,7 @@ afterEach(() => {
 
 describe("SQLite migrations", () => {
   test("create the agent index schema", () => {
-    const dir = mkdtempSync(join(tmpdir(), "shepherd-db-"));
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-db-"));
     tempDirs.push(dir);
     const { sqlite } = openSqlite(join(dir, "test.sqlite"));
     applyMigrations(sqlite, { migrationsFolder: "drizzle" });

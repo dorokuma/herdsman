@@ -1,18 +1,18 @@
-# Shepherd Runtime Config and CLI Cleanup Implementation Plan
+# Herdsman Runtime Config and CLI Cleanup Implementation Plan
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task.
 
 **Goal:** Replace scattered CLI options and `SHEPHERD_*` path environment variables with one `SHEPHERD_HOME`-centered runtime model, optional `runtime:` path settings in `config.yaml`, a simpler positional CLI, and a non-public Gateway service entrypoint.
 
-**Architecture:** Add a shared runtime resolver that derives Shepherd home, config/env paths, and runtime paths before any command connects to the Gateway or opens the DB. Keep `SHEPHERD_HOME` as the only user-facing environment variable; load `$SHEPHERD_HOME/.env` with file values overriding shell values for credentials, while ignoring Shepherd control variables. Move foreground Gateway startup out of the public `shepherd gateway run` command into an internal JS entrypoint spawned by `gateway start`.
+**Architecture:** Add a shared runtime resolver that derives Herdsman home, config/env paths, and runtime paths before any command connects to the Gateway or opens the DB. Keep `SHEPHERD_HOME` as the only user-facing environment variable; load `$SHEPHERD_HOME/.env` with file values overriding shell values for credentials, while ignoring Herdsman control variables. Move foreground Gateway startup out of the public `herdsman gateway run` command into an internal JS entrypoint spawned by `gateway start`.
 
 **Tech Stack:** TypeScript ESM with NodeNext, TypeBox/Ajv config schema, Vitest, Biome, Node `fs`/`path`/`os` APIs, existing SQLite/JSON Lines Gateway stack.
 
 **Status:** Done
 
 **Progress:**
-- Done — runtime resolver, `runtime:` config schema, `.env` loading, invalid-config management fallback, internal Gateway entrypoint, simplified CLI, `shepherd-tools` migration, Pi bridge default, README/README.ja/AGENTS updates, and tests are implemented.
-- Verified — `pnpm check`, `pnpm build`, and `SHEPHERD_HOME=/tmp/shepherd-plan-smoke node dist/src/cli/shepherd.js gateway status` passed.
+- Done — runtime resolver, `runtime:` config schema, `.env` loading, invalid-config management fallback, internal Gateway entrypoint, simplified CLI, `herdsman-tools` migration, Pi bridge default, README/README.ja/AGENTS updates, and tests are implemented.
+- Verified — `pnpm check`, `pnpm build`, and `SHEPHERD_HOME=/tmp/herdsman-plan-smoke node dist/src/cli/herdsman.js gateway status` passed.
 
 **Next steps:**
 - Archived for historical reference.
@@ -20,7 +20,7 @@
 ## Global Constraints
 
 - User-facing environment configuration is limited to `SHEPHERD_HOME`.
-- If `SHEPHERD_HOME` is unset, the default home is `~/.shepherd` on all platforms. Windows is not a supported/verified target in this change.
+- If `SHEPHERD_HOME` is unset, the default home is `~/.herdsman` on all platforms. Windows is not a supported/verified target in this change.
 - Default layout:
   - Config: `$SHEPHERD_HOME/config.yaml`
   - Env: `$SHEPHERD_HOME/.env`
@@ -40,42 +40,42 @@
   ```
 - Relative `runtime.*_path` values are resolved relative to `$SHEPHERD_HOME`. Absolute paths remain absolute.
 - `$SHEPHERD_HOME/config.yaml` is optional. If absent, commands use default runtime paths and minimal Gateway behavior.
-- If `config.yaml` exists and is invalid, normal commands fail. `shepherd gateway status` and `shepherd gateway stop` fall back to `$SHEPHERD_HOME/runtime.json`, then home defaults, and must print a warning to stderr.
-- `$SHEPHERD_HOME/.env` values override shell values for non-Shepherd variables. The loader must ignore variables whose names start with `SHEPHERD_`.
+- If `config.yaml` exists and is invalid, normal commands fail. `herdsman gateway status` and `herdsman gateway stop` fall back to `$SHEPHERD_HOME/runtime.json`, then home defaults, and must print a warning to stderr.
+- `$SHEPHERD_HOME/.env` values override shell values for non-Herdsman variables. The loader must ignore variables whose names start with `SHEPHERD_`.
 - Internal Pi bridge environment variables remain allowed only as process-to-process protocol: `SHEPHERD_SESSION_ID`, `SHEPHERD_GATEWAY_ID`, `SHEPHERD_GATEWAY_SOCKET_PATH`. Users should not need to export them.
 - Public CLI path/config/socket/db options are removed. Session/text/title become positional arguments.
-- Remove public `shepherd gateway run`. Do not replace it with another public or hidden CLI command. Use an internal JS entrypoint instead.
+- Remove public `herdsman gateway run`. Do not replace it with another public or hidden CLI command. Use an internal JS entrypoint instead.
 - Keep changes minimal and compatible with existing TypeScript style. No new runtime dependency is required for `.env` parsing.
 - After implementation changes, run `pnpm check`. Because CLI entrypoints and dist import resolution change, also run `pnpm build`.
 
 ## Current Context
 
-- `src/cli/shepherd.ts` currently parses per-command `--db`, `--socket`, `--config`, `--pid`, `--log`, `--session`, `--text`, `--title`, `--after`, `--limit`, `--json`, and provider override flags.
-- `src/cli/shepherd.ts` currently defaults DB to `shepherd.sqlite` and socket to `/tmp/shepherd.sock` through `SHEPHERD_DB_PATH` and `SHEPHERD_GATEWAY_SOCKET_PATH` fallback.
-- `src/gateway/process-manager.ts` currently spawns the main Shepherd CLI as `node <current shepherd CLI path> gateway run` with DB, socket, and config command-line options.
-- `src/cli/shepherd-tools.ts` currently accepts `--socket` and falls back to `SHEPHERD_GATEWAY_SOCKET_PATH`.
+- `src/cli/herdsman.ts` currently parses per-command `--db`, `--socket`, `--config`, `--pid`, `--log`, `--session`, `--text`, `--title`, `--after`, `--limit`, `--json`, and provider override flags.
+- `src/cli/herdsman.ts` currently defaults DB to `herdsman.sqlite` and socket to `/tmp/herdsman.sock` through `SHEPHERD_DB_PATH` and `SHEPHERD_GATEWAY_SOCKET_PATH` fallback.
+- `src/gateway/process-manager.ts` currently spawns the main Herdsman CLI as `node <current herdsman CLI path> gateway run` with DB, socket, and config command-line options.
+- `src/cli/herdsman-tools.ts` currently accepts `--socket` and falls back to `SHEPHERD_GATEWAY_SOCKET_PATH`.
 - `src/db/migrate.ts` currently reads `SHEPHERD_DB_PATH` directly.
-- `packages/shepherd-pi/extensions/index.js` currently defaults socket path to `/tmp/shepherd.sock` and reads internal bridge env variables.
-- Hermes Agent reference: `HERMES_HOME` is the single home source, `config.yaml` and `.env` live under home, and `.env` is loaded on startup. Shepherd should adopt the home-centered idea but keep stricter config-error behavior for normal commands.
+- `packages/herdsman-pi/extensions/index.js` currently defaults socket path to `/tmp/herdsman.sock` and reads internal bridge env variables.
+- Hermes Agent reference: `HERMES_HOME` is the single home source, `config.yaml` and `.env` live under home, and `.env` is loaded on startup. Herdsman should adopt the home-centered idea but keep stricter config-error behavior for normal commands.
 
 ## File Structure
 
 - Create: `src/config/runtime.ts` — resolve `SHEPHERD_HOME`, optional config, runtime paths, home-relative path values, runtime record path, and `.env` overlay.
-- Create: `src/gateway/service.ts` — exported Gateway foreground service runner extracted from `src/cli/shepherd.ts`.
-- Create: `src/cli/shepherd-gateway.ts` — internal JS entrypoint for the long-running Gateway service; not added to `package.json#bin`.
+- Create: `src/gateway/service.ts` — exported Gateway foreground service runner extracted from `src/cli/herdsman.ts`.
+- Create: `src/cli/herdsman-gateway.ts` — internal JS entrypoint for the long-running Gateway service; not added to `package.json#bin`.
 - Modify: `src/config/schema.ts` — add optional top-level `runtime` schema.
 - Modify: `src/config/load.ts` — keep existing config validation; use from runtime resolver.
-- Modify: `src/cli/shepherd.ts` — simplify public CLI parser and delegate runtime path resolution.
-- Modify: `src/cli/shepherd-tools.ts` — remove `--socket` and resolve socket via shared runtime resolver.
+- Modify: `src/cli/herdsman.ts` — simplify public CLI parser and delegate runtime path resolution.
+- Modify: `src/cli/herdsman-tools.ts` — remove `--socket` and resolve socket via shared runtime resolver.
 - Modify: `src/gateway/process-manager.ts` — spawn the internal service entrypoint, write runtime record, remove `resolveGatewayControlPaths` default-by-DB behavior.
 - Modify: `src/db/migrate.ts` — resolve DB through shared runtime resolver instead of `SHEPHERD_DB_PATH`.
-- Modify: `packages/shepherd-pi/extensions/index.js` — update default socket fallback from `/tmp/shepherd.sock` to `$SHEPHERD_HOME/gateway.sock` for direct Pi sessions without a binding.
+- Modify: `packages/herdsman-pi/extensions/index.js` — update default socket fallback from `/tmp/herdsman.sock` to `$SHEPHERD_HOME/gateway.sock` for direct Pi sessions without a binding.
 - Modify: `README.md` — update usage and configuration examples to the new CLI and home/config model.
 - Test: `test/unit/config-runtime.test.ts` — runtime resolver, `.env`, config error fallback.
 - Test: `test/unit/config-schema.test.ts` and `test/unit/config-loader.test.ts` — `runtime:` schema coverage.
 - Test: `test/unit/cli.test.ts` — simplified parser and command execution dependencies.
 - Test: `test/unit/gateway-process-manager.test.ts` — internal entrypoint spawn and runtime record behavior.
-- Test: `test/unit/shepherd-tools.test.ts` — no-arg resolver behavior.
+- Test: `test/unit/herdsman-tools.test.ts` — no-arg resolver behavior.
 - Test: `test/unit/pi-readiness.test.ts`, `test/unit/pi-supervisor.test.ts` — internal env still passed.
 
 ## Tasks
@@ -107,7 +107,7 @@
   };
 
   export type RuntimeResolution = {
-    config?: ShepherdConfig;
+    config?: HerdsmanConfig;
     configErrors?: ConfigLoadError[];
     configPath: string;
     environment: NodeJS.ProcessEnv;
@@ -115,13 +115,13 @@
     paths: RuntimePaths;
   };
 
-  export function getShepherdHome(environment?: NodeJS.ProcessEnv): string;
+  export function getHerdsmanHome(environment?: NodeJS.ProcessEnv): string;
   export function resolveRuntimePath(homeDir: string, value: string): string;
   export function resolveRuntimePaths(input: {
-    config?: ShepherdConfig;
+    config?: HerdsmanConfig;
     environment?: NodeJS.ProcessEnv;
   }): RuntimePaths;
-  export function loadShepherdDotEnv(input: {
+  export function loadHerdsmanDotEnv(input: {
     baseEnvironment?: NodeJS.ProcessEnv;
     envPath: string;
   }): NodeJS.ProcessEnv;
@@ -130,14 +130,14 @@
     environment?: NodeJS.ProcessEnv;
   }): RuntimeResolution;
   ```
-- Consumes: existing `loadShepherdConfig`, `ShepherdConfig`.
+- Consumes: existing `loadHerdsmanConfig`, `HerdsmanConfig`.
 
 - [ ] **Step 1: Write failing runtime resolver tests**
 
 Create `test/unit/config-runtime.test.ts` with these cases:
 
-1. `getShepherdHome({ HOME: "/Users/test" })` returns `/Users/test/.shepherd` when `SHEPHERD_HOME` is absent.
-2. `getShepherdHome({ SHEPHERD_HOME: "/tmp/shepherd-dev" })` returns `/tmp/shepherd-dev`.
+1. `getHerdsmanHome({ HOME: "/Users/test" })` returns `/Users/test/.herdsman` when `SHEPHERD_HOME` is absent.
+2. `getHerdsmanHome({ SHEPHERD_HOME: "/tmp/herdsman-dev" })` returns `/tmp/herdsman-dev`.
 3. `resolveRuntime({ environment: { SHEPHERD_HOME: dir } })` returns default paths under `dir`: `config.yaml`, `.env`, `state.db`, `gateway.sock`, `gateway.pid`, `logs/gateway.log`, `runtime.json`, `pi-sessions`.
 4. With config file:
    ```yaml
@@ -154,8 +154,8 @@ Create `test/unit/config-runtime.test.ts` with these cases:
    ```
    the resolved paths use `$SHEPHERD_HOME/data/state.sqlite`, `$SHEPHERD_HOME/sockets/dev.sock`, `$SHEPHERD_HOME/run/dev.pid`, `$SHEPHERD_HOME/logs/dev.log`.
 5. Absolute runtime paths remain absolute.
-6. `loadShepherdDotEnv` overrides shell values from `.env` for `SLACK_BOT_TOKEN`, keeps existing values not mentioned in `.env`, and ignores `SHEPHERD_HOME` / `SHEPHERD_GATEWAY_SOCKET_PATH` in `.env`.
-7. Invalid config returns `configErrors` only when `allowInvalidConfig: true`; without it, `resolveRuntime` throws an error containing `Invalid Shepherd config`.
+6. `loadHerdsmanDotEnv` overrides shell values from `.env` for `SLACK_BOT_TOKEN`, keeps existing values not mentioned in `.env`, and ignores `SHEPHERD_HOME` / `SHEPHERD_GATEWAY_SOCKET_PATH` in `.env`.
+7. Invalid config returns `configErrors` only when `allowInvalidConfig: true`; without it, `resolveRuntime` throws an error containing `Invalid Herdsman config`.
 
 - [ ] **Step 2: Run tests to verify failure**
 
@@ -183,7 +183,7 @@ const runtimePathsSchema = Type.Object(
 );
 ```
 
-Then add this field to `shepherdConfigSchema`:
+Then add this field to `herdsmanConfigSchema`:
 
 ```ts
 runtime: Type.Optional(runtimePathsSchema),
@@ -199,8 +199,8 @@ Implement with Node built-ins only:
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
-import { loadShepherdConfig, type ConfigLoadError } from "@/config/load.js";
-import type { ShepherdConfig } from "@/config/schema.js";
+import { loadHerdsmanConfig, type ConfigLoadError } from "@/config/load.js";
+import type { HerdsmanConfig } from "@/config/schema.js";
 
 export type RuntimePaths = {
   configPath: string;
@@ -215,7 +215,7 @@ export type RuntimePaths = {
 };
 
 export type RuntimeResolution = {
-  config?: ShepherdConfig;
+  config?: HerdsmanConfig;
   configErrors?: ConfigLoadError[];
   configPath: string;
   environment: NodeJS.ProcessEnv;
@@ -223,9 +223,9 @@ export type RuntimeResolution = {
   paths: RuntimePaths;
 };
 
-export function getShepherdHome(environment: NodeJS.ProcessEnv = process.env): string {
+export function getHerdsmanHome(environment: NodeJS.ProcessEnv = process.env): string {
   const explicit = environment.SHEPHERD_HOME?.trim();
-  return resolve(explicit && explicit.length > 0 ? explicit : resolve(homedir(), ".shepherd"));
+  return resolve(explicit && explicit.length > 0 ? explicit : resolve(homedir(), ".herdsman"));
 }
 
 export function resolveRuntimePath(homeDir: string, value: string): string {
@@ -233,10 +233,10 @@ export function resolveRuntimePath(homeDir: string, value: string): string {
 }
 
 export function resolveRuntimePaths(input: {
-  config?: ShepherdConfig;
+  config?: HerdsmanConfig;
   environment?: NodeJS.ProcessEnv;
 } = {}): RuntimePaths {
-  const homeDir = getShepherdHome(input.environment);
+  const homeDir = getHerdsmanHome(input.environment);
   const runtime = input.config?.runtime;
   return {
     homeDir,
@@ -255,7 +255,7 @@ export function resolveRuntimePaths(input: {
 Add a minimal `.env` parser in the same file:
 
 ```ts
-export function loadShepherdDotEnv(input: {
+export function loadHerdsmanDotEnv(input: {
   baseEnvironment?: NodeJS.ProcessEnv;
   envPath: string;
 }): NodeJS.ProcessEnv {
@@ -294,7 +294,7 @@ export function resolveRuntime(input: {
   environment?: NodeJS.ProcessEnv;
 } = {}): RuntimeResolution {
   const initialPaths = resolveRuntimePaths({ environment: input.environment });
-  const environment = loadShepherdDotEnv({
+  const environment = loadHerdsmanDotEnv({
     baseEnvironment: input.environment,
     envPath: initialPaths.envPath,
   });
@@ -304,7 +304,7 @@ export function resolveRuntime(input: {
     return { configPath: basePaths.configPath, environment, homeDir: basePaths.homeDir, paths: basePaths };
   }
 
-  const loaded = loadShepherdConfig(basePaths.configPath);
+  const loaded = loadHerdsmanConfig(basePaths.configPath);
   if (!loaded.ok) {
     if (input.allowInvalidConfig) {
       return {
@@ -315,7 +315,7 @@ export function resolveRuntime(input: {
         paths: basePaths,
       };
     }
-    throw new Error(`Invalid Shepherd config: ${loaded.errors.map((error) => error.message).join("; ")}`);
+    throw new Error(`Invalid Herdsman config: ${loaded.errors.map((error) => error.message).join("; ")}`);
   }
 
   const paths = resolveRuntimePaths({ config: loaded.value, environment });
@@ -337,7 +337,7 @@ Expected: all listed tests pass.
 
 ```bash
 git add src/config/runtime.ts src/config/schema.ts test/unit/config-runtime.test.ts test/unit/config-schema.test.ts test/unit/config-loader.test.ts
-git commit -m "feat: add Shepherd runtime path resolver"
+git commit -m "feat: add Herdsman runtime path resolver"
 ```
 
 ### Task 2: Add runtime record helpers and safer socket startup
@@ -375,7 +375,7 @@ Update `test/unit/gateway-process-manager.test.ts`:
 1. Replace the old `resolveGatewayControlPaths({ dbPath })` expectation with explicit `RuntimePaths` input once Task 3 wires it. In this task, add tests for runtime record read/write only.
 2. Test `writeGatewayRuntimeRecord` writes JSON with mode `0600` and `readGatewayRuntimeRecord` returns the same record.
 3. Test `readGatewayRuntimeRecord` returns `undefined` for missing file and invalid JSON.
-4. Test `prepareGatewaySocketPath` throws `Shepherd Gateway socket is already reachable` when `connectSocket` returns `true`.
+4. Test `prepareGatewaySocketPath` throws `Herdsman Gateway socket is already reachable` when `connectSocket` returns `true`.
 5. Test `prepareGatewaySocketPath` removes an existing stale socket path when `connectSocket` returns `false`.
 
 - [ ] **Step 2: Run tests to verify failure**
@@ -405,7 +405,7 @@ In `src/gateway/process-manager.ts`:
     if (!existsSync(input.socketPath)) return;
     const connectSocket = input.deps?.connectSocket ?? defaultConnectSocket;
     if (await connectSocket(input.socketPath)) {
-      throw new Error(`Shepherd Gateway socket is already reachable: ${input.socketPath}`);
+      throw new Error(`Herdsman Gateway socket is already reachable: ${input.socketPath}`);
     }
     rmSync(input.socketPath, { force: true });
   }
@@ -434,12 +434,12 @@ git commit -m "feat: record gateway runtime paths"
 
 ### Task 3: Extract Gateway foreground service into an internal entrypoint
 
-**Objective:** Remove the public `gateway run` execution path from the main CLI and spawn `src/cli/shepherd-gateway.ts` for the long-running service process.
+**Objective:** Remove the public `gateway run` execution path from the main CLI and spawn `src/cli/herdsman-gateway.ts` for the long-running service process.
 
 **Files:**
 - Create: `src/gateway/service.ts`
-- Create: `src/cli/shepherd-gateway.ts`
-- Modify: `src/cli/shepherd.ts`
+- Create: `src/cli/herdsman-gateway.ts`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `src/gateway/process-manager.ts`
 - Test: `test/unit/gateway-process-manager.test.ts`
 - Test: `test/unit/cli.test.ts`
@@ -460,10 +460,10 @@ Update `test/unit/cli.test.ts`:
 1. `parseCliArgs(["gateway", "run"])` throws `Unknown gateway action: run` or `Unknown gateway action`.
 2. `helpText()` does not contain `gateway run`.
 3. `helpText()` contains only:
-   - `shepherd gateway start`
-   - `shepherd gateway stop`
-   - `shepherd gateway restart`
-   - `shepherd gateway status`
+   - `herdsman gateway start`
+   - `herdsman gateway stop`
+   - `herdsman gateway restart`
+   - `herdsman gateway status`
 
 Update `test/unit/gateway-process-manager.test.ts`:
 
@@ -472,7 +472,7 @@ Update `test/unit/gateway-process-manager.test.ts`:
   expect(spawned).toMatchObject([
     {
       command: "/usr/bin/node",
-      args: ["/repo/dist/src/cli/shepherd-gateway.js"],
+      args: ["/repo/dist/src/cli/herdsman-gateway.js"],
       options: { detached: true },
     },
   ]);
@@ -491,21 +491,21 @@ Expected: tests fail because `gateway run` still exists and process-manager stil
 
 - [ ] **Step 3: Create `src/gateway/service.ts`**
 
-Move the current foreground Gateway block from `src/cli/shepherd.ts` into `runGatewayService`. The function must:
+Move the current foreground Gateway block from `src/cli/herdsman.ts` into `runGatewayService`. The function must:
 
 1. Call `resolveRuntime({ environment })`.
 2. Use `runtime.paths.dbPath` instead of `command.dbPath`.
 3. Use `runtime.paths.socketPath` instead of `command.socketPath`.
 4. Use `runtime.paths.piSessionDir` instead of `resolve(stateDir, "pi-sessions")`.
 5. Use `runtime.config` instead of `loadConfigOrThrow(command.configPath)`.
-6. Preserve the existing config-absent behavior exactly: when `runtime.config` is `undefined`, create the SQLite stores, `WorkingContextResolver`, `PiSessionMetadataStore`, and `ShepherdGatewayServer`, but leave `gatewayRuntime`, `headlessPi`, `platformRuntime`, `logicalTools`, `providerOverrides`, and Pi readiness checks undefined/disabled. `allowedRoots` should be `[]`, and `allowUnconfiguredLocalPaths` should stay `true`.
-7. Use `runtime.environment` when creating platform/gateway providers that accept environment dependencies. If a called factory currently reads `process.env`, set `process.env[key] = value` for values returned by `loadShepherdDotEnv` before constructing runtimes.
+6. Preserve the existing config-absent behavior exactly: when `runtime.config` is `undefined`, create the SQLite stores, `WorkingContextResolver`, `PiSessionMetadataStore`, and `HerdsmanGatewayServer`, but leave `gatewayRuntime`, `headlessPi`, `platformRuntime`, `logicalTools`, `providerOverrides`, and Pi readiness checks undefined/disabled. `allowedRoots` should be `[]`, and `allowUnconfiguredLocalPaths` should stay `true`.
+7. Use `runtime.environment` when creating platform/gateway providers that accept environment dependencies. If a called factory currently reads `process.env`, set `process.env[key] = value` for values returned by `loadHerdsmanDotEnv` before constructing runtimes.
 8. Call `prepareGatewaySocketPath({ socketPath: runtime.paths.socketPath })` before `server.start()`.
 9. Keep shutdown behavior identical: close platform runtime, stop headless Pi, stop server, close gateway runtime, close SQLite.
 
 The service should keep importing existing stores and runtime factories. Remove no behavior except public CLI parsing.
 
-- [ ] **Step 4: Create `src/cli/shepherd-gateway.ts`**
+- [ ] **Step 4: Create `src/cli/herdsman-gateway.ts`**
 
 Create an internal executable entrypoint:
 
@@ -518,7 +518,7 @@ import { runGatewayService } from "@/gateway/service.js";
 
 async function main(): Promise<void> {
   if (argv.length > 2) {
-    throw new Error("shepherd-gateway does not accept CLI arguments");
+    throw new Error("herdsman-gateway does not accept CLI arguments");
   }
   await runGatewayService();
 }
@@ -531,7 +531,7 @@ if (fileURLToPath(import.meta.url) === resolve(argv[1] ?? "")) {
 }
 ```
 
-Do not add `shepherd-gateway` to `package.json#bin`.
+Do not add `herdsman-gateway` to `package.json#bin`.
 
 - [ ] **Step 5: Update `startGatewayProcess`**
 
@@ -545,10 +545,10 @@ Remove `cliPath`, `configPath`, `dbPath`, and command-line args from this functi
 
 - [ ] **Step 6: Update main CLI to call internal entrypoint**
 
-In `src/cli/shepherd.ts`, remove `GatewayRunCommand`, remove `"run"` from `GatewayAction`, remove the foreground Gateway service block, and update `gateway start/restart` to pass:
+In `src/cli/herdsman.ts`, remove `GatewayRunCommand`, remove `"run"` from `GatewayAction`, remove the foreground Gateway service block, and update `gateway start/restart` to pass:
 
 ```ts
-entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "shepherd-gateway.js"),
+entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "herdsman-gateway.js"),
 runtimeRecordPath: runtime.paths.runtimeRecordPath,
 runtimeRecord: {
   dbPath: runtime.paths.dbPath,
@@ -559,7 +559,7 @@ runtimeRecord: {
 },
 ```
 
-The main CLI should no longer import `ShepherdGatewayServer`, `createGatewayRuntime`, `createPlatformRuntime`, store classes used only by service startup, or `checkPiReadiness` unless still needed elsewhere.
+The main CLI should no longer import `HerdsmanGatewayServer`, `createGatewayRuntime`, `createPlatformRuntime`, store classes used only by service startup, or `checkPiReadiness` unless still needed elsewhere.
 
 - [ ] **Step 7: Run focused tests**
 
@@ -575,16 +575,16 @@ Expected: focused tests and typecheck pass.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add src/gateway/service.ts src/cli/shepherd-gateway.ts src/cli/shepherd.ts src/gateway/process-manager.ts test/unit/cli.test.ts test/unit/gateway-process-manager.test.ts
+git add src/gateway/service.ts src/cli/herdsman-gateway.ts src/cli/herdsman.ts src/gateway/process-manager.ts test/unit/cli.test.ts test/unit/gateway-process-manager.test.ts
 git commit -m "refactor: move gateway service to internal entrypoint"
 ```
 
-### Task 4: Simplify public `shepherd` CLI to positional arguments and runtime resolver
+### Task 4: Simplify public `herdsman` CLI to positional arguments and runtime resolver
 
 **Objective:** Remove user-facing path/config/session/text/title options and make public commands resolve paths from shared runtime configuration.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Test: `test/unit/cli.test.ts`
 
 **Interfaces:**
@@ -642,20 +642,20 @@ Expected: parser tests fail because the old option parser is still active.
 
 - [ ] **Step 3: Replace `parseCliArgs` implementation**
 
-Implement direct positional parsing. Remove `parseOptions` from `src/cli/shepherd.ts` once no longer used. A command with any extra argument not explicitly accepted should throw `Invalid argument: <value>`.
+Implement direct positional parsing. Remove `parseOptions` from `src/cli/herdsman.ts` once no longer used. A command with any extra argument not explicitly accepted should throw `Invalid argument: <value>`.
 
 Expected usage text:
 
 ```text
 Usage:
-  shepherd
-  shepherd gateway [start|stop|restart|status]
-  shepherd open <session-id>
-  shepherd send <session-id> <text>
-  shepherd watch <session-id>
-  shepherd rename <session-id> <title>
-  shepherd audit <session-id>
-  shepherd help
+  herdsman
+  herdsman gateway [start|stop|restart|status]
+  herdsman open <session-id>
+  herdsman send <session-id> <text>
+  herdsman watch <session-id>
+  herdsman rename <session-id> <title>
+  herdsman audit <session-id>
+  herdsman help
 ```
 
 Remove mentions of `--db`, `--socket`, `--config`, `--pid`, `--log`, `--session`, `--text`, `--title`, `--after`, `--limit`, `--json`, `--actor`, `--display-name`, `--provider`, and `--model`.
@@ -703,8 +703,8 @@ Expected: tests and typecheck pass.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add src/cli/shepherd.ts test/unit/cli.test.ts
-git commit -m "feat: simplify shepherd CLI arguments"
+git add src/cli/herdsman.ts test/unit/cli.test.ts
+git commit -m "feat: simplify herdsman CLI arguments"
 ```
 
 ### Task 5: Implement config-error fallback for `gateway status` and `gateway stop`
@@ -712,7 +712,7 @@ git commit -m "feat: simplify shepherd CLI arguments"
 **Objective:** Keep strict config validation for normal commands while allowing stop/status to operate when config is broken.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `src/config/runtime.ts`
 - Modify: `src/gateway/process-manager.ts`
 - Test: `test/unit/cli.test.ts`
@@ -738,8 +738,8 @@ In `test/unit/config-runtime.test.ts`:
 In `test/unit/cli.test.ts`, use injected dependencies or parser-level tests to verify `gatewayStartHint` no longer mentions `--config <path>` and instead says:
 
 ```text
-Shepherd Gateway is not reachable. Start it with:
-  shepherd gateway start
+Herdsman Gateway is not reachable. Start it with:
+  herdsman gateway start
 ```
 
 - [ ] **Step 2: Run tests to verify failure**
@@ -760,10 +760,10 @@ In `src/config/runtime.ts`, add a function that:
 2. If a readable runtime record exists at `$SHEPHERD_HOME/runtime.json`, returns the record's `dbPath`, `socketPath`, `pidPath`, and `logPath` with current home `configPath`, `envPath`, `runtimeRecordPath`, and `piSessionDir`.
 3. If no valid record exists, returns home defaults.
 
-In `src/cli/shepherd.ts`, when `resolveRuntime({ allowInvalidConfig: true })` returns `configErrors`, print one warning to stderr for `status` and `stop`:
+In `src/cli/herdsman.ts`, when `resolveRuntime({ allowInvalidConfig: true })` returns `configErrors`, print one warning to stderr for `status` and `stop`:
 
 ```text
-Warning: Invalid Shepherd config; using last runtime record or home defaults for gateway status/stop.
+Warning: Invalid Herdsman config; using last runtime record or home defaults for gateway status/stop.
 ```
 
 Then use the fallback paths.
@@ -774,7 +774,7 @@ Change `gatewayStartHint` to avoid `SHEPHERD_CONFIG` and `--config`:
 
 ```ts
 export function gatewayStartHint(): string {
-  return "Shepherd Gateway is not reachable. Start it with:\n  shepherd gateway start";
+  return "Herdsman Gateway is not reachable. Start it with:\n  herdsman gateway start";
 }
 ```
 
@@ -791,18 +791,18 @@ Expected: tests pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/config/runtime.ts src/cli/shepherd.ts src/gateway/process-manager.ts test/unit/config-runtime.test.ts test/unit/cli.test.ts
+git add src/config/runtime.ts src/cli/herdsman.ts src/gateway/process-manager.ts test/unit/config-runtime.test.ts test/unit/cli.test.ts
 git commit -m "feat: allow gateway status stop with invalid config"
 ```
 
-### Task 6: Update `shepherd-tools` and DB migration to use runtime resolver
+### Task 6: Update `herdsman-tools` and DB migration to use runtime resolver
 
-**Objective:** Remove `--socket` and `SHEPHERD_GATEWAY_SOCKET_PATH` from `shepherd-tools`, and remove `SHEPHERD_DB_PATH` from migration.
+**Objective:** Remove `--socket` and `SHEPHERD_GATEWAY_SOCKET_PATH` from `herdsman-tools`, and remove `SHEPHERD_DB_PATH` from migration.
 
 **Files:**
-- Modify: `src/cli/shepherd-tools.ts`
+- Modify: `src/cli/herdsman-tools.ts`
 - Modify: `src/db/migrate.ts`
-- Test: `test/unit/shepherd-tools.test.ts`
+- Test: `test/unit/herdsman-tools.test.ts`
 
 **Interfaces:**
 - Consumes: `resolveRuntime`.
@@ -810,33 +810,33 @@ git commit -m "feat: allow gateway status stop with invalid config"
 
 - [ ] **Step 1: Write failing tests**
 
-Update `test/unit/shepherd-tools.test.ts`:
+Update `test/unit/herdsman-tools.test.ts`:
 
 ```ts
-expect(parseShepherdToolsArgs([])).toEqual({ command: "serve" });
-expect(parseShepherdToolsArgs(["serve"])).toEqual({ command: "serve" });
-expect(parseShepherdToolsArgs(["--socket", "/tmp/shepherd.sock"])).toThrow("Unknown argument: --socket");
-expect(shepherdToolsHelpText()).toContain("shepherd-tools [serve]");
-expect(shepherdToolsHelpText()).not.toContain("--socket");
+expect(parseHerdsmanToolsArgs([])).toEqual({ command: "serve" });
+expect(parseHerdsmanToolsArgs(["serve"])).toEqual({ command: "serve" });
+expect(parseHerdsmanToolsArgs(["--socket", "/tmp/herdsman.sock"])).toThrow("Unknown argument: --socket");
+expect(herdsmanToolsHelpText()).toContain("herdsman-tools [serve]");
+expect(herdsmanToolsHelpText()).not.toContain("--socket");
 ```
 
-Adjust `ShepherdToolsCommand` expected shape to `{ command: "serve" } | { command: "help" }`.
+Adjust `HerdsmanToolsCommand` expected shape to `{ command: "serve" } | { command: "help" }`.
 
 - [ ] **Step 2: Run tests to verify failure**
 
 Run:
 
 ```bash
-pnpm test -- test/unit/shepherd-tools.test.ts
+pnpm test -- test/unit/herdsman-tools.test.ts
 ```
 
 Expected: tests fail because `--socket` still exists.
 
-- [ ] **Step 3: Update `src/cli/shepherd-tools.ts`**
+- [ ] **Step 3: Update `src/cli/herdsman-tools.ts`**
 
 - Remove `env` import from `node:process` if unused.
 - Remove `parseOptions`.
-- `parseShepherdToolsArgs` should accept only no args, `serve`, `help`, `--help`, `-h`.
+- `parseHerdsmanToolsArgs` should accept only no args, `serve`, `help`, `--help`, `-h`.
 - In `main`, call `resolveRuntime()` and connect to `runtime.paths.socketPath`.
 
 - [ ] **Step 4: Update `src/db/migrate.ts`**
@@ -857,7 +857,7 @@ Ensure import style works with existing relative imports. If `@/*` alias is not 
 Run:
 
 ```bash
-pnpm test -- test/unit/shepherd-tools.test.ts
+pnpm test -- test/unit/herdsman-tools.test.ts
 pnpm typecheck
 ```
 
@@ -866,17 +866,17 @@ Expected: tests and typecheck pass.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add src/cli/shepherd-tools.ts src/db/migrate.ts test/unit/shepherd-tools.test.ts
+git add src/cli/herdsman-tools.ts src/db/migrate.ts test/unit/herdsman-tools.test.ts
 git commit -m "feat: use runtime resolver for tools and migrations"
 ```
 
 ### Task 7: Update Pi bridge defaults without changing internal attach protocol
 
-**Objective:** Keep internal Pi bridge env variables while moving default socket fallback away from `/tmp/shepherd.sock`.
+**Objective:** Keep internal Pi bridge env variables while moving default socket fallback away from `/tmp/herdsman.sock`.
 
 **Files:**
-- Modify: `packages/shepherd-pi/extensions/index.js`
-- Modify: `src/cli/shepherd.ts`
+- Modify: `packages/herdsman-pi/extensions/index.js`
+- Modify: `src/cli/herdsman.ts`
 - Modify: `src/gateway/pi-readiness.ts`
 - Modify: `src/gateway/pi-supervisor.ts`
 - Test: `test/unit/pi-readiness.test.ts`
@@ -893,37 +893,37 @@ git commit -m "feat: use runtime resolver for tools and migrations"
 
 Keep tests that assert `piOpenEnvironment`, `HeadlessPiSupervisor`, and `checkPiReadiness` pass `SHEPHERD_GATEWAY_SOCKET_PATH` to child Pi processes. These env vars are still correct because they are internal process protocol.
 
-Add a unit-like test if a package extension harness exists. If there is no harness, rely on `pnpm pi-package:check` and code inspection for `packages/shepherd-pi/extensions/index.js`.
+Add a unit-like test if a package extension harness exists. If there is no harness, rely on `pnpm pi-package:check` and code inspection for `packages/herdsman-pi/extensions/index.js`.
 
 - [ ] **Step 2: Update package extension default socket**
 
-In `packages/shepherd-pi/extensions/index.js`, replace:
+In `packages/herdsman-pi/extensions/index.js`, replace:
 
 ```js
-const DEFAULT_SOCKET_PATH = "/tmp/shepherd.sock";
+const DEFAULT_SOCKET_PATH = "/tmp/herdsman.sock";
 ```
 
 with helper functions:
 
 ```js
-const DEFAULT_HOME_NAME = ".shepherd";
+const DEFAULT_HOME_NAME = ".herdsman";
 
-function defaultShepherdHome() {
+function defaultHerdsmanHome() {
   return process.env.SHEPHERD_HOME || `${process.env.HOME || ""}/${DEFAULT_HOME_NAME}`;
 }
 
 function defaultSocketPath() {
-  return `${defaultShepherdHome().replace(/\/$/, "")}/gateway.sock`;
+  return `${defaultHerdsmanHome().replace(/\/$/, "")}/gateway.sock`;
 }
 ```
 
 Then replace uses of `DEFAULT_SOCKET_PATH` with `defaultSocketPath()`.
 
-Do not parse `config.yaml` in the Pi extension. Direct Pi sessions without binding use the home default socket. Sessions launched by Shepherd keep receiving the resolved socket via internal env or binding.
+Do not parse `config.yaml` in the Pi extension. Direct Pi sessions without binding use the home default socket. Sessions launched by Herdsman keep receiving the resolved socket via internal env or binding.
 
 - [ ] **Step 3: Ensure CLI uses resolved socket in internal env**
 
-In `src/cli/shepherd.ts`, ensure `runPiSession` receives `runtime.paths.socketPath` from the caller. `piOpenEnvironment` still sets `SHEPHERD_GATEWAY_SOCKET_PATH` to that resolved path.
+In `src/cli/herdsman.ts`, ensure `runPiSession` receives `runtime.paths.socketPath` from the caller. `piOpenEnvironment` still sets `SHEPHERD_GATEWAY_SOCKET_PATH` to that resolved path.
 
 - [ ] **Step 4: Run focused checks**
 
@@ -939,8 +939,8 @@ Expected: tests pass and package check passes.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add packages/shepherd-pi/extensions/index.js src/cli/shepherd.ts src/gateway/pi-readiness.ts src/gateway/pi-supervisor.ts test/unit/cli.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts
-git commit -m "feat: align pi bridge with shepherd home defaults"
+git add packages/herdsman-pi/extensions/index.js src/cli/herdsman.ts src/gateway/pi-readiness.ts src/gateway/pi-supervisor.ts test/unit/cli.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts
+git commit -m "feat: align pi bridge with herdsman home defaults"
 ```
 
 ### Task 8: Update README and archived-plan references only where user-facing examples are stale
@@ -958,8 +958,8 @@ git commit -m "feat: align pi bridge with shepherd home defaults"
 
 Change README to say:
 
-- Shepherd reads `$SHEPHERD_HOME/config.yaml`; default `SHEPHERD_HOME` is `~/.shepherd`.
-- Shepherd reads `$SHEPHERD_HOME/.env`; values in this file override shell values for non-`SHEPHERD_*` variables.
+- Herdsman reads `$SHEPHERD_HOME/config.yaml`; default `SHEPHERD_HOME` is `~/.herdsman`.
+- Herdsman reads `$SHEPHERD_HOME/.env`; values in this file override shell values for non-`SHEPHERD_*` variables.
 - Optional runtime path overrides live under top-level `runtime:`.
 
 Show example:
@@ -982,14 +982,14 @@ gateway:
 Replace command snippets:
 
 ```bash
-shepherd gateway start
-shepherd
-shepherd open "$SHEPHERD_SESSION_ID"
-shepherd send "$SHEPHERD_SESSION_ID" "continue from here"
-shepherd watch "$SHEPHERD_SESSION_ID"
-shepherd rename "$SHEPHERD_SESSION_ID" "Review Slack sync"
-shepherd audit "$SHEPHERD_SESSION_ID"
-shepherd-tools
+herdsman gateway start
+herdsman
+herdsman open "$SHEPHERD_SESSION_ID"
+herdsman send "$SHEPHERD_SESSION_ID" "continue from here"
+herdsman watch "$SHEPHERD_SESSION_ID"
+herdsman rename "$SHEPHERD_SESSION_ID" "Review Slack sync"
+herdsman audit "$SHEPHERD_SESSION_ID"
+herdsman-tools
 ```
 
 Do not document `SHEPHERD_DB_PATH`, `SHEPHERD_GATEWAY_SOCKET_PATH`, `SHEPHERD_CONFIG`, or `gateway run` as user-facing controls.
@@ -1008,7 +1008,7 @@ Expected: no stale user-facing CLI examples remain. Internal tests may still men
 
 ```bash
 git add README.md
-git commit -m "docs: update shepherd runtime configuration usage"
+git commit -m "docs: update herdsman runtime configuration usage"
 ```
 
 ### Task 9: Final validation and cleanup
@@ -1034,14 +1034,14 @@ Expected:
 
 - No `SHEPHERD_DB_PATH` or `SHEPHERD_CONFIG` in `src`, `test`, or `README.md`.
 - No public CLI help/tests/examples for removed flags.
-- `SHEPHERD_GATEWAY_SOCKET_PATH` remains only in internal Pi bridge code/tests and `packages/shepherd-pi/extensions/index.js`.
+- `SHEPHERD_GATEWAY_SOCKET_PATH` remains only in internal Pi bridge code/tests and `packages/herdsman-pi/extensions/index.js`.
 
 - [ ] **Step 2: Run focused tests**
 
 Run:
 
 ```bash
-pnpm test -- test/unit/config-runtime.test.ts test/unit/config-schema.test.ts test/unit/config-loader.test.ts test/unit/cli.test.ts test/unit/shepherd-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts
+pnpm test -- test/unit/config-runtime.test.ts test/unit/config-schema.test.ts test/unit/config-loader.test.ts test/unit/cli.test.ts test/unit/herdsman-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts
 ```
 
 Expected: all listed tests pass.
@@ -1062,32 +1062,32 @@ Expected: both commands pass.
 Run with an isolated home:
 
 ```bash
-SHEPHERD_HOME=/tmp/shepherd-plan-smoke node dist/src/cli/shepherd.js gateway status
+SHEPHERD_HOME=/tmp/herdsman-plan-smoke node dist/src/cli/herdsman.js gateway status
 ```
 
-Expected: JSON status showing `state: "stopped"`, `pidPath` under `/tmp/shepherd-plan-smoke/gateway.pid`, and `socketPath` under `/tmp/shepherd-plan-smoke/gateway.sock`. The command must not create unrelated cwd-local `shepherd.sqlite`.
+Expected: JSON status showing `state: "stopped"`, `pidPath` under `/tmp/herdsman-plan-smoke/gateway.pid`, and `socketPath` under `/tmp/herdsman-plan-smoke/gateway.sock`. The command must not create unrelated cwd-local `herdsman.sqlite`.
 
 - [ ] **Step 5: Commit final fixes**
 
 ```bash
 git add src test packages README.md package.json tsconfig*.json
-git commit -m "chore: validate shepherd runtime config cleanup"
+git commit -m "chore: validate herdsman runtime config cleanup"
 ```
 
 Only include files that actually changed.
 
 ## Validation
 
-- `pnpm test -- test/unit/config-runtime.test.ts test/unit/config-schema.test.ts test/unit/config-loader.test.ts test/unit/cli.test.ts test/unit/shepherd-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts` — focused unit coverage passes.
+- `pnpm test -- test/unit/config-runtime.test.ts test/unit/config-schema.test.ts test/unit/config-loader.test.ts test/unit/cli.test.ts test/unit/herdsman-tools.test.ts test/unit/gateway-process-manager.test.ts test/unit/pi-readiness.test.ts test/unit/pi-supervisor.test.ts` — focused unit coverage passes.
 - `pnpm check` — typecheck, tests, Biome, Drizzle check, and Pi package check pass.
-- `pnpm build` — TypeScript build and `tsc-alias` import rewriting pass, including the new internal `dist/src/cli/shepherd-gateway.js` entrypoint.
-- `SHEPHERD_HOME=/tmp/shepherd-plan-smoke node dist/src/cli/shepherd.js gateway status` — reports stopped status using home-derived pid/socket paths.
+- `pnpm build` — TypeScript build and `tsc-alias` import rewriting pass, including the new internal `dist/src/cli/herdsman-gateway.js` entrypoint.
+- `SHEPHERD_HOME=/tmp/herdsman-plan-smoke node dist/src/cli/herdsman.js gateway status` — reports stopped status using home-derived pid/socket paths.
 
 ## Risks, Tradeoffs, and Open Questions
 
 - Removing CLI path flags means ad-hoc testing must use `SHEPHERD_HOME` or `runtime:` config instead of `--db`/`--socket`. This is intentional for a smaller public surface.
 - `SHEPHERD_GATEWAY_SOCKET_PATH` remains in code as internal Pi bridge protocol. Do not document it as a user configuration variable.
-- The Pi extension will not parse `config.yaml`; direct Pi launches without Shepherd binding use `$SHEPHERD_HOME/gateway.sock`. Custom `runtime.socket_path` is supported for Pi sessions launched through Shepherd because Shepherd passes the resolved socket internally.
+- The Pi extension will not parse `config.yaml`; direct Pi launches without Herdsman binding use `$SHEPHERD_HOME/gateway.sock`. Custom `runtime.socket_path` is supported for Pi sessions launched through Herdsman because Herdsman passes the resolved socket internally.
 - `.env` values override shell env for non-`SHEPHERD_*` variables. This follows the Hermes-style home/profile reproducibility model, but differs from some dotenv conventions.
-- `gateway status` should not create `$SHEPHERD_HOME`. `gateway start`, `shepherd`, and other commands that write state may create required directories with restrictive permissions.
-- Windows remains unverified. Use `~/.shepherd` via `os.homedir()` rather than adding partial Windows-native path behavior.
+- `gateway status` should not create `$SHEPHERD_HOME`. `gateway start`, `herdsman`, and other commands that write state may create required directories with restrictive permissions.
+- Windows remains unverified. Use `~/.herdsman` via `os.homedir()` rather than adding partial Windows-native path behavior.

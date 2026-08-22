@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, test } from "vitest";
-import type { AgentEventWireRecord } from "../../packages/shepherd-pi/src/daemon-client.js";
+import type { AgentEventWireRecord } from "../../packages/herdsman-pi/src/daemon-client.js";
 import {
   AGENT_UPDATE_EXCERPT_CHARS,
   createAgentOutcomeProjector,
   formatAgentOutcomeUpdates,
   projectAgentOutcomes,
   WAKE_SETTLE_MS,
-} from "../../packages/shepherd-pi/src/wake.js";
+} from "../../packages/herdsman-pi/src/wake.js";
 
 function event(
   id: number,
@@ -151,7 +151,7 @@ describe("Pi agent wake projection", () => {
     if (!outcome) throw new Error("expected one agent outcome");
     expect(outcome.truncated).toBe(true);
     expect(outcome.text.length).toBeLessThanOrEqual(2_000);
-    expect(outcome.text).toContain(" … [truncated; run shepherd agent read wB:p2]");
+    expect(outcome.text).toContain(" … [truncated; run herdsman agent read wB:p2]");
   });
 
   test("uses unknown in the truncation hint when pane ID is absent", () => {
@@ -161,7 +161,7 @@ describe("Pi agent wake projection", () => {
 
     expect(outcome).toBeDefined();
     if (!outcome) throw new Error("expected one agent outcome");
-    expect(outcome.text).toContain(" … [truncated; run shepherd agent read unknown]");
+    expect(outcome.text).toContain(" … [truncated; run herdsman agent read unknown]");
   });
 
   test("removes terminal control sequences before formatting agent evidence", () => {

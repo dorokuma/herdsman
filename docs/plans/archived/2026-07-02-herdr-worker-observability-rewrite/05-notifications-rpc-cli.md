@@ -159,8 +159,8 @@ git commit -m "feat(daemon): expose observability RPC"
 **Objective:** Replace session/Gateway CLI commands with observed workspace JSON/JSONL commands.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
-- Delete: `src/cli/shepherd-tools.ts`
+- Modify: `src/cli/herdsman.ts`
+- Delete: `src/cli/herdsman-tools.ts`
 - Modify: `package.json` if bin entries change
 - Test: `test/unit/cli.test.ts`
 
@@ -196,9 +196,9 @@ Observed workspace ow_abc123 (active) -> Herdr workspace w1
 
 For `events`, print JSON Lines in `--json` mode and tab-separated summaries otherwise.
 
-- [x] **Step 4: Delete `shepherd-tools`**
+- [x] **Step 4: Delete `herdsman-tools`**
 
-Delete `src/cli/shepherd-tools.ts` and remove the bin entry. Do not rewrite it for the MVP because the formal API is the observed-workspace CLI plus JSONL daemon RPC.
+Delete `src/cli/herdsman-tools.ts` and remove the bin entry. Do not rewrite it for the MVP because the formal API is the observed-workspace CLI plus JSONL daemon RPC.
 
 - [x] **Step 5: Run tests**
 
@@ -209,7 +209,7 @@ Expected: CLI tests pass.
 - [x] **Step 6: Commit**
 
 ```bash
-git add src/cli/shepherd.ts src/cli/shepherd-tools.ts package.json test/unit/cli.test.ts
+git add src/cli/herdsman.ts src/cli/herdsman-tools.ts package.json test/unit/cli.test.ts
 git commit -m "feat(cli): switch to observed workspace commands"
 ```
 

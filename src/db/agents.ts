@@ -89,7 +89,7 @@ export class AgentStore {
       for (const id of temporaryPaneIds) {
         this.#sqlite
           .prepare("update agents set pane_id = ? where id = ?")
-          .run(`__shepherd_moving__:${id}`, id);
+          .run(`__herdsman_moving__:${id}`, id);
       }
 
       const retainedIds: string[] = [];

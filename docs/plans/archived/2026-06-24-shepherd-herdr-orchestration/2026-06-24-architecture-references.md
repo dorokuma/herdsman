@@ -1,8 +1,8 @@
-# Shepherd Architecture References
+# Herdsman Architecture References
 
 Date: 2026-06-24
 
-Parent: [Shepherd Herdr Orchestration Plan](../2026-06-24-shepherd-herdr-orchestration.md)
+Parent: [Herdsman Herdr Orchestration Plan](../2026-06-24-herdsman-herdr-orchestration.md)
 
 ## Status
 
@@ -15,11 +15,11 @@ Archived. Reference decisions were applied to the MVP implementation.
 
 ## Next steps
 
-- Use as historical reference when comparing Shepherd against Hermes, Pi, OpenCode, NanoClaw, and NemoClaw.
+- Use as historical reference when comparing Herdsman against Hermes, Pi, OpenCode, NanoClaw, and NemoClaw.
 
 ## Goal
 
-Record which existing systems Shepherd should learn from, and what not to copy.
+Record which existing systems Herdsman should learn from, and what not to copy.
 
 ## Implementation status
 
@@ -30,7 +30,7 @@ Applied:
 - Hermes-inspired gateway/provider/session-summary shape, while keeping Herdr as the execution surface.
 - Pi/OpenCode-inspired provider registry, `default_agent`, and `when` agent descriptions.
 - Herdr-first terminal/workspace/agent orchestration through named sessions and socket APIs.
-- NanoClaw-style platform adapter separation and delivery router with platform identifiers mapped to Shepherd sessions.
+- NanoClaw-style platform adapter separation and delivery router with platform identifiers mapped to Herdsman sessions.
 - NemoClaw-style conservative policy/recovery mindset, without adding sandbox lifecycle machinery to MVP.
 - AI SDK provider packages for OpenAI, Anthropic, OpenRouter, and Codex app-server.
 
@@ -58,7 +58,7 @@ Ideas to borrow:
 - summary/compression only when context pressure requires it
 - prompt assembly that avoids mutating the stable prompt unnecessarily
 
-Things not to copy into Shepherd MVP:
+Things not to copy into Herdsman MVP:
 
 - Hermes as the execution runtime
 - general coding-agent behavior in the gateway LLM
@@ -82,9 +82,9 @@ Ideas to borrow:
 - OAuth login/refresh/getApiKey abstraction
 - model capability metadata
 
-Things not to copy into Shepherd MVP:
+Things not to copy into Herdsman MVP:
 
-- making Shepherd gateway a full Pi coding agent
+- making Herdsman gateway a full Pi coding agent
 - direct project editing tools in the gateway LLM
 
 ## OpenCode
@@ -103,17 +103,17 @@ Ideas to borrow:
 - `when`/description text for gateway agent selection
 - provider options such as `baseURL`, `apiKey`, `headers`, model maps
 
-Things not to copy into Shepherd MVP:
+Things not to copy into Herdsman MVP:
 
-- exposing arbitrary npm provider package loading in Shepherd config
+- exposing arbitrary npm provider package loading in Herdsman config
 - making Herdr worker agents part of the gateway provider registry
-- OpenCode's internal agent model as Shepherd's core abstraction
+- OpenCode's internal agent model as Herdsman's core abstraction
 
 ## Herdr
 
-Herdr is not just a reference; it is Shepherd's execution surface.
+Herdr is not just a reference; it is Herdsman's execution surface.
 
-Herdr facts that shape Shepherd:
+Herdr facts that shape Herdsman:
 
 - panes are real terminals
 - agents are recognized processes inside panes
@@ -125,7 +125,7 @@ Herdr facts that shape Shepherd:
 
 ## NanoClaw
 
-NanoClaw is relevant as a compact messaging-agent host architecture, not as Shepherd's gateway LLM runner.
+NanoClaw is relevant as a compact messaging-agent host architecture, not as Herdsman's gateway LLM runner.
 
 Useful ideas:
 
@@ -135,7 +135,7 @@ Useful ideas:
 - scheduled work represented as message rows rather than a separate scheduler subsystem
 - outbound delivery through a host-side delivery router with per-platform capability fallback
 
-Things not to copy into Shepherd MVP:
+Things not to copy into Herdsman MVP:
 
 - per-session Docker containers as the primary execution model; Herdr already owns execution surfaces
 - Claude Code / Claude Agent SDK as the default worker model
@@ -143,7 +143,7 @@ Things not to copy into Shepherd MVP:
 
 ## NemoClaw
 
-NemoClaw is relevant as a sandbox lifecycle and policy reference, not as Shepherd's core framework.
+NemoClaw is relevant as a sandbox lifecycle and policy reference, not as Herdsman's core framework.
 
 Useful ideas later:
 
@@ -152,15 +152,15 @@ Useful ideas later:
 - versioned blueprint/policy artifacts for reproducible sandbox setup
 - clear separation between host CLI, sandbox runtime integration, and provider routing
 
-Things not to copy into Shepherd MVP:
+Things not to copy into Herdsman MVP:
 
-- OpenShell sandbox orchestration as the core runtime; Shepherd's runtime target is Herdr
+- OpenShell sandbox orchestration as the core runtime; Herdsman's runtime target is Herdr
 - heavyweight onboarding, blueprint, and sandbox lifecycle machinery
-- provider/inference routing inside a sandbox unless Shepherd later adds isolated worker environments
+- provider/inference routing inside a sandbox unless Herdsman later adds isolated worker environments
 
 ## AI SDK and Codex providers
 
-AI SDK is useful as an implementation layer, not the Shepherd architecture boundary.
+AI SDK is useful as an implementation layer, not the Herdsman architecture boundary.
 
 Use initially:
 
@@ -169,7 +169,7 @@ Use initially:
 - Anthropic provider package
 - `ai-sdk-provider-codex-cli` for Codex app-server gateway
 
-For Codex app-server tool access, expose a curated Shepherd/Herdr tool subset while keeping Shepherd as the policy and execution owner. The MVP implementation uses the AI SDK executable tool bridge; a Hermes-style internal callback can replace the transport later without changing Shepherd logical tools.
+For Codex app-server tool access, expose a curated Herdsman/Herdr tool subset while keeping Herdsman as the policy and execution owner. The MVP implementation uses the AI SDK executable tool bridge; a Hermes-style internal callback can replace the transport later without changing Herdsman logical tools.
 
 Do not depend on:
 

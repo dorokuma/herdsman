@@ -7,7 +7,7 @@ import { JsonLineDecoder } from "@/shared/json-lines.js";
 import {
   type DaemonStreamMessage,
   ReconnectingDaemonClient,
-} from "../../packages/shepherd-pi/src/daemon-client.js";
+} from "../../packages/herdsman-pi/src/daemon-client.js";
 
 const resources: Array<{ client?: ReconnectingDaemonClient; dir: string; server?: Server }> = [];
 
@@ -161,7 +161,7 @@ describe("ReconnectingDaemonClient", () => {
 
     client.close();
     await expect(client.request("agent.list", {})).rejects.toThrow(
-      "Shepherd daemon client is closed",
+      "Herdsman daemon client is closed",
     );
   });
 });
@@ -191,7 +191,7 @@ async function startServer(
 }
 
 function createResource() {
-  const dir = mkdtempSync(join(tmpdir(), "shepherd-pi-client-"));
+  const dir = mkdtempSync(join(tmpdir(), "herdsman-pi-client-"));
   const resource: {
     client?: ReconnectingDaemonClient;
     dir: string;

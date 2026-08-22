@@ -225,7 +225,7 @@ export class HerdrSessionWatchManager {
       } catch (error) {
         if (signal.aborted) return;
         reconnectCount += 1;
-        console.warn("Shepherd Herdr subscription reconnect", {
+        console.warn("Herdsman Herdr subscription reconnect", {
           sessionName: entry.name,
           socketPath: entry.socketPath,
           paneIds: lastPaneIds,

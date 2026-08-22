@@ -1,8 +1,8 @@
-# RPC and CLI: `shepherd agent list/get/read` Plan
+# RPC and CLI: `herdsman agent list/get/read` Plan
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task.
 
-**Goal:** Replace old context/snapshot/worker CLI and RPC surface with Herdr-aligned `shepherd agent list/get/read` backed by the daemon DB/cache.
+**Goal:** Replace old context/snapshot/worker CLI and RPC surface with Herdr-aligned `herdsman agent list/get/read` backed by the daemon DB/cache.
 
 **Architecture:** CLI remains a thin JSON Lines RPC client. It parses Herdr environment variables to set default scope, sends agent RPC requests to the daemon, and formats human/JSON output. The daemon resolves targets from indexed agents and uses `AgentHistoryService` for compact history and recent messages.
 
@@ -10,14 +10,14 @@
 
 ## Global Constraints
 
-- CLI requires daemon; if unavailable, tell the user to run `shepherd daemon start`.
+- CLI requires daemon; if unavailable, tell the user to run `herdsman daemon start`.
 - Do not auto-start daemon.
 - Remove old external CLI commands: `context`, `snapshot`, `events`, `notifications`, `ack`, `message-worker`, `wait-worker`.
-- Keep daemon management command: `shepherd daemon [start|stop|restart|status]`.
+- Keep daemon management command: `herdsman daemon [start|stop|restart|status]`.
 - Add:
-  - `shepherd agent list [--all] [--workspace <id>] [--session <name>] [--json]`
-  - `shepherd agent get <target> [--workspace <id>] [--session <name>] [--json]`
-  - `shepherd agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]`
+  - `herdsman agent list [--all] [--workspace <id>] [--session <name>] [--json]`
+  - `herdsman agent get <target> [--workspace <id>] [--session <name>] [--json]`
+  - `herdsman agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]`
 - Default scope is current Herdr workspace when `HERDR_ENV=1`, using `HERDR_WORKSPACE_ID`. If available, pass Herdr session identity from daemon index via workspace id; do not require users to know session names.
 - `--all` is valid for `agent list` only.
 - Scope combinations are explicit:
@@ -33,7 +33,7 @@
 
 ## Current Context
 
-- `src/cli/shepherd.ts` currently parses old commands and builds `context` by composing `workspace.observe`, `workspace.snapshot`, and notification subscribe.
+- `src/cli/herdsman.ts` currently parses old commands and builds `context` by composing `workspace.observe`, `workspace.snapshot`, and notification subscribe.
 - `src/daemon/observability-server.ts` currently dispatches old methods.
 - `test/unit/cli.test.ts` currently expects old help and context output.
 
@@ -41,7 +41,7 @@
 
 - Modify: `src/daemon/observability-server.ts` — dispatch `agent.list`, `agent.get`, `agent.read`, `agent.events`, `agent.notifications.subscribe`, `agent.notifications.ack`, `agent.telemetry`.
 - Modify: `src/observability/schemas.ts` — ensure agent RPC schemas are used in server dispatch.
-- Modify: `src/cli/shepherd.ts` — parse and render `agent` subcommands only plus daemon/help.
+- Modify: `src/cli/herdsman.ts` — parse and render `agent` subcommands only plus daemon/help.
 - Modify: `test/unit/cli.test.ts` — replace old command tests.
 - Modify: `test/integration/observability-rpc.test.ts` — test agent RPC methods.
 
@@ -183,12 +183,12 @@ git add src/daemon/observability-server.ts src/observability/schemas.ts test/int
 git commit -m "rpc: expose agent history methods"
 ```
 
-### Task 2: Parse `shepherd agent` CLI commands
+### Task 2: Parse `herdsman agent` CLI commands
 
 **Objective:** Replace old CLI commands with Herdr-aligned agent subcommands.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Test: `test/unit/cli.test.ts`
 
 **Interfaces:**
@@ -221,9 +221,9 @@ Expected: Tests fail because parser still supports old commands and not agent su
 Parser rules:
 
 ```text
-shepherd agent list [--all] [--workspace <id>] [--session <name>] [--json]
-shepherd agent get <target> [--workspace <id>] [--session <name>] [--json]
-shepherd agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]
+herdsman agent list [--all] [--workspace <id>] [--session <name>] [--json]
+herdsman agent get <target> [--workspace <id>] [--session <name>] [--json]
+herdsman agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]
 ```
 
 Use current Herdr workspace only when `HERDR_ENV=1` and `HERDR_WORKSPACE_ID` exists. `HERDR_SOCKET_PATH` is not needed by CLI because daemon already indexes running sessions. Error if no current workspace and no `--workspace`/`--all`:
@@ -243,16 +243,16 @@ Expected: CLI parse/help tests pass.
 - [x] **Step 5: Commit**
 
 ```bash
-git add src/cli/shepherd.ts test/unit/cli.test.ts
-git commit -m "cli: add shepherd agent commands"
+git add src/cli/herdsman.ts test/unit/cli.test.ts
+git commit -m "cli: add herdsman agent commands"
 ```
 
 ### Task 3: Dispatch CLI to agent RPC and format output
 
-**Objective:** Make `shepherd agent list/get/read` call the daemon and render useful human/JSON output.
+**Objective:** Make `herdsman agent list/get/read` call the daemon and render useful human/JSON output.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Test: `test/unit/cli.test.ts`
 
 **Interfaces:**
@@ -269,7 +269,7 @@ Add run command tests:
 4. Human `agent list` prints a table header: `status	agent	pane	last user	last assistant	updated`.
 5. Human `agent get` prints metadata lines plus compact history and last tool if present.
 6. Human `agent read` prints each message as `timestamp role tool text`, truncating each text cell to a human-readable width.
-7. Socket connection errors produce: `Run \`shepherd daemon start\` before using Shepherd commands.`
+7. Socket connection errors produce: `Run \`herdsman daemon start\` before using Herdsman commands.`
 
 - [x] **Step 2: Run test to verify it fails**
 
@@ -302,7 +302,7 @@ Expected: All CLI tests pass.
 - [x] **Step 5: Commit**
 
 ```bash
-git add src/cli/shepherd.ts test/unit/cli.test.ts
+git add src/cli/herdsman.ts test/unit/cli.test.ts
 git commit -m "cli: read agent history via daemon"
 ```
 
@@ -311,7 +311,7 @@ git commit -m "cli: read agent history via daemon"
 **Objective:** Make daemon dependency simple and predictable.
 
 **Files:**
-- Modify: `src/cli/shepherd.ts`
+- Modify: `src/cli/herdsman.ts`
 - Test: `test/unit/cli.test.ts`
 
 **Interfaces:**
@@ -322,10 +322,10 @@ git commit -m "cli: read agent history via daemon"
 
 Tests:
 
-1. When `connect()` rejects with `ECONNREFUSED`, output contains `Run \`shepherd daemon start\``.
+1. When `connect()` rejects with `ECONNREFUSED`, output contains `Run \`herdsman daemon start\``.
 2. When socket path is missing (`ENOENT`), output contains same guidance.
 3. CLI does not call `startDaemonProcess()` for agent commands.
-4. `shepherd daemon start` behavior remains handled by `main()` and existing daemon tests still pass.
+4. `herdsman daemon start` behavior remains handled by `main()` and existing daemon tests still pass.
 
 - [x] **Step 2: Run test to verify it fails**
 
@@ -335,7 +335,7 @@ Expected: Any missing daemon-required behavior fails.
 
 - [x] **Step 3: Write minimal implementation**
 
-Keep existing daemon command handling. Ensure agent commands go through `ObservabilityRpcClient` and do not call daemon start. Update `formatCliError()` message from observability wording to Shepherd daemon wording if needed.
+Keep existing daemon command handling. Ensure agent commands go through `ObservabilityRpcClient` and do not call daemon start. Update `formatCliError()` message from observability wording to Herdsman daemon wording if needed.
 
 - [x] **Step 4: Run test to verify it passes**
 
@@ -346,8 +346,8 @@ Expected: Tests pass.
 - [x] **Step 5: Commit**
 
 ```bash
-git add src/cli/shepherd.ts test/unit/cli.test.ts test/unit/daemon-process-manager.test.ts
-git commit -m "cli: require shepherd daemon for agent reads"
+git add src/cli/herdsman.ts test/unit/cli.test.ts test/unit/daemon-process-manager.test.ts
+git commit -m "cli: require herdsman daemon for agent reads"
 ```
 
 ## Validation

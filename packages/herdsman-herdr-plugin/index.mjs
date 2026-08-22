@@ -2,7 +2,7 @@
 import { createConnection } from "node:net";
 
 const CURRENT_HERDR_CONTEXT_ERROR =
-  "Shepherd agent commands require HERDR_ENV=1 and HERDR_WORKSPACE_ID. Run them inside a Herdr workspace.";
+  "Herdsman agent commands require HERDR_ENV=1 and HERDR_WORKSPACE_ID. Run them inside a Herdr workspace.";
 
 /** @typedef {{ request(method: string, params: unknown): Promise<unknown>, close(): void }} DaemonClient */
 /** @typedef {{ reject(error: Error): void, resolve(value: unknown): void }} PendingRequest */
@@ -37,7 +37,7 @@ export async function runPluginCommand(args = process.argv.slice(2), deps = defa
 /** @param {AgentListResult} input */
 export function renderAgents(input) {
   const agents = input.agents ?? [];
-  if (agents.length === 0) return "No Shepherd agents indexed.";
+  if (agents.length === 0) return "No Herdsman agents indexed.";
   return [
     ["status", "name", "agent", "pane", "last user", "last assistant"].join("\t"),
     ...agents.map((agent) =>
@@ -80,8 +80,8 @@ function defaultDeps() {
 
 /** @param {NodeJS.ProcessEnv} env */
 function defaultSocketPath(env) {
-  const home = (env.SHEPHERD_HOME || `${env.HOME || ""}/.shepherd`).replace(/\/$/, "");
-  return `${home}/shepherd.sock`;
+  const home = (env.SHEPHERD_HOME || `${env.HOME || ""}/.herdsman`).replace(/\/$/, "");
+  return `${home}/herdsman.sock`;
 }
 
 /** @param {unknown} value */
@@ -102,7 +102,7 @@ class JsonLineDaemonClient {
     this.#socket = createConnection(socketPath);
     this.#socket.on("data", (chunk) => this.#handleData(chunk.toString("utf8")));
     this.#socket.on("error", (error) => this.#rejectAll(error));
-    this.#socket.on("close", () => this.#rejectAll(new Error("Shepherd daemon socket closed")));
+    this.#socket.on("close", () => this.#rejectAll(new Error("Herdsman daemon socket closed")));
   }
 
   close() {
@@ -137,7 +137,7 @@ class JsonLineDaemonClient {
       const pending = this.#pending.get(message.id);
       if (!pending) continue;
       this.#pending.delete(message.id);
-      if (message.error) pending.reject(new Error(message.error.message ?? "Shepherd RPC failed"));
+      if (message.error) pending.reject(new Error(message.error.message ?? "Herdsman RPC failed"));
       else pending.resolve(message.result);
     }
   }

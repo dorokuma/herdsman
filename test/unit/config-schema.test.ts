@@ -1,15 +1,15 @@
 import { describe, expect, test } from "vitest";
-import { parseShepherdConfig } from "@/config/schema.js";
+import { parseHerdsmanConfig } from "@/config/schema.js";
 
-describe("Shepherd config schema", () => {
+describe("Herdsman config schema", () => {
   test("accepts minimal observability config with runtime paths", () => {
-    const result = parseShepherdConfig({
+    const result = parseHerdsmanConfig({
       observability: { telemetry: { max_excerpt_bytes: 2048 } },
       runtime: {
         db_path: "data/state.db",
-        log_path: "logs/shepherd.log",
-        pid_path: "shepherd.pid",
-        socket_path: "shepherd.sock",
+        log_path: "logs/herdsman.log",
+        pid_path: "herdsman.pid",
+        socket_path: "herdsman.sock",
       },
     });
 
@@ -17,7 +17,7 @@ describe("Shepherd config schema", () => {
   });
 
   test("defaults telemetry excerpt limit", () => {
-    const result = parseShepherdConfig({ observability: { telemetry: {} } });
+    const result = parseHerdsmanConfig({ observability: { telemetry: {} } });
     expect(result).toMatchObject({
       ok: true,
       value: { observability: { telemetry: { max_excerpt_bytes: 4096 } } },
@@ -30,7 +30,7 @@ describe("Shepherd config schema", () => {
       { providers: { example: {} } },
       { orchestration: { queue: {} } },
     ]) {
-      const result = parseShepherdConfig(config);
+      const result = parseHerdsmanConfig(config);
       expect(result.ok).toBe(false);
       if (!result.ok)
         expect(result.errors.some((error) => error.keyword === "additionalProperties")).toBe(true);
@@ -38,7 +38,7 @@ describe("Shepherd config schema", () => {
   });
 
   test("rejects unknown runtime and observability keys", () => {
-    expect(parseShepherdConfig({ runtime: { extra: "nope" } }).ok).toBe(false);
-    expect(parseShepherdConfig({ observability: { retention: { days: 7 } } }).ok).toBe(false);
+    expect(parseHerdsmanConfig({ runtime: { extra: "nope" } }).ok).toBe(false);
+    expect(parseHerdsmanConfig({ observability: { retention: { days: 7 } } }).ok).toBe(false);
   });
 });

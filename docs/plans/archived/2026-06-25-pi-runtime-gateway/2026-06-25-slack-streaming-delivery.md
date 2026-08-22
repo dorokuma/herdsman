@@ -2,7 +2,7 @@
 
 Date: 2026-06-25
 
-Parent: [Shepherd Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
+Parent: [Herdsman Pi Runtime Gateway Plan](../2026-06-25-pi-runtime-gateway.md)
 
 ## Status
 
@@ -15,7 +15,7 @@ Done.
 - **Done** — Final assistant text is persisted as `gateway.message`.
 - **Done** — Slack tool progress defaults to `off`.
 - **Done** — Slack `chat.update` support and in-memory stream state exist for final-answer streaming.
-- **Done** — `gateway.stream_delta`, `gateway.stream_finish`, `gateway.stream_segment_break`, and default-off `gateway.stream_tool_progress` RPC exist; `shepherd-pi` forwards assistant updates and final stream finish.
+- **Done** — `gateway.stream_delta`, `gateway.stream_finish`, `gateway.stream_segment_break`, and default-off `gateway.stream_tool_progress` RPC exist; `herdsman-pi` forwards assistant updates and final stream finish.
 
 ## Next steps
 
@@ -142,7 +142,7 @@ tool_progress: off
 Meaning:
 
 - Do not send per-tool Slack progress bubbles by default.
-- Pi tool events may still be recorded as Shepherd tool events when useful.
+- Pi tool events may still be recorded as Herdsman tool events when useful.
 - Final answer streaming remains enabled.
 
 Future opt-in:

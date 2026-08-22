@@ -1,25 +1,25 @@
 ---
-name: shepherd
-description: "Inspect the status, progress, latest messages, compact structured history, and recent tool results of coding agents managed by Herdr using Shepherd. Use whenever the user asks what another Herdr-managed coding agent is doing, whether it is working, blocked, idle, or done, what it recently reported or changed, or needs structured context before coordinating with that agent. Also use outside Herdr when the user provides an explicit Herdr workspace or session scope for agent inspection."
-compatibility: "Requires the Shepherd CLI and daemon. Current-workspace lookup requires HERDR_ENV=1 and HERDR_WORKSPACE_ID. Explicit Shepherd workspace or session scopes work outside Herdr."
+name: herdsman
+description: "Inspect the status, progress, latest messages, compact structured history, and recent tool results of coding agents managed by Herdr using Herdsman. Use whenever the user asks what another Herdr-managed coding agent is doing, whether it is working, blocked, idle, or done, what it recently reported or changed, or needs structured context before coordinating with that agent. Also use outside Herdr when the user provides an explicit Herdr workspace or session scope for agent inspection."
+compatibility: "Requires the Herdsman CLI and daemon. Current-workspace lookup requires HERDR_ENV=1 and HERDR_WORKSPACE_ID. Explicit Herdsman workspace or session scopes work outside Herdr."
 ---
 
-# Shepherd agent inspection
+# Herdsman agent inspection
 
-Use Shepherd for structured coding-agent status, compact message history, and recent compact tool results. Use the official `herdr` skill for live workspace, tab, pane, terminal input/output, focus, spawn, and wait operations.
+Use Herdsman for structured coding-agent status, compact message history, and recent compact tool results. Use the official `herdr` skill for live workspace, tab, pane, terminal input/output, focus, spawn, and wait operations.
 
 ## Ensure the daemon is running
 
-Check the daemon before the first Shepherd query:
+Check the daemon before the first Herdsman query:
 
 ```bash
-shepherd daemon status
+herdsman daemon status
 ```
 
 If the JSON response has `state: "stopped"`, start it once:
 
 ```bash
-shepherd daemon start
+herdsman daemon start
 ```
 
 Do not restart or stop a running daemon unless the user asks.
@@ -29,7 +29,7 @@ Do not restart or stop a running daemon unless the user asks.
 Use the current workspace only when both `HERDR_ENV=1` and `HERDR_WORKSPACE_ID` are set:
 
 ```bash
-shepherd agent list --json
+herdsman agent list --json
 ```
 
 If either value is missing, do not guess the workspace or fall back to `--all`. Ask for an explicit scope.
@@ -37,21 +37,21 @@ If either value is missing, do not guess the workspace or fall back to `--all`. 
 Outside Herdr, or when the user names a scope, pass it explicitly:
 
 ```bash
-shepherd agent list --workspace <workspace-id> --json
-shepherd agent list --all --json
+herdsman agent list --workspace <workspace-id> --json
+herdsman agent list --all --json
 ```
 
 Use `--session <name>` when workspace ids or agent targets are ambiguous across running Herdr sessions.
 
 ## Inspect an agent
 
-Start with `agent list`. Each row contains an optional Herdr live `name`, such as `reviewer`, and a runtime `agent` kind, such as `codex`. Shepherd resolves an exact pane id, terminal id, or Shepherd agent id first; an exact live name second; and a unique runtime kind only as a fallback. Use an exact pane id or terminal id when the caller has already selected a row. Otherwise use its live name when present. Do not call `agent list` repeatedly in a polling loop, and inspect `updatedAt` when freshness matters.
+Start with `agent list`. Each row contains an optional Herdr live `name`, such as `reviewer`, and a runtime `agent` kind, such as `codex`. Herdsman resolves an exact pane id, terminal id, or Herdsman agent id first; an exact live name second; and a unique runtime kind only as a fallback. Use an exact pane id or terminal id when the caller has already selected a row. Otherwise use its live name when present. Do not call `agent list` repeatedly in a polling loop, and inspect `updatedAt` when freshness matters.
 
 Use `agent get` or `agent read` for explicit current detail after selecting the exact target.
 
 ```bash
-shepherd agent get <target> --json
-shepherd agent read <target> --limit 20 --json
+herdsman agent get <target> --json
+herdsman agent read <target> --limit 20 --json
 ```
 
 Add the same `--workspace` and `--session` scope used for `agent list` when operating outside the current Herdr workspace.
@@ -76,7 +76,7 @@ Do not copy or guess Herdr CLI commands in this skill.
 
 ## Boundaries
 
-- Shepherd returns agents from running Herdr sessions only.
-- Use Shepherd for structured semantic history, not raw terminal fidelity.
-- Shepherd does not start, prompt, wait for, focus, or send terminal input to agents.
+- Herdsman returns agents from running Herdr sessions only.
+- Use Herdsman for structured semantic history, not raw terminal fidelity.
+- Herdsman does not start, prompt, wait for, focus, or send terminal input to agents.
 - Use the official `herdr` skill for live terminal state and control.

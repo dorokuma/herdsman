@@ -4,29 +4,29 @@
 
 **Status:** Completed and archived
 
-**Goal:** Publish the Shepherd CLI/daemon and Pi extension as `@ryonakae/shepherd` and `@ryonakae/shepherd-pi`, keep the Herdr plugin on its existing GitHub-subdirectory distribution path, and document a repeatable release process.
+**Goal:** Publish the Herdsman CLI/daemon and Pi extension as `@dorokuma/herdsman` and `@dorokuma/herdsman-pi`, keep the Herdr plugin on its existing GitHub-subdirectory distribution path, and document a repeatable release process.
 
-**Architecture:** Keep the root package as the CLI/daemon distribution and keep `packages/shepherd-pi` as the Pi-native installation unit. Leave `packages/shepherd-herdr-plugin` in place so existing Herdr GitHub install paths remain valid, but mark it private because Herdr 0.7.2 installs plugins from `owner/repo/subdir`, not npm. Restrict the root npm tarball to built runtime files and migrations, and clean `dist` before every build so removed modules cannot leak into a release.
+**Architecture:** Keep the root package as the CLI/daemon distribution and keep `packages/herdsman-pi` as the Pi-native installation unit. Leave `packages/herdsman-herdr-plugin` in place so existing Herdr GitHub install paths remain valid, but mark it private because Herdr 0.7.2 installs plugins from `owner/repo/subdir`, not npm. Restrict the root npm tarball to built runtime files and migrations, and clean `dist` before every build so removed modules cannot leak into a release.
 
 **Tech Stack:** Node.js 24.18.0, pnpm 11.9.0, npm public registry, TypeScript ESM, Vitest, Biome, GitHub CLI, Pi 0.80.6, Herdr 0.7.2.
 
 ## Global Constraints
 
 - Publish exactly two npm packages:
-  - `@ryonakae/shepherd`
-  - `@ryonakae/shepherd-pi`
-- Do not publish `packages/shepherd-herdr-plugin` to npm. Keep its GitHub install path `ryonakae/shepherd/packages/shepherd-herdr-plugin` and add `"private": true` to its package manifest.
+  - `@dorokuma/herdsman`
+  - `@dorokuma/herdsman-pi`
+- Do not publish `packages/herdsman-herdr-plugin` to npm. Keep its GitHub install path `ryonakae/herdsman/packages/herdsman-herdr-plugin` and add `"private": true` to its package manifest.
 - Do not turn the repository into a pnpm workspace. `pnpm-workspace.yaml` remains reserved for pnpm 11 `allowBuilds` configuration.
 - Release the scoped packages as `0.3.1`. The existing `v0.3.0` tag predates scoped package names and must not move.
 - Keep all four release versions synchronized:
   - root `package.json`
-  - `packages/shepherd-pi/package.json`
-  - `packages/shepherd-herdr-plugin/package.json`
-  - `packages/shepherd-herdr-plugin/herdr-plugin.toml`
+  - `packages/herdsman-pi/package.json`
+  - `packages/herdsman-herdr-plugin/package.json`
+  - `packages/herdsman-herdr-plugin/herdr-plugin.toml`
 - Set `publishConfig.access` to `public` in both public package manifests. Keep the explicit `npm publish --access public` flag in the release procedure as an additional guard.
-- Preserve the CLI binary name `shepherd`.
+- Preserve the CLI binary name `herdsman`.
 - Root package runtime content must include compiled `dist/` output and `drizzle/` migrations. It must not include source, tests, plans, nested packages, repository configuration, assets, or stale removed modules.
-- `packages/shepherd-pi` continues to ship TypeScript source because Pi loads its extension entrypoint directly.
+- `packages/herdsman-pi` continues to ship TypeScript source because Pi loads its extension entrypoint directly.
 - Do not publish from a dirty worktree, an unpushed commit, or a commit that is not on `main`.
 - Do not place npm credentials, OTP values, tokens, or generated tarballs in the repository.
 - npm versions are immutable. If a published artifact is wrong, do not move a tag or reuse the version; use the next unused patch version.
@@ -41,7 +41,7 @@
 - The root package currently packs 403 files, about 1.3 MB compressed and 3.0 MB unpacked. It includes `src/`, `test/`, `docs/plans/`, `packages/`, repository configuration, the cover image, and stale removed `dist` modules.
 - The stale output exists because `pnpm build` emits into `dist` without removing the previous build.
 - The Pi package currently packs seven files and has an appropriate runtime boundary, but it lacks an explicit file allowlist, scoped name, public access setting, and repository metadata.
-- Herdr 0.7.2 exposes `herdr plugin install <owner>/<repo>[/subdir...]`. The installed Shepherd plugin records `source.kind: "github"` and `subdir: "packages/shepherd-herdr-plugin"`.
+- Herdr 0.7.2 exposes `herdr plugin install <owner>/<repo>[/subdir...]`. The installed Herdsman plugin records `source.kind: "github"` and `subdir: "packages/herdsman-herdr-plugin"`.
 - The repository deliberately is not a pnpm workspace. Root scripts validate nested packages with `pnpm --dir`.
 - `pnpm check` currently passes 33 test files and 199 tests.
 
@@ -52,10 +52,10 @@
 - Create: `test/unit/package-publication.test.ts` — public/private package boundary, scope, access, file allowlist, repository metadata, and synchronized-version contract.
 - Create: `docs/releasing.md` — authoritative version, validation, npm publication, GitHub Release, verification, and recovery procedure.
 - Modify: `package.json` — scoped name, root file allowlist, public access, clean build, prepack, and root package check.
-- Modify: `packages/shepherd-pi/package.json` — scoped name, file allowlist, public access, and repository metadata.
-- Modify: `packages/shepherd-herdr-plugin/package.json` — private package marker while retaining local validation scripts.
-- Modify: `packages/shepherd-pi/README.md` — npm/Pi installation commands and daemon prerequisite.
-- Modify: `packages/shepherd-herdr-plugin/README.md` — GitHub-subdirectory installation and explicit non-npm distribution.
+- Modify: `packages/herdsman-pi/package.json` — scoped name, file allowlist, public access, and repository metadata.
+- Modify: `packages/herdsman-herdr-plugin/package.json` — private package marker while retaining local validation scripts.
+- Modify: `packages/herdsman-pi/README.md` — npm/Pi installation commands and daemon prerequisite.
+- Modify: `packages/herdsman-herdr-plugin/README.md` — GitHub-subdirectory installation and explicit non-npm distribution.
 - Modify: `README.md` — npm-first CLI/Pi install, source-install fallback, Herdr plugin command, package table, and release guide link.
 - Modify: `README.ja.md` — Japanese counterpart of installation and package distribution.
 - Modify: `AGENTS.md` — package checks, release documentation path, and the two-package publication boundary.
@@ -70,9 +70,9 @@
 
 ```json
 {
-  "name": "@ryonakae/shepherd",
+  "name": "@dorokuma/herdsman",
   "bin": {
-    "shepherd": "dist/src/cli/shepherd.js"
+    "herdsman": "dist/src/cli/herdsman.js"
   },
   "files": [
     "dist",
@@ -107,8 +107,8 @@ drizzle/**
 It must contain at least:
 
 ```text
-dist/src/cli/shepherd.js
-dist/src/cli/shepherd-daemon.js
+dist/src/cli/herdsman.js
+dist/src/cli/herdsman-daemon.js
 drizzle/meta/_journal.json
 ```
 
@@ -116,11 +116,11 @@ It must reject every path under `src/`, `test/`, `docs/`, `packages/`, `assets/`
 
 ### Pi package
 
-`packages/shepherd-pi/package.json` must contain:
+`packages/herdsman-pi/package.json` must contain:
 
 ```json
 {
-  "name": "@ryonakae/shepherd-pi",
+  "name": "@dorokuma/herdsman-pi",
   "files": [
     "src"
   ],
@@ -129,8 +129,8 @@ It must reject every path under `src/`, `test/`, `docs/`, `packages/`, `assets/`
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/ryonakae/shepherd.git",
-    "directory": "packages/shepherd-pi"
+    "url": "git+https://github.com/ryonakae/herdsman.git",
+    "directory": "packages/herdsman-pi"
   }
 }
 ```
@@ -139,7 +139,7 @@ Keep the Pi and Pi TUI peer dependencies at `>=0.80.6`. The packed package must 
 
 ### Herdr integration package
 
-`packages/shepherd-herdr-plugin/package.json` keeps its existing name and scripts but adds:
+`packages/herdsman-herdr-plugin/package.json` keeps its existing name and scripts but adds:
 
 ```json
 {
@@ -160,8 +160,8 @@ Its package version remains synchronized with `herdr-plugin.toml` because the Gi
 - Create: `scripts/clean-dist.mjs`
 - Create: `scripts/check-root-package.mjs`
 - Modify: `package.json`
-- Modify: `packages/shepherd-pi/package.json`
-- Modify: `packages/shepherd-herdr-plugin/package.json`
+- Modify: `packages/herdsman-pi/package.json`
+- Modify: `packages/herdsman-herdr-plugin/package.json`
 
 - [x] **Step 1: Write the failing publication contract test**
 
@@ -191,21 +191,21 @@ async function readManifest(relativePath: string): Promise<PackageManifest> {
 describe("npm publication metadata", () => {
   test("keeps public packages scoped and the Herdr integration private", async () => {
     const root = await readManifest("../../package.json");
-    const pi = await readManifest("../../packages/shepherd-pi/package.json");
+    const pi = await readManifest("../../packages/herdsman-pi/package.json");
     const herdr = await readManifest(
-      "../../packages/shepherd-herdr-plugin/package.json",
+      "../../packages/herdsman-herdr-plugin/package.json",
     );
     const pluginToml = await readFile(
       new URL(
-        "../../packages/shepherd-herdr-plugin/herdr-plugin.toml",
+        "../../packages/herdsman-herdr-plugin/herdr-plugin.toml",
         import.meta.url,
       ),
       "utf8",
     );
     const pluginVersion = /^version = "([^"]+)"$/m.exec(pluginToml)?.[1];
 
-    expect(root.name).toBe("@ryonakae/shepherd");
-    expect(root.bin).toEqual({ shepherd: "dist/src/cli/shepherd.js" });
+    expect(root.name).toBe("@dorokuma/herdsman");
+    expect(root.bin).toEqual({ herdsman: "dist/src/cli/herdsman.js" });
     expect(root.files).toEqual(["dist", "drizzle"]);
     expect(root.publishConfig?.access).toBe("public");
     expect(root.scripts).toMatchObject({
@@ -218,13 +218,13 @@ describe("npm publication metadata", () => {
     expect(root.scripts?.build).toContain("pnpm clean:dist");
     expect(root.scripts?.check).toContain("pnpm package:check");
 
-    expect(pi.name).toBe("@ryonakae/shepherd-pi");
+    expect(pi.name).toBe("@dorokuma/herdsman-pi");
     expect(pi.files).toEqual(["src"]);
     expect(pi.publishConfig?.access).toBe("public");
     expect(pi.repository).toEqual({
       type: "git",
-      url: "git+https://github.com/ryonakae/shepherd.git",
-      directory: "packages/shepherd-pi",
+      url: "git+https://github.com/ryonakae/herdsman.git",
+      directory: "packages/herdsman-pi",
     });
 
     expect(herdr.private).toBe(true);
@@ -284,8 +284,8 @@ const [packed] = JSON.parse(
 );
 const files = packed?.files?.map(({ path }) => path) ?? [];
 const required = [
-  "dist/src/cli/shepherd.js",
-  "dist/src/cli/shepherd-daemon.js",
+  "dist/src/cli/herdsman.js",
+  "dist/src/cli/herdsman-daemon.js",
   "drizzle/meta/_journal.json",
 ];
 const topLevel = new Set([
@@ -343,8 +343,8 @@ Expected: the test passes; root dry-run contains only the allowlist; Pi dry-run 
 ```bash
 git add \
   package.json \
-  packages/shepherd-pi/package.json \
-  packages/shepherd-herdr-plugin/package.json \
+  packages/herdsman-pi/package.json \
+  packages/herdsman-herdr-plugin/package.json \
   scripts/clean-dist.mjs \
   scripts/check-root-package.mjs \
   test/unit/package-publication.test.ts
@@ -360,8 +360,8 @@ git push origin main
 - Create: `docs/releasing.md`
 - Modify: `README.md`
 - Modify: `README.ja.md`
-- Modify: `packages/shepherd-pi/README.md`
-- Modify: `packages/shepherd-herdr-plugin/README.md`
+- Modify: `packages/herdsman-pi/README.md`
+- Modify: `packages/herdsman-herdr-plugin/README.md`
 - Modify: `AGENTS.md`
 
 - [x] **Step 1: Update the English and Japanese installation paths**
@@ -369,27 +369,27 @@ git push origin main
 Make npm installation the first path:
 
 ```bash
-npm install --global @ryonakae/shepherd
-shepherd help
+npm install --global @dorokuma/herdsman
+herdsman help
 ```
 
 Add Pi installation:
 
 ```bash
-pi install npm:@ryonakae/shepherd-pi
+pi install npm:@dorokuma/herdsman-pi
 ```
 
 Use a shell `VERSION` variable in the release guide and the current stable tag in README examples for Herdr plugin installation:
 
 ```bash
-herdr plugin install ryonakae/shepherd/packages/shepherd-herdr-plugin --ref v0.3.1 --yes
+herdr plugin install ryonakae/herdsman/packages/herdsman-herdr-plugin --ref v0.3.1 --yes
 ```
 
 Keep source installation in a separate section and state that pnpm is required only for source builds and development. Update the package table to distinguish the two public npm packages from the GitHub-distributed Herdr integration.
 
 - [x] **Step 2: Update companion package READMEs**
 
-The Pi README must show `pi install npm:@ryonakae/shepherd-pi` and `npm install --global @ryonakae/shepherd` before daemon startup.
+The Pi README must show `pi install npm:@dorokuma/herdsman-pi` and `npm install --global @dorokuma/herdsman` before daemon startup.
 
 The Herdr README must show the GitHub-subdirectory command, state that npm does not distribute the plugin, and retain the daemon prerequisite.
 
@@ -407,7 +407,7 @@ Document these sections with copyable commands and expected checks:
 8. Root npm publish, registry verification, Pi npm publish, registry verification.
 9. Remote tag push and GitHub Release creation only after both registry entries exist.
 10. Final verification of npm dist-tags, GitHub latest release, tag target, and clean tree.
-11. Failure handling for timeout-after-publish and partial two-package publication. Require `npm view` before retrying. If root `0.3.1` exists but Pi needs a content change, delete only the unpushed local `v0.3.1` tag, bump all four version files to `0.3.2`, rebuild and republish both packages at `0.3.2`, then create only `v0.3.2`. After the complete replacement release exists, deprecate the orphaned root version with `npm deprecate @ryonakae/shepherd@0.3.1 "Incomplete paired release; use 0.3.2"`. Never move a remote tag or reuse a published version.
+11. Failure handling for timeout-after-publish and partial two-package publication. Require `npm view` before retrying. If root `0.3.1` exists but Pi needs a content change, delete only the unpushed local `v0.3.1` tag, bump all four version files to `0.3.2`, rebuild and republish both packages at `0.3.2`, then create only `v0.3.2`. After the complete replacement release exists, deprecate the orphaned root version with `npm deprecate @dorokuma/herdsman@0.3.1 "Incomplete paired release; use 0.3.2"`. Never move a remote tag or reuse a published version.
 12. Authentication for `auth-and-writes` 2FA. Run each publish in an interactive terminal and let npm request the second factor. Never pass an OTP in command arguments or put it in a file, command history, plan evidence, or chat.
 13. Explicit statement that the Herdr plugin is never sent to `npm publish`.
 
@@ -423,7 +423,7 @@ Check every internal link, compare English/Japanese install commands, and run se
 
 ```bash
 rg -n 'npm install|pi install|herdr plugin install' README.md README.ja.md packages/*/README.md docs/releasing.md
-rg -n 'shepherd-pi|shepherd-herdr-plugin|@ryonakae/shepherd' README.md README.ja.md AGENTS.md docs/releasing.md packages/*/README.md
+rg -n 'herdsman-pi|herdsman-herdr-plugin|@dorokuma/herdsman' README.md README.ja.md AGENTS.md docs/releasing.md packages/*/README.md
 ```
 
 Expected: npm names use the scope; Herdr commands use GitHub paths; no document instructs npm to install or publish the Herdr plugin.
@@ -436,8 +436,8 @@ git add \
   README.md \
   README.ja.md \
   docs/releasing.md \
-  packages/shepherd-pi/README.md \
-  packages/shepherd-herdr-plugin/README.md \
+  packages/herdsman-pi/README.md \
+  packages/herdsman-herdr-plugin/README.md \
   docs/plans/2026-07-15-npm-publication.md
 git commit -m "docs: document npm installation and releases"
 git push origin main
@@ -463,12 +463,12 @@ Expected: typecheck, all Vitest files, Biome, Drizzle, root package check, Pi pa
 RELEASE_TMP="$(mktemp -d)"
 npm pack --pack-destination "$RELEASE_TMP"
 (
-  cd packages/shepherd-pi
+  cd packages/herdsman-pi
   npm pack --pack-destination "$RELEASE_TMP"
 )
 EXPECTED_TARBALLS="$(printf '%s\n' \
-  ryonakae-shepherd-0.3.0.tgz \
-  ryonakae-shepherd-pi-0.3.0.tgz)"
+  ryonakae-herdsman-0.3.0.tgz \
+  ryonakae-herdsman-pi-0.3.0.tgz)"
 ACTUAL_TARBALLS="$(find "$RELEASE_TMP" -maxdepth 1 -type f -name '*.tgz' \
   -exec basename {} \; | sort)"
 test "$ACTUAL_TARBALLS" = "$EXPECTED_TARBALLS"
@@ -482,20 +482,20 @@ Expected: the exact two scoped tarball filenames match. The Herdr directory prod
 ```bash
 mkdir -p "$RELEASE_TMP/root-prefix"
 npm install --global --prefix "$RELEASE_TMP/root-prefix" \
-  "$RELEASE_TMP/ryonakae-shepherd-0.3.0.tgz"
-"$RELEASE_TMP/root-prefix/bin/shepherd" help
+  "$RELEASE_TMP/ryonakae-herdsman-0.3.0.tgz"
+"$RELEASE_TMP/root-prefix/bin/herdsman" help
 ```
 
-Expected: installation succeeds without repository files; `shepherd help` exits zero and prints the CLI command list.
+Expected: installation succeeds without repository files; `herdsman help` exits zero and prints the CLI command list.
 
 - [x] **Step 4: Install and inspect the Pi tarball**
 
 ```bash
 mkdir -p "$RELEASE_TMP/pi-prefix"
 npm install --prefix "$RELEASE_TMP/pi-prefix" --ignore-scripts \
-  "$RELEASE_TMP/ryonakae-shepherd-pi-0.3.0.tgz"
-test -f "$RELEASE_TMP/pi-prefix/node_modules/@ryonakae/shepherd-pi/src/index.ts"
-test ! -f "$RELEASE_TMP/pi-prefix/node_modules/@ryonakae/shepherd-pi/tsconfig.json"
+  "$RELEASE_TMP/ryonakae-herdsman-pi-0.3.0.tgz"
+test -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts"
+test ! -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/tsconfig.json"
 ```
 
 Expected: package installation succeeds and only the declared runtime files appear.
@@ -531,8 +531,8 @@ process.stdin.on("end", () => {
   }
 });'
 gh auth status
-npm view @ryonakae/shepherd@0.3.1 version
-npm view @ryonakae/shepherd-pi@0.3.1 version
+npm view @dorokuma/herdsman@0.3.1 version
+npm view @dorokuma/herdsman-pi@0.3.1 version
 ```
 
 Expected: branch is `main`; tree is clean; `HEAD` equals `origin/main`; npm account is `ryonakae` with verified email and write 2FA; GitHub auth succeeds; both `npm view` commands return `E404` before first publication. Treat any returned version as a hard stop.
@@ -561,9 +561,9 @@ Repeat Task 3 with a fresh temporary directory and the `0.3.1` tarball names. Do
 ```bash
 git add \
   package.json \
-  packages/shepherd-pi/package.json \
-  packages/shepherd-herdr-plugin/package.json \
-  packages/shepherd-herdr-plugin/herdr-plugin.toml
+  packages/herdsman-pi/package.json \
+  packages/herdsman-herdr-plugin/package.json \
+  packages/herdsman-herdr-plugin/herdr-plugin.toml
 git commit -m "chore(release): 0.3.1"
 test "$(git branch --show-current)" = "main"
 test -z "$(git status --porcelain)"
@@ -590,13 +590,13 @@ Run publication from an interactive terminal and let npm request the second fact
 
 ```bash
 npm publish --access public
-npm view @ryonakae/shepherd@0.3.1 \
+npm view @dorokuma/herdsman@0.3.1 \
   name version dist-tags.latest repository bin --json
 ```
 
-Expected: publication succeeds; name/version are exact; `latest` is `0.3.1`; binary is `shepherd`. Do not paste the OTP into chat or save it in plan evidence.
+Expected: publication succeeds; name/version are exact; `latest` is `0.3.1`; binary is `herdsman`. Do not paste the OTP into chat or save it in plan evidence.
 
-If publish returns a network or timeout error, run `npm view @ryonakae/shepherd@0.3.1 version` before retrying. Do not retry if the version exists.
+If publish returns a network or timeout error, run `npm view @dorokuma/herdsman@0.3.1 version` before retrying. Do not retry if the version exists.
 
 - [x] **Step 7: Publish and verify the Pi package**
 
@@ -604,16 +604,16 @@ Run a separate interactive publish so npm requests a fresh second factor:
 
 ```bash
 (
-  cd packages/shepherd-pi
+  cd packages/herdsman-pi
   npm publish --access public
 )
-npm view @ryonakae/shepherd-pi@0.3.1 \
+npm view @dorokuma/herdsman-pi@0.3.1 \
   name version dist-tags.latest repository peerDependencies --json
 ```
 
 Expected: publication succeeds; `latest` is `0.3.1`; repository directory and Pi peers are present.
 
-Apply the same `npm view` before-retry rule after ambiguous failures. If root exists but Pi requires a content change, delete the unpushed local tag with `git tag -d v0.3.1`; export `VERSION=0.3.2 TAG=v0.3.2`; update all four version files and the Herdr tag references in `README.md`, `README.ja.md`, and `packages/shepherd-herdr-plugin/README.md`; commit the replacement, confirm a clean tree, push `main`, verify `HEAD` equals `origin/main`, and only then create the replacement local tag and continue publication. Do not create a GitHub `v0.3.1` release.
+Apply the same `npm view` before-retry rule after ambiguous failures. If root exists but Pi requires a content change, delete the unpushed local tag with `git tag -d v0.3.1`; export `VERSION=0.3.2 TAG=v0.3.2`; update all four version files and the Herdr tag references in `README.md`, `README.ja.md`, and `packages/herdsman-herdr-plugin/README.md`; commit the replacement, confirm a clean tree, push `main`, verify `HEAD` equals `origin/main`, and only then create the replacement local tag and continue publication. Do not create a GitHub `v0.3.1` release.
 
 - [x] **Step 8: Verify registry installation**
 
@@ -622,11 +622,11 @@ Use a new temporary directory and install from the registry, not local tarballs:
 ```bash
 REGISTRY_TMP="$(mktemp -d)"
 npm install --global --prefix "$REGISTRY_TMP/root-prefix" \
-  @ryonakae/shepherd@0.3.1
-"$REGISTRY_TMP/root-prefix/bin/shepherd" help
+  @dorokuma/herdsman@0.3.1
+"$REGISTRY_TMP/root-prefix/bin/herdsman" help
 npm install --prefix "$REGISTRY_TMP/pi-prefix" --ignore-scripts \
-  @ryonakae/shepherd-pi@0.3.1
-test -f "$REGISTRY_TMP/pi-prefix/node_modules/@ryonakae/shepherd-pi/src/index.ts"
+  @dorokuma/herdsman-pi@0.3.1
+test -f "$REGISTRY_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts"
 ```
 
 Expected: both registry installs succeed and the CLI runs.
@@ -636,17 +636,17 @@ Expected: both registry installs succeed and the CLI runs.
 Create and inspect the exact notes file:
 
 ````bash
-cat > /tmp/shepherd-v0.3.1-release-notes.md <<'EOF'
+cat > /tmp/herdsman-v0.3.1-release-notes.md <<'EOF'
 ## Installation
 
 ```bash
-npm install --global @ryonakae/shepherd
-pi install npm:@ryonakae/shepherd-pi
+npm install --global @dorokuma/herdsman
+pi install npm:@dorokuma/herdsman-pi
 ```
 
 ## Changes
 
-- Published the Shepherd CLI/daemon and Pi extension under the `@ryonakae` npm scope.
+- Published the Herdsman CLI/daemon and Pi extension under the `@ryonakae` npm scope.
 - Restricted the root npm package to compiled runtime files and Drizzle migrations.
 - Added clean builds and package-content validation so removed modules cannot remain in `dist`.
 - Documented npm installation, GitHub-based Herdr plugin installation, and the release procedure.
@@ -662,13 +662,13 @@ The Herdr plugin remains a GitHub-subdirectory integration and is not published 
 - Root and Pi tarball dry-runs and isolated installs passed.
 - Exact-version installs from the npm registry passed.
 EOF
-rg -n '@ryonakae/shepherd|Herdr plugin|pnpm check' \
-  /tmp/shepherd-v0.3.1-release-notes.md
+rg -n '@dorokuma/herdsman|Herdr plugin|pnpm check' \
+  /tmp/herdsman-v0.3.1-release-notes.md
 git push origin v0.3.1
 gh release create v0.3.1 \
   --verify-tag \
   --title "v0.3.1" \
-  --notes-file /tmp/shepherd-v0.3.1-release-notes.md \
+  --notes-file /tmp/herdsman-v0.3.1-release-notes.md \
   --latest
 ````
 
@@ -679,10 +679,10 @@ Expected: the notes include both npm install commands, scoped publication, root 
 Verify:
 
 ```bash
-npm view @ryonakae/shepherd@0.3.1 version
-npm view @ryonakae/shepherd-pi@0.3.1 version
+npm view @dorokuma/herdsman@0.3.1 version
+npm view @dorokuma/herdsman-pi@0.3.1 version
 gh release view v0.3.1 --json tagName,name,isDraft,isPrerelease,url,publishedAt
-gh api repos/ryonakae/shepherd/releases/latest --jq .tag_name
+gh api repos/ryonakae/herdsman/releases/latest --jq .tag_name
 git ls-remote --tags origin refs/tags/v0.3.1 refs/tags/v0.3.1^{}
 git status --short
 ```
@@ -741,10 +741,10 @@ Expected: the docs-only archive commit is after `v0.3.1`; the tag remains on the
 - `pnpm check` passed with 34 test files and 200 tests. `pnpm build`, root/Pi dry-runs, Herdr package validation, and `git diff --check` passed.
 - Local tarballs installed in isolated prefixes. The root CLI printed help, and the Pi package contained runtime source without `tsconfig.json`.
 - Root tarball: 195 files and 94,093 bytes. Pi tarball: 6 files and 11,878 bytes.
-- Registry installs passed for `@ryonakae/shepherd@0.3.1` and `@ryonakae/shepherd-pi@0.3.1`; the installed root CLI executed successfully.
-- npm packages: <https://www.npmjs.com/package/@ryonakae/shepherd> and <https://www.npmjs.com/package/@ryonakae/shepherd-pi>.
-- GitHub Release: <https://github.com/ryonakae/shepherd/releases/tag/v0.3.1>.
-- npm access lists exactly the two public packages. `@ryonakae/shepherd-herdr-plugin` and unscoped `shepherd-herdr-plugin` remain unpublished.
+- Registry installs passed for `@dorokuma/herdsman@0.3.1` and `@dorokuma/herdsman-pi@0.3.1`; the installed root CLI executed successfully.
+- npm packages: <https://www.npmjs.com/package/@dorokuma/herdsman> and <https://www.npmjs.com/package/@dorokuma/herdsman-pi>.
+- GitHub Release: <https://github.com/ryonakae/herdsman/releases/tag/v0.3.1>.
+- npm access lists exactly the two public packages. `@dorokuma/herdsman-herdr-plugin` and unscoped `herdsman-herdr-plugin` remain unpublished.
 - Remote annotated `v0.3.1` dereferences to `84294825a3e3278ed22505031f11c2d1a6cd68cc`, the same commit used by the GitHub Release.
 
 ## Risks and Tradeoffs

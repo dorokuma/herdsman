@@ -25,7 +25,7 @@ afterEach(async () => {
 });
 
 async function sourceFile(name: string): Promise<string> {
-  const dir = await mkdtemp(join(tmpdir(), "shepherd-history-service-"));
+  const dir = await mkdtemp(join(tmpdir(), "herdsman-history-service-"));
   tempDirs.push(dir);
   const path = join(dir, name);
   await writeFile(path, "history\\n");

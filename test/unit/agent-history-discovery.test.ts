@@ -50,7 +50,7 @@ describe("agent history discovery", () => {
   });
 
   test("discovers Codex JSONL by session_meta cwd", async () => {
-    const homeDir = await tempHome("shepherd-codex-home-");
+    const homeDir = await tempHome("herdsman-codex-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const older = join(
@@ -87,7 +87,7 @@ describe("agent history discovery", () => {
   });
 
   test("discovers OpenCode DB session by cwd", async () => {
-    const homeDir = await tempHome("shepherd-opencode-home-");
+    const homeDir = await tempHome("herdsman-opencode-home-");
     const dbPath = join(homeDir, ".local", "share", "opencode", "opencode.db");
     await mkdir(join(homeDir, ".local", "share", "opencode"), { recursive: true });
     const sqlite = new DatabaseSync(dbPath);
@@ -119,7 +119,7 @@ describe("agent history discovery", () => {
   });
 
   test("discovers Gemini session JSON through .project_root", async () => {
-    const homeDir = await tempHome("shepherd-gemini-home-");
+    const homeDir = await tempHome("herdsman-gemini-home-");
     const projectDir = join(homeDir, ".gemini", "tmp", "repo-project");
     const chatsDir = join(projectDir, "chats");
     await mkdir(chatsDir, { recursive: true });
@@ -147,7 +147,7 @@ describe("agent history discovery", () => {
   });
 
   test("drops stale candidates whose mtime predates firstSeenAtMs by more than the grace window", async () => {
-    const homeDir = await tempHome("shepherd-codex-stale-home-");
+    const homeDir = await tempHome("herdsman-codex-stale-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(
@@ -173,7 +173,7 @@ describe("agent history discovery", () => {
   });
 
   test("keeps a candidate whose mtime is at or after firstSeenAtMs", async () => {
-    const homeDir = await tempHome("shepherd-codex-recent-home-");
+    const homeDir = await tempHome("herdsman-codex-recent-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(
@@ -206,7 +206,7 @@ describe("agent history discovery", () => {
   });
 
   test("keeps a candidate whose mtime is before firstSeenAtMs but within the grace window", async () => {
-    const homeDir = await tempHome("shepherd-codex-grace-home-");
+    const homeDir = await tempHome("herdsman-codex-grace-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(
@@ -239,7 +239,7 @@ describe("agent history discovery", () => {
   });
 
   test("keeps old behavior when firstSeenAtMs is omitted", async () => {
-    const homeDir = await tempHome("shepherd-codex-noftime-home-");
+    const homeDir = await tempHome("herdsman-codex-noftime-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
     const path = join(
@@ -269,7 +269,7 @@ describe("agent history discovery", () => {
   });
 
   test("leaves the authoritative agentSession path resolve unaffected by firstSeenAtMs", async () => {
-    const homeDir = await tempHome("shepherd-path-home-");
+    const homeDir = await tempHome("herdsman-path-home-");
     const sessionPath = join(homeDir, ".pi", "agent", "sessions", "ses-1.jsonl");
     await mkdir(join(homeDir, ".pi", "agent", "sessions"), { recursive: true });
     await writeFile(sessionPath, "{}");

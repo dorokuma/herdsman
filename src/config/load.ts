@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { parseDocument } from "yaml";
-import { parseShepherdConfig, type ShepherdConfig } from "./schema.js";
+import { parseHerdsmanConfig, type HerdsmanConfig } from "./schema.js";
 
 export type ConfigLoadError = {
   message: string;
@@ -8,10 +8,10 @@ export type ConfigLoadError = {
 };
 
 export type ConfigLoadResult =
-  | { ok: true; value: ShepherdConfig }
+  | { ok: true; value: HerdsmanConfig }
   | { errors: ConfigLoadError[]; ok: false };
 
-export function loadShepherdConfig(path: string): ConfigLoadResult {
+export function loadHerdsmanConfig(path: string): ConfigLoadResult {
   const source = readFileSync(path, "utf8");
   const document = parseDocument(source);
 
@@ -25,7 +25,7 @@ export function loadShepherdConfig(path: string): ConfigLoadResult {
     };
   }
 
-  const result = parseShepherdConfig(document.toJSON());
+  const result = parseHerdsmanConfig(document.toJSON());
   if (result.ok) {
     return result;
   }

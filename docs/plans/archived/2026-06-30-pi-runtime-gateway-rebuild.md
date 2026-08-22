@@ -2,9 +2,9 @@
 
 > **For implementers:** Execute this plan task-by-task. Complete each checkbox step, run the listed validation, and commit after each task.
 
-**Goal:** Rebuild Shepherd around `Pi = structured coordinator runtime`, `Herdr = execution surface`, and `Shepherd Gateway = session / delivery / queue`, removing the legacy provider runner path and resetting the DB baseline.
+**Goal:** Rebuild Herdsman around `Pi = structured coordinator runtime`, `Herdr = execution surface`, and `Herdsman Gateway = session / delivery / queue`, removing the legacy provider runner path and resetting the DB baseline.
 
-**Architecture:** Pi owns the model/provider/session conversation and acts as the coordinator runtime. Herdr owns terminal execution surfaces: workspaces, tabs, panes, agents, logs, tests, and shells. Shepherd Gateway owns platform sessions, delivery, Pi turn queueing, logical tool policy/idempotency, Herdr bindings, worker-agent bindings, and audit/recovery events.
+**Architecture:** Pi owns the model/provider/session conversation and acts as the coordinator runtime. Herdr owns terminal execution surfaces: workspaces, tabs, panes, agents, logs, tests, and shells. Herdsman Gateway owns platform sessions, delivery, Pi turn queueing, logical tool policy/idempotency, Herdr bindings, worker-agent bindings, and audit/recovery events.
 
 **Tech Stack:** TypeScript ESM with NodeNext, TypeBox/Ajv runtime schemas, SQLite through `node:sqlite` and Drizzle, JSON Lines RPC over Unix sockets, Herdr socket API, Slack Web API delivery/streaming, Vitest, Biome, pnpm 11.
 
@@ -22,21 +22,21 @@ No implementation steps remain for this plan. Future changes should use a new ac
 
 ## Global Constraints
 
-- This repository is still in development. Do not preserve compatibility with existing Shepherd DB files, existing Drizzle migration history, old queued/running Gateway runs, old `gateway.run.*` events, old `gateway.message` naming, old `gateway.stream_*`/`gateway.complete_run` RPCs, or old provider config.
+- This repository is still in development. Do not preserve compatibility with existing Herdsman DB files, existing Drizzle migration history, old queued/running Gateway runs, old `gateway.run.*` events, old `gateway.message` naming, old `gateway.stream_*`/`gateway.complete_run` RPCs, or old provider config.
 - Reset `$SHEPHERD_HOME` during manual testing if an old DB blocks validation.
 - Replace `drizzle/0000` through `drizzle/0004` with a new `0000` baseline generated from the new `src/db/schema.ts`.
-- Pi session files are the canonical agent conversation history. Shepherd DB stores platform/orchestration/audit/recovery facts and must not reconstruct normal Pi LLM context from event history during normal operation.
-- Keep `session_summaries` table/store, but remove automatic provider-backed summary updates. Do not inject Shepherd summaries into normal Pi turns.
-- Remove Shepherd-owned LLM/provider runtime: delete provider runner, provider factories/adapters, provider override handling, and provider config schema. Pi owns provider auth and model selection.
+- Pi session files are the canonical agent conversation history. Herdsman DB stores platform/orchestration/audit/recovery facts and must not reconstruct normal Pi LLM context from event history during normal operation.
+- Keep `session_summaries` table/store, but remove automatic provider-backed summary updates. Do not inject Herdsman summaries into normal Pi turns.
+- Remove Herdsman-owned LLM/provider runtime: delete provider runner, provider factories/adapters, provider override handling, and provider config schema. Pi owns provider auth and model selection.
 - Use `pi_turns` instead of `gateway_runs`. Queueing, owner claiming, terminal state, and recovery are Pi turn state.
 - Use `assistant.message` for final assistant text. `pi.turn.*` events are lifecycle events and must not carry the final assistant text.
 - Do not persist token deltas. `pi.stream_delta` is transient delivery state keyed by `piTurnId`; only final `assistant.message` is persisted.
 - Persist `pi.tool.started`, `pi.tool.completed`, and `pi.tool.failed` as compact timeline events. Keep detailed logical tool input/result/status in `logical_tool_calls`.
 - Scope logical tool idempotency to `(pi_turn_id, idempotency_key)`, not the entire session.
-- State-changing Herdr operations for Shepherd-managed work must go through Shepherd logical tools. Normal read-only inspection should use `shepherd_herdr_read`; raw Herdr read is an escape hatch for insufficient Shepherd tools or explicit user requests.
-- Gateway does not intercept raw Herdr socket/CLI mutations outside the Shepherd tool surface. Enforcement boundary is the Pi tool surface plus hidden prompt guidance.
-- Headless Pi starts with the user's normal Pi configuration. It is not forced into a Shepherd-only profile; Pi may complete light tasks without Herdr.
-- Use this prompt tone in `shepherd-pi` hidden context: `Choose the execution surface that fits the work. Use Pi directly for quick reasoning, small edits, and short checks. Use Shepherd/Herdr when a visible terminal surface, parallel worker agents, long-running commands, resumable execution, or inspection by the user or another Pi owner would help.`
+- State-changing Herdr operations for Herdsman-managed work must go through Herdsman logical tools. Normal read-only inspection should use `herdsman_herdr_read`; raw Herdr read is an escape hatch for insufficient Herdsman tools or explicit user requests.
+- Gateway does not intercept raw Herdr socket/CLI mutations outside the Herdsman tool surface. Enforcement boundary is the Pi tool surface plus hidden prompt guidance.
+- Headless Pi starts with the user's normal Pi configuration. It is not forced into a Herdsman-only profile; Pi may complete light tasks without Herdr.
+- Use this prompt tone in `herdsman-pi` hidden context: `Choose the execution surface that fits the work. Use Pi directly for quick reasoning, small edits, and short checks. Use Herdsman/Herdr when a visible terminal surface, parallel worker agents, long-running commands, resumable execution, or inspection by the user or another Pi owner would help.`
 - Attached Pi conversation mirroring follows the archived bidirectional sync decision: Pi-originated user messages are stored, published, and delivered to Slack bindings without queueing another Pi turn; Slack-originated messages do not echo back as user messages.
 - Slack `platforms.slack.streaming.tool_progress` remains exactly `"off" | "compact" | "verbose"`; default is `off`. Compact/verbose progress is transient and sanitized.
 - Do not persist or send raw Pi tool args, raw tool results, stdout/stderr dumps, full file contents, provider request/response payloads, or hidden thinking.
@@ -54,16 +54,16 @@ No implementation steps remain for this plan. Future changes should use a new ac
 - `src/db/schema.ts` currently contains `gateway_runs`, `logical_tool_calls` with `(session_id, idempotency_key)` uniqueness, `herdr_bindings` for workspace binding only, and `session_summaries`.
 - `src/gateway/turn-queue.ts` currently defines `GatewayRunStore` over `gateway_runs` and imports provider-runner types.
 - `src/gateway/external-run-queue.ts` currently queues `gateway.run.queued`, claims `gateway.run.started`, and completes with `gateway.message` + `gateway.run.completed`.
-- `packages/shepherd-pi/src/index.ts` currently calls legacy RPCs such as `gateway.stream_delta`, `gateway.stream_finish`, and `gateway.complete_run`.
+- `packages/herdsman-pi/src/index.ts` currently calls legacy RPCs such as `gateway.stream_delta`, `gateway.stream_finish`, and `gateway.complete_run`.
 - `src/herdr/progress-subscriptions.ts` currently loops on `source.waitForEvent()`, which uses Herdr `events.wait`. Herdr 0.7.0 returned `not_implemented` for `events.wait`; use `events.subscribe`.
 - `src/herdr/orchestrator.ts` currently records workspace bindings in `herdr_bindings` and returns agent pane results from `startAgent`, but it does not persist worker-agent bindings.
-- `packages/shepherd-pi/src/index.ts` registers Gateway tools as visible Pi tools with `shepherd_${tool.name}` names.
+- `packages/herdsman-pi/src/index.ts` registers Gateway tools as visible Pi tools with `herdsman_${tool.name}` names.
 - Existing validation command is `pnpm check`; DB migrations are generated with `pnpm db:generate`; build validation is `pnpm build`.
 
 ## File Structure
 
 - Create: `src/db/pi-turns.ts` — `PiTurnStore` for queued/running/completed/failed/recovery-required turn state.
-- Create: `src/db/worker-agent-bindings.ts` — store for Shepherd worker-agent bindings and best-effort status/health cache.
+- Create: `src/db/worker-agent-bindings.ts` — store for Herdsman worker-agent bindings and best-effort status/health cache.
 - Create: `src/gateway/pi-runtime-events.ts` — Pi runtime payload types, parsers, sanitizer, idempotency helpers, and terminal conflict helpers.
 - Create: `src/platforms/slack/tool-progress.ts` — transient Slack compact/verbose Pi tool progress rendering.
 - Create: `test/unit/pi-runtime-events.test.ts` — payload helper tests.
@@ -87,15 +87,15 @@ No implementation steps remain for this plan. Future changes should use a new ac
 - Modify: `src/platforms/runtime.ts` — expose `runtimeDelivery` keyed by `piTurnId` and Slack transient tool progress.
 - Modify: `src/platforms/slack/delivery.ts` — render `assistant.message`, generic stream keys, and Pi user-message delivery prefixes.
 - Modify: `src/gateway/context.ts` — keep only audit/recovery/admin formatting; do not inject summaries into normal Pi turns.
-- Modify: `packages/shepherd-pi/src/index.ts` — new `pi.*` RPC flow, current `piTurnId` hidden context, revised Shepherd boundary prompt, tool lifecycle mirroring, and no legacy RPC calls.
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md` — optional documentation updated to the new boundary wording; hidden context remains the authoritative always-on guidance.
+- Modify: `packages/herdsman-pi/src/index.ts` — new `pi.*` RPC flow, current `piTurnId` hidden context, revised Herdsman boundary prompt, tool lifecycle mirroring, and no legacy RPC calls.
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md` — optional documentation updated to the new boundary wording; hidden context remains the authoritative always-on guidance.
 - Modify: `README.md` — remove provider config instructions, document DB reset during development, and describe Pi/Herdr/Gateway split at a high level.
 - Test: `test/unit/config-schema.test.ts`, `test/unit/config-loader.test.ts` — provider config removal.
 - Test: `test/integration/gateway-runtime.test.ts` — Pi runtime creation without provider runner.
 - Test: `test/integration/gateway-rpc.test.ts` — `pi.*` RPCs, owner priority, terminal conflicts, and no legacy RPCs.
 - Test: `test/integration/builtin-tools.test.ts` — renamed tool surface and worker binding behavior.
 - Test: `test/integration/herdr-progress.test.ts` — `events.subscribe` progress manager behavior.
-- Test: `test/unit/shepherd-pi-extension.test.ts` — hidden context text, tool registration names, and `/shepherd` command compatibility.
+- Test: `test/unit/herdsman-pi-extension.test.ts` — hidden context text, tool registration names, and `/herdsman` command compatibility.
 - Delete: `src/gateway/runner.ts`, `src/gateway/provider-factory.ts`, `src/gateway/provider-overrides.ts`, `src/gateway/ai-sdk-provider.ts`, `src/gateway/codex-provider.ts`, and provider-runner-only tests.
 - Delete: `src/gateway/summary.ts` automatic updater; keep `src/db/session-summary.ts`.
 
@@ -233,7 +233,7 @@ Emit `worker_agent.status_changed` only when the cached worker binding state cha
 
 ### Pi RPC Methods
 
-Expose these RPC methods from `ShepherdGatewayServer`:
+Expose these RPC methods from `HerdsmanGatewayServer`:
 
 ```text
 pi.handshake
@@ -266,7 +266,7 @@ gateway.fail_run
 
 ### Tool Names
 
-Pi-visible names are `shepherd_${internalName}`. Use these internal names:
+Pi-visible names are `herdsman_${internalName}`. Use these internal names:
 
 High-level tools:
 
@@ -313,21 +313,21 @@ read_agent_output
 ensure_agent_pane
 ```
 
-### Hidden Shepherd Context
+### Hidden Herdsman Context
 
-`packages/shepherd-pi` should inject only identity and rules:
+`packages/herdsman-pi` should inject only identity and rules:
 
 ```text
 [SHEPHERD ATTACHED CONTEXT]
-Shepherd session id: <sessionId>
+Herdsman session id: <sessionId>
 Current Pi turn id: <piTurnId if any>
 Pi owner kind: <headless_pi|tui_pi>
 
-Shepherd is the session, delivery, queue, and Herdr orchestration gateway. Pi owns the model conversation and coordination. Herdr owns terminal execution surfaces.
+Herdsman is the session, delivery, queue, and Herdr orchestration gateway. Pi owns the model conversation and coordination. Herdr owns terminal execution surfaces.
 
-Choose the execution surface that fits the work. Use Pi directly for quick reasoning, small edits, and short checks. Use Shepherd/Herdr when a visible terminal surface, parallel worker agents, long-running commands, resumable execution, or inspection by the user or another Pi owner would help.
+Choose the execution surface that fits the work. Use Pi directly for quick reasoning, small edits, and short checks. Use Herdsman/Herdr when a visible terminal surface, parallel worker agents, long-running commands, resumable execution, or inspection by the user or another Pi owner would help.
 
-Use Shepherd logical tools for Shepherd session inspection and Shepherd-managed Herdr orchestration. Use shepherd_herdr_read for normal read-only Herdr inspection. Do not mutate Herdr state through raw Herdr commands for Shepherd-managed work. Treat Shepherd session ids, Pi turn ids, socket paths, and owner ids as internal unless the user asks.
+Use Herdsman logical tools for Herdsman session inspection and Herdsman-managed Herdr orchestration. Use herdsman_herdr_read for normal read-only Herdr inspection. Do not mutate Herdr state through raw Herdr commands for Herdsman-managed work. Treat Herdsman session ids, Pi turn ids, socket paths, and owner ids as internal unless the user asks.
 ```
 
 Do not include worker binding lists, Herdr workspace state, recent events, or session summaries in hidden context.
@@ -506,7 +506,7 @@ git commit -m "db: reset schema around pi turns"
 
 ### Task 2: Remove Legacy Provider Runtime and Config Surface
 
-**Objective:** Delete Shepherd-owned provider/model execution and leave Pi as the only runtime owner.
+**Objective:** Delete Herdsman-owned provider/model execution and leave Pi as the only runtime owner.
 
 **Files:**
 - Modify: `src/config/schema.ts`
@@ -588,8 +588,8 @@ In `src/gateway/service.ts`:
 
 - Always use Pi turn queue when `config` exists.
 - Keep `HeadlessPiSupervisor` creation with `config.gateway.pi?.idle_timeout_ms ?? 600_000`.
-- Remove `providerOverrides` option passed to `ShepherdGatewayServer`.
-- Remove `summaries` from the normal wake path and from `ShepherdGatewayServer` constructor options. Keep `SessionSummaryStore` as a standalone DB store with its existing integration test, but do not instantiate it in `runGatewayService()`.
+- Remove `providerOverrides` option passed to `HerdsmanGatewayServer`.
+- Remove `summaries` from the normal wake path and from `HerdsmanGatewayServer` constructor options. Keep `SessionSummaryStore` as a standalone DB store with its existing integration test, but do not instantiate it in `runGatewayService()`.
 
 - [x] **Step 6: Delete legacy provider files and tests**
 
@@ -764,7 +764,7 @@ Expected: tests pass.
 - [x] **Step 8: Commit**
 
 ```bash
-git add src/gateway/pi-turn-queue.ts src/gateway/server.ts src/gateway/recovery.ts src/gateway/service.ts src/tui/client.ts packages/shepherd-pi/src/index.ts test/integration/gateway-rpc.test.ts test/unit/herdr-session-lifecycle.test.ts
+git add src/gateway/pi-turn-queue.ts src/gateway/server.ts src/gateway/recovery.ts src/gateway/service.ts src/tui/client.ts packages/herdsman-pi/src/index.ts test/integration/gateway-rpc.test.ts test/unit/herdr-session-lifecycle.test.ts
 git commit -m "gateway: queue work as pi turns"
 ```
 
@@ -929,14 +929,14 @@ git add src/gateway/pi-runtime-events.ts src/gateway/server.ts src/platforms/run
 git commit -m "gateway: persist pi turns and assistant messages"
 ```
 
-### Task 5: Update Shepherd Pi Extension for Pi Turns
+### Task 5: Update Herdsman Pi Extension for Pi Turns
 
-**Objective:** Make `shepherd-pi` use the new `pi.*` turn protocol, mirror attached Pi conversation, and inject the revised minimal hidden context.
+**Objective:** Make `herdsman-pi` use the new `pi.*` turn protocol, mirror attached Pi conversation, and inject the revised minimal hidden context.
 
 **Files:**
-- Modify: `packages/shepherd-pi/src/index.ts`
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md`
-- Test: `test/unit/shepherd-pi-extension.test.ts`
+- Modify: `packages/herdsman-pi/src/index.ts`
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md`
+- Test: `test/unit/herdsman-pi-extension.test.ts`
 
 **Interfaces:**
 - Consumes Task 4 RPCs.
@@ -944,23 +944,23 @@ git commit -m "gateway: persist pi turns and assistant messages"
 
 - [x] **Step 1: Write failing extension tests**
 
-Extend `test/unit/shepherd-pi-extension.test.ts` or add a new test harness around exported helpers so it verifies:
+Extend `test/unit/herdsman-pi-extension.test.ts` or add a new test harness around exported helpers so it verifies:
 
 1. Hidden context contains `Current Pi turn id:` when active and does not mention Gateway run ids.
 2. Hidden context contains the exact execution-surface guidance from Global Constraints.
-3. Hidden context says `Use shepherd_herdr_read for normal read-only Herdr inspection`.
+3. Hidden context says `Use herdsman_herdr_read for normal read-only Herdr inspection`.
 4. Gateway response map no longer includes legacy `gateway.stream_*` or `gateway.complete_run` calls in compiled TypeScript checks.
-5. Registered tool names still use `shepherd_${tool.name}`.
+5. Registered tool names still use `herdsman_${tool.name}`.
 
-Export a pure `buildShepherdHiddenContext(state)` helper from `packages/shepherd-pi/src/index.ts` and test it directly. Cover lifecycle RPC behavior through TypeScript checks plus `test/integration/gateway-rpc.test.ts`; do not build a full fake Pi runtime harness in this task.
+Export a pure `buildHerdsmanHiddenContext(state)` helper from `packages/herdsman-pi/src/index.ts` and test it directly. Cover lifecycle RPC behavior through TypeScript checks plus `test/integration/gateway-rpc.test.ts`; do not build a full fake Pi runtime harness in this task.
 
 - [x] **Step 2: Update extension state and RPC map**
 
-In `packages/shepherd-pi/src/index.ts`:
+In `packages/herdsman-pi/src/index.ts`:
 
 - Rename `currentRun` to `currentTurn`.
 - Store `activePiTurnId`, `activeInputEventIds`, `activeSource`, `pendingImmediate`, `pendingFollowUps`, and `toolStartTimes`.
-- Replace `ShepherdRun` type with `ShepherdTurn` carrying `id`, `userText`, `triggeringEventId`, `actorId`, `presentation`, `piSessionFile`, and `piSessionId`.
+- Replace `HerdsmanRun` type with `HerdsmanTurn` carrying `id`, `userText`, `triggeringEventId`, `actorId`, `presentation`, `piSessionFile`, and `piSessionId`.
 - Replace response map methods:
   - `gateway.claim_next_run` → `pi.claim_next_turn`
   - `gateway.start_run` → `pi.start_turn`
@@ -972,7 +972,7 @@ In `packages/shepherd-pi/src/index.ts`:
 Add `pi.on("input", ...)`:
 
 - If unattached, return continue.
-- If `source === "extension"`, do not mirror; this is Shepherd-injected input from queued Slack/user work.
+- If `source === "extension"`, do not mirror; this is Herdsman-injected input from queued Slack/user work.
 - For `source === "interactive" | "rpc"`, create or reuse a `piTurnId` according to delivery:
   - immediate: new pending turn
   - steer: current active turn if present, otherwise new pending turn
@@ -984,7 +984,7 @@ Add `pi.on("input", ...)`:
 
 Add or update `pi.on("agent_start", ...)`:
 
-- For a queued Shepherd turn, use the claimed `piTurnId` and `triggeringEventId`.
+- For a queued Herdsman turn, use the claimed `piTurnId` and `triggeringEventId`.
 - For direct Pi input, use the pending immediate/follow-up turn and its mirrored event id.
 - For unexpected agent start, create a new `piTurnId` with no input event ids.
 - Set `activePiTurnId` before the model runs so hidden context can show it.
@@ -1032,16 +1032,16 @@ Replace `claimNext()` internals:
 
 - [x] **Step 8: Update hidden context and skill doc**
 
-Change `before_agent_start` hidden context to exactly the form in **Core Interfaces / Hidden Shepherd Context**. Replace `Gateway run id` with `Current Pi turn id`.
+Change `before_agent_start` hidden context to exactly the form in **Core Interfaces / Hidden Herdsman Context**. Replace `Gateway run id` with `Current Pi turn id`.
 
-Update `packages/shepherd-pi/skills/shepherd/SKILL.md` as optional reference only. It should say normal attached sessions rely on hidden context and dynamic tool descriptions.
+Update `packages/herdsman-pi/skills/herdsman/SKILL.md` as optional reference only. It should say normal attached sessions rely on hidden context and dynamic tool descriptions.
 
 - [x] **Step 9: Run validation**
 
 Run:
 
 ```bash
-pnpm test test/unit/shepherd-pi-extension.test.ts
+pnpm test test/unit/herdsman-pi-extension.test.ts
 pnpm pi-package:check
 ```
 
@@ -1050,11 +1050,11 @@ Expected: tests and package validation pass.
 - [x] **Step 10: Commit**
 
 ```bash
-git add packages/shepherd-pi/src/index.ts packages/shepherd-pi/skills/shepherd/SKILL.md test/unit/shepherd-pi-extension.test.ts
-git commit -m "pi: drive shepherd turns through pi runtime rpc"
+git add packages/herdsman-pi/src/index.ts packages/herdsman-pi/skills/herdsman/SKILL.md test/unit/herdsman-pi-extension.test.ts
+git commit -m "pi: drive herdsman turns through pi runtime rpc"
 ```
 
-### Task 6: Rename and Extend Shepherd Logical Tools
+### Task 6: Rename and Extend Herdsman Logical Tools
 
 **Objective:** Implement the two-layer tool surface, rename old tools without aliases, and add worker binding read/ensure tools.
 
@@ -1103,7 +1103,7 @@ Update `test/integration/builtin-tools.test.ts`:
 4. `ensure_worker_agent` creates a binding with `role`, `description`, and `lastTask` when absent.
 5. `list_worker_agents` and `get_worker_agent` read DB binding state without Herdr calls.
 6. Low-level tools use `herdr_` internal names.
-7. Every tool has `promptSnippet`; boundary tools have `promptGuidelines` naming the visible `shepherd_*` tool.
+7. Every tool has `promptSnippet`; boundary tools have `promptGuidelines` naming the visible `herdsman_*` tool.
 
 - [x] **Step 2: Run tests to verify failure**
 
@@ -1133,11 +1133,11 @@ In `src/gateway/builtin-tools.ts`, rename registrations according to **Core Inte
 
 Update prompt guidance:
 
-- `ensure_workspace`: high-level Shepherd workspace ensure, no `herdr_`.
-- `attach_workspace`: only when user explicitly asks to attach an existing non-Shepherd Herdr workspace.
+- `ensure_workspace`: high-level Herdsman workspace ensure, no `herdr_`.
+- `attach_workspace`: only when user explicitly asks to attach an existing non-Herdsman Herdr workspace.
 - `ensure_worker_agent`: high-level worker ensure/reuse with `role`, `description`, `lastTask`.
 - `herdr_read`: normal read-only Herdr inspection.
-- `herdr_*` mutation tools: only inside Shepherd-managed Herdr resources.
+- `herdr_*` mutation tools: only inside Herdsman-managed Herdr resources.
 
 - [x] **Step 5: Implement worker tools**
 
@@ -1194,7 +1194,7 @@ Expected: tests pass.
 
 ```bash
 git add src/gateway/tools.ts src/gateway/builtin-tools.ts src/herdr/orchestrator.ts src/tui/client.ts test/integration/builtin-tools.test.ts test/integration/gateway-rpc.test.ts
-git commit -m "tools: split shepherd and herdr tool surface"
+git commit -m "tools: split herdsman and herdr tool surface"
 ```
 
 ### Task 7: Rebuild Herdr Progress on `events.subscribe`
@@ -1290,7 +1290,7 @@ git commit -m "herdr: subscribe to progress events"
 
 ### Task 8: Update Gateway Context, Summary, and Recovery Boundaries
 
-**Objective:** Keep Shepherd event context useful for audit/recovery/admin while ensuring normal Pi turns do not use Shepherd summary or reconstructed LLM context.
+**Objective:** Keep Herdsman event context useful for audit/recovery/admin while ensuring normal Pi turns do not use Herdsman summary or reconstructed LLM context.
 
 **Files:**
 - Modify: `src/gateway/context.ts`
@@ -1372,7 +1372,7 @@ git commit -m "gateway: keep summaries out of pi turns"
 - Modify: `src/gateway/service.ts`
 - Modify: `src/gateway/pi-supervisor.ts`
 - Modify: `src/gateway/pi-readiness.ts` if readiness command args change
-- Modify: `src/cli/shepherd.ts` if config validation output changes
+- Modify: `src/cli/herdsman.ts` if config validation output changes
 - Test: `test/integration/gateway-rpc.test.ts`
 - Test: `test/unit/pi-readiness.test.ts`
 - Test: `test/unit/cli.test.ts`
@@ -1406,7 +1406,7 @@ Expected: failures until service/server names are updated.
 In `src/gateway/service.ts`:
 
 - Remove conditional `gatewayRuntime.runner` checks.
-- Always pass `piTurns: gatewayRuntime.turns` to `ShepherdGatewayServer` when config exists.
+- Always pass `piTurns: gatewayRuntime.turns` to `HerdsmanGatewayServer` when config exists.
 - Pass `runtimeDelivery: platformRuntime.runtimeDelivery`.
 - Keep `checkPiReadiness()` when config exists and Pi runtime is enabled.
 - Apply `config.gateway.pi?.idle_timeout_ms ?? 600_000` and `readiness_timeout_ms ?? 10_000`.
@@ -1434,7 +1434,7 @@ Expected: tests pass.
 - [x] **Step 6: Commit**
 
 ```bash
-git add src/gateway/service.ts src/gateway/pi-supervisor.ts src/gateway/pi-readiness.ts src/cli/shepherd.ts test/integration/gateway-rpc.test.ts test/unit/pi-readiness.test.ts
+git add src/gateway/service.ts src/gateway/pi-supervisor.ts src/gateway/pi-readiness.ts src/cli/herdsman.ts test/integration/gateway-rpc.test.ts test/unit/pi-readiness.test.ts
 git commit -m "gateway: run pi runtime without provider fallback"
 ```
 
@@ -1486,14 +1486,14 @@ Add a short section:
 ```text
 Pi owns model/provider/session conversation state.
 Herdr owns terminal execution surfaces.
-Shepherd Gateway owns platform sessions, delivery, Pi turn queueing, logical tool policy/idempotency, Herdr bindings, and recovery events.
+Herdsman Gateway owns platform sessions, delivery, Pi turn queueing, logical tool policy/idempotency, Herdr bindings, and recovery events.
 ```
 
 Mention that DB reset is acceptable during development if old migrations conflict.
 
 - [x] **Step 4: Update tool naming docs**
 
-If README lists tools, update to the new `shepherd_ensure_worker_agent`, `shepherd_herdr_*`, `shepherd_list_worker_agents`, and `shepherd_get_worker_agent` names.
+If README lists tools, update to the new `herdsman_ensure_worker_agent`, `herdsman_herdr_*`, `herdsman_list_worker_agents`, and `herdsman_get_worker_agent` names.
 
 - [x] **Step 5: Run docs-adjacent checks**
 
@@ -1540,7 +1540,7 @@ Expected: no active source/test/README matches. This plan may contain historical
 Run:
 
 ```bash
-rg -n "pi_turns|pi\.turn|assistant\.message|ensure_worker_agent|worker_agent_bindings|events\.subscribe|shepherd_herdr_read" src packages test README.md docs/plans/2026-06-30-pi-runtime-gateway-rebuild.md
+rg -n "pi_turns|pi\.turn|assistant\.message|ensure_worker_agent|worker_agent_bindings|events\.subscribe|herdsman_herdr_read" src packages test README.md docs/plans/2026-06-30-pi-runtime-gateway-rebuild.md
 ```
 
 Expected: implementation, tests, README, and this plan reference the new names.
@@ -1551,7 +1551,7 @@ Run:
 
 ```bash
 pnpm db:check
-SHEPHERD_HOME=/tmp/shepherd-pi-runtime-rebuild pnpm db:migrate
+SHEPHERD_HOME=/tmp/herdsman-pi-runtime-rebuild pnpm db:migrate
 ```
 
 Expected: Drizzle check passes and migration applies to a fresh SQLite DB.
@@ -1594,18 +1594,18 @@ git commit -m "chore: validate pi runtime gateway rebuild"
 - `pnpm test test/integration/gateway-rpc.test.ts` — Pi turn queue/RPC/terminal conflict behavior passes.
 - `pnpm test test/integration/builtin-tools.test.ts` — renamed tools and worker bindings pass.
 - `pnpm test test/integration/herdr-socket-client.test.ts test/integration/herdr-progress.test.ts` — `events.subscribe` progress path passes.
-- `pnpm test test/unit/shepherd-pi-extension.test.ts` — extension hidden context/tool registration tests pass.
+- `pnpm test test/unit/herdsman-pi-extension.test.ts` — extension hidden context/tool registration tests pass.
 - `pnpm pi-package:check` — package validation passes.
 - `pnpm db:check` — Drizzle schema/migration state passes.
-- `SHEPHERD_HOME=/tmp/shepherd-pi-runtime-rebuild pnpm db:migrate` — fresh DB migration succeeds.
+- `SHEPHERD_HOME=/tmp/herdsman-pi-runtime-rebuild pnpm db:migrate` — fresh DB migration succeeds.
 - `pnpm check` — repository validation passes.
 - `pnpm build` — compiled output resolves imports.
 
 ## Risks, Tradeoffs, and Open Questions
 
 - DB compatibility is intentionally dropped. Developers must reset old `$SHEPHERD_HOME` state when testing this rebuild.
-- Headless Pi uses normal Pi configuration. If that configuration exposes raw Herdr mutation tools, Shepherd relies on prompt guidance rather than Gateway interception.
-- `worker_agent_bindings.agentStatus` and `bindingHealth` are best-effort cache fields. Strict current state must be confirmed with `shepherd_herdr_read` or a direct Herdr read when Shepherd tools are insufficient.
+- Headless Pi uses normal Pi configuration. If that configuration exposes raw Herdr mutation tools, Herdsman relies on prompt guidance rather than Gateway interception.
+- `worker_agent_bindings.agentStatus` and `bindingHealth` are best-effort cache fields. Strict current state must be confirmed with `herdsman_herdr_read` or a direct Herdr read when Herdsman tools are insufficient.
 - `events.subscribe` behavior should be verified against the installed Herdr version during implementation. If Herdr rejects filtered subscriptions, subscribe broadly and filter client-side.
 - This plan keeps `session_summaries` storage but removes automatic updating. If summary updates are needed later, design a Pi-runtime summary job instead of reintroducing provider config.
 - The plan uses `assistant.message` even though the archived runtime-events plan used `gateway.message`; implementation must update Slack delivery, context formatting, and tests together to avoid mixed naming.

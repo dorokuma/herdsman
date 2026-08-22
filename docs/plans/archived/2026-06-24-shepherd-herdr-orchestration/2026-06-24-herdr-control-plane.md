@@ -1,8 +1,8 @@
-# Shepherd Herdr Control-Plane Mapping
+# Herdsman Herdr Control-Plane Mapping
 
 Date: 2026-06-24
 
-Parent: [Shepherd Herdr Orchestration Plan](../2026-06-24-shepherd-herdr-orchestration.md)
+Parent: [Herdsman Herdr Orchestration Plan](../2026-06-24-herdsman-herdr-orchestration.md)
 
 ## Status
 
@@ -11,15 +11,15 @@ Archived. MVP Herdr control-plane mapping and implementation were completed.
 ## Progress
 
 - **Done** — Herdr session/workspace/tab/pane/agent orchestration was specified and implemented.
-- **Done** — Shepherd logical tools were mapped to Herdr operations.
+- **Done** — Herdsman logical tools were mapped to Herdr operations.
 
 ## Next steps
 
-- Keep using this mapping as the Herdr backend contract for Pi-exposed Shepherd tools.
+- Keep using this mapping as the Herdr backend contract for Pi-exposed Herdsman tools.
 
 ## Goal
 
-Define how Shepherd maps its sessions and working contexts onto Herdr sessions, workspaces, tabs, panes, and agents.
+Define how Herdsman maps its sessions and working contexts onto Herdr sessions, workspaces, tabs, panes, and agents.
 
 ## Implementation status
 
@@ -30,14 +30,14 @@ Implemented:
 - Herdr named-session validation and CLI lifecycle through `herdr --session <name>`.
 - reusable Herdr socket client and managed client pool.
 - workspace create/list/get/focus, tab create/list/get, pane split/list/get/read/run/send-text, agent start/list/get/read/send/focus, and wait wrappers.
-- Shepherd workspace layout creation with `agents`, `tests`, `logs`, `review`, and `scratch` tabs.
+- Herdsman workspace layout creation with `agents`, `tests`, `logs`, `review`, and `scratch` tabs.
 - Herdr DB bindings for created and explicitly attached workspaces.
 - gateway logical tools for `herdr_read`, `ensure_herdr_workspace`, `attach_herdr_workspace`, `open_pane`, `run_pane_command`, `send_pane_text`, `read_pane`, `start_agent`, `send_agent_message`, `read_agent_output`, and waits.
-- Herdr `events.wait` socket wrapper and progress adapter that normalizes Herdr events into idempotent `herdr.progress` Shepherd events.
+- Herdr `events.wait` socket wrapper and progress adapter that normalizes Herdr events into idempotent `herdr.progress` Herdsman events.
 
 MVP limits:
 
-- Herdr event wait/progress recording and automatic daemon-managed subscription lifecycle are implemented for Shepherd-bound workspaces.
+- Herdr event wait/progress recording and automatic daemon-managed subscription lifecycle are implemented for Herdsman-bound workspaces.
 - `send_agent_message` uses Herdr `agent.send`, not the older draft's internal `pane.send_input` example.
 - Explicit attach is included in MVP only when the user asks for it; broad attach/discovery modes remain out of scope.
 
@@ -55,7 +55,7 @@ From Herdr documentation and source:
 
 ## Named session lifecycle
 
-Shepherd uses Herdr's named-session CLI lifecycle to ensure or create the named session for a working context. After the session exists, Shepherd uses the Herdr socket API for normal control-plane operations.
+Herdsman uses Herdr's named-session CLI lifecycle to ensure or create the named session for a working context. After the session exists, Herdsman uses the Herdr socket API for normal control-plane operations.
 
 - Do not start or supervise `herdr server` directly in MVP.
 - Do not use one-off CLI wrappers for every operation when a socket API is available.
@@ -65,10 +65,10 @@ Shepherd uses Herdr's named-session CLI lifecycle to ensure or create the named 
 
 ```text
 working context
-  -> Herdr named session: shepherd-<working-context-slug>
+  -> Herdr named session: herdsman-<working-context-slug>
 
-Shepherd session
-  -> Herdr workspace: shepherd-<task-slug>-<short-id>
+Herdsman session
+  -> Herdr workspace: herdsman-<task-slug>-<short-id>
 
 Herdr tabs
   -> agents / tests / logs / review / scratch
@@ -80,15 +80,15 @@ Herdr panes
 Rationale:
 
 - One working context gets one Herdr named session.
-- Multiple Shepherd sessions for the same working context become separate Herdr workspaces inside that named session.
+- Multiple Herdsman sessions for the same working context become separate Herdr workspaces inside that named session.
 - Workspace names describe work, not the platform where the conversation began.
-- The `shepherd-` prefix helps humans distinguish Shepherd-managed Herdr resources when using Herdr directly.
+- The `herdsman-` prefix helps humans distinguish Herdsman-managed Herdr resources when using Herdr directly.
 
 ## Naming
 
 ```text
-Herdr named session: shepherd-<working-context-slug>
-Herdr workspace:     shepherd-<task-slug>-<short-id>
+Herdr named session: herdsman-<working-context-slug>
+Herdr workspace:     herdsman-<task-slug>-<short-id>
 ```
 
 Rules:
@@ -106,7 +106,7 @@ Signals may include:
 
 - configured catalog entries
 - path name
-- recent Shepherd bindings
+- recent Herdsman bindings
 - Herdr existing sessions/workspaces
 - `.git`
 - `package.json`
@@ -115,48 +115,48 @@ Signals may include:
 - `go.mod`
 - `README*`
 - `AGENTS.md`, `CLAUDE.md`, `HERMES.md`, `.hermes.md`
-- `.shepherd.toml` if introduced later
+- `.herdsman.toml` if introduced later
 
 Resolution order:
 
 1. explicit configured catalog
-2. previous Shepherd DB bindings and recent working contexts
+2. previous Herdsman DB bindings and recent working contexts
 3. allowed roots scan
 4. user clarification when ambiguous
 
-Allowed root scanning is opt-in. Shepherd must not scan the whole home directory by default.
+Allowed root scanning is opt-in. Herdsman must not scan the whole home directory by default.
 
 ## Agent and pane operations
 
 Use Herdr APIs at the right level:
 
 - `agent.start` for configured worker agents.
-- `send_agent_message` as a Shepherd-level tool that sends through Herdr `agent.send`.
+- `send_agent_message` as a Herdsman-level tool that sends through Herdr `agent.send`.
 - `pane.split`, `pane.run`, `pane.read`, and related pane APIs for tests, servers, logs, and shells.
 - `agent.read` / `pane.read` for result summarization.
 - `events.subscribe` / waits for Herdr state changes.
 
 ## Autonomy boundary
 
-Inside Shepherd-managed Herdr resources, the gateway LLM may create workspaces, tabs, panes, and agents, send input, wait, read output, and summarize results.
+Inside Herdsman-managed Herdr resources, the gateway LLM may create workspaces, tabs, panes, and agents, send input, wait, read output, and summarize results.
 
-Expose that capability through high-level Shepherd logical tools, not raw Herdr socket methods. The logical tools should cover workspace setup, agent pane preparation, agent start, pane creation, controlled pane commands, reads, waits, and agent messaging while Shepherd enforces DB bindings and policy.
+Expose that capability through high-level Herdsman logical tools, not raw Herdr socket methods. The logical tools should cover workspace setup, agent pane preparation, agent start, pane creation, controlled pane commands, reads, waits, and agent messaging while Herdsman enforces DB bindings and policy.
 
-For non-Shepherd Herdr resources:
+For non-Herdsman Herdr resources:
 
 - Do not attach unless the user explicitly asks.
-- Once attached, record the binding in Shepherd DB.
+- Once attached, record the binding in Herdsman DB.
 - Do not add broad discovery/auto-attach modes in MVP.
-- The prompt must remind the gateway LLM that non-Shepherd resources are user-owned.
+- The prompt must remind the gateway LLM that non-Herdsman resources are user-owned.
 
 ## DB bindings
 
-`herdr_bindings` records the relation between Shepherd and Herdr:
+`herdr_bindings` records the relation between Herdsman and Herdr:
 
-- Shepherd session id
+- Herdsman session id
 - Herdr named session name
 - Herdr workspace id
 - created vs attached metadata
 - timestamps and last-seen state
 
-Shepherd DB remains the source of truth for bindings.
+Herdsman DB remains the source of truth for bindings.

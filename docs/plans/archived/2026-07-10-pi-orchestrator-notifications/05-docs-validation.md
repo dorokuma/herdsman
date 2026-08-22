@@ -8,13 +8,13 @@
 
 **Architecture:** Public docs explain that all Pi instances retain agent context/telemetry while exactly one explicitly selected terminal receives pushed updates. Automated validation combines contracts, SQLite, daemon sockets, topology reconciliation, and Pi package tests; manual dogfood covers terminal/session behavior that unit tests cannot fully represent.
 
-**Tech Stack:** Markdown, Vitest, pnpm checks/build, npm pack dry-run, Shepherd daemon/CLI, Herdr 0.7.x, Pi 0.80.x.
+**Tech Stack:** Markdown, Vitest, pnpm checks/build, npm pack dry-run, Herdsman daemon/CLI, Herdr 0.7.x, Pi 0.80.x.
 
 ## Global Constraints
 
 - Inherit all parent constraints.
 - Documentation must not describe automatic owner election or project configuration.
-- `/shepherd orchestrator ...` is a Pi extension command, not a `shepherd` shell CLI command.
+- `/herdsman orchestrator ...` is a Pi extension command, not a `herdsman` shell CLI command.
 - Do not add orchestrator commands to root `SKILL.md` as shell commands. The skill may state when hidden updates are available.
 - README English/Japanese sections must remain semantically aligned.
 - Manual validation must use a disposable `SHEPHERD_HOME` when DB reset/restart behavior is exercised.
@@ -22,8 +22,8 @@
 
 ## Current Context
 
-- Root README and `packages/shepherd-pi/README.md` currently say every Pi subscribes to current-workspace updates.
-- Both Shepherd skill files say Pi may receive unread updates but do not describe role selection.
+- Root README and `packages/herdsman-pi/README.md` currently say every Pi subscribes to current-workspace updates.
+- Both Herdsman skill files say Pi may receive unread updates but do not describe role selection.
 - `pnpm check` already includes typecheck, all tests, Biome, Drizzle, Pi package dry-run, and Herdr plugin checks.
 - `pnpm build` is separately required for package/entrypoint changes.
 
@@ -31,8 +31,8 @@
 
 - Modify: `README.md` — orchestrator selection and behavior.
 - Modify: `README.ja.md` — aligned Japanese behavior.
-- Modify: `packages/shepherd-pi/README.md` — command reference and lifecycle semantics.
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md` — owner-only update note.
+- Modify: `packages/herdsman-pi/README.md` — command reference and lifecycle semantics.
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md` — owner-only update note.
 - Modify: `SKILL.md` — owner-only hidden update boundary.
 - Modify: `docs/plans/2026-07-10-pi-orchestrator-notifications.md` — progress/completion evidence after implementation.
 - Modify: child plan progress boxes only while executing corresponding tasks.
@@ -46,8 +46,8 @@
 **Files:**
 - Modify: `README.md`
 - Modify: `README.ja.md`
-- Modify: `packages/shepherd-pi/README.md`
-- Modify: `packages/shepherd-pi/skills/shepherd/SKILL.md`
+- Modify: `packages/herdsman-pi/README.md`
+- Modify: `packages/herdsman-pi/skills/herdsman/SKILL.md`
 - Modify: `SKILL.md`
 
 **Interfaces:**
@@ -60,8 +60,8 @@ English content must state:
 
 - every Pi still receives compact current-workspace agent context before turns;
 - pushed unread agent updates go only to the explicit orchestrator;
-- select it from that Pi with `/shepherd orchestrator on`;
-- inspect with `/shepherd orchestrator` or `status`;
+- select it from that Pi with `/herdsman orchestrator on`;
+- inspect with `/herdsman orchestrator` or `status`;
 - another Pi's `on` atomically transfers the role in the same Herdr session/workspace;
 - release with `off` from the owner;
 - no owner means no push notifications;
@@ -74,25 +74,25 @@ Add equivalent Japanese statements to `README.ja.md`. Keep examples concise; do 
 Include this exact command block:
 
 ```text
-/shepherd orchestrator on
-/shepherd orchestrator
-/shepherd orchestrator status
-/shepherd orchestrator off
+/herdsman orchestrator on
+/herdsman orchestrator
+/herdsman orchestrator status
+/herdsman orchestrator off
 ```
 
-Clarify that these are entered in Pi, not a shell, and that only the owner displays `Shepherd: orchestrator` in the footer.
+Clarify that these are entered in Pi, not a shell, and that only the owner displays `Herdsman: orchestrator` in the footer.
 
 - [x] **Step 3: Update skill boundaries**
 
-Replace generic “Pi may receive unread updates” text with: current workspace agent context remains available to all Pi instances; unread updates are included only when that terminal is the explicit Shepherd orchestrator. Do not instruct the model to claim the role without the user asking.
+Replace generic “Pi may receive unread updates” text with: current workspace agent context remains available to all Pi instances; unread updates are included only when that terminal is the explicit Herdsman orchestrator. Do not instruct the model to claim the role without the user asking.
 
 - [x] **Step 4: Check links and bilingual parity**
 
 Run:
 
 ```bash
-rg -n "orchestrator|オーケストレーター|agent updates|agent update" README.md README.ja.md packages/shepherd-pi/README.md packages/shepherd-pi/skills/shepherd/SKILL.md SKILL.md
-rg -n "agent\.notifications\.subscribe|subscriptionId" README.md README.ja.md packages/shepherd-pi/README.md packages/shepherd-pi/skills/shepherd/SKILL.md SKILL.md
+rg -n "orchestrator|オーケストレーター|agent updates|agent update" README.md README.ja.md packages/herdsman-pi/README.md packages/herdsman-pi/skills/herdsman/SKILL.md SKILL.md
+rg -n "agent\.notifications\.subscribe|subscriptionId" README.md README.ja.md packages/herdsman-pi/README.md packages/herdsman-pi/skills/herdsman/SKILL.md SKILL.md
 ```
 
 Expected: role behavior appears in all relevant docs; internal/removed RPC terms do not appear.
@@ -100,7 +100,7 @@ Expected: role behavior appears in all relevant docs; internal/removed RPC terms
 - [x] **Step 5: Commit docs**
 
 ```bash
-git add README.md README.ja.md packages/shepherd-pi/README.md packages/shepherd-pi/skills/shepherd/SKILL.md SKILL.md
+git add README.md README.ja.md packages/herdsman-pi/README.md packages/herdsman-pi/skills/herdsman/SKILL.md SKILL.md
 git commit -m "docs: explain pi orchestrator notifications"
 ```
 
@@ -141,16 +141,16 @@ pnpm test \
 
 Expected: owner-only routing, scoped role broadcast, shared unread transfer, grace, and moves pass.
 
-- [x] **Step 3: Validate shepherd-pi**
+- [x] **Step 3: Validate herdsman-pi**
 
 Run:
 
 ```bash
 pnpm test \
-  test/integration/shepherd-pi-daemon-client.test.ts \
-  test/unit/shepherd-pi-extension.test.ts
-pnpm --dir packages/shepherd-pi typecheck
-(cd packages/shepherd-pi && npm pack --dry-run --json)
+  test/integration/herdsman-pi-daemon-client.test.ts \
+  test/unit/herdsman-pi-extension.test.ts
+pnpm --dir packages/herdsman-pi typecheck
+(cd packages/herdsman-pi && npm pack --dry-run --json)
 ```
 
 Expected: reconnect/commands/context/telemetry pass and package includes both source files.
@@ -160,7 +160,7 @@ Expected: reconnect/commands/context/telemetry pass and package includes both so
 Run:
 
 ```bash
-rg "agent\.notifications\.subscribe|currentSubscriptionId|subscriptionId|AgentNotificationCursorStore|AgentNotificationService" src packages/shepherd-pi test -n
+rg "agent\.notifications\.subscribe|currentSubscriptionId|subscriptionId|AgentNotificationCursorStore|AgentNotificationService" src packages/herdsman-pi test -n
 rg "publishAgentEvent" src/daemon/observability-server.ts test/integration -n
 ```
 
@@ -209,34 +209,34 @@ If full validation exposed a defect, add a regression test in the owning test fi
 **Prerequisites:**
 
 - Installed Herdr supports `HERDR_SOCKET_PATH`, `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID`, `terminal_id`, `pane.moved`, and `session.snapshot`.
-- Built Shepherd CLI/package points at this checkout.
+- Built Herdsman CLI/package points at this checkout.
 - Two Pi panes and one non-owner agent pane can run in the same Herdr workspace.
-- Every dogfood Pi process is launched with `SHEPHERD_HOME=/tmp/shepherd-orchestrator-dogfood` so its extension connects to the isolated daemon socket; setting the variable only on the daemon is insufficient.
+- Every dogfood Pi process is launched with `SHEPHERD_HOME=/tmp/herdsman-orchestrator-dogfood` so its extension connects to the isolated daemon socket; setting the variable only on the daemon is insufficient.
 
 - [x] **Step 1: Start isolated daemon**
 
 ```bash
-rm -rf /tmp/shepherd-orchestrator-dogfood
-SHEPHERD_HOME=/tmp/shepherd-orchestrator-dogfood shepherd daemon start
+rm -rf /tmp/herdsman-orchestrator-dogfood
+SHEPHERD_HOME=/tmp/herdsman-orchestrator-dogfood herdsman daemon start
 ```
 
-Expected: daemon creates/migrates a new DB and listens without schema errors. If daemon start is foreground-only in the current build, run it in a dedicated Herdr pane instead of backgrounding it. Launch/relaunch Pi A, Pi B, and later Pi C as `SHEPHERD_HOME=/tmp/shepherd-orchestrator-dogfood pi` before continuing.
+Expected: daemon creates/migrates a new DB and listens without schema errors. If daemon start is foreground-only in the current build, run it in a dedicated Herdr pane instead of backgrounding it. Launch/relaunch Pi A, Pi B, and later Pi C as `SHEPHERD_HOME=/tmp/herdsman-orchestrator-dogfood pi` before continuing.
 
 - [ ] **Step 2: Verify no-owner state**
 
-In Pi A and Pi B, run `/shepherd orchestrator status`.
+In Pi A and Pi B, run `/herdsman orchestrator status`.
 
-Expected: both report no owner; neither footer shows `Shepherd: orchestrator`. Trigger a worker status transition in the same workspace; neither Pi gets unread updates, while each next normal turn still includes current `[SHEPHERD AGENT CONTEXT]`.
+Expected: both report no owner; neither footer shows `Herdsman: orchestrator`. Trigger a worker status transition in the same workspace; neither Pi gets unread updates, while each next normal turn still includes current `[SHEPHERD AGENT CONTEXT]`.
 
 - [ ] **Step 3: Claim and replace owner**
 
-In Pi A run `/shepherd orchestrator on`, then in Pi B run the same command.
+In Pi A run `/herdsman orchestrator on`, then in Pi B run the same command.
 
 Expected:
 
 - A initially gets the footer;
 - B's claim moves the footer to B;
-- A gets one transient `Shepherd orchestrator moved to <B pane>` notification;
+- A gets one transient `Herdsman orchestrator moved to <B pane>` notification;
 - status from both identifies B;
 - A cannot clear B by running `off`.
 
@@ -272,9 +272,9 @@ Expected:
 
 - [ ] **Step 8: Verify daemon restart recovery**
 
-Restart the isolated Shepherd daemon while B remains running.
+Restart the isolated Herdsman daemon while B remains running.
 
-Expected: shepherd-pi reconnects automatically within startup grace, B footer returns/stays, and role does not require another command. Event delivery resumes.
+Expected: herdsman-pi reconnects automatically within startup grace, B footer returns/stays, and role does not require another command. Event delivery resumes.
 
 - [ ] **Step 9: Verify disconnect expiry**
 
@@ -327,4 +327,4 @@ Do not move the plan under `docs/plans/archived/` in the implementation commit. 
 
 ## Next Steps
 
-Archived in a separate docs-only commit. Interactive Steps 2-9 remain explicitly unverified because the sandbox blocked a policy-preserving Pi launch with the disposable Shepherd home.
+Archived in a separate docs-only commit. Interactive Steps 2-9 remain explicitly unverified because the sandbox blocked a policy-preserving Pi launch with the disposable Herdsman home.
