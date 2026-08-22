@@ -11,9 +11,11 @@ import type { AgentEventRecord, AgentIndexRecord, AgentScope } from "@/observabi
 export const ACTIVE_REVISION_POLL_MS = 10_000;
 export const FULL_RESCAN_MS = 60_000;
 
+type Client = Pick<HerdrSocketClient, "close" | "subscribeEvents">;
+
 type Watcher = {
   abort: AbortController;
-  client: Pick<HerdrSocketClient, "close" | "subscribeEvents">;
+  client: Client;
   entry: HerdrSessionListEntry;
   loop: Promise<void>;
 };
@@ -147,13 +149,14 @@ export class HerdrSessionWatchManager {
     });
     const abort = new AbortController();
     const client = this.#clientFactory({ socketPath: entry.socketPath });
-    const loop = this.#watch(entry, client, abort.signal).catch(() => undefined);
-    this.#watchers.set(entry.name, { abort, client, entry, loop });
+    const watcher = { abort, client, entry, loop: Promise.resolve() };
+    watcher.loop = this.#watch(entry, watcher, generation, abort.signal).catch(() => undefined);
+    this.#watchers.set(entry.name, watcher);
     if (this.#stopping || generation !== this.#lifecycleGeneration) {
       abort.abort();
       client.close();
       this.#watchers.delete(entry.name);
-      await loop;
+      await watcher.loop;
     }
   }
 
@@ -176,21 +179,22 @@ export class HerdrSessionWatchManager {
 
   async #watch(
     entry: HerdrSessionListEntry,
-    client: Pick<HerdrSocketClient, "close" | "subscribeEvents">,
+    watcher: Watcher,
+    generation: number,
     signal: AbortSignal,
   ): Promise<void> {
     let reconnectCount = 0;
     let lastPaneIds: string[] = [];
     let lastEvent: Record<string, unknown> | undefined;
     let lastClosedTriggered = false;
-    while (!signal.aborted) {
+    while (!signal.aborted && generation === this.#lifecycleGeneration) {
       let restart = false;
       try {
         const agents = await this.#refresh(entry);
         if (signal.aborted) return;
         const paneIds = agents.map((agent) => agent.paneId);
         lastPaneIds = paneIds;
-        for await (const event of client.subscribeEvents({ paneIds }, { signal })) {
+        for await (const event of watcher.client.subscribeEvents({ paneIds }, { signal })) {
           if (signal.aborted) return;
           const eventRecord = record(event);
           lastEvent = eventRecord;
@@ -225,6 +229,10 @@ export class HerdrSessionWatchManager {
       } catch (error) {
         if (signal.aborted) return;
         reconnectCount += 1;
+        const reconnectDelayMs = Math.min(
+          this.#reconnectDelayMs * 2 ** (reconnectCount - 1),
+          30_000,
+        );
         console.warn("Herdsman Herdr subscription reconnect", {
           sessionName: entry.name,
           socketPath: entry.socketPath,
@@ -237,8 +245,18 @@ export class HerdrSessionWatchManager {
           error: error instanceof Error ? error.message : String(error),
         });
         lastClosedTriggered = false;
+        watcher.client.close();
+        if (signal.aborted) return;
+        watcher.client = this.#clientFactory({ socketPath: entry.socketPath });
+        await delay(reconnectDelayMs, signal);
+        continue;
       }
-      if (!restart) await delay(this.#reconnectDelayMs, signal);
+      if (restart) {
+        reconnectCount = 0;
+        continue;
+      }
+      reconnectCount = 0;
+      await delay(this.#reconnectDelayMs, signal);
     }
   }
 

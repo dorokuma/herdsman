@@ -1,6 +1,6 @@
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { join } from "node:path";
+import { join, isAbsolute, normalize, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts.js";
 
@@ -11,8 +11,13 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
 // Herdr observation delay is on the second scale, so a 10-minute grace window
 // is far more generous than needed; it only discards sessions that had already
 // stopped being written well before the agent appeared.
-export const DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
+export const ALLOWED_SESSION_ROOTS = [
+  "/root/.pi/agent/sessions",
+  "/tmp/pi-role-sessions",
+] as const;
 
+
+export const DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
 export type AgentHistoryLookupInput = {
   agent: string | null;
   agentSession: AgentSessionRef | null;
@@ -32,15 +37,14 @@ type Candidate = {
 export async function discoverAgentHistory(
   input: AgentHistoryLookupInput,
 ): Promise<AgentHistoryRef | null> {
-  if (input.agentSession?.kind === "path" && existsSync(input.agentSession.value)) {
-    const source = historySourceFromSessionRef(input.agentSession);
-    return {
-      kind: "agent_session",
-      path: input.agentSession.value,
-      source,
-      value: input.agentSession.value,
-    };
+  if (input.agentSession?.kind === "path") {
+    const resolved = safeAllowedSessionPath(input.agentSession.value, input.homeDir);
+    if (resolved && existsSync(resolved)) {
+      const source = historySourceFromSessionRef(input.agentSession);
+      return { kind: "agent_session", path: resolved, source, value: resolved };
+    }
   }
+
 
   const cwd = input.cwd ?? input.foregroundCwd;
   const homeDir = input.homeDir ?? process.env.HOME ?? "";
@@ -101,6 +105,23 @@ export function historySourceFromSessionRef(ref: AgentSessionRef): AgentHistoryR
   return "unknown";
 }
 
+function safeAllowedSessionPath(value: string, homeDir?: string): string | null {
+  if (!isAbsolute(value) || value.includes("..")) return null;
+  const resolved = normalize(value);
+  try {
+    const real = realpathSync(resolved);
+    const homeSessionRoot = join(homeDir ?? process.env.HOME ?? "/root", ".pi/agent/sessions");
+    const roots = [homeSessionRoot, ...ALLOWED_SESSION_ROOTS];
+    return roots.some((root) => {
+      const rest = relative(root, real);
+      return rest === "" || (!rest.startsWith("..") && !isAbsolute(rest));
+    })
+      ? real
+      : null;
+  } catch {
+    return null;
+  }
+}
 async function scanRoot(root: string, source: AgentHistoryRef["source"]): Promise<Candidate[]> {
   if (!existsSync(root)) return [];
   const files = await listJsonlFiles(root);

@@ -730,13 +730,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             "Herdsman couldn’t acknowledge agent updates · updates remain pending",
             "warning",
           );
-          const failedEventId = batch.events.at(-1)?.id;
-          if (failedEventId !== undefined) {
-            state.failedWakeThroughEventId = Math.max(
-              state.failedWakeThroughEventId,
-              failedEventId,
-            );
-          }
+          const failedEventId = event.id;
+          state.failedWakeThroughEventId = Math.max(
+            state.failedWakeThroughEventId,
+            failedEventId,
+          );
           break;
         }
       }

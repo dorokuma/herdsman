@@ -146,7 +146,25 @@ export class AgentIndexService {
           agent.terminalId ? ([[agent.terminalId, agent]] as const) : [],
         ),
       );
+      const refreshEpoch = this.#mutationEpochBySession.get(input.herdrSessionName) ?? 0;
       const snapshot = normalizeHerdrSessionSnapshot(await client.sessionSnapshot());
+      const mutationEpoch = this.#mutationEpochBySession.get(input.herdrSessionName) ?? 0;
+      if (mutationEpoch !== refreshEpoch) {
+        console.warn("Herdsman discarding stale Herdr session refresh", {
+          sessionName: input.herdrSessionName,
+          refreshEpoch,
+          mutationEpoch,
+        });
+        return { agents: previous, contextChangedScopes: [], events: [] };
+      }
+      if (mutationEpoch !== refreshEpoch) {
+        console.warn("Herdsman discarding stale Herdr session refresh", {
+          sessionName: input.herdrSessionName,
+          refreshEpoch,
+          mutationEpoch,
+        });
+        return { agents: previous, contextChangedScopes: [], events: [] };
+      }
       const revisionByPane = new Map(
         snapshot.panes.flatMap((pane) => {
           const value = record(pane);
