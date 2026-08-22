@@ -15,8 +15,9 @@ import {
   type ShepherdFooterState,
 } from "./agent-update-ui.js";
 import {
-  formatAgentOutcomeUpdates,
   projectAgentOutcomes,
+  createAgentOutcomeProjector,
+  formatAgentOutcomeUpdates,
   WAKE_SETTLE_MS,
 } from "./wake.js";
 
@@ -160,6 +161,8 @@ export function defaultSocketPath() {
 export function createShepherdPiExtension(options: ExtensionOptions = {}) {
   return function shepherdPiExtension(pi: PiApi): void {
     pi.registerMessageRenderer?.("shepherd-wake", renderAgentUpdateMessage);
+
+    const projector = createAgentOutcomeProjector();
 
     const state: ShepherdState = {
       client: undefined,
@@ -306,7 +309,7 @@ export function createShepherdPiExtension(options: ExtensionOptions = {}) {
             return;
           }
           const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
-          const batchOutcomes = projectAgentOutcomes(batchEvents).outcomes;
+          const batchOutcomes = projector(batchEvents).outcomes;
           state.deliveredBatch = {
             assistantFinalSucceeded: false,
             events: batchEvents,
