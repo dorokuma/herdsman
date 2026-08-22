@@ -2,9 +2,35 @@ import type { DatabaseSync } from "node:sqlite";
 import type {
   AgentEventRecord,
   AgentEventType,
+  AgentIndexRecord,
   AgentQueryScope,
   CompactAgentHistory,
 } from "@/observability/contracts.js";
+import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
+
+/** The single delivery predicate shared by pending discovery and acknowledgement. */
+export function isDeliverableAgentEvent(
+  event: AgentEventRecord,
+  agent: AgentIndexRecord | undefined,
+  scope: { herdrSessionName: string; workspaceId: string },
+  ownerTerminalId: string,
+): boolean {
+  return (
+    event.agentId !== null &&
+    agent !== undefined &&
+    event.type !== "agent.status.changed" &&
+    !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
+    event.deliverable === 1 &&
+    agent.paneId === event.paneId &&
+    (event.paneGeneration === null || agent.paneGeneration === event.paneGeneration) &&
+    agent.workspaceId === scope.workspaceId &&
+    event.workspaceId === scope.workspaceId &&
+    event.herdrSessionName === scope.herdrSessionName &&
+    event.terminalId !== null &&
+    event.terminalId !== ownerTerminalId
+  );
+}
+
 
 type AgentEventRow = {
   agent_id: string | null;
@@ -121,31 +147,35 @@ export class AgentEventStore {
     herdrSessionName: string;
     ownerTerminalId: string;
     workspaceId: string;
+    getAgent?: (agentId: string) => AgentIndexRecord | undefined;
   }): AgentEventRecord | undefined {
-    const row = this.#sqlite
-      .prepare(
-        `select * from agent_events
-         where id > ?
-           and deliverable = 1
-           and herdr_session_name = ?
-           and workspace_id = ?
-           and terminal_id is not null
-           and terminal_id != ?
-           and agent_id is not null
-           and exists (
+    const agentFilter = input.getAgent
+      ? ""
+      : `and exists (
              select 1 from agents
              where agents.id = agent_events.agent_id
                and agents.herdr_session_name = agent_events.herdr_session_name
                and agents.workspace_id = agent_events.workspace_id
                and agents.pane_id = agent_events.pane_id
-           )
-         order by id asc
-         limit 1`,
+           )`;
+    const params = [input.afterEventId, input.herdrSessionName, input.workspaceId, input.ownerTerminalId];
+    const rows = this.#sqlite
+      .prepare(
+        `select * from agent_events
+         where id > ? and deliverable = 1 and herdr_session_name = ? and workspace_id = ?
+           and terminal_id is not null and terminal_id != ? and agent_id is not null
+           ${agentFilter}
+         order by id asc limit 1000`,
       )
-      .get(input.afterEventId, input.herdrSessionName, input.workspaceId, input.ownerTerminalId) as
-      | AgentEventRow
-      | undefined;
-    return row ? mapAgentEvent(row) : undefined;
+      .all(...params) as AgentEventRow[];
+    const scope = { herdrSessionName: input.herdrSessionName, workspaceId: input.workspaceId };
+    for (const row of rows) {
+      const event = mapAgentEvent(row);
+      if (!input.getAgent || isDeliverableAgentEvent(event, input.getAgent(event.agentId!), scope, input.ownerTerminalId)) {
+        return event;
+      }
+    }
+    return undefined;
   }
 
   latestEventId(scope: AgentQueryScope = {}): number {

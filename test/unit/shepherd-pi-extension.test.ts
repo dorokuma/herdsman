@@ -1168,7 +1168,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toHaveLength(2);
+      expect(pi.customMessages).toHaveLength(1);
 
       client.emitStream({ method: "agent.event", params: { event: event(87, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);

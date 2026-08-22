@@ -1,4 +1,4 @@
-import type { AgentEventStore } from "@/db/agent-events.js";
+import { AgentEventStore, isDeliverableAgentEvent } from "@/db/agent-events.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { AgentStore } from "@/db/agents.js";
 import type {
@@ -7,7 +7,6 @@ import type {
   AgentOrchestratorState,
   AgentScope,
 } from "@/observability/contracts.js";
-import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
 
 export type AgentOrchestratorChange = {
   current: AgentOrchestratorState;
@@ -69,20 +68,12 @@ export class AgentOrchestratorService {
       scanned += batch.length;
       afterEventId = batch.at(-1)?.id ?? afterEventId;
       for (const event of batch) {
-        // Strict identity prevents an old event from being delivered after a pane is rebound.
-        const valid =
-          event.agentId !== null &&
-          !(
-            isInteractivePiAgent(validAgents.get(event.agentId)) &&
-            (event.type === "agent.idle" || event.type === "agent.status.changed")
-          ) &&
-          event.deliverable === 1 &&
-          validAgents.get(event.agentId)?.paneId === event.paneId &&
-          (event.paneGeneration === null ||
-            validAgents.get(event.agentId)?.paneGeneration === event.paneGeneration) &&
-          validAgents.get(event.agentId)?.workspaceId === input.workspaceId &&
-          event.workspaceId === input.workspaceId &&
-          event.herdrSessionName === input.herdrSessionName;
+        const valid = isDeliverableAgentEvent(
+          event,
+          event.agentId ? validAgents.get(event.agentId) : undefined,
+          input,
+          input.terminalId,
+        );
         if (valid && event.terminalId !== null && event.terminalId !== input.terminalId) {
           pending.push(event);
         }
@@ -102,35 +93,9 @@ export class AgentOrchestratorService {
       ...input,
       afterEventId: state.ackedEventId,
       ownerTerminalId: input.terminalId,
+      getAgent: (agentId) => this.#agents.get(agentId),
     });
-    if (next?.id === input.eventId) {
-      const nextAgent = next.agentId ? this.#agents.get(next.agentId) : undefined;
-      if (
-        !isInteractivePiAgent(nextAgent) ||
-        (next?.type !== "agent.idle" && next?.type !== "agent.status.changed")
-      ) {
-        return this.#scopes.ack(input);
-      }
-    }
-    if (!next) {
-      const candidate = this.#agentEvents.get(input.eventId);
-      const candidateAgent = candidate.agentId ? this.#agents.get(candidate.agentId) : undefined;
-      if (
-        candidate.herdrSessionName === input.herdrSessionName &&
-        candidate.workspaceId === input.workspaceId &&
-        candidate.agentId !== null &&
-        !(
-          isInteractivePiAgent(candidateAgent) &&
-          (candidate.type === "agent.idle" || candidate.type === "agent.status.changed")
-        ) &&
-        candidate.paneId !== null &&
-        (candidate.paneGeneration === null ||
-          candidate.paneGeneration === candidateAgent?.paneGeneration) &&
-        candidate.id > state.ackedEventId
-      ) {
-        return this.#scopes.ack(input);
-      }
-    }
+    if (next?.id === input.eventId) return this.#scopes.ack(input);
     throw new Error("Only the next pending orchestrator event can be acknowledged");
   }
 

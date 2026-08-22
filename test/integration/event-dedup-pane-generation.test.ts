@@ -36,6 +36,8 @@ describe("event deduplication and pane generations", () => {
     const a = h.agents.replaceForSession({ herdrSessionName: "default", agents: [agent("a", "gen-1")] })[0]!;
     const e = h.agentEvents.append({ agentId: a.id, ...scope, paneId: "wJ:p2", paneGeneration: "gen-1", payload: {}, terminalId: "term-agent", type: "agent.done" });
     h.agentEvents.invalidatePane({ herdrSessionName: "default", paneId: "wJ:p2", paneGeneration: "gen-1" });
-    expect(service.ack({ ...scope, eventId: e.id, terminalId: "term-owner" }).ackedEventId).toBe(e.id); h.sqlite.close();
+    expect(() => service.ack({ ...scope, eventId: e.id, terminalId: "term-owner" })).toThrow(
+      "Only the next pending orchestrator event can be acknowledged",
+    );
   });
 });
