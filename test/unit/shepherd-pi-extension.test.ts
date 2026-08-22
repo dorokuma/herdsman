@@ -1600,6 +1600,80 @@ describe("herdsman-pi orchestrator bridge", () => {
 
 const USAGE = "Usage: /herdsman [on|off|status]";
 
+describe("herdsman-pi disconnect regression (independent coverage)", () => {
+  test("does not abort on a transient disconnect, invalidates the delivered batch, and advances the failed wake cursor", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      client.emitStream({ method: "agent.event", params: { event: event(201, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.customMessages[0]?.[0]).toMatchObject({ details: { eventIds: [201] } });
+
+      client.disconnect(new Error("transient disconnect"));
+      expect(ctx.aborts).toBe(0);
+
+      await client.connect();
+      client.emitStream({ method: "agent.event", params: { event: event(202, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+});
+
+describe("pi acknowledgement cursor regression (independent coverage)", () => {
+  test("advances failedWakeThroughEventId only through a failed event while later events remain wakeable", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const baseResponse = client.response;
+    let failEvent202 = true;
+    client.response = (method, params) => {
+      if (
+        method === "agent.notifications.ack" &&
+        (params as { eventId: number }).eventId === 202 &&
+        failEvent202
+      ) {
+        failEvent202 = false;
+        throw new Error("ack failed");
+      }
+      return baseResponse(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      for (const id of [201, 202, 203]) {
+        client.emitStream({ method: "agent.event", params: { event: event(id, "term_agent") } });
+      }
+      await vi.advanceTimersByTimeAsync(500);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: 201 }],
+        ["agent.notifications.ack", { eventId: 202 }],
+      ]);
+      client.emitStream({ method: "agent.event", params: { event: event(204, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({
+        details: { eventIds: [203, 204] },
+      });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+});
+
 function createWakeClient(replayedEvents: AgentEventWireRecord[] = []) {
   const client = createFakeClient();
   client.response = (method) => {
