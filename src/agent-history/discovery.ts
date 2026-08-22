@@ -1,6 +1,6 @@
 import { existsSync, realpathSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
-import { join, isAbsolute, normalize, relative } from "node:path";
+import { isAbsolute, join, normalize, relative } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts.js";
 
@@ -11,11 +11,7 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
 // Herdr observation delay is on the second scale, so a 10-minute grace window
 // is far more generous than needed; it only discards sessions that had already
 // stopped being written well before the agent appeared.
-export const ALLOWED_SESSION_ROOTS = [
-  "/root/.pi/agent/sessions",
-  "/tmp/pi-role-sessions",
-] as const;
-
+export const ALLOWED_SESSION_ROOTS = ["/root/.pi/agent/sessions", "/tmp/pi-role-sessions"] as const;
 
 export const DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
 export type AgentHistoryLookupInput = {
@@ -44,7 +40,6 @@ export async function discoverAgentHistory(
       return { kind: "agent_session", path: resolved, source, value: resolved };
     }
   }
-
 
   const cwd = input.cwd ?? input.foregroundCwd;
   const homeDir = input.homeDir ?? process.env.HOME ?? "";

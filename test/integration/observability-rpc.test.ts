@@ -320,9 +320,7 @@ describe("ObservabilityRpcServer", () => {
       .request("agent.orchestrator.set", { enabled: true })
       .catch((error: unknown) => error);
     expect(replacementError).toBeInstanceOf(Error);
-    expect((replacementError as Error).message).toContain(
-      "ORCHESTRATOR_SCOPE_ALREADY_CLAIMED",
-    );
+    expect((replacementError as Error).message).toContain("ORCHESTRATOR_SCOPE_ALREADY_CLAIMED");
 
     piA.close();
     await new Promise((resolve) => setTimeout(resolve, 75));

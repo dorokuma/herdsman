@@ -44,4 +44,3 @@ export class JsonLineDecoder {
     return [JSON.parse(line)];
   }
 }
-

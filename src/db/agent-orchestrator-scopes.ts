@@ -110,12 +110,15 @@ export class AgentOrchestratorScopeStore {
         .run(now, input.from.herdrSessionName, input.from.workspaceId);
       const sourceCurrent = this.get(input.from);
       if (!sourceCurrent) throw new Error("Orchestrator source disappeared during move");
-      const target = this.#claim({
-        ...input.to,
-        ackedEventId: input.targetAckedEventId,
-        paneId: input.paneId,
-        terminalId: input.terminalId,
-      }, true);
+      const target = this.#claim(
+        {
+          ...input.to,
+          ackedEventId: input.targetAckedEventId,
+          paneId: input.paneId,
+          terminalId: input.terminalId,
+        },
+        true,
+      );
       return [{ current: sourceCurrent, previous: sourcePrevious }, target];
     });
   }

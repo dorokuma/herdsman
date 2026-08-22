@@ -1,7 +1,7 @@
-import { createConnection } from "node:net";
 import { mkdtempSync } from "node:fs";
-import { join } from "node:path";
+import { createConnection } from "node:net";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test } from "vitest";
 import { createAgentHistoryService } from "@/agent-history/service.js";
 import { ObservabilityRpcServer } from "@/daemon/observability-server.js";

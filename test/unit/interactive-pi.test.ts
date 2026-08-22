@@ -5,9 +5,14 @@ import { afterEach, describe, expect, test } from "vitest";
 import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
 
 const tempDirs: string[] = [];
-afterEach(() => { for (const dir of tempDirs.splice(0)) rmSync(dir, { force: true, recursive: true }); });
+afterEach(() => {
+  for (const dir of tempDirs.splice(0)) rmSync(dir, { force: true, recursive: true });
+});
 function agent(value: string | null | undefined) {
-  return { agent: "pi", agentSession: value === undefined ? undefined : value === null ? null : { value } } as any;
+  return {
+    agent: "pi",
+    agentSession: value === undefined ? undefined : value === null ? null : { value },
+  } as unknown as Parameters<typeof isInteractivePiAgent>[0];
 }
 describe("interactive Pi session classification", () => {
   test("rejects a session path containing .. as non-interactive", () => {
@@ -17,8 +22,10 @@ describe("interactive Pi session classification", () => {
     expect(isInteractivePiAgent(agent("/tmp/pi-role-sessions/role-x/session.jsonl"))).toBe(false);
   });
   test("classifies a real root Pi session as interactive", () => {
-    const dir = mkdtempSync(join(tmpdir(), "interactive-pi-test-")); tempDirs.push(dir);
-    const file = join(dir, "x.jsonl"); writeFileSync(file, "");
+    const dir = mkdtempSync(join(tmpdir(), "interactive-pi-test-"));
+    tempDirs.push(dir);
+    const file = join(dir, "x.jsonl");
+    writeFileSync(file, "");
     expect(isInteractivePiAgent(agent(file))).toBe(true);
   });
   test("does not isolate Pi agents without a session path", () => {

@@ -74,9 +74,12 @@ export class AgentStore {
         const canUsePaneFallback =
           paneMatch && (snapshot.terminalId === null || paneMatch.terminal_id === null);
         const generationMatches =
-          !incomingGeneration || !paneMatch?.pane_generation || incomingGeneration === paneMatch.pane_generation;
+          !incomingGeneration ||
+          !paneMatch?.pane_generation ||
+          incomingGeneration === paneMatch.pane_generation;
         return {
-          existing: terminalMatch ?? (generationMatches && canUsePaneFallback ? paneMatch : undefined),
+          existing:
+            terminalMatch ?? (generationMatches && canUsePaneFallback ? paneMatch : undefined),
           snapshot,
         };
       });

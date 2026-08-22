@@ -146,12 +146,14 @@ describe("orchestrator pane movement", () => {
     await expect(piA.waitForNotification("agent.event")).resolves.toMatchObject({
       params: { event: { id: destinationEvent.id } },
     });
-    expect(harness.agentEvents.nextDeliverableAfter({
-      afterEventId: targetAck.id,
-      herdrSessionName: "default",
-      ownerTerminalId: "term_a",
-      workspaceId: "wB",
-    })).toEqual(destinationEvent);
+    expect(
+      harness.agentEvents.nextDeliverableAfter({
+        afterEventId: targetAck.id,
+        herdrSessionName: "default",
+        ownerTerminalId: "term_a",
+        workspaceId: "wB",
+      }),
+    ).toEqual(destinationEvent);
     await expect(
       piA.request("agent.notifications.ack", { eventId: destinationEvent.id }),
     ).resolves.toMatchObject({ acknowledged: true, state: { ackedEventId: destinationEvent.id } });

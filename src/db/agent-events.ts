@@ -31,7 +31,6 @@ export function isDeliverableAgentEvent(
   );
 }
 
-
 type AgentEventRow = {
   agent_id: string | null;
   compact_history_json: string | null;
@@ -98,20 +97,26 @@ export class AgentEventStore {
     return this.get(Number(result.lastInsertRowid));
   }
 
-  invalidatePane(input: { herdrSessionName: string; paneId: string; paneGeneration?: string | null }): void {
+  invalidatePane(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+  }): void {
     this.#sqlite
       .prepare(
         `update agent_events set deliverable = 0
          where herdr_session_name = ? and pane_id = ?
            and (? is null or pane_generation = ? or pane_generation is null)`,
       )
-      .run(input.herdrSessionName, input.paneId, input.paneGeneration ?? null, input.paneGeneration ?? null);
+      .run(
+        input.herdrSessionName,
+        input.paneId,
+        input.paneGeneration ?? null,
+        input.paneGeneration ?? null,
+      );
   }
 
-  latestStatusTransition(
-    agentId: string,
-    herdrSessionName: string,
-  ): AgentEventRecord | undefined {
+  latestStatusTransition(agentId: string, herdrSessionName: string): AgentEventRecord | undefined {
     const row = this.#sqlite
       .prepare(
         `select * from agent_events
@@ -158,7 +163,12 @@ export class AgentEventStore {
                and agents.workspace_id = agent_events.workspace_id
                and agents.pane_id = agent_events.pane_id
            )`;
-    const params = [input.afterEventId, input.herdrSessionName, input.workspaceId, input.ownerTerminalId];
+    const params = [
+      input.afterEventId,
+      input.herdrSessionName,
+      input.workspaceId,
+      input.ownerTerminalId,
+    ];
     const rows = this.#sqlite
       .prepare(
         `select * from agent_events
@@ -171,7 +181,12 @@ export class AgentEventStore {
     const scope = { herdrSessionName: input.herdrSessionName, workspaceId: input.workspaceId };
     for (const row of rows) {
       const event = mapAgentEvent(row);
-      if (!input.getAgent || isDeliverableAgentEvent(event, input.getAgent(event.agentId!), scope, input.ownerTerminalId)) {
+      const agentId = event.agentId;
+      if (agentId === null) continue;
+      if (
+        !input.getAgent ||
+        isDeliverableAgentEvent(event, input.getAgent(agentId), scope, input.ownerTerminalId)
+      ) {
         return event;
       }
     }
@@ -206,7 +221,7 @@ export class AgentEventStore {
 }
 
 export function mapAgentEvent(row: AgentEventRow): AgentEventRecord {
-    return {
+  return {
     agentId: row.agent_id,
     compactHistory: parseJson<CompactAgentHistory>(row.compact_history_json),
     createdAt: new Date(row.created_at),

@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { describe, expect, test } from "vitest";
 import type { AgentEventWireRecord } from "../../packages/herdsman-pi/src/daemon-client.js";
 import {
   AGENT_UPDATE_EXCERPT_CHARS,
@@ -99,7 +99,9 @@ describe("Pi agent wake projection", () => {
       outcomes: [],
       rawEvents: [{ id: 21 }],
     });
-    expect(projector([event(22, "agent.done", { from: "working", to: "done" })]).outcomes).toHaveLength(1);
+    expect(
+      projector([event(22, "agent.done", { from: "working", to: "done" })]).outcomes,
+    ).toHaveLength(1);
   });
   test("formats the fixed policy before bounded agent evidence", () => {
     const outcomes = projectAgentOutcomes([

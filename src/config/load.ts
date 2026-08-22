@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { parseDocument } from "yaml";
-import { parseHerdsmanConfig, type HerdsmanConfig } from "./schema.js";
+import { type HerdsmanConfig, parseHerdsmanConfig } from "./schema.js";
 
 export type ConfigLoadError = {
   message: string;

@@ -183,8 +183,12 @@ export async function startDaemonProcess(input: {
     pidPath: input.pidPath,
     socketPath: input.socketPath,
   });
-  if (existing.state === "running") throw new Error(`Herdsman daemon is already running with pid ${existing.pid}`);
-  if (existing.state === "orphaned") throw new Error(`Herdsman daemon socket is reachable but its PID is stale: ${existing.socketPath}`);
+  if (existing.state === "running")
+    throw new Error(`Herdsman daemon is already running with pid ${existing.pid}`);
+  if (existing.state === "orphaned")
+    throw new Error(
+      `Herdsman daemon socket is reachable but its PID is stale: ${existing.socketPath}`,
+    );
   if (existing.stalePid !== undefined) rmSync(input.pidPath, { force: true });
   let pidFd: number;
   try {
@@ -220,11 +224,13 @@ export async function startDaemonProcess(input: {
     child.unref();
     writeFileSync(input.pidPath, `${child.pid}\n`, { mode: 0o600 });
     try {
-      const waitMs = input.deps?.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+      const waitMs =
+        input.deps?.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
       const connectSocket = input.deps?.readinessProbe ?? defaultConnectSocket;
       const deadline = Date.now() + (input.deps?.readinessTimeoutMs ?? 10_000);
       while (Date.now() < deadline && !(await connectSocket(input.socketPath))) await waitMs(50);
-      if (!(await connectSocket(input.socketPath))) throw new Error("Timed out waiting for Herdsman daemon socket");
+      if (!(await connectSocket(input.socketPath)))
+        throw new Error("Timed out waiting for Herdsman daemon socket");
     } catch (error) {
       const killProcess = input.deps?.killProcess ?? ((pid, signal) => process.kill(pid, signal));
       killProcess(child.pid, "SIGTERM");
@@ -270,23 +276,25 @@ export async function stopDaemonProcess(input: {
   const killProcess = deps.killProcess ?? ((pid, signal) => process.kill(pid, signal));
   const processIsRunning = deps.isProcessRunning ?? isProcessRunning;
   const waitMs = deps.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+  const pid = status.pid;
+  if (pid === undefined) throw new Error("Herdsman daemon status is missing a PID");
 
-  killProcess(status.pid!, "SIGTERM");
+  killProcess(pid, "SIGTERM");
   const deadline = Date.now() + input.timeoutMs;
   while (Date.now() < deadline) {
-    if (!processIsRunning(status.pid!)) {
+    if (!processIsRunning(pid)) {
       rmSync(input.pidPath, { force: true });
-      return { alreadyStopped: false, pid: status.pid! };
+      return { alreadyStopped: false, pid };
     }
     await waitMs(50);
   }
 
-  killProcess(status.pid!, "SIGKILL");
+  killProcess(pid, "SIGKILL");
   const killDeadline = Date.now() + input.timeoutMs;
-  while (Date.now() < killDeadline && processIsRunning(status.pid!)) await waitMs(50);
-  if (!processIsRunning(status.pid!)) {
+  while (Date.now() < killDeadline && processIsRunning(pid)) await waitMs(50);
+  if (!processIsRunning(pid)) {
     rmSync(input.pidPath, { force: true });
-    return { alreadyStopped: false, pid: status.pid! };
+    return { alreadyStopped: false, pid };
   }
   throw new Error(`Timed out waiting for Herdsman daemon pid ${status.pid} to stop after SIGKILL`);
 }

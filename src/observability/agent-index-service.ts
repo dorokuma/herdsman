@@ -1,7 +1,7 @@
-import type { AgentEventStore } from "@/db/agent-events.js";
 import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
-import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
+import type { AgentEventStore } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
+import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { AgentStore, HerdrAgentLike } from "@/db/agents.js";
 import type { HerdrSessionStore } from "@/db/herdr-sessions.js";
 import type { HerdrWorkspaceStore } from "@/db/herdr-workspaces.js";
@@ -269,7 +269,8 @@ export class AgentIndexService {
       const scopes = new Map<string, AgentScope>();
       for (const agent of retired) {
         const scope = scopeOf(agent);
-        const terminalId = stringValue(event.terminal_id) ?? stringValue(event.terminalId) ?? agent.terminalId;
+        const terminalId =
+          stringValue(event.terminal_id) ?? stringValue(event.terminalId) ?? agent.terminalId;
         if (terminalId && this.#stores.agentOrchestratorScopes) {
           const change = this.#stores.agentOrchestratorScopes.releaseIfOwner({
             ...scope,
@@ -405,12 +406,12 @@ export class AgentIndexService {
       compactHistory: input.compactHistory,
       herdrSessionName: input.agent.herdrSessionName,
       idempotencyKey: idempotencyKey(
-          "agent.status.changed",
-          input.agent,
-          input.from,
-          input.to,
-          `${observationId}:${input.herdrEventKey ?? "legacy"}:agent.status.changed`,
-        ),
+        "agent.status.changed",
+        input.agent,
+        input.from,
+        input.to,
+        `${observationId}:${input.herdrEventKey ?? "legacy"}:agent.status.changed`,
+      ),
       paneId: input.agent.paneId,
       paneGeneration: input.agent.paneGeneration ?? null,
       payload: payload(input.agent, input.from, input.to),
@@ -554,12 +555,12 @@ function herdrInputIdempotencyKey(
   event: Record<string, unknown>,
   targetStatus: AgentStatus,
 ): string {
-  const eventId = stringValue(event.id) ?? stringValue(event.event_id) ?? stringValue(event.eventId);
+  const eventId =
+    stringValue(event.id) ?? stringValue(event.event_id) ?? stringValue(event.eventId);
   if (eventId) return `${sessionName}:${paneId}:${String(event.type)}:${eventId}`;
   const revision = integerValue(event.revision) ?? integerValue(event.pane_revision) ?? "unknown";
   return `${sessionName}:${paneId}:${revision}:${targetStatus}`;
 }
-
 
 function statusTransitionMatches(
   event: AgentEventRecord,

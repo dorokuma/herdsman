@@ -1,4 +1,4 @@
-import { AgentEventStore, isDeliverableAgentEvent } from "@/db/agent-events.js";
+import { type AgentEventStore, isDeliverableAgentEvent } from "@/db/agent-events.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { AgentStore } from "@/db/agents.js";
 import type {
@@ -33,7 +33,9 @@ export class AgentOrchestratorService {
     return this.#scopes.get(scope);
   }
 
-  claim(input: AgentScope & { paneId: string; terminalId: string; ownerConnected?: boolean }): AgentOrchestratorChange {
+  claim(
+    input: AgentScope & { paneId: string; terminalId: string; ownerConnected?: boolean },
+  ): AgentOrchestratorChange {
     const change = this.#scopes.claim({ ...input, ackedEventId: this.#claimCursor(input) });
     return { ...change, reason: "claimed" };
   }

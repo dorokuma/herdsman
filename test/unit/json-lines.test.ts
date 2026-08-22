@@ -1,5 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { encodeJsonLine, JsonLineDecoder, JsonLineFrameTooLargeError } from "@/shared/json-lines.js";
+import {
+  encodeJsonLine,
+  JsonLineDecoder,
+  JsonLineFrameTooLargeError,
+} from "@/shared/json-lines.js";
 
 describe("JSON Lines framing", () => {
   test("encodes one JSON value per newline-delimited frame", () => {
@@ -27,7 +31,7 @@ describe("JSON Lines framing", () => {
   test("parses a frame just below the default 1 MiB limit", () => {
     const decoder = new JsonLineDecoder();
     const value = "a".repeat(1024 * 1024 - 20);
-    expect(decoder.push(JSON.stringify(value) + "\n")).toEqual([value]);
+    expect(decoder.push(`${JSON.stringify(value)}\n`)).toEqual([value]);
   });
 
   test("rejects a frame that exceeds the limit across chunks", () => {

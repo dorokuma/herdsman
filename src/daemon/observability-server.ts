@@ -33,8 +33,11 @@ import {
   agentOrchestratorSetInputSchema,
   agentReadInputSchema,
 } from "@/observability/schemas.js";
-import { encodeJsonLine, JsonLineDecoder, JsonLineFrameTooLargeError } from "@/shared/json-lines.js";
-import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
+import {
+  encodeJsonLine,
+  JsonLineDecoder,
+  JsonLineFrameTooLargeError,
+} from "@/shared/json-lines.js";
 
 export const DISCONNECT_GRACE_MS = 5_000;
 export const STARTUP_RECONNECT_GRACE_MS = 10_000;
@@ -183,9 +186,7 @@ export class ObservabilityRpcServer {
 
   publishAgentEvent(event: AgentEventRecord): void {
     if (!event.workspaceId || !event.terminalId || !event.agentId) return;
-    // Pi is an interactive observer. Its routine idle/status transitions are
-    // persisted for history, but never routed as worker wake events.
-    const agent = this.#stores.agents.get(event.agentId);
+    // Status changes are persisted for history but never routed as worker wake events.
     if (event.type === "agent.status.changed") return;
     const scope = { herdrSessionName: event.herdrSessionName, workspaceId: event.workspaceId };
     const owner = this.#orchestrator.status(scope)?.owner;

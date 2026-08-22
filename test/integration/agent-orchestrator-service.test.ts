@@ -137,7 +137,9 @@ describe("AgentOrchestratorService", () => {
     expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
       expect.objectContaining({ id: workerEvent.id }),
     ]);
-    expect(service.ack({ ...scope, eventId: workerEvent.id, terminalId: "term_owner" })).toMatchObject({
+    expect(
+      service.ack({ ...scope, eventId: workerEvent.id, terminalId: "term_owner" }),
+    ).toMatchObject({
       ackedEventId: workerEvent.id,
     });
   });
@@ -145,7 +147,11 @@ describe("AgentOrchestratorService", () => {
   test("does not filter non-Pi agent idle events", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
-    const event = appendEvent(harness, { agent: "codex", terminalId: "term_other", type: "agent.idle" });
+    const event = appendEvent(harness, {
+      agent: "codex",
+      terminalId: "term_other",
+      type: "agent.idle",
+    });
     expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
       expect.objectContaining({ id: event.id }),
     ]);
