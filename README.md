@@ -21,7 +21,7 @@ Herdsman currently supports session history from Claude Code, Codex, Gemini CLI,
 
 ## Requirements
 
-- Node.js >= 24.18.0
+- Node.js >= 22.12.0
 - Herdr >= 0.7.0
 - Pi >= 0.80.6 when using `herdsman-pi`
 
@@ -37,7 +37,7 @@ herdsman help
 Source builds also require pnpm >= 11.9.0.
 
 ```bash
-git clone https://github.com/ryonakae/herdsman.git
+git clone https://github.com/dorokuma/herdsman.git
 cd herdsman
 pnpm install
 pnpm build
@@ -83,7 +83,7 @@ herdsman agent read wB:p2 --workspace wB --limit 20 --json
 Install the Herdsman CLI and start its daemon before adding the Agent Skill. Then add the Herdsman instructions to supported coding agents:
 
 ```bash
-npx skills add ryonakae/herdsman --skill herdsman -g
+npx skills add dorokuma/herdsman --skill herdsman -g
 ```
 
 The Herdsman skill reads structured agent status, compact history, and recent tool results. Use it alone for agent inspection.
@@ -115,7 +115,7 @@ Use `/herdsman` or `/herdsman status` to inspect the current Pi, and `/herdsman 
 Install the optional plugin from the GitHub release tag:
 
 ```bash
-herdr plugin install ryonakae/herdsman/packages/herdsman-herdr-plugin --ref v0.4.0 --yes
+herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.6.0 --yes
 ```
 
 The plugin connects to the Herdsman daemon and shows compact agent rows for the current Herdr workspace, including separate live-name and runtime-kind columns plus cached history excerpts. Herdr installs it from the repository subdirectory; it is not published to npm or required for the CLI and Pi extension.

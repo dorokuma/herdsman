@@ -44,7 +44,7 @@ describe("npm publication metadata", () => {
     expect(root.scripts?.check).toContain("pnpm package:check");
 
     expect(pi.name).toBe("@dorokuma/herdsman-pi");
-    expect(pi.files).toEqual(["src"]);
+    expect(pi.files).toEqual(["src", "../LICENSE"]);
     expect(pi.publishConfig?.access).toBe("public");
     expect(pi.repository).toEqual({
       type: "git",
@@ -52,7 +52,7 @@ describe("npm publication metadata", () => {
       directory: "packages/herdsman-pi",
     });
 
-    expect(herdr.private).not.toBe(true);
+    expect(herdr.private).toBe(true);
     expect(pluginVersion).toBeDefined();
     expect(new Set([root.version, pi.version, herdr.version, pluginVersion])).toEqual(
       new Set([root.version]),

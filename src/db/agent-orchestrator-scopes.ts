@@ -7,6 +7,7 @@ export type ClaimOrchestratorInput = AgentOrchestratorScopeKey & {
   ackedEventId: number;
   paneId: string;
   terminalId: string;
+  ownerConnected?: boolean;
 };
 
 type ScopeRow = {
@@ -114,7 +115,7 @@ export class AgentOrchestratorScopeStore {
         ackedEventId: input.targetAckedEventId,
         paneId: input.paneId,
         terminalId: input.terminalId,
-      });
+      }, true);
       return [{ current: sourceCurrent, previous: sourcePrevious }, target];
     });
   }
@@ -141,7 +142,7 @@ export class AgentOrchestratorScopeStore {
     });
   }
 
-  #claim(input: ClaimOrchestratorInput): ScopeChange {
+  #claim(input: ClaimOrchestratorInput, allowOwnerReplacement = false): ScopeChange {
     const row = this.#getRow(input);
     const now = Date.now();
     if (!row) {
@@ -165,6 +166,14 @@ export class AgentOrchestratorScopeStore {
       return { current, previous: { ...current, owner: null } };
     }
     const previous = mapScope(row);
+    if (
+      !allowOwnerReplacement &&
+      row.owner_terminal_id !== null &&
+      row.owner_terminal_id !== input.terminalId &&
+      input.ownerConnected === true
+    ) {
+      throw new Error("ORCHESTRATOR_SCOPE_ALREADY_CLAIMED: scope is owned by another terminal");
+    }
     this.#sqlite
       .prepare(
         `update agent_orchestrator_scopes

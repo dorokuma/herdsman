@@ -5,7 +5,9 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection } from "node:net";
@@ -51,10 +53,12 @@ type DaemonSpawnProcess = (
 
 export type DaemonProcessDependencies = {
   connectSocket?: (socketPath: string) => Promise<boolean>;
+  readinessProbe?: (socketPath: string) => Promise<boolean>;
   isProcessRunning?: (pid: number) => boolean;
   killProcess?: (pid: number, signal: NodeJS.Signals) => void;
   spawnProcess?: DaemonSpawnProcess;
   waitMs?: (ms: number) => Promise<void>;
+  readinessTimeoutMs?: number;
 };
 
 export function readDaemonRuntimeRecord(path: string): DaemonRuntimeRecord | undefined {
@@ -164,55 +168,73 @@ export async function startDaemonProcess(input: {
   runtimeRecordPath: string;
   socketPath: string;
 }): Promise<{ pid: number }> {
-  const status = await getDaemonStatus({
+  mkdirSync(dirname(input.pidPath), { mode: 0o700, recursive: true });
+  mkdirSync(dirname(input.logPath), { mode: 0o700, recursive: true });
+  const existing = await getDaemonStatus({
     ...(input.deps !== undefined ? { deps: input.deps } : {}),
     pidPath: input.pidPath,
     socketPath: input.socketPath,
   });
-  if (status.state === "running") {
-    throw new Error(`Herdsman daemon is already running with pid ${status.pid}`);
-  }
-  if (status.state === "orphaned") {
-    throw new Error(
-      `Herdsman daemon socket is reachable but its PID is stale: ${status.socketPath}`,
-    );
-  }
-
-  mkdirSync(dirname(input.pidPath), { mode: 0o700, recursive: true });
-  mkdirSync(dirname(input.logPath), { mode: 0o700, recursive: true });
-  if (status.state === "stopped" && status.stalePid !== undefined) {
-    rmSync(input.pidPath, { force: true });
-  }
-
-  const logFd = openSync(input.logPath, "a", 0o600);
-  let child: { pid: number | undefined; unref(): void };
+  if (existing.state === "running") throw new Error(`Herdsman daemon is already running with pid ${existing.pid}`);
+  if (existing.state === "orphaned") throw new Error(`Herdsman daemon socket is reachable but its PID is stale: ${existing.socketPath}`);
+  if (existing.stalePid !== undefined) rmSync(input.pidPath, { force: true });
+  let pidFd: number;
   try {
-    child = (input.deps?.spawnProcess ?? spawnDaemonProcess)(
-      input.nodePath,
-      [input.entrypointPath],
-      {
-        detached: true,
-        env: input.env,
-        stdio: ["ignore", logFd, logFd],
-      },
-    );
+    pidFd = openSync(input.pidPath, "wx", 0o600);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`Herdsman daemon is already running: ${input.pidPath}`);
+    }
+    throw error;
+  }
+  try {
+    await prepareDaemonSocketPath({
+      ...(input.deps !== undefined ? { deps: input.deps } : {}),
+      socketPath: input.socketPath,
+    });
+    const logFd = openRotatedLog(input.logPath);
+    let child: { pid: number | undefined; unref(): void };
+    try {
+      child = (input.deps?.spawnProcess ?? spawnDaemonProcess)(
+        input.nodePath,
+        [input.entrypointPath],
+        {
+          detached: true,
+          env: input.env,
+          stdio: ["ignore", logFd, logFd],
+        },
+      );
+    } finally {
+      closeSync(logFd);
+    }
+
+    if (!child.pid) throw new Error("Failed to start Herdsman daemon: child pid was not assigned");
+    child.unref();
+    writeFileSync(input.pidPath, `${child.pid}\n`, { mode: 0o600 });
+    try {
+      const waitMs = input.deps?.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
+      const connectSocket = input.deps?.readinessProbe ?? defaultConnectSocket;
+      const deadline = Date.now() + (input.deps?.readinessTimeoutMs ?? 10_000);
+      while (Date.now() < deadline && !(await connectSocket(input.socketPath))) await waitMs(50);
+      if (!(await connectSocket(input.socketPath))) throw new Error("Timed out waiting for Herdsman daemon socket");
+    } catch (error) {
+      const killProcess = input.deps?.killProcess ?? ((pid, signal) => process.kill(pid, signal));
+      killProcess(child.pid, "SIGTERM");
+      throw error;
+    }
+    writeDaemonRuntimeRecord(input.runtimeRecordPath, {
+      ...input.runtimeRecord,
+      pid: child.pid,
+      startedAt: new Date().toISOString(),
+      version: 1,
+    });
+    return { pid: child.pid };
+  } catch (error) {
+    rmSync(input.pidPath, { force: true });
+    throw error;
   } finally {
-    closeSync(logFd);
+    closeSync(pidFd);
   }
-
-  if (!child.pid) {
-    throw new Error("Failed to start Herdsman daemon: child pid was not assigned");
-  }
-
-  child.unref();
-  writeFileSync(input.pidPath, `${child.pid}\n`, { mode: 0o600 });
-  writeDaemonRuntimeRecord(input.runtimeRecordPath, {
-    ...input.runtimeRecord,
-    pid: child.pid,
-    startedAt: new Date().toISOString(),
-    version: 1,
-  });
-  return { pid: child.pid };
 }
 
 export async function stopDaemonProcess(input: {
@@ -251,9 +273,24 @@ export async function stopDaemonProcess(input: {
     await waitMs(50);
   }
 
-  throw new Error(`Timed out waiting for Herdsman daemon pid ${status.pid} to stop`);
+  killProcess(status.pid, "SIGKILL");
+  const killDeadline = Date.now() + input.timeoutMs;
+  while (Date.now() < killDeadline && processIsRunning(status.pid)) await waitMs(50);
+  if (!processIsRunning(status.pid)) {
+    rmSync(input.pidPath, { force: true });
+    return { alreadyStopped: false, pid: status.pid };
+  }
+  throw new Error(`Timed out waiting for Herdsman daemon pid ${status.pid} to stop after SIGKILL`);
 }
 
+function openRotatedLog(path: string): number {
+  try {
+    if (statSync(path).size > 10 * 1024 * 1024) renameSync(path, `${path}.1`);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+  }
+  return openSync(path, "a", 0o600);
+}
 function spawnDaemonProcess(
   command: string,
   args: string[],

@@ -23,7 +23,7 @@ git fetch origin main
 test "$(git branch --show-current)" = "main"
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
-test "$(npm whoami)" = "ryonakae"
+test "$(npm whoami)" = "dorokuma"
 npm profile get --json | node -e '
 let input = "";
 process.stdin.on("data", (chunk) => (input += chunk));
@@ -106,8 +106,8 @@ npm pack --pack-destination "$RELEASE_TMP"
 )
 
 EXPECTED_TARBALLS="$(printf '%s\n' \
-  "ryonakae-herdsman-$VERSION.tgz" \
-  "ryonakae-herdsman-pi-$VERSION.tgz")"
+  "dorokuma-herdsman-$VERSION.tgz" \
+  "dorokuma-herdsman-pi-$VERSION.tgz")"
 ACTUAL_TARBALLS="$(find "$RELEASE_TMP" -maxdepth 1 -type f -name '*.tgz' \
   -exec basename {} \; | sort)"
 test "$ACTUAL_TARBALLS" = "$EXPECTED_TARBALLS"
@@ -117,11 +117,11 @@ Install both tarballs in isolated prefixes:
 
 ```bash
 npm install --global --prefix "$RELEASE_TMP/root-prefix" \
-  "$RELEASE_TMP/ryonakae-herdsman-$VERSION.tgz"
+  "$RELEASE_TMP/dorokuma-herdsman-$VERSION.tgz"
 "$RELEASE_TMP/root-prefix/bin/herdsman" help
 
 npm install --prefix "$RELEASE_TMP/pi-prefix" --ignore-scripts \
-  "$RELEASE_TMP/ryonakae-herdsman-pi-$VERSION.tgz"
+  "$RELEASE_TMP/dorokuma-herdsman-pi-$VERSION.tgz"
 test -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts"
 test ! -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/tsconfig.json"
 ```
@@ -215,7 +215,7 @@ Verify every external artifact:
 npm view "@dorokuma/herdsman@$VERSION" version
 npm view "@dorokuma/herdsman-pi@$VERSION" version
 gh release view "$TAG" --json tagName,name,isDraft,isPrerelease,url,publishedAt
-gh api repos/ryonakae/herdsman/releases/latest --jq .tag_name
+gh api repos/dorokuma/herdsman/releases/latest --jq .tag_name
 git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
 test -z "$(git status --porcelain)"
 ```

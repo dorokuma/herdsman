@@ -33,7 +33,7 @@ export class AgentOrchestratorService {
     return this.#scopes.get(scope);
   }
 
-  claim(input: AgentScope & { paneId: string; terminalId: string }): AgentOrchestratorChange {
+  claim(input: AgentScope & { paneId: string; terminalId: string; ownerConnected?: boolean }): AgentOrchestratorChange {
     const change = this.#scopes.claim({ ...input, ackedEventId: this.#claimCursor(input) });
     return { ...change, reason: "claimed" };
   }

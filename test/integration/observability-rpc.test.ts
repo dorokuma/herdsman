@@ -316,53 +316,35 @@ describe("ObservabilityRpcServer", () => {
     await tick();
     expect(piA.notifications).toEqual([]);
 
+    const replacementError = await piB
+      .request("agent.orchestrator.set", { enabled: true })
+      .catch((error: unknown) => error);
+    expect(replacementError).toBeInstanceOf(Error);
+    expect((replacementError as Error).message).toContain(
+      "ORCHESTRATOR_SCOPE_ALREADY_CLAIMED",
+    );
+
+    piA.close();
+    await new Promise((resolve) => setTimeout(resolve, 75));
     const replacement = await piB.request("agent.orchestrator.set", { enabled: true });
     expect(replacement).toMatchObject({
       changed: true,
       events: [expect.objectContaining({ id: self.id })],
       state: { owner: { terminalId: "term_b" } },
     });
-    await Promise.all([
-      piA.waitForNotification("agent.orchestrator.changed"),
-      piB.waitForNotification("agent.orchestrator.changed"),
-    ]);
+    await piB.waitForNotification("agent.orchestrator.changed");
 
-    await expect(piA.request("agent.notifications.ack", { eventId: self.id })).rejects.toThrow(
-      "Only the current orchestrator",
-    );
     await expect(
       piB.request("agent.notifications.ack", { eventId: agentEvent.id }),
     ).resolves.toMatchObject({
       acknowledged: true,
       state: { ackedEventId: agentEvent.id },
     });
-    await expect(
-      piB.request("agent.notifications.ack", { eventId: self.id }),
-    ).resolves.toMatchObject({
-      acknowledged: true,
-      state: { ackedEventId: self.id },
-    });
-    await expect(piA.request("agent.orchestrator.set", { enabled: false })).resolves.toMatchObject({
-      changed: false,
-      state: { owner: { terminalId: "term_b" } },
-    });
     await expect(piB.request("agent.orchestrator.set", { enabled: false })).resolves.toMatchObject({
       changed: true,
       state: { owner: null },
     });
-    await Promise.all([
-      piA.waitForNotification("agent.orchestrator.changed"),
-      piB.waitForNotification("agent.orchestrator.changed"),
-    ]);
 
-    const ownerless = appendRoutedEvent(harness, "term_b", "wB");
-    await expect(piA.request("agent.orchestrator.set", { enabled: true })).resolves.toMatchObject({
-      changed: true,
-      events: [],
-      state: { ackedEventId: ownerless.id, owner: { terminalId: "term_a" } },
-    });
-
-    piA.close();
     piB.close();
     piC.close();
     generic.close();

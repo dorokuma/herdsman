@@ -228,6 +228,7 @@ describe("daemon process manager", () => {
 
     const result = await startDaemonProcess({
       deps: {
+        readinessProbe: async () => true,
         spawnProcess: (command, args, options) => {
           spawned.push({ args, command, options });
           return { pid: 5678, unref() {} };

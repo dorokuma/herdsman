@@ -1,4 +1,4 @@
-import { existsSync, unlinkSync } from "node:fs";
+import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { Value } from "@sinclair/typebox/value";
 import type { AgentHistoryService } from "@/agent-history/service.js";
@@ -33,7 +33,7 @@ import {
   agentOrchestratorSetInputSchema,
   agentReadInputSchema,
 } from "@/observability/schemas.js";
-import { encodeJsonLine, JsonLineDecoder } from "@/shared/json-lines.js";
+import { encodeJsonLine, JsonLineDecoder, JsonLineFrameTooLargeError } from "@/shared/json-lines.js";
 import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
 
 export const DISCONNECT_GRACE_MS = 5_000;
@@ -140,6 +140,7 @@ export class ObservabilityRpcServer {
     await new Promise<void>((resolve, reject) => {
       this.#server.once("error", reject);
       this.#server.listen(this.#socketPath, () => {
+        chmodSync(this.#socketPath, 0o600);
         this.#server.off("error", reject);
         resolve();
       });
@@ -254,8 +255,15 @@ export class ObservabilityRpcServer {
     this.#connectionOrderBySocket.set(socket, this.#connectionSequence);
     const decoder = new JsonLineDecoder();
     socket.on("data", (chunk) => {
-      for (const message of decoder.push(chunk.toString("utf8"))) {
-        void this.#handleRequest(socket, message as RpcRequest);
+      try {
+        for (const message of decoder.push(chunk.toString("utf8"))) {
+          void this.#handleRequest(socket, message as RpcRequest);
+        }
+      } catch (error) {
+        if (error instanceof JsonLineFrameTooLargeError) {
+          console.warn(`Closing observability connection: ${error.message}`);
+        }
+        socket.destroy();
       }
     });
     socket.on("close", () => this.#handleSocketClose(socket));
@@ -337,7 +345,11 @@ export class ObservabilityRpcServer {
         const enabled = (params as { enabled: boolean }).enabled;
         let changed = false;
         if (enabled) {
-          const change = this.#orchestrator.claim(presence);
+          const current = this.#orchestrator.status(presence);
+          const ownerConnected = current?.owner
+            ? this.#hasTerminalPresence({ ...presence, terminalId: current.owner.terminalId })
+            : false;
+          const change = this.#orchestrator.claim({ ...presence, ownerConnected });
           changed = !sameOwner(change.current.owner, change.previous.owner);
           if (changed) this.#publishOrchestratorChange(toWireChange(change));
         } else {

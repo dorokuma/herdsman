@@ -30,7 +30,7 @@ herdsman help
 ソースからbuildする場合はpnpm >= 11.9.0も必要です。
 
 ```bash
-git clone https://github.com/ryonakae/herdsman.git
+git clone https://github.com/dorokuma/herdsman.git
 cd herdsman
 pnpm install
 pnpm build
@@ -76,7 +76,7 @@ herdsman agent read wB:p2 --workspace wB --limit 20 --json
 Agent Skill を追加する前に、Herdsman CLI をインストールして daemon を起動します。次のコマンドで、対応する coding agent に Herdsman の手順を追加します。
 
 ```bash
-npx skills add ryonakae/herdsman --skill herdsman -g
+npx skills add dorokuma/herdsman --skill herdsman -g
 ```
 
 Herdsman skill は agent の status、compact history、直近の tool result を構造化データとして読み取ります。agent の確認だけなら、Herdsman skill を単独で使えます。
@@ -108,7 +108,7 @@ agentが完了またはblockedになると、visibleなHerdsman turnを1回開�
 任意のpluginはGitHub Releaseのtagからインストールします。
 
 ```bash
-herdr plugin install ryonakae/herdsman/packages/herdsman-herdr-plugin --ref v0.4.0 --yes
+herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.6.0 --yes
 ```
 
 plugin は Herdsman daemon に接続し、current Herdr workspace の compact agent row を Herdr UI に表示します。row には live name と runtime kind の column、cached history の抜粋が含まれます。Herdrはrepository subdirectoryからpluginをインストールします。npmには公開せず、CLIとPi extensionだけを使う場合は不要です。
