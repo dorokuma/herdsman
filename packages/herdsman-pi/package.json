@@ -1,6 +1,6 @@
 {
   "name": "@dorokuma/herdsman-pi",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "description": "Pi extension bridge for Herdsman agent history. Forked from @ryonakae/shepherd.",
   "type": "module",
   "keywords": [

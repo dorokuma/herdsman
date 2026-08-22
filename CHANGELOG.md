@@ -1,3 +1,9 @@
+## 0.6.3
+
+- History ownership: Pi fallback discovery now scans dispatched role session roots, requires an exact cwd match, and skips session files already owned by another agent, so a worker pane can no longer be attributed the orchestrator's own transcript (f47e9c1).
+- Late session refs are treated as an identity change, replacing snapshots that were built from a fallback guess (f47e9c1).
+- Closed panes disappear from injected context immediately: the pinned snapshot is intersected with the newest one by pane identity, with agent reuse detected via agent id (f47e9c1, 31045b4).
+
 ## 0.6.2
 
 - Acknowledgement: allow the orchestrator cursor to advance past events that became undeliverable after delivery (for example when a worker pane is retired), instead of rejecting the ack and freezing the cursor. Skipping ahead of still-deliverable events is still refused, and sealed events remain unacknowledgeable (9007766).
