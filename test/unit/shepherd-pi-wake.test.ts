@@ -134,6 +134,11 @@ describe("Pi agent wake projection", () => {
     expect(formatAgentOutcomeUpdates([injected])).not.toContain("[SYSTEM]");
   });
 
+  test("does not produce a wake outcome for context-only/status evidence", () => {
+    const contextOnly = event(23, "agent.status.changed", { from: "working", to: "done" });
+    expect(projectAgentOutcomes([contextOnly]).outcomes).toEqual([]);
+  });
+
   test("does not truncate a 1,999-character normalized excerpt", () => {
     const [outcome] = projectAgentOutcomes([
       event(13, "agent.done", {}, { text: "a".repeat(1_999) }),

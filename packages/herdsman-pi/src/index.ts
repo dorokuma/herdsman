@@ -16,7 +16,6 @@ import {
 } from "./agent-update-ui.js";
 import {
   projectAgentOutcomes,
-  createAgentOutcomeProjector,
   formatAgentOutcomeUpdates,
   WAKE_SETTLE_MS,
 } from "./wake.js";
@@ -162,8 +161,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
   return function herdsmanPiExtension(pi: PiApi): void {
     pi.registerMessageRenderer?.("herdsman-wake", renderAgentUpdateMessage);
 
-    const projector = createAgentOutcomeProjector();
-
     const state: HerdsmanState = {
       client: undefined,
       connected: false,
@@ -301,18 +298,20 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             return;
           }
 
-          const current = projectAgentOutcomes(state.pendingEvents).outcomes.filter(
+          const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
+          const batchOutcomes = projectAgentOutcomes(batchEvents).outcomes.filter(
             (outcome) => outcome.eventId > state.failedWakeThroughEventId,
           );
-          if (current.length === 0) {
+          if (batchOutcomes.length === 0) {
             state.wakeTimer = undefined;
             return;
           }
-          const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
-          const batchOutcomes = projector(batchEvents).outcomes;
+          const current = batchOutcomes;
           state.deliveredBatch = {
             assistantFinalSucceeded: false,
-            events: batchEvents,
+            events: batchEvents.filter((event) =>
+              batchOutcomes.some((outcome) => outcome.eventId === event.id),
+            ),
             invalidated: false,
             ownerTerminalId,
             herdsmanTriggered: true,
