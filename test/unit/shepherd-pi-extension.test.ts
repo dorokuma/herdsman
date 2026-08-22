@@ -2004,3 +2004,63 @@ function restoreEnv(previous: Record<string, string | undefined>) {
 async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
 }
+
+describe("herdsman-pi context intersection regressions (independent coverage)", () => {
+  test("新快照缺少某 pane 时注入内容移除该 pane，仍存在的 pane 保留", async () => {
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx();
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    const paneA = {
+      agent: "claude",
+      agentStatus: "idle",
+      history: { lastAssistantMessage: { text: "keep-pane" } },
+      paneId: "wB:p-agent",
+      terminalId: "term_agent",
+    };
+    const paneB = {
+      agent: "codex",
+      agentStatus: "idle",
+      history: { lastAssistantMessage: { text: "drop-pane" } },
+      paneId: "wB:p-other",
+      terminalId: "term_other",
+    };
+    const first = {
+      agents: [paneA, paneB],
+      herdrSessionName: "default",
+      updatedAt: "2026-07-16T00:00:00.000Z",
+      workspaceId: "wB",
+    };
+    const second = {
+      agents: [paneA],
+      herdrSessionName: "default",
+      updatedAt: "2026-07-16T00:00:01.000Z",
+      workspaceId: "wB",
+    };
+    client.response = (method) =>
+      method === "agent.orchestrator.register" ? connectionResponse({ context: first }) : {};
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
+    const previous = withHerdrEnv();
+    try {
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+      await pi.emit("agent_start", {}, ctx);
+      const before = await pi.emitContext([], ctx);
+      expect(before).toEqual([
+        expect.objectContaining({ content: expect.stringContaining("keep-pane") }),
+      ]);
+      expect((before[0] as { content: string }).content).toContain("drop-pane");
+      client.emitStream({
+        method: "agent.context.changed",
+        params: { context: second, herdrSessionName: "default", workspaceId: "wB" },
+      });
+      const after = await pi.emitContext([], ctx);
+      expect(after).toEqual([
+        expect.objectContaining({ content: expect.stringContaining("keep-pane") }),
+      ]);
+      expect((after[0] as { content: string }).content).not.toContain("drop-pane");
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+});

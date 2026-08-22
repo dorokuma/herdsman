@@ -503,3 +503,51 @@ function snapshot(agents: Record<string, unknown>[], panes: Record<string, unkno
     },
   };
 }
+
+describe("AgentIndexService identity regressions (independent coverage)", () => {
+  test("agentSession 由空变为存在时 identityChanged 为真并强制 discovery", async () => {
+    const harness = openObservabilityDbHarness();
+    const calls: Array<{ forceDiscovery?: boolean }> = [];
+    let current = oneAgent("working", 10, "pi");
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return current;
+        },
+      }),
+      history: {
+        async resolveCompactHistory(
+          _agent: Parameters<AgentHistoryService["resolveCompactHistory"]>[0],
+          options: Parameters<AgentHistoryService["resolveCompactHistory"]>[1],
+        ) {
+          calls.push(options ?? {});
+          return {
+            compactHistory: { ...emptyCompactHistory("pi-jsonl"), lastAssistantMessage: null },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    calls.length = 0;
+    current = snapshot(
+      [
+        agent({
+          agent: "pi",
+          agent_session: { agent: "pi", kind: "id", source: "herdr:pi", value: "role-session-1" },
+          pane_id: "wJ:p2",
+          revision: undefined,
+          terminal_id: "term_claude",
+          workspace_id: "wJ",
+        }),
+      ],
+      [{ pane_id: "wJ:p2", revision: 11 }],
+    );
+    await index.refreshHerdrSession(sessionInput());
+    expect(calls).toEqual([{ forceDiscovery: true }]);
+    harness.sqlite.close();
+  });
+});

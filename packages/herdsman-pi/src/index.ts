@@ -525,10 +525,16 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.currentScope.workspaceId === message.params.workspaceId
         ) {
           const next = message.params.context ?? undefined;
-          const currentIds = new Set(next?.agents.map((agent) => agent.id) ?? []);
           const retain = (snapshot: AgentWorkspaceContextSnapshot | undefined) =>
             snapshot
-              ? { ...snapshot, agents: snapshot.agents.filter((agent) => currentIds.has(agent.id)) }
+              ? {
+                  ...snapshot,
+                  agents: snapshot.agents.filter((agent) => {
+                    const nextAgent = next?.agents.find((candidate) => candidate.paneId === agent.paneId);
+                    if (!nextAgent) return false;
+                    return !agent.id || !nextAgent.id || agent.id === nextAgent.id;
+                  }),
+                }
               : undefined;
           state.latestContext = next;
           state.pinnedContext = retain(state.pinnedContext);
