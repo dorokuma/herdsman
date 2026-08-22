@@ -26,7 +26,8 @@ function appendEvent(
   input: {
     agent?: string;
     terminalId: string;
-    type?: "agent.done" | "agent.idle";
+    type?: "agent.done" | "agent.idle" | "agent.status.changed";
+    sessionPath?: string;
     workspaceId?: string;
   },
 ) {
@@ -54,6 +55,16 @@ function appendEvent(
           pane_id: paneId,
           terminal_id: input.terminalId,
           workspace_id: workspaceId,
+          ...(input.sessionPath
+            ? {
+                agent_session: {
+                  agent: input.agent ?? "codex",
+                  kind: "path",
+                  source: "test",
+                  value: input.sessionPath,
+                },
+              }
+            : {}),
         },
       ],
     })
@@ -102,6 +113,7 @@ describe("AgentOrchestratorService", () => {
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
     const observerEvent = appendEvent(harness, {
       agent: "pi",
+      sessionPath: "/root/.pi/agent/sessions/interactive.jsonl",
       terminalId: "term_other",
       type: "agent.idle",
     });
@@ -112,15 +124,33 @@ describe("AgentOrchestratorService", () => {
     ).toThrow("Only the next pending orchestrator event can be acknowledged");
   });
 
-  test("still delivers dispatched worker events", () => {
+  test("still delivers and acknowledges dispatched Pi role events", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
-    const workerEvent = appendEvent(harness, { agent: "codex", terminalId: "term_worker" });
+    const workerEvent = appendEvent(harness, {
+      agent: "pi",
+      sessionPath: "/tmp/pi-role-sessions/role-worker-fd92d978/session.jsonl",
+      terminalId: "term_worker",
+      type: "agent.idle",
+    });
 
     expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
       expect.objectContaining({ id: workerEvent.id }),
     ]);
+    expect(service.ack({ ...scope, eventId: workerEvent.id, terminalId: "term_owner" })).toMatchObject({
+      ackedEventId: workerEvent.id,
+    });
   });
+
+  test("does not filter non-Pi agent idle events", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { agent: "codex", terminalId: "term_other", type: "agent.idle" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: event.id }),
+    ]);
+  });
+
   test("returns ordered non-self pending events across bounded scan pages", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p1", terminalId: "term_owner" });

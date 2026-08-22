@@ -34,6 +34,7 @@ import {
   agentReadInputSchema,
 } from "@/observability/schemas.js";
 import { encodeJsonLine, JsonLineDecoder } from "@/shared/json-lines.js";
+import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
 
 export const DISCONNECT_GRACE_MS = 5_000;
 export const STARTUP_RECONNECT_GRACE_MS = 10_000;
@@ -185,7 +186,7 @@ export class ObservabilityRpcServer {
     // persisted for history, but never routed as worker wake events.
     const agent = this.#stores.agents.get(event.agentId);
     if (
-      agent.agent === "pi" &&
+      isInteractivePiAgent(agent) &&
       (event.type === "agent.idle" || event.type === "agent.status.changed")
     )
       return;

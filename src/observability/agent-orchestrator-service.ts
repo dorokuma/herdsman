@@ -7,6 +7,7 @@ import type {
   AgentOrchestratorState,
   AgentScope,
 } from "@/observability/contracts.js";
+import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
 
 export type AgentOrchestratorChange = {
   current: AgentOrchestratorState;
@@ -72,7 +73,7 @@ export class AgentOrchestratorService {
         const valid =
           event.agentId !== null &&
           !(
-            validAgents.get(event.agentId)?.agent === "pi" &&
+            isInteractivePiAgent(validAgents.get(event.agentId)) &&
             (event.type === "agent.idle" || event.type === "agent.status.changed")
           ) &&
           event.deliverable === 1 &&
@@ -105,7 +106,7 @@ export class AgentOrchestratorService {
     if (next?.id === input.eventId) {
       const nextAgent = next.agentId ? this.#agents.get(next.agentId) : undefined;
       if (
-        nextAgent?.agent !== "pi" ||
+        !isInteractivePiAgent(nextAgent) ||
         (next?.type !== "agent.idle" && next?.type !== "agent.status.changed")
       ) {
         return this.#scopes.ack(input);
@@ -119,7 +120,7 @@ export class AgentOrchestratorService {
         candidate.workspaceId === input.workspaceId &&
         candidate.agentId !== null &&
         !(
-          candidateAgent?.agent === "pi" &&
+          isInteractivePiAgent(candidateAgent) &&
           (candidate.type === "agent.idle" || candidate.type === "agent.status.changed")
         ) &&
         candidate.paneId !== null &&
