@@ -238,9 +238,13 @@ export class AgentIndexService {
     socketPath: string;
   }): Promise<AgentEventHandlingResult> {
     const event = record(input.event);
-    if (event.type !== "pane.agent_status_changed") return { contextChangedScopes: [], events: [] };
     const paneId = stringValue(event.pane_id) ?? stringValue(event.paneId);
     if (!paneId) return { contextChangedScopes: [], events: [] };
+    if (event.type === "pane.closed") {
+      this.#stores.agentEvents.invalidatePane({ herdrSessionName: input.herdrSessionName, paneId });
+      return { contextChangedScopes: [], events: [] };
+    }
+    if (event.type !== "pane.agent_status_changed") return { contextChangedScopes: [], events: [] };
     let agent = this.#stores.agents.findByPane({
       herdrSessionName: input.herdrSessionName,
       paneId,
@@ -257,6 +261,7 @@ export class AgentIndexService {
     }
     const from = recovered ? "unknown" : agent.agentStatus;
     const to = parseAgentStatus(event.agent_status);
+    const herdrEventKey = herdrInputIdempotencyKey(input.herdrSessionName, paneId, event, to);
     const updated = this.#stores.agents.updateStatus({
       agentStatus: to,
       herdrSessionName: input.herdrSessionName,
@@ -279,8 +284,10 @@ export class AgentIndexService {
         agent: current,
         compactHistory: refreshed.snapshot.compactHistory,
         from,
+        herdrEventKey,
         to,
       });
+
       if (statusEvent) events.push(statusEvent);
     }
     return { contextChangedScopes: sortedScopes(scopes), events };
@@ -342,6 +349,7 @@ export class AgentIndexService {
       | NonNullable<ReturnType<AgentContextService["getAgentSnapshot"]>>["compactHistory"]
       | undefined;
     from: AgentStatus;
+    herdrEventKey?: string;
     to: AgentStatus;
   }): AgentEventRecord | undefined {
     if (input.from === input.to || !input.compactHistory) return undefined;
@@ -357,13 +365,14 @@ export class AgentIndexService {
       compactHistory: input.compactHistory,
       herdrSessionName: input.agent.herdrSessionName,
       idempotencyKey: idempotencyKey(
-        "agent.status.changed",
-        input.agent,
-        input.from,
-        input.to,
-        observationId,
-      ),
+          "agent.status.changed",
+          input.agent,
+          input.from,
+          input.to,
+          `${observationId}:${input.herdrEventKey ?? "legacy"}:agent.status.changed`,
+        ),
       paneId: input.agent.paneId,
+      paneGeneration: input.agent.paneGeneration ?? null,
       payload: payload(input.agent, input.from, input.to),
       terminalId: input.agent.terminalId,
       type: "agent.status.changed",
@@ -380,8 +389,9 @@ export class AgentIndexService {
           input.agent,
           input.from,
           input.to,
-          observationId,
+          `${observationId}:${input.herdrEventKey ?? "legacy"}:${statusType}`,
         ),
+
         paneId: input.agent.paneId,
         payload: payload(input.agent, input.from, input.to),
         terminalId: input.agent.terminalId,
@@ -497,6 +507,19 @@ function idempotencyKey(
 ): string {
   return `${type}:${agent.herdrSessionName}:${agent.paneId}:${from}:${to}:${observationId}`;
 }
+
+function herdrInputIdempotencyKey(
+  sessionName: string,
+  paneId: string,
+  event: Record<string, unknown>,
+  targetStatus: AgentStatus,
+): string {
+  const eventId = stringValue(event.id) ?? stringValue(event.event_id) ?? stringValue(event.eventId);
+  if (eventId) return `${sessionName}:${paneId}:${String(event.type)}:${eventId}`;
+  const revision = integerValue(event.revision) ?? integerValue(event.pane_revision) ?? "unknown";
+  return `${sessionName}:${paneId}:${revision}:${targetStatus}`;
+}
+
 
 function statusTransitionMatches(
   event: AgentEventRecord,

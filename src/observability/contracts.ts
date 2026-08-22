@@ -39,6 +39,7 @@ export type AgentIndexRecord = {
   name: string | null;
   paneId: string;
   paneRevision: number | null;
+  paneGeneration?: string | null;
   tabId: string | null;
   terminalId: string | null;
   workspaceId: string;
@@ -145,6 +146,7 @@ export type AgentEventRecord = {
   herdrSessionName: string;
   id: number;
   paneId: string | null;
+  paneGeneration?: string | null;
   payload: unknown;
   terminalId: string | null;
   type: AgentEventType;

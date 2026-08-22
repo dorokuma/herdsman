@@ -179,15 +179,21 @@ export class HerdrSessionWatchManager {
     client: Pick<HerdrSocketClient, "close" | "subscribeEvents">,
     signal: AbortSignal,
   ): Promise<void> {
+    let reconnectCount = 0;
+    let lastPaneIds: string[] = [];
+    let lastEvent: Record<string, unknown> | undefined;
+    let lastClosedTriggered = false;
     while (!signal.aborted) {
       let restart = false;
       try {
         const agents = await this.#refresh(entry);
         if (signal.aborted) return;
         const paneIds = agents.map((agent) => agent.paneId);
+        lastPaneIds = paneIds;
         for await (const event of client.subscribeEvents({ paneIds }, { signal })) {
           if (signal.aborted) return;
           const eventRecord = record(event);
+          lastEvent = eventRecord;
           if (eventRecord.type === "pane.agent_status_changed") {
             const result = await this.#index.handleHerdrEvent({
               event,
@@ -202,13 +208,35 @@ export class HerdrSessionWatchManager {
             });
             continue;
           }
+          if (eventRecord.type === "pane.closed") {
+            await this.#index.handleHerdrEvent({
+              event,
+              herdrSessionName: entry.name,
+              sessionDir: entry.sessionDir,
+              socketPath: entry.socketPath,
+            });
+          }
           if (shouldRestartSubscription(eventRecord.type)) {
             restart = true;
+            lastClosedTriggered = eventRecord.type === "pane.closed";
             break;
           }
         }
-      } catch {
+      } catch (error) {
         if (signal.aborted) return;
+        reconnectCount += 1;
+        console.warn("Shepherd Herdr subscription reconnect", {
+          sessionName: entry.name,
+          socketPath: entry.socketPath,
+          paneIds: lastPaneIds,
+          subscriptionGeneration: this.#lifecycleGeneration,
+          eventId: lastEvent?.id ?? lastEvent?.event_id ?? null,
+          revision: lastEvent?.revision ?? lastEvent?.pane_revision ?? null,
+          reconnectCount,
+          paneClosedTriggered: lastClosedTriggered,
+          error: error instanceof Error ? error.message : String(error),
+        });
+        lastClosedTriggered = false;
       }
       if (!restart) await delay(this.#reconnectDelayMs, signal);
     }

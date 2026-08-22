@@ -97,10 +97,18 @@ export class AgentOrchestratorService {
       afterEventId: state.ackedEventId,
       ownerTerminalId: input.terminalId,
     });
-    if (next?.id !== input.eventId) {
-      throw new Error("Only the next pending orchestrator event can be acknowledged");
+    if (next?.id === input.eventId) return this.#scopes.ack(input);
+    if (!next) {
+      const candidate = this.#agentEvents.get(input.eventId);
+      if (
+        candidate.herdrSessionName === input.herdrSessionName &&
+        candidate.workspaceId === input.workspaceId &&
+        candidate.id > state.ackedEventId
+      ) {
+        return this.#scopes.ack(input);
+      }
     }
-    return this.#scopes.ack(input);
+    throw new Error("Only the next pending orchestrator event can be acknowledged");
   }
 
   move(input: {
