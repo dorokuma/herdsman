@@ -39,7 +39,7 @@ describe("daemon process manager", () => {
     });
   });
 
-  test("reports orphaned when the pid file is missing but the daemon socket is reachable", async () => {
+  test("reports running when the pid file is missing but the daemon socket is reachable", async () => {
     const dir = tempDir();
     const pidPath = join(dir, "missing.pid");
 
@@ -51,9 +51,10 @@ describe("daemon process manager", () => {
       }),
     ).resolves.toEqual({
       pidPath,
+      pidFileMissing: true,
       socketPath: "/tmp/herdsman.sock",
       socketReachable: true,
-      state: "orphaned",
+      state: "running",
     });
   });
 

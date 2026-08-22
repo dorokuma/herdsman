@@ -26,10 +26,18 @@ export type DaemonRuntimeRecord = {
 
 export type DaemonStatus =
   | {
+      pid?: number;
+      pidPath: string;
+      pidFileMissing: true;
+      socketPath: string;
+      socketReachable: true;
+      state: "running";
+    }
+  | {
       pidPath: string;
       socketPath: string;
       socketReachable: true;
-      stalePid?: number;
+      stalePid: number;
       state: "orphaned";
     }
   | { pidPath: string; socketPath: string; state: "stopped"; stalePid?: number }
@@ -60,7 +68,6 @@ export type DaemonProcessDependencies = {
   waitMs?: (ms: number) => Promise<void>;
   readinessTimeoutMs?: number;
 };
-
 export function readDaemonRuntimeRecord(path: string): DaemonRuntimeRecord | undefined {
   if (!existsSync(path)) {
     return undefined;
@@ -121,9 +128,10 @@ export async function getDaemonStatus(input: {
     if (await connectSocket(input.socketPath)) {
       return {
         pidPath: input.pidPath,
+        pidFileMissing: true,
         socketPath: input.socketPath,
         socketReachable: true,
-        state: "orphaned",
+        state: "running",
       };
     }
     return { pidPath: input.pidPath, socketPath: input.socketPath, state: "stopped" };
@@ -263,22 +271,22 @@ export async function stopDaemonProcess(input: {
   const processIsRunning = deps.isProcessRunning ?? isProcessRunning;
   const waitMs = deps.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
 
-  killProcess(status.pid, "SIGTERM");
+  killProcess(status.pid!, "SIGTERM");
   const deadline = Date.now() + input.timeoutMs;
   while (Date.now() < deadline) {
-    if (!processIsRunning(status.pid)) {
+    if (!processIsRunning(status.pid!)) {
       rmSync(input.pidPath, { force: true });
-      return { alreadyStopped: false, pid: status.pid };
+      return { alreadyStopped: false, pid: status.pid! };
     }
     await waitMs(50);
   }
 
-  killProcess(status.pid, "SIGKILL");
+  killProcess(status.pid!, "SIGKILL");
   const killDeadline = Date.now() + input.timeoutMs;
-  while (Date.now() < killDeadline && processIsRunning(status.pid)) await waitMs(50);
-  if (!processIsRunning(status.pid)) {
+  while (Date.now() < killDeadline && processIsRunning(status.pid!)) await waitMs(50);
+  if (!processIsRunning(status.pid!)) {
     rmSync(input.pidPath, { force: true });
-    return { alreadyStopped: false, pid: status.pid };
+    return { alreadyStopped: false, pid: status.pid! };
   }
   throw new Error(`Timed out waiting for Herdsman daemon pid ${status.pid} to stop after SIGKILL`);
 }
