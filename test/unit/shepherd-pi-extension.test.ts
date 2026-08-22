@@ -249,9 +249,7 @@ describe("herdsman-pi orchestrator bridge", () => {
         method: "agent.context.changed",
         params: { context: null, herdrSessionName: "default", workspaceId: "wB" },
       });
-      expect(await pi.emitContext([], ctx)).toEqual([
-        expect.objectContaining({ content: expect.stringContaining("second") }),
-      ]);
+      expect(await pi.emitContext([], ctx)).toEqual([]);
       await pi.emit("agent_settled", {}, ctx);
       await pi.emit("agent_start", {}, ctx);
       expect(await pi.emitContext([], ctx)).toEqual([]);

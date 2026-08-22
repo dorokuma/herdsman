@@ -21,6 +21,7 @@ export type AgentHistoryLookupInput = {
   foregroundCwd: string | null;
   firstSeenAtMs?: number;
   homeDir?: string;
+  occupiedSessionPaths?: ReadonlySet<string>;
 };
 
 type Candidate = {
@@ -55,7 +56,10 @@ export async function discoverAgentHistory(
   const agent = input.agent?.toLowerCase() ?? input.agentSession?.agent.toLowerCase() ?? "";
   const candidates: Candidate[] = [];
   if (agent === "pi") {
-    candidates.push(...(await scanRoot(join(homeDir, ".pi", "agent", "sessions"), "pi-jsonl")));
+    const roots = new Set([join(homeDir, ".pi", "agent", "sessions"), ...ALLOWED_SESSION_ROOTS]);
+    for (const root of roots) {
+      candidates.push(...(await scanRoot(root, "pi-jsonl")));
+    }
   }
   if (agent === "claude") {
     candidates.push(...(await scanRoot(join(homeDir, ".claude", "projects"), "claude-jsonl")));
@@ -71,15 +75,14 @@ export async function discoverAgentHistory(
     if (ref) return ref;
   }
   const ranked = candidates
+    .filter((candidate) => cwd !== null && candidate.cwd === cwd)
+    .filter((candidate) => !input.occupiedSessionPaths?.has(candidate.path))
     .filter(
       (candidate) =>
         input.firstSeenAtMs === undefined ||
         candidate.mtimeMs >= input.firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS,
     )
     .sort((a, b) => {
-      const aMatch = cwd && a.cwd === cwd ? 1 : 0;
-      const bMatch = cwd && b.cwd === cwd ? 1 : 0;
-      if (aMatch !== bMatch) return bMatch - aMatch;
       if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
       return a.path.localeCompare(b.path);
     });

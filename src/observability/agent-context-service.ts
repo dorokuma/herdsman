@@ -60,7 +60,7 @@ export class AgentContextService {
     });
     const resolved = bindAuthoritativeId(
       input.agent,
-      await this.#history.resolveCompactHistory(historyLookup(input.agent), {
+      await this.#history.resolveCompactHistory(historyLookup(input.agent, this.#stores.agents), {
         forceDiscovery,
         ...(preferredRef ? { preferredRef } : {}),
       }),
@@ -182,13 +182,21 @@ function bindAuthoritativeId(
   };
 }
 
-function historyLookup(agent: AgentIndexRecord) {
+function historyLookup(agent: AgentIndexRecord, agents: AgentStore) {
   return {
     agent: agent.agent,
     agentSession: agent.agentSession,
     cwd: agent.cwd,
     firstSeenAtMs: agent.firstSeenAt.getTime(),
     foregroundCwd: agent.foregroundCwd,
+    occupiedSessionPaths: new Set(
+      agents
+        .listForHerdrSession(agent.herdrSessionName)
+        .filter((candidate) => candidate.id !== agent.id)
+        .flatMap((candidate) =>
+          candidate.agentSession?.kind === "path" ? [candidate.agentSession.value] : [],
+        ),
+    ),
   };
 }
 

@@ -524,7 +524,14 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.currentScope?.herdrSessionName === message.params.herdrSessionName &&
           state.currentScope.workspaceId === message.params.workspaceId
         ) {
-          state.latestContext = message.params.context ?? undefined;
+          const next = message.params.context ?? undefined;
+          const currentIds = new Set(next?.agents.map((agent) => agent.id) ?? []);
+          const retain = (snapshot: AgentWorkspaceContextSnapshot | undefined) =>
+            snapshot
+              ? { ...snapshot, agents: snapshot.agents.filter((agent) => currentIds.has(agent.id)) }
+              : undefined;
+          state.latestContext = next;
+          state.pinnedContext = retain(state.pinnedContext);
         }
         return;
       }
