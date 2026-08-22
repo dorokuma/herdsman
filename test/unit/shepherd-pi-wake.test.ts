@@ -1,7 +1,8 @@
-import { describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test } from "vitest";
 import type { AgentEventWireRecord } from "../../packages/shepherd-pi/src/daemon-client.js";
 import {
   AGENT_UPDATE_EXCERPT_CHARS,
+  createAgentOutcomeProjector,
   formatAgentOutcomeUpdates,
   projectAgentOutcomes,
   WAKE_SETTLE_MS,
@@ -81,6 +82,25 @@ describe("Pi agent wake projection", () => {
     ]);
   });
 
+  test("deduplicates outcomes across wake cycles but only consumes projected outcomes", () => {
+    const projector = createAgentOutcomeProjector();
+    const outcomeEvent = event(20, "agent.done", { from: "working", to: "done" });
+    const evidenceOnly = event(21, "agent.status.changed", { from: "working", to: "done" });
+
+    expect(projector([outcomeEvent, evidenceOnly])).toMatchObject({
+      outcomes: [expect.objectContaining({ eventId: 20 })],
+      rawEvents: [{ id: 20 }, { id: 21 }],
+    });
+    expect(projector([outcomeEvent, evidenceOnly])).toMatchObject({
+      outcomes: [],
+      rawEvents: [{ id: 21 }],
+    });
+    expect(projector([evidenceOnly])).toMatchObject({
+      outcomes: [],
+      rawEvents: [{ id: 21 }],
+    });
+    expect(projector([event(22, "agent.done", { from: "working", to: "done" })]).outcomes).toHaveLength(1);
+  });
   test("formats the fixed policy before bounded agent evidence", () => {
     const outcomes = projectAgentOutcomes([
       event(12, "agent.done", { name: "reviewer" }, { text: "  finished\n  with   evidence  " }),
