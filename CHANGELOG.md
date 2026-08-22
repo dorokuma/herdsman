@@ -1,3 +1,8 @@
+## 0.6.2
+
+- Acknowledgement: allow the orchestrator cursor to advance past events that became undeliverable after delivery (for example when a worker pane is retired), instead of rejecting the ack and freezing the cursor. Skipping ahead of still-deliverable events is still refused, and sealed events remain unacknowledgeable (9007766).
+- Lint and formatting debt from the hardening rounds cleared; biome check is now clean and enforced by the pre-commit hook (288adab).
+
 ## 0.6.1
 
 - Delivery pipeline: unified the deliverable-event predicate across pending discovery, acknowledgement, and publication so filtered events can no longer pin the queue (ddbc5ca, 49b6218).
