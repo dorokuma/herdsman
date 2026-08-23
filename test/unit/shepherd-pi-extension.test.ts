@@ -2072,6 +2072,99 @@ async function tick(): Promise<void> {
 }
 
 describe("herdsman-pi context intersection regressions (independent coverage)", () => {
+  test("retains a pane when any same-pane entry has a matching id", async () => {
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx();
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    const first = {
+      agents: [
+        {
+          agent: "pi",
+          agentStatus: "idle",
+          id: "same",
+          history: { lastAssistantMessage: { text: "matching-entry" } },
+          paneId: "wB:p-agent",
+          terminalId: "term_agent",
+        },
+        {
+          agent: "pi",
+          agentStatus: "idle",
+          id: "old",
+          history: { lastAssistantMessage: { text: "other-entry" } },
+          paneId: "wB:p-agent",
+          terminalId: "term_agent-2",
+        },
+      ],
+      herdrSessionName: "default",
+      updatedAt: "2026-07-16T00:00:00.000Z",
+      workspaceId: "wB",
+    };
+    const second = {
+      ...first,
+      agents: [
+        { ...first.agents[0], id: "same" },
+        { ...first.agents[1], id: "new" },
+      ],
+    };
+    client.response = (method) =>
+      method === "agent.orchestrator.register" ? connectionResponse({ context: first }) : {};
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
+    const previous = withHerdrEnv();
+    try {
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+      await pi.emit("agent_start", {}, ctx);
+      client.emitStream({
+        method: "agent.context.changed",
+        params: { context: second, herdrSessionName: "default", workspaceId: "wB" },
+      });
+      expect((await pi.emitContext([], ctx))[0]).toEqual(
+        expect.objectContaining({ content: expect.stringContaining("matching-entry") }),
+      );
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+
+  test("removes a pane when all same-pane entries have different ids", async () => {
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx();
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    const first = {
+      agents: [
+        {
+          agent: "pi",
+          agentStatus: "idle",
+          id: "old",
+          history: { lastAssistantMessage: { text: "keep" } },
+          paneId: "wB:p-agent",
+          terminalId: "term_agent",
+        },
+      ],
+      herdrSessionName: "default",
+      updatedAt: "2026-07-16T00:00:00.000Z",
+      workspaceId: "wB",
+    };
+    const second = { ...first, agents: [{ ...first.agents[0], id: "new" }] };
+    client.response = (method) =>
+      method === "agent.orchestrator.register" ? connectionResponse({ context: first }) : {};
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
+    const previous = withHerdrEnv();
+    try {
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+      await pi.emit("agent_start", {}, ctx);
+      client.emitStream({
+        method: "agent.context.changed",
+        params: { context: second, herdrSessionName: "default", workspaceId: "wB" },
+      });
+      expect(await pi.emitContext([], ctx)).toEqual([]);
+    } finally {
+      restoreEnv(previous);
+    }
+  });
   test("新快照缺少某 pane 时注入内容移除该 pane，仍存在的 pane 保留", async () => {
     const client = createFakeClient();
     const pi = createFakePi();

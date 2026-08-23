@@ -442,6 +442,9 @@ describe("ObservabilityRpcServer", () => {
       params: { context: { agents: [{ terminalId: "term_b" }] }, workspaceId: "wB" },
     });
     await tick();
+    server.publishAgentContext({ herdrSessionName: "default", workspaceId: "wB" });
+    await tick();
+    expect(owner.notifications).toEqual([]);
     expect(off.notifications).toEqual([]);
     expect(other.notifications).toEqual([]);
 

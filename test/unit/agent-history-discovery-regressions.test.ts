@@ -108,6 +108,56 @@ describe("agent history discovery bounds (independent coverage)", () => {
     ).resolves.toBeNull();
   });
 
+  test("Pi id ref resolves a filename match before mtime discovery", async () => {
+    const root = await roleRoot();
+    const id = "ses-target-123";
+    const matched = join(root, `${id}-new.jsonl`);
+    const competing = join(root, "unrelated.jsonl");
+    await writeFile(matched, `${JSON.stringify({ cwd: "/wrong" })}\n`);
+    await writeFile(competing, `${JSON.stringify({ cwd: "/repo" })}\n`);
+    const now = Date.now();
+    await utimes(matched, new Date(now - 2_000), new Date(now - 2_000));
+    await utimes(competing, new Date(now), new Date(now));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: { agent: "pi", kind: "id", source: "herdr:pi", value: id },
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir: "/nonexistent-herdsman-home",
+      }),
+    ).resolves.toMatchObject({ kind: "agent_session", path: matched, value: id });
+  });
+
+  test("Pi id ref falls back to recursive discovery when no filename contains the id", async () => {
+    const root = await roleRoot();
+    const fallback = await session(root, "nested-session", "/repo");
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: { agent: "pi", kind: "id", source: "herdr:pi", value: "missing-id" },
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir: "/nonexistent-herdsman-home",
+      }),
+    ).resolves.toMatchObject({ kind: "discovered_file", path: fallback, value: fallback });
+  });
+
+  test("normalizes trailing and repeated slashes when matching candidate cwd", async () => {
+    const root = await roleRoot();
+    const path = await session(root, "normalized-cwd", "//repo///");
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: null,
+        cwd: "/repo/",
+        foregroundCwd: null,
+        homeDir: "/nonexistent-herdsman-home",
+      }),
+    ).resolves.toMatchObject({ path, value: path });
+  });
+
   test("stops discovery at maxFiles=2000 while returning candidates before the bound", async () => {
     const root = await roleRoot();
     const dir = join(root, "many");
@@ -118,8 +168,10 @@ describe("agent history discovery bounds (independent coverage)", () => {
         `${JSON.stringify({ cwd: "/repo" })}\n`,
       );
     }
-    const candidate = join(dir, "session-2000.jsonl");
-    await writeFile(candidate, `${JSON.stringify({ cwd: "/repo" })}\n`);
+    await writeFile(
+      join(root, "many", "session-2000.jsonl"),
+      `${JSON.stringify({ cwd: "/repo" })}\n`,
+    );
     await expect(
       discoverAgentHistory({
         agent: "pi",
@@ -137,7 +189,7 @@ describe("agent history discovery bounds (independent coverage)", () => {
         foregroundCwd: null,
         homeDir: "/nonexistent-herdsman-home",
       }),
-    ).resolves.not.toMatchObject({ path: candidate });
+    ).resolves.not.toMatchObject({ path: join(dir, "session-2000.jsonl") });
   });
 
   test("reads only the bounded prefix of an oversized jsonl and finds cwd", async () => {
