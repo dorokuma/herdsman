@@ -87,3 +87,74 @@ describe("agent history discovery regressions (independent coverage)", () => {
     ).resolves.toBeNull();
   });
 });
+
+describe("agent history discovery bounds (independent coverage)", () => {
+  test("does not scan jsonl beyond maxDepth=4", async () => {
+    const root = await roleRoot();
+    let current = root;
+    for (let depth = 1; depth <= 5; depth += 1) {
+      current = join(current, `depth-${depth}`);
+      await mkdir(current, { recursive: true });
+    }
+    await writeFile(join(current, "too-deep.jsonl"), `${JSON.stringify({ cwd: "/repo" })}\n`);
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: null,
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir: "/nonexistent-herdsman-home",
+      }),
+    ).resolves.toBeNull();
+  });
+
+  test("stops discovery at maxFiles=2000 while returning candidates before the bound", async () => {
+    const root = await roleRoot();
+    const dir = join(root, "many");
+    await mkdir(dir, { recursive: true });
+    for (let index = 0; index < 2_000; index += 1) {
+      await writeFile(
+        join(dir, `session-${String(index).padStart(4, "0")}.jsonl`),
+        `${JSON.stringify({ cwd: "/repo" })}\n`,
+      );
+    }
+    const candidate = join(dir, "session-2000.jsonl");
+    await writeFile(candidate, `${JSON.stringify({ cwd: "/repo" })}\n`);
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: null,
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir: "/nonexistent-herdsman-home",
+      }),
+    ).resolves.toMatchObject({ path: expect.stringContaining("session-19") });
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: null,
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir: "/nonexistent-herdsman-home",
+      }),
+    ).resolves.not.toMatchObject({ path: candidate });
+  });
+
+  test("reads only the bounded prefix of an oversized jsonl and finds cwd", async () => {
+    const root = await roleRoot();
+    const path = join(root, "large", "session.jsonl");
+    await mkdir(join(root, "large"), { recursive: true });
+    await writeFile(path, `${JSON.stringify({ cwd: "/repo" })}\n${"x".repeat(300 * 1024)}\n`);
+    const started = performance.now();
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: null,
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir: "/nonexistent-herdsman-home",
+      }),
+    ).resolves.toMatchObject({ path });
+    expect(performance.now() - started).toBeLessThan(2_000);
+  });
+});

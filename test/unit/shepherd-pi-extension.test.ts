@@ -1627,7 +1627,46 @@ describe("herdsman-pi disconnect regression (independent coverage)", () => {
   });
 });
 
-describe("pi acknowledgement cursor regression (independent coverage)", () => {
+describe("pi transient reconnect cursor regression (independent coverage)", () => {
+  test("replays the same batch after a transient disconnect and advances the cursor only after ack", async () => {
+    vi.useFakeTimers();
+    const pending = event(220, "term_agent");
+    let registrations = 0;
+    const client = createFakeClient();
+    client.response = (method) => {
+      if (method === "agent.orchestrator.register") {
+        registrations += 1;
+        return connectionResponse({ events: registrations === 1 ? [pending] : [pending] });
+      }
+      if (method === "agent.orchestrator.get") return connectionResponse();
+      if (method === "agent.list") return agentListResponse();
+      return { acknowledged: true };
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      client.disconnect(new Error("transient disconnect"));
+      expect(pi.customMessages).toEqual([]);
+      await client.connect();
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages).toHaveLength(1);
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: 220 }],
+      ]);
+      client.emitStream({ method: "agent.event", params: { event: event(221, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [221] } });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
   test("advances failedWakeThroughEventId only through a failed event while later events remain wakeable", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();

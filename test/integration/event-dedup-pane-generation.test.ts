@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
@@ -141,5 +141,112 @@ describe("event deduplication and pane generations", () => {
     expect(() => service.ack({ ...scope, eventId: e.id, terminalId: "term-owner" })).toThrow(
       "Only the next pending orchestrator event can be acknowledged",
     );
+  });
+});
+
+describe("agent event pagination regressions (independent coverage)", () => {
+  test("nextDeliverableAfter crosses more than 1000 filtered noise events", () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning({
+      name: "default",
+      sessionDir: "/tmp/herdr",
+      socketPath: "/tmp/herdr.sock",
+    });
+    const agent = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "claude",
+          agent_status: "working",
+          cwd: "/repo",
+          pane_id: "wB:p2",
+          pane_generation: "g1",
+          revision: 1,
+          terminal_id: "term-agent",
+          workspace_id: "wB",
+        },
+      ],
+    })[0];
+    if (!agent) throw new Error("Expected agent");
+    for (let i = 0; i < 1_001; i += 1)
+      h.agentEvents.append({
+        agentId: agent.id,
+        herdrSessionName: "default",
+        workspaceId: "wB",
+        paneId: "wB:noise",
+        payload: {},
+        terminalId: "term-agent",
+        type: "agent.done",
+      });
+    const pending = h.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      workspaceId: "wB",
+      paneId: "wB:p2",
+      payload: {},
+      terminalId: "term-agent",
+      type: "agent.done",
+    });
+    expect(
+      h.agentEvents.nextDeliverableAfter({
+        afterEventId: 0,
+        herdrSessionName: "default",
+        workspaceId: "wB",
+        ownerTerminalId: "term-owner",
+        getAgent: () => agent,
+      })?.id,
+    ).toBe(pending.id);
+    h.sqlite.close();
+  });
+
+  test("returns empty and warns when every event is noise", () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning({
+      name: "default",
+      sessionDir: "/tmp/herdr",
+      socketPath: "/tmp/herdr.sock",
+    });
+    const agent = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "claude",
+          agent_status: "working",
+          cwd: "/repo",
+          pane_id: "wB:p2",
+          pane_generation: "g1",
+          revision: 1,
+          terminal_id: "term-agent",
+          workspace_id: "wB",
+        },
+      ],
+    })[0];
+    if (!agent) throw new Error("Expected agent");
+    for (let i = 0; i < 50_001; i += 1)
+      h.agentEvents.append({
+        agentId: agent.id,
+        herdrSessionName: "default",
+        workspaceId: "wB",
+        paneId: "wB:noise",
+        payload: {},
+        terminalId: "term-agent",
+        type: "agent.done",
+      });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    expect(
+      h.agentEvents.nextDeliverableAfter({
+        afterEventId: 0,
+        herdrSessionName: "default",
+        workspaceId: "wB",
+        ownerTerminalId: "term-owner",
+        getAgent: () => agent,
+      }),
+    ).toBeUndefined();
+    expect(warning).toHaveBeenCalledWith(
+      expect.stringContaining("stopped scanning"),
+      expect.anything(),
+    );
+    warning.mockRestore();
+    h.sqlite.close();
   });
 });
