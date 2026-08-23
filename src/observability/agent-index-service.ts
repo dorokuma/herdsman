@@ -210,6 +210,11 @@ export class AgentIndexService {
       for (const prior of previous) {
         if (!currentIds.has(prior.id)) addScope(scopes, scopeOf(prior));
       }
+      const occupiedSessionPaths = new Set(
+        agents.flatMap((candidate) =>
+          candidate.agentSession?.kind === "path" ? [candidate.agentSession.value] : [],
+        ),
+      );
       for (const agent of agents) {
         const prior = matchingPrior(agent, previousByTerminal, previousByPane);
         const identityChanged = !prior || !sameIdentity(prior, agent);
@@ -222,7 +227,14 @@ export class AgentIndexService {
           identityChanged;
         let refreshed = cached;
         if (dirty) {
-          const result = await this.#context.refreshAgent({ agent, identityChanged });
+          const occupiedForCurrent = new Set(occupiedSessionPaths);
+          if (agent.agentSession?.kind === "path")
+            occupiedForCurrent.delete(agent.agentSession.value);
+          const result = await this.#context.refreshAgent({
+            agent,
+            identityChanged,
+            occupiedSessionPaths: occupiedForCurrent,
+          });
           refreshed = result.snapshot;
           if (result.changed) addScope(scopes, scopeOf(agent));
         }

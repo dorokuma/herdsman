@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { env, exit } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -25,10 +25,21 @@ export async function runObservabilityDaemonService(
 ): Promise<void> {
   const runtime = resolveRuntime({ environment: input.environment });
   applyEnvironment(runtime.environment);
-  mkdirSync(dirname(runtime.paths.dbPath), { recursive: true });
-  mkdirSync(dirname(runtime.paths.socketPath), { recursive: true });
+  mkdirSync(runtime.paths.homeDir, { mode: 0o700, recursive: true });
+  chmodSync(runtime.paths.homeDir, 0o700);
+  mkdirSync(dirname(runtime.paths.dbPath), { mode: 0o700, recursive: true });
+  chmodSync(dirname(runtime.paths.dbPath), 0o700);
+  mkdirSync(dirname(runtime.paths.socketPath), { mode: 0o700, recursive: true });
+  chmodSync(dirname(runtime.paths.socketPath), 0o700);
 
   const { sqlite } = openSqlite(runtime.paths.dbPath);
+  for (const path of [
+    runtime.paths.dbPath,
+    `${runtime.paths.dbPath}-wal`,
+    `${runtime.paths.dbPath}-shm`,
+  ]) {
+    if (existsSync(path)) chmodSync(path, 0o600);
+  }
   applyMigrations(sqlite, {
     migrationsFolder: resolveMigrationsFolder(dirname(fileURLToPath(import.meta.url))),
   });

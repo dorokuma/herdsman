@@ -199,6 +199,8 @@ export async function startDaemonProcess(input: {
     }
     throw error;
   }
+  let childPid: number | undefined;
+  let childConfirmedDead = false;
   try {
     await prepareDaemonSocketPath({
       ...(input.deps !== undefined ? { deps: input.deps } : {}),
@@ -221,6 +223,7 @@ export async function startDaemonProcess(input: {
     }
 
     if (!child.pid) throw new Error("Failed to start Herdsman daemon: child pid was not assigned");
+    childPid = child.pid;
     child.unref();
     writeFileSync(input.pidPath, `${child.pid}\n`, { mode: 0o600 });
     try {
@@ -233,7 +236,21 @@ export async function startDaemonProcess(input: {
         throw new Error("Timed out waiting for Herdsman daemon socket");
     } catch (error) {
       const killProcess = input.deps?.killProcess ?? ((pid, signal) => process.kill(pid, signal));
+      const processIsRunning = input.deps?.isProcessRunning ?? isProcessRunning;
+      const waitMs =
+        input.deps?.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
       killProcess(child.pid, "SIGTERM");
+      const deadline = Date.now() + (input.deps?.readinessTimeoutMs ?? 10_000);
+      while (Date.now() < deadline && processIsRunning(child.pid)) await waitMs(50);
+      if (processIsRunning(child.pid)) {
+        killProcess(child.pid, "SIGKILL");
+        const killDeadline = Date.now() + (input.deps?.readinessTimeoutMs ?? 10_000);
+        while (Date.now() < killDeadline && processIsRunning(child.pid)) await waitMs(50);
+      }
+      if (!processIsRunning(child.pid)) {
+        childConfirmedDead = true;
+        rmSync(input.pidPath, { force: true });
+      }
       throw error;
     }
     writeDaemonRuntimeRecord(input.runtimeRecordPath, {
@@ -244,7 +261,7 @@ export async function startDaemonProcess(input: {
     });
     return { pid: child.pid };
   } catch (error) {
-    rmSync(input.pidPath, { force: true });
+    if (childPid !== undefined && childConfirmedDead) rmSync(input.pidPath, { force: true });
     throw error;
   } finally {
     closeSync(pidFd);

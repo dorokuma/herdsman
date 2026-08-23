@@ -1,5 +1,5 @@
-import { createReadStream, existsSync, realpathSync } from "node:fs";
-import { readdir, readFile, stat } from "node:fs/promises";
+import { createReadStream, existsSync, lstatSync, realpathSync } from "node:fs";
+import { lstat, readdir, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative } from "node:path";
 import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
@@ -121,13 +121,21 @@ export function safeAllowedSessionPath(value: string, homeDir?: string): string 
     return null;
   }
 }
+const CURRENT_EUID = process.geteuid?.() ?? -1;
+
 async function scanRoot(root: string, source: AgentHistoryRef["source"]): Promise<Candidate[]> {
   if (!existsSync(root)) return [];
+  const rootStats = await stat(root).catch(() => null);
+  if (!rootStats || rootStats.uid !== CURRENT_EUID || (rootStats.mode & 0o022) !== 0) {
+    console.warn(`Skipping unsafe discovery root: ${root}`);
+    return [];
+  }
   const files = await listJsonlFiles(root);
   const candidates: Candidate[] = [];
   for (const path of files) {
     const stats = await stat(path).catch(() => null);
-    if (!stats?.isFile()) continue;
+    const linkStats = await lstat(path).catch(() => null);
+    if (!stats?.isFile() || !linkStats?.isFile() || stats.uid !== CURRENT_EUID) continue;
     candidates.push({ cwd: await readCandidateCwd(path), mtimeMs: stats.mtimeMs, path, source });
   }
   return candidates;
@@ -145,7 +153,9 @@ async function listJsonlFiles(root: string, depth = 0, state = { count: 0 }): Pr
     const path = join(root, entry.name);
     if (entry.isDirectory()) files.push(...(await listJsonlFiles(path, depth + 1, state)));
     if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-      files.push(path);
+      const candidate = join(root, entry.name);
+      if (!lstatSync(candidate, { throwIfNoEntry: false })?.isFile()) continue;
+      files.push(candidate);
       state.count += 1;
     }
   }

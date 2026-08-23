@@ -270,6 +270,34 @@ describe("daemon process manager", () => {
     expect(existsSync(logPath)).toBe(true);
   });
 
+  test("readiness failure escalates to SIGKILL and retains pid when death cannot be confirmed", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    const signals: NodeJS.Signals[] = [];
+    await expect(
+      startDaemonProcess({
+        deps: {
+          readinessProbe: async () => false,
+          readinessTimeoutMs: 1,
+          isProcessRunning: () => true,
+          killProcess: (_pid, signal) => signals.push(signal),
+          spawnProcess: () => ({ pid: 1234, unref() {} }),
+          waitMs: async () => undefined,
+        },
+        entrypointPath: "/repo/daemon.js",
+        env: {},
+        logPath: join(dir, "daemon.log"),
+        nodePath: "/usr/bin/node",
+        pidPath,
+        runtimeRecord: runtimeRecord(dir),
+        runtimeRecordPath: join(dir, "runtime.json"),
+        socketPath: "/tmp/missing.sock",
+      }),
+    ).rejects.toThrow("Timed out waiting");
+    expect(signals).toEqual(["SIGTERM", "SIGKILL"]);
+    expect(existsSync(pidPath)).toBe(true);
+  });
+
   test("sends SIGTERM and removes the pid file after the process disappears", async () => {
     const dir = tempDir();
     const pidPath = join(dir, "herdsman.pid");

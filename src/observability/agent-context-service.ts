@@ -19,6 +19,7 @@ import type {
 export type RefreshAgentContextInput = {
   agent: AgentIndexRecord;
   identityChanged: boolean;
+  occupiedSessionPaths?: ReadonlySet<string>;
 };
 
 export type RefreshAgentContextResult = {
@@ -32,6 +33,7 @@ export class AgentContextService {
     agentContextSnapshots: AgentContextSnapshotStore;
     agents: AgentStore;
   };
+  readonly #occupiedFingerprintByAgent = new Map<string, string>();
 
   constructor(options: {
     history: AgentHistoryService;
@@ -51,19 +53,29 @@ export class AgentContextService {
       directAuthoritativeRef ??
       matchingAuthoritativeIdRef(input.agent, previous?.historyRef ?? null) ??
       (input.agent.agentSession ? null : (previous?.historyRef ?? null));
+    const occupiedSessionPaths =
+      input.occupiedSessionPaths ?? occupiedForAgent(input.agent, this.#stores.agents);
+    const occupiedFingerprint = fingerprintOccupied(occupiedSessionPaths);
+    const priorOccupiedFingerprint = this.#occupiedFingerprintByAgent.get(input.agent.id);
+    const occupiedChanged =
+      priorOccupiedFingerprint !== undefined && priorOccupiedFingerprint !== occupiedFingerprint;
+    this.#occupiedFingerprintByAgent.set(input.agent.id, occupiedFingerprint);
     const forceDiscovery = await shouldForceDiscovery({
       agent: input.agent,
       directAuthoritativeRef,
-      identityChanged: input.identityChanged,
+      identityChanged: input.identityChanged || occupiedChanged,
       preferredRef,
       previous,
     });
     const resolved = bindAuthoritativeId(
       input.agent,
-      await this.#history.resolveCompactHistory(historyLookup(input.agent, this.#stores.agents), {
-        forceDiscovery,
-        ...(preferredRef ? { preferredRef } : {}),
-      }),
+      await this.#history.resolveCompactHistory(
+        historyLookup(input.agent, this.#stores.agents, occupiedSessionPaths),
+        {
+          forceDiscovery,
+          ...(preferredRef ? { preferredRef } : {}),
+        },
+      ),
     );
     const next = {
       agentId: input.agent.id,
@@ -182,21 +194,33 @@ function bindAuthoritativeId(
   };
 }
 
-function historyLookup(agent: AgentIndexRecord, agents: AgentStore) {
+function occupiedForAgent(agent: AgentIndexRecord, agents: AgentStore): ReadonlySet<string> {
+  return new Set(
+    agents
+      .listForHerdrSession(agent.herdrSessionName)
+      .filter((candidate) => candidate.id !== agent.id)
+      .flatMap((candidate) =>
+        candidate.agentSession?.kind === "path" ? [candidate.agentSession.value] : [],
+      ),
+  );
+}
+
+function fingerprintOccupied(paths: ReadonlySet<string>): string {
+  return [...paths].sort().join("\0");
+}
+
+function historyLookup(
+  agent: AgentIndexRecord,
+  agents: AgentStore,
+  occupiedSessionPaths?: ReadonlySet<string>,
+) {
   return {
     agent: agent.agent,
     agentSession: agent.agentSession,
     cwd: agent.cwd,
     firstSeenAtMs: agent.firstSeenAt.getTime(),
     foregroundCwd: agent.foregroundCwd,
-    occupiedSessionPaths: new Set(
-      agents
-        .listForHerdrSession(agent.herdrSessionName)
-        .filter((candidate) => candidate.id !== agent.id)
-        .flatMap((candidate) =>
-          candidate.agentSession?.kind === "path" ? [candidate.agentSession.value] : [],
-        ),
-    ),
+    occupiedSessionPaths: occupiedSessionPaths ?? occupiedForAgent(agent, agents),
   };
 }
 

@@ -1,4 +1,5 @@
 import { createConnection, type Socket } from "node:net";
+import { JsonLineDecoder } from "@/shared/json-lines.js";
 
 export type AgentEventWireRecord = {
   agentId?: string | null;
@@ -99,8 +100,9 @@ export class ReconnectingDaemonClient {
   readonly #pending = new Map<string, PendingRequest>();
   readonly #reconnectDelaysMs: readonly number[];
   readonly #socketPath: string;
-  #buffer = "";
+  #decoder = new JsonLineDecoder();
   #generation = 0;
+  #incompatible = false;
   #nextId = 1;
   #reconnectAttempt = 0;
   #reconnectTimer: ReturnType<typeof setTimeout> | undefined;
@@ -114,6 +116,13 @@ export class ReconnectingDaemonClient {
         ? options.reconnectDelaysMs
         : DEFAULT_RECONNECT_DELAYS_MS;
     queueMicrotask(() => this.#connect());
+  }
+
+  resetForSession(): void {
+    if (this.#state === "closed") return;
+    this.#incompatible = false;
+    this.#reconnectAttempt = 0;
+    this.#connect();
   }
 
   close(): void {
@@ -143,11 +152,11 @@ export class ReconnectingDaemonClient {
   }
 
   #connect(): void {
-    if (this.#state === "closed" || this.#state === "connecting") return;
+    if (this.#state === "closed" || this.#incompatible) return;
     this.#state = "connecting";
     this.#generation += 1;
     const generation = this.#generation;
-    this.#buffer = "";
+    this.#decoder = new JsonLineDecoder();
     const socket = createConnection(this.#socketPath);
     this.#socket = socket;
     let disconnected = false;
@@ -177,11 +186,12 @@ export class ReconnectingDaemonClient {
   }
 
   #handleDisconnect(error: Error, generation: number): void {
-    if (generation !== this.#generation || this.#state === "closed") return;
+    if (this.#state === "closed" || this.#incompatible) return;
     this.#state = "idle";
     this.#socket = undefined;
     this.#rejectAll(error);
     this.onDisconnected?.(error);
+    if (this.#incompatible) return;
     const delay =
       this.#reconnectDelaysMs[
         Math.min(this.#reconnectAttempt, this.#reconnectDelaysMs.length - 1)
@@ -194,29 +204,37 @@ export class ReconnectingDaemonClient {
   }
 
   #handleData(chunk: string): void {
-    this.#buffer += chunk;
-    let newline = this.#buffer.indexOf("\n");
-    while (newline >= 0) {
-      const line = this.#buffer.slice(0, newline).trim();
-      this.#buffer = this.#buffer.slice(newline + 1);
-      newline = this.#buffer.indexOf("\n");
-      if (!line) continue;
-      const message = JSON.parse(line) as RpcMessage;
-      if (
-        message.method === "agent.event" ||
-        message.method === "agent.context.changed" ||
-        message.method === "agent.orchestrator.changed"
-      ) {
-        this.onStreamMessage?.(message as DaemonStreamMessage);
-        continue;
-      }
-      if (message.id === undefined) continue;
-      const pending = this.#pending.get(String(message.id));
-      if (!pending) continue;
-      this.#pending.delete(String(message.id));
-      if (message.error) pending.reject(new Error(message.error.message ?? "Herdsman RPC failed"));
-      else pending.resolve(message.result);
+    for (const message of this.#decoder.push(chunk)) {
+      this.#handleMessage(message as RpcMessage);
     }
+  }
+
+  #handleMessage(message: RpcMessage): void {
+    if (
+      message.method === "agent.event" ||
+      message.method === "agent.context.changed" ||
+      message.method === "agent.orchestrator.changed"
+    ) {
+      this.onStreamMessage?.(message as DaemonStreamMessage);
+      return;
+    }
+    if (message.id === undefined) return;
+    const pending = this.#pending.get(String(message.id));
+    if (!pending) return;
+    this.#pending.delete(String(message.id));
+    if (message.error) {
+      const error = new Error(message.error.message ?? "Herdsman RPC failed");
+      pending.reject(error);
+      if (/unknown|not found|unsupported|method/i.test(error.message)) {
+        const incompatible = new Error("Herdsman daemon version is incompatible; restart the session");
+        this.#incompatible = true;
+        this.#state = "idle";
+        this.#socket?.destroy();
+        this.#socket = undefined;
+        this.#rejectAll(incompatible);
+        this.onDisconnected?.(incompatible);
+      }
+    } else pending.resolve(message.result);
   }
 
   #rejectAll(error: Error): void {

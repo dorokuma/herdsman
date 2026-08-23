@@ -140,6 +140,7 @@ export class ObservabilityRpcServer {
   async start(): Promise<void> {
     this.#stopping = false;
     if (existsSync(this.#socketPath)) unlinkSync(this.#socketPath);
+    process.umask(0o077);
     await new Promise<void>((resolve, reject) => {
       this.#server.once("error", reject);
       this.#server.listen(this.#socketPath, () => {

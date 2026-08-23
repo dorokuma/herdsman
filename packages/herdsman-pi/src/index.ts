@@ -56,6 +56,7 @@ export type HerdsmanDaemonClient = {
   onConnected: (() => Promise<void> | void) | undefined;
   onDisconnected: ((error: Error) => void) | undefined;
   onStreamMessage: ((message: DaemonStreamMessage) => void) | undefined;
+  resetForSession?(): void;
   request(method: string, params: unknown): Promise<unknown>;
 };
 
@@ -570,6 +571,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         })
         .catch((error) => {
           state.connected = false;
+          const incompatibleMessage =
+            error instanceof Error && /incompatible/i.test(error.message)
+              ? error.message
+              : undefined;
+          if (incompatibleMessage) ctx.ui.notify?.(incompatibleMessage, "error");
           markDisconnected(ctx);
           throw error;
         })
@@ -644,6 +650,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }
       state.client?.close();
       const client = options.clientFactory?.() ?? new ReconnectingDaemonClient({ socketPath: defaultSocketPath() });
+      client.resetForSession?.();
       state.client = client;
       client.onConnected = () => registerPresence(ctx);
       client.onDisconnected = () => {

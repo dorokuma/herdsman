@@ -191,12 +191,14 @@ export class HerdrSessionWatchManager {
       let restart = false;
       try {
         const agents = await this.#refresh(entry);
+        reconnectCount = 0;
         if (signal.aborted) return;
         const paneIds = agents.map((agent) => agent.paneId);
         lastPaneIds = paneIds;
         for await (const event of watcher.client.subscribeEvents({ paneIds }, { signal })) {
           if (signal.aborted) return;
           const eventRecord = record(event);
+          reconnectCount = 0;
           lastEvent = eventRecord;
           if (eventRecord.type === "pane.agent_status_changed") {
             const result = await this.#index.handleHerdrEvent({
