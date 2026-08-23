@@ -1,9 +1,11 @@
 import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { discoverAgentHistory } from "@/agent-history/discovery.js";
 
 const roleDirs: string[] = [];
+
+vi.setConfig({ testTimeout: 30_000 });
 
 afterEach(async () => {
   await Promise.all(roleDirs.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));

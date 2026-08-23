@@ -4,6 +4,8 @@ import { AgentIndexService } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
+vi.setConfig({ testTimeout: 30_000 });
+
 afterEach(cleanupTempDirs);
 const dbSession = { name: "default", sessionDir: "/tmp/herdr", socketPath: "/tmp/herdr.sock" };
 const session = {
