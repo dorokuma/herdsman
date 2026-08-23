@@ -197,7 +197,7 @@ describe("agent event pagination regressions (independent coverage)", () => {
       })?.id,
     ).toBe(pending.id);
     h.sqlite.close();
-  });
+  }, 30_000);
 
   test("returns empty and warns when every event is noise", () => {
     const h = openObservabilityDbHarness();

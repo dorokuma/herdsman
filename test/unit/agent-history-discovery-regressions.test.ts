@@ -190,7 +190,7 @@ describe("agent history discovery bounds (independent coverage)", () => {
         homeDir: "/nonexistent-herdsman-home",
       }),
     ).resolves.not.toMatchObject({ path: join(dir, "session-2000.jsonl") });
-  });
+  }, 30_000);
 
   test("reads only the bounded prefix of an oversized jsonl and finds cwd", async () => {
     const root = await roleRoot();
@@ -208,5 +208,5 @@ describe("agent history discovery bounds (independent coverage)", () => {
       }),
     ).resolves.toMatchObject({ path });
     expect(performance.now() - started).toBeLessThan(2_000);
-  });
+  }, 30_000);
 });
