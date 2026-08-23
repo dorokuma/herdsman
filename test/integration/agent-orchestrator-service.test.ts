@@ -435,3 +435,28 @@ describe("AgentOrchestratorService ack regression", () => {
     expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toEqual(first);
   });
 });
+
+describe("AgentOrchestratorService invalidated acknowledgement wording (independent coverage)", () => {
+  test("uses invalidated wording for a known event that is no longer deliverable", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const known = appendEvent(harness, { terminalId: "term_worker" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: known.id }),
+    ]);
+    harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
+
+    expect(() => service.ack({ ...scope, eventId: known.id, terminalId: "term_owner" })).toThrow(
+      "orchestrator event is no longer pending (invalidated)",
+    );
+  });
+
+  test("uses the original next-pending wording for an unknown event", () => {
+    const { service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+
+    expect(() => service.ack({ ...scope, eventId: 99_999, terminalId: "term_owner" })).toThrow(
+      "Only the next pending orchestrator event can be acknowledged",
+    );
+  });
+});

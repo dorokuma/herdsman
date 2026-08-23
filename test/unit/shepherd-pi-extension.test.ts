@@ -1738,11 +1738,107 @@ describe("pi transient reconnect cursor regression (independent coverage)", () =
   });
 });
 
-function createWakeClient(replayedEvents: AgentEventWireRecord[] = []) {
+describe("pi invalidated-event wake-loop regression (independent coverage)", () => {
+  test("clears an invalidated event, advances through the delivered batch, and does not wake it again", async () => {
+    vi.useFakeTimers();
+    const invalidatedId = 301;
+    const client = createWakeClient([event(invalidatedId, "term_agent"), event(302, "term_agent")]);
+    const baseResponse = client.response;
+    client.response = (method, params) => {
+      if (
+        method === "agent.notifications.ack" &&
+        (params as { eventId: number }).eventId === invalidatedId
+      ) {
+        throw new Error("orchestrator event is no longer pending (invalidated)");
+      }
+      return baseResponse(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      await vi.advanceTimersByTimeAsync(500);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: invalidatedId }],
+        ["agent.notifications.ack", { eventId: 302 }],
+      ]);
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
+
+      client.emitStream({ method: "agent.event", params: { event: event(303, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [303] } });
+      expect(pi.customMessages.some(([, options]) => options?.triggerTurn)).toBe(true);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("retains a normal jump rejection and leaves the failed wake cursor unchanged", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient([event(311, "term_agent"), event(313, "term_agent")]);
+    const baseResponse = client.response;
+    client.response = (method, params) => {
+      if (method === "agent.notifications.ack" && (params as { eventId: number }).eventId === 313) {
+        throw new Error("Only the next pending orchestrator event can be acknowledged");
+      }
+      return baseResponse(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      await vi.advanceTimersByTimeAsync(500);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+
+      client.emitStream({ method: "agent.event", params: { event: event(314, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [313, 314] } });
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: 311 }],
+        ["agent.notifications.ack", { eventId: 313 }],
+      ]);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("prunes pending events through the acknowledged id from a register response", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient([event(321, "term_agent"), event(322, "term_agent")], 321);
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [322] } });
+      expect(pi.customMessages.at(-1)?.[0]).not.toMatchObject({ details: { eventIds: [321] } });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+});
+
+function createWakeClient(replayedEvents: AgentEventWireRecord[] = [], ackedEventId?: number) {
   const client = createFakeClient();
   client.response = (method) => {
     if (method === "agent.orchestrator.register") {
-      return connectionResponse({ events: replayedEvents });
+      return connectionResponse({
+        ...(ackedEventId === undefined ? {} : { ackedEventId }),
+        events: replayedEvents,
+      });
     }
     if (method === "agent.orchestrator.get") return connectionResponse();
     if (method === "agent.list") return agentListResponse();
@@ -1910,6 +2006,7 @@ function fakeCtx(options: { idle?: boolean; sessionId?: string } = {}) {
 
 function connectionResponse(
   options: {
+    ackedEventId?: number;
     changed?: boolean;
     context?: AgentWorkspaceContextSnapshot | null;
     events?: AgentEventWireRecord[];
@@ -1925,6 +2022,7 @@ function connectionResponse(
   return {
     ...(options.changed === undefined ? {} : { changed: options.changed }),
     ...(options.context === undefined ? {} : { context: options.context }),
+    ...(options.ackedEventId === undefined ? {} : { ackedEventId: options.ackedEventId }),
     events: options.events ?? [],
     presence: {
       connectedAt: 1,
@@ -1935,7 +2033,7 @@ function connectionResponse(
       workspaceId,
     },
     state: {
-      ackedEventId: 0,
+      ackedEventId: options.ackedEventId ?? 0,
       herdrSessionName: "default",
       owner: ownerTerminalId
         ? {
