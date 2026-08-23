@@ -1,4 +1,4 @@
-## Unreleased
+## 0.7.0 (2026-08-23)
 
 - 接入 grok/agy 历史读取与发现，新增 `grokHome` 元数据及安全校验，移除 shepherd 命名残留。
 
