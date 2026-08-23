@@ -352,11 +352,10 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     const loseRole = (ctx: PiContext | undefined, options: { abort?: boolean } = {}) => {
       if (state.deliveredBatch) {
         state.deliveredBatch.invalidated = true;
-        const lastEventId = state.deliveredBatch.events.at(-1)?.id;
-        if (lastEventId !== undefined) {
+    if (options.abort) {
           state.failedWakeThroughEventId = Math.max(
             state.failedWakeThroughEventId,
-            lastEventId,
+            ...state.deliveredBatch.events.map((event) => event.id),
           );
         }
         if (
@@ -731,13 +730,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const stillOwner =
         state.isOrchestrator && state.currentScope?.terminalId === batch.ownerTerminalId;
       const failBatch = () => {
-        const lastEventId = batch.events.at(-1)?.id;
-        if (lastEventId !== undefined) {
-          state.failedWakeThroughEventId = Math.max(
-            state.failedWakeThroughEventId,
-            lastEventId,
-          );
-        }
         ctx.ui.notify?.(
           "Herdsman couldn’t acknowledge agent updates · updates remain pending",
           "warning",
@@ -773,11 +765,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             "Herdsman couldn’t acknowledge agent updates · updates remain pending",
             "warning",
           );
-          const failedEventId = event.id;
-          state.failedWakeThroughEventId = Math.max(
-            state.failedWakeThroughEventId,
-            failedEventId,
-          );
+          // Keep the event pending so a later delivery can retry it. A server-side
+          // rejection may mean the pane was invalidated; advancing the wake cursor
+          // here would make a reconnect skip a still-pending event.
           break;
         }
       }

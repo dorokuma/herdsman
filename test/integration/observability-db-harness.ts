@@ -24,7 +24,7 @@ export function openObservabilityDbHarness() {
     agentEvents,
     agentHistoryCache: new AgentHistoryCacheStore(sqlite),
     agentOrchestratorScopes: new AgentOrchestratorScopeStore(sqlite),
-    agents: new AgentStore(sqlite),
+    agents: new AgentStore(sqlite, agentEvents),
     herdrSessions: new HerdrSessionStore(sqlite),
     herdrWorkspaces: new HerdrWorkspaceStore(sqlite),
     sqlite,

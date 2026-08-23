@@ -1,6 +1,7 @@
-import { existsSync, realpathSync } from "node:fs";
+import { createReadStream, existsSync, realpathSync } from "node:fs";
 import { readdir, readFile, stat } from "node:fs/promises";
 import { isAbsolute, join, normalize, relative } from "node:path";
+import { createInterface } from "node:readline";
 import { DatabaseSync } from "node:sqlite";
 import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts.js";
 
@@ -103,7 +104,7 @@ export function historySourceFromSessionRef(ref: AgentSessionRef): AgentHistoryR
   return "unknown";
 }
 
-function safeAllowedSessionPath(value: string, homeDir?: string): string | null {
+export function safeAllowedSessionPath(value: string, homeDir?: string): string | null {
   if (!isAbsolute(value) || value.includes("..")) return null;
   const resolved = normalize(value);
   try {
@@ -132,38 +133,52 @@ async function scanRoot(root: string, source: AgentHistoryRef["source"]): Promis
   return candidates;
 }
 
-async function listJsonlFiles(root: string): Promise<string[]> {
+const MAX_DISCOVERY_DEPTH = 4;
+const MAX_DISCOVERY_FILES = 2000;
+
+async function listJsonlFiles(root: string, depth = 0, state = { count: 0 }): Promise<string[]> {
+  if (depth > MAX_DISCOVERY_DEPTH || state.count >= MAX_DISCOVERY_FILES) return [];
   const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
   const files: string[] = [];
   for (const entry of entries) {
+    if (state.count >= MAX_DISCOVERY_FILES) break;
     const path = join(root, entry.name);
-    if (entry.isDirectory()) files.push(...(await listJsonlFiles(path)));
-    if (entry.isFile() && entry.name.endsWith(".jsonl")) files.push(path);
+    if (entry.isDirectory()) files.push(...(await listJsonlFiles(path, depth + 1, state)));
+    if (entry.isFile() && entry.name.endsWith(".jsonl")) {
+      files.push(path);
+      state.count += 1;
+    }
   }
   return files;
 }
 
 async function readCandidateCwd(path: string): Promise<string | null> {
-  const content = await readFile(path, "utf8").catch(() => "");
+  const input = createReadStream(path, { encoding: "utf8", start: 0, end: 256 * 1024 - 1 });
+  const lines = createInterface({ input, crlfDelay: Infinity });
   let inspected = 0;
-  for (const line of content.split(/\r?\n/)) {
-    if (line.trim().length === 0) continue;
-    inspected += 1;
-    try {
-      const parsed = JSON.parse(line) as unknown;
-      const record = recordValue(parsed);
-      const cwd = stringValue(record.cwd) ?? stringValue(record.foreground_cwd);
-      if (cwd) return cwd;
-      const payload = recordValue(record.payload);
-      const payloadCwd = stringValue(payload.cwd) ?? stringValue(payload.foreground_cwd);
-      if (payloadCwd) return payloadCwd;
-      const message = recordValue(record.message);
-      const nestedCwd = stringValue(message.cwd) ?? stringValue(message.foreground_cwd);
-      if (nestedCwd) return nestedCwd;
-    } catch {
-      continue;
+  try {
+    for await (const line of lines) {
+      if (line.trim().length === 0) continue;
+      inspected += 1;
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        const record = recordValue(parsed);
+        const cwd = stringValue(record.cwd) ?? stringValue(record.foreground_cwd);
+        if (cwd) return cwd;
+        const payload = recordValue(record.payload);
+        const payloadCwd = stringValue(payload.cwd) ?? stringValue(payload.foreground_cwd);
+        if (payloadCwd) return payloadCwd;
+        const message = recordValue(record.message);
+        const nestedCwd = stringValue(message.cwd) ?? stringValue(message.foreground_cwd);
+        if (nestedCwd) return nestedCwd;
+      } catch {
+        // Ignore malformed candidate records, preserving existing matching semantics.
+      }
+      if (inspected >= 100) break;
     }
-    if (inspected >= 100) break;
+  } finally {
+    lines.close();
+    input.destroy();
   }
   return null;
 }

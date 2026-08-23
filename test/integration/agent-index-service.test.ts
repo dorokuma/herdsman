@@ -1,3 +1,5 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
@@ -324,11 +326,14 @@ describe("AgentIndexService", () => {
       history: history(() => undefined),
       stores: harness,
     });
+    const allowedPath = join("/tmp/pi-role-sessions", `early-${Date.now()}.jsonl`);
+    mkdirSync("/tmp/pi-role-sessions", { recursive: true });
+    writeFileSync(allowedPath, JSON.stringify({ cwd: "/tmp" }));
     const sessionRef = {
       agent: "pi" as const,
       kind: "path" as const,
       source: "herdr:pi",
-      value: "/tmp/early-pi-session.jsonl",
+      value: allowedPath,
     };
 
     await expect(
@@ -372,8 +377,10 @@ describe("AgentIndexService", () => {
       agent: "pi" as const,
       kind: "path" as const,
       source: "herdr:pi",
-      value: "/tmp/pi-session.jsonl",
+      value: "/tmp/pi-role-sessions/serialized-pi-session.jsonl",
     };
+    mkdirSync("/tmp/pi-role-sessions", { recursive: true });
+    writeFileSync(sessionRef.value, JSON.stringify({ cwd: "/tmp" }));
 
     const first = index.refreshHerdrSession(sessionInput());
     const registration = index.registerPiSessionRef({

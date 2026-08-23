@@ -35,8 +35,8 @@ export async function runObservabilityDaemonService(
 
   const herdrSessions = new HerdrSessionStore(sqlite);
   const herdrWorkspaces = new HerdrWorkspaceStore(sqlite);
-  const agents = new AgentStore(sqlite);
   const agentEvents = new AgentEventStore(sqlite);
+  const agents = new AgentStore(sqlite, agentEvents);
   const agentHistoryCache = new AgentHistoryCacheStore(sqlite);
   const agentContextSnapshots = new AgentContextSnapshotStore(sqlite);
   const agentOrchestratorScopes = new AgentOrchestratorScopeStore(sqlite);

@@ -19,6 +19,7 @@ export function isDeliverableAgentEvent(
     event.agentId !== null &&
     agent !== undefined &&
     event.type !== "agent.status.changed" &&
+    !(event.type === "agent.idle" && asRecord(event.payload).from !== "working") &&
     !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
     event.deliverable === 1 &&
     agent.paneId === event.paneId &&
@@ -29,6 +30,12 @@ export function isDeliverableAgentEvent(
     event.terminalId !== null &&
     event.terminalId !== ownerTerminalId
   );
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {};
 }
 
 type AgentEventRow = {
@@ -154,6 +161,7 @@ export class AgentEventStore {
     workspaceId: string;
     getAgent?: (agentId: string) => AgentIndexRecord | undefined;
   }): AgentEventRecord | undefined {
+    const scope = { herdrSessionName: input.herdrSessionName, workspaceId: input.workspaceId };
     const agentFilter = input.getAgent
       ? ""
       : `and exists (
@@ -163,33 +171,37 @@ export class AgentEventStore {
                and agents.workspace_id = agent_events.workspace_id
                and agents.pane_id = agent_events.pane_id
            )`;
-    const params = [
-      input.afterEventId,
-      input.herdrSessionName,
-      input.workspaceId,
-      input.ownerTerminalId,
-    ];
-    const rows = this.#sqlite
-      .prepare(
-        `select * from agent_events
-         where id > ? and deliverable = 1 and herdr_session_name = ? and workspace_id = ?
-           and terminal_id is not null and terminal_id != ? and agent_id is not null
-           ${agentFilter}
-         order by id asc limit 1000`,
-      )
-      .all(...params) as AgentEventRow[];
-    const scope = { herdrSessionName: input.herdrSessionName, workspaceId: input.workspaceId };
-    for (const row of rows) {
-      const event = mapAgentEvent(row);
-      const agentId = event.agentId;
-      if (agentId === null) continue;
-      if (
-        !input.getAgent ||
-        isDeliverableAgentEvent(event, input.getAgent(agentId), scope, input.ownerTerminalId)
-      ) {
-        return event;
+    let afterEventId = input.afterEventId;
+    for (let page = 0; page < 50; page += 1) {
+      const params = [
+        afterEventId,
+        input.herdrSessionName,
+        input.workspaceId,
+        input.ownerTerminalId,
+      ];
+      const rows = this.#sqlite
+        .prepare(
+          `select * from agent_events
+           where id > ? and deliverable = 1 and herdr_session_name = ? and workspace_id = ?
+             and terminal_id is not null and terminal_id != ? and agent_id is not null
+             ${agentFilter}
+           order by id asc limit 1000`,
+        )
+        .all(...params) as AgentEventRow[];
+      if (rows.length === 0) return undefined;
+      for (const row of rows) {
+        const event = mapAgentEvent(row);
+        const agentId = event.agentId;
+        if (
+          agentId !== null &&
+          (!input.getAgent ||
+            isDeliverableAgentEvent(event, input.getAgent(agentId), scope, input.ownerTerminalId))
+        )
+          return event;
       }
+      afterEventId = rows.at(-1)?.id ?? afterEventId;
     }
+    console.warn("Herdsman stopped scanning pending agent events after 50 pages", scope);
     return undefined;
   }
 

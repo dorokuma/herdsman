@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import type { DatabaseSync } from "node:sqlite";
+import type { AgentEventStore } from "@/db/agent-events.js";
 import {
   type AgentIndexRecord,
   type AgentQueryScope,
@@ -33,9 +34,11 @@ type AgentRow = {
 
 export class AgentStore {
   readonly #sqlite: DatabaseSync;
+  readonly #agentEvents: AgentEventStore;
 
-  constructor(sqlite: DatabaseSync) {
+  constructor(sqlite: DatabaseSync, agentEvents: AgentEventStore) {
     this.#sqlite = sqlite;
+    this.#agentEvents = agentEvents;
   }
 
   replaceForSession(input: {
@@ -143,6 +146,13 @@ export class AgentStore {
       const removedIds = existing
         .map((agent) => agent.id)
         .filter((id) => !retainedIds.includes(id));
+      for (const agent of existing.filter((candidate) => removedIds.includes(candidate.id))) {
+        this.#agentEvents.invalidatePane({
+          herdrSessionName: input.herdrSessionName,
+          paneId: agent.pane_id,
+          paneGeneration: agent.pane_generation,
+        });
+      }
       if (removedIds.length > 0) {
         const placeholders = removedIds.map(() => "?").join(", ");
         this.#sqlite

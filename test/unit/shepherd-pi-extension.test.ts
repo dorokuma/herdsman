@@ -1120,7 +1120,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("does not retry a failed batch until a newer outcome arrives", async () => {
+  test("retries a failed batch when its event remains pending", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
@@ -1134,12 +1134,12 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("message_end", assistantMessage("aborted"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.customMessages).toHaveLength(2);
 
       client.emitStream({ method: "agent.event", params: { event: event(82, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.customMessages).toHaveLength(2);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [82] } });
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [81] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1166,7 +1166,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.customMessages).toHaveLength(2);
 
       client.emitStream({ method: "agent.event", params: { event: event(87, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
@@ -1210,7 +1210,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.emitStream({ method: "agent.event", params: { event: event(89, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.customMessages).toHaveLength(2);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [89] } });
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [88, 89] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1662,7 +1662,7 @@ describe("pi acknowledgement cursor regression (independent coverage)", () => {
       client.emitStream({ method: "agent.event", params: { event: event(204, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.customMessages.at(-1)?.[0]).toMatchObject({
-        details: { eventIds: [203, 204] },
+        details: { eventIds: [202, 203, 204] },
       });
     } finally {
       vi.clearAllTimers();

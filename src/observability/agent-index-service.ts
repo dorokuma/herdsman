@@ -1,3 +1,4 @@
+import { safeAllowedSessionPath } from "@/agent-history/discovery.js";
 import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
 import type { AgentEventStore } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
@@ -340,6 +341,9 @@ export class AgentIndexService {
     terminalId: string;
   }): Promise<PiSessionRefRegistrationResult> {
     const key = terminalSessionKey(input.herdrSessionName, input.terminalId);
+    if (input.sessionRef.kind === "path" && !safeAllowedSessionPath(input.sessionRef.value)) {
+      return { agent: undefined, contextChangedScopes: [] };
+    }
     const previous = this.#stores.agents.findByTerminal(input);
     if (!previous) {
       this.#pendingPiSessionRefs.set(key, input.sessionRef);

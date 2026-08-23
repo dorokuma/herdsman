@@ -27,6 +27,7 @@ function appendEvent(
     agent?: string;
     terminalId: string;
     type?: "agent.done" | "agent.idle" | "agent.status.changed";
+    from?: "working" | "unknown" | "blocked";
     sessionPath?: string;
     workspaceId?: string;
   },
@@ -74,7 +75,7 @@ function appendEvent(
     agentId: agent.id,
     herdrSessionName: "default",
     paneId,
-    payload: {},
+    payload: input.type === "agent.idle" ? { from: input.from ?? "working" } : {},
     terminalId: input.terminalId,
     type: input.type ?? "agent.done",
     workspaceId,
@@ -131,9 +132,9 @@ describe("AgentOrchestratorService", () => {
       agent: "pi",
       sessionPath: "/tmp/pi-role-sessions/role-worker-fd92d978/session.jsonl",
       terminalId: "term_worker",
+      from: "working",
       type: "agent.idle",
     });
-
     expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
       expect.objectContaining({ id: workerEvent.id }),
     ]);
@@ -144,17 +145,31 @@ describe("AgentOrchestratorService", () => {
     });
   });
 
-  test("does not filter non-Pi agent idle events", () => {
+  test("filters idle events unless they transition from working", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
-    const event = appendEvent(harness, {
+    const working = appendEvent(harness, {
       agent: "codex",
       terminalId: "term_other",
+      from: "working",
       type: "agent.idle",
     });
-    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
-      expect.objectContaining({ id: event.id }),
-    ]);
+    const unknown = appendEvent(harness, {
+      agent: "codex",
+      terminalId: "term_unknown",
+      from: "unknown",
+      type: "agent.idle",
+    });
+    const blocked = appendEvent(harness, {
+      agent: "codex",
+      terminalId: "term_blocked",
+      from: "blocked",
+      type: "agent.idle",
+    });
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    expect(pending.map((event) => event.id)).toContain(working.id);
+    expect(pending.map((event) => event.id)).not.toContain(unknown.id);
+    expect(pending.map((event) => event.id)).not.toContain(blocked.id);
   });
 
   test("returns ordered non-self pending events across bounded scan pages", () => {
@@ -354,7 +369,7 @@ describe("AgentOrchestratorService", () => {
 });
 
 describe("AgentOrchestratorService ack regression", () => {
-  test("acknowledges a delivered event after its worker pane is retired", () => {
+  test("rejects acknowledging an event invalidated with its retired worker pane", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
     const event = appendEvent(harness, { terminalId: "term_worker" });
@@ -363,20 +378,27 @@ describe("AgentOrchestratorService ack regression", () => {
     ]);
     harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
 
-    expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toMatchObject({
-      ackedEventId: event.id,
-    });
+    expect(() => service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toThrow(
+      "Only the next pending orchestrator event can be acknowledged",
+    );
   });
 
-  test("acknowledges a delivered event when no later event is deliverable", () => {
+  test("rejects an invalidated event without blocking a later pending event", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
     const event = appendEvent(harness, { terminalId: "term_worker" });
     harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
 
-    expect(
-      service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" }).ackedEventId,
-    ).toBe(event.id);
+    expect(() => service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toThrow(
+      "Only the next pending orchestrator event can be acknowledged",
+    );
+    const later = appendEvent(harness, { terminalId: "term_later" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: later.id }),
+    ]);
+    expect(service.ack({ ...scope, eventId: later.id, terminalId: "term_owner" })).toMatchObject({
+      ackedEventId: later.id,
+    });
   });
 
   test("still rejects acknowledging past a later deliverable event", () => {
