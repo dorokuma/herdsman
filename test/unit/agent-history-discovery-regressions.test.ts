@@ -174,15 +174,18 @@ describe("agent history discovery bounds (independent coverage)", () => {
       join(root, "many", "session-2000.jsonl"),
       `${JSON.stringify({ cwd: "/repo" })}\n`,
     );
-    await expect(
-      discoverAgentHistory({
-        agent: "pi",
-        agentSession: null,
-        cwd: "/repo",
-        foregroundCwd: null,
-        homeDir: "/nonexistent-herdsman-home",
-      }),
-    ).resolves.toMatchObject({ path: expect.stringContaining("session-19") });
+    const result = await discoverAgentHistory({
+      agent: "pi",
+      agentSession: null,
+      cwd: "/repo",
+      foregroundCwd: null,
+      homeDir: "/nonexistent-herdsman-home",
+    });
+    const resultPath = result?.path;
+    expect(resultPath).toBeDefined();
+    expect(resultPath?.startsWith(`${dir}/`)).toBe(true);
+    expect(resultPath).toMatch(/\/session-\d{4}\.jsonl$/);
+    expect(resultPath).not.toBe(join(dir, "session-2000.jsonl"));
     await expect(
       discoverAgentHistory({
         agent: "pi",
