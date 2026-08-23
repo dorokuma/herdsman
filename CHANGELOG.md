@@ -1,3 +1,8 @@
+## 0.6.6
+
+- Fix an infinite re-wake loop: acknowledging an invalidated orchestrator event is now rejected with a distinct "no longer pending" error, and the extension treats that as terminal - it prunes the outcome from its pending set and advances past the delivered batch instead of retrying forever. Acknowledged ids returned by the server also prune stale pending events on register and after each ack (1aa2612..cce0a5a).
+- Suggestion-tier improvements: Pi id-kind session refs resolve their file by id before falling back to discovery; candidate cwd comparison normalizes trailing/repeated slashes; pinned-context retain compares all entries sharing a pane id; snapshot excerpts are capped at 2000 characters; unchanged context snapshots are no longer re-pushed (1aa2612).
+
 ## 0.6.5
 
 - Hotfix: the pi extension crashed on load ("Cannot find module '@/shared/json-lines.js'") because 0.6.4 introduced a cross-package path alias that does not resolve when the extension is loaded as standalone TypeScript. The JSON-lines decoder is now vendored inside the herdsman-pi package (same 1 MiB semantics), the alias import is gone, and a regression test loads the extension independently and rejects an oversized frame (4d41230).
