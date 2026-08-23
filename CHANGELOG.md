@@ -1,3 +1,7 @@
+## 0.6.5
+
+- Hotfix: the pi extension crashed on load ("Cannot find module '@/shared/json-lines.js'") because 0.6.4 introduced a cross-package path alias that does not resolve when the extension is loaded as standalone TypeScript. The JSON-lines decoder is now vendored inside the herdsman-pi package (same 1 MiB semantics), the alias import is gone, and a regression test loads the extension independently and rejects an oversized frame (4d41230).
+
 ## 0.6.4
 
 Full re-audit hardening (correctness / security / reliability), all findings verified against source:

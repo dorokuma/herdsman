@@ -1,6 +1,6 @@
 id = "herdsman.agents"
 name = "Herdsman Agents"
-version = "0.6.4"
+version = "0.6.5"
 min_herdr_version = "0.7.0"
 description = "Read compact Herdr agent history through Herdsman."
 platforms = ["linux", "macos", "windows"]
