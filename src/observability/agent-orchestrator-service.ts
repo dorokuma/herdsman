@@ -99,10 +99,12 @@ export class AgentOrchestratorService {
     }
     if (
       event.herdrSessionName !== input.herdrSessionName ||
-      event.workspaceId !== input.workspaceId ||
-      event.deliverable !== 1
+      event.workspaceId !== input.workspaceId
     ) {
       throw new Error("Only the next pending orchestrator event can be acknowledged");
+    }
+    if (event.deliverable !== 1) {
+      throw new Error("orchestrator event is no longer pending (invalidated)");
     }
     const eventAgent = event.agentId ? this.#agents.get(event.agentId) : undefined;
     if (eventAgent && !isDeliverableAgentEvent(event, eventAgent, input, input.terminalId)) {

@@ -45,6 +45,7 @@ type PiPresence = {
 
 type ConnectionStateResponse = {
   changed?: boolean;
+  ackedEventId?: number;
   context?: AgentWorkspaceContextSnapshot | null;
   events?: AgentEventWireRecord[];
   presence: PiPresence;
@@ -221,6 +222,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.latestContext = undefined;
       state.pinnedContext = undefined;
       state.runActive = false;
+    };
+
+    const pruneAcknowledgedEvents = (ackedEventId: number | undefined) => {
+      if (ackedEventId === undefined) return;
+      state.pendingEvents = state.pendingEvents.filter((event) => event.id > ackedEventId);
     };
 
     const applyOwnerContext = (response: ConnectionStateResponse) => {
@@ -448,6 +454,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       applyOwnerContext(response);
       setHerdsmanUi(ctx);
       addPendingEvents(response.events ?? [], ctx);
+      pruneAcknowledgedEvents(response.state?.ackedEventId ?? response.ackedEventId);
+      setHerdsmanUi(ctx);
       scheduleWake(ctx);
     };
 
@@ -764,10 +772,25 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
       for (const event of batch.events) {
         try {
-          await state.client.request("agent.notifications.ack", { eventId: event.id });
+          const ackResponse = (await state.client.request("agent.notifications.ack", {
+            eventId: event.id,
+          })) as { ackedEventId?: number; state?: { ackedEventId?: number } };
+          pruneAcknowledgedEvents(ackResponse?.ackedEventId ?? ackResponse?.state?.ackedEventId);
           state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
           setHerdsmanUi(ctx);
-        } catch {
+        } catch (error) {
+          if (
+            error instanceof Error &&
+            /no longer pending|invalidated/i.test(error.message)
+          ) {
+            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id > event.id);
+            state.failedWakeThroughEventId = Math.max(
+              state.failedWakeThroughEventId,
+              ...batch.events.map((batchEvent) => batchEvent.id),
+            );
+            setHerdsmanUi(ctx);
+            continue;
+          }
           // Keep the event pending so the next Herdsman round retries the acknowledgement.
           // Acknowledgement failure must not block delivery of the main turn.
           ctx.ui.notify?.(

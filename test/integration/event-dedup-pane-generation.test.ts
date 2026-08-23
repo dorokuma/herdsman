@@ -139,7 +139,7 @@ describe("event deduplication and pane generations", () => {
       paneGeneration: "gen-1",
     });
     expect(() => service.ack({ ...scope, eventId: e.id, terminalId: "term-owner" })).toThrow(
-      "Only the next pending orchestrator event can be acknowledged",
+      "orchestrator event is no longer pending (invalidated)",
     );
   });
 });

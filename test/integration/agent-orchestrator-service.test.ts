@@ -379,7 +379,7 @@ describe("AgentOrchestratorService ack regression", () => {
     harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
 
     expect(() => service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toThrow(
-      "Only the next pending orchestrator event can be acknowledged",
+      "orchestrator event is no longer pending (invalidated)",
     );
   });
 
@@ -390,7 +390,7 @@ describe("AgentOrchestratorService ack regression", () => {
     harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
 
     expect(() => service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toThrow(
-      "Only the next pending orchestrator event can be acknowledged",
+      "orchestrator event is no longer pending (invalidated)",
     );
     const later = appendEvent(harness, { terminalId: "term_later" });
     expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
