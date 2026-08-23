@@ -1,3 +1,18 @@
+## 0.6.4
+
+Full re-audit hardening (correctness / security / reliability), all findings verified against source:
+
+- Delivery cursor deadlocks: transient disconnects no longer advance the failed-wake cursor past unacknowledged events, so batches are redelivered and acknowledged after reconnect; rejected acks only drop the batch (266fdc9).
+- Idle events now count as outcomes only when transitioning from working, aligning the delivery predicate with acknowledgement (266fdc9).
+- Replacing an agent invalidates its pane's events, so orphans can neither be delivered nor wedge the cursor (266fdc9).
+- Authoritative path session refs are validated against the session allowlist at registration; invalid refs fall back to discovery (266fdc9).
+- Pending scans paginate past noise windows instead of truncating at 1000 rows (266fdc9).
+- History discovery is bounded (depth 4, 2000 files, 256KB cwd prefix) and hardened: role session roots require daemon-owned roots and regular, unlinked, owner-matching files (726d92f).
+- Data directory permissions are enforced (0700 home, 0600 db/wal/shm); the socket is created under a private umask (726d92f).
+- Reconnect backoff resets once a subscription is established, and protocol-incompatible daemons stop reconnect loops until the next session (726d92f).
+- Readiness failures escalate SIGTERM to SIGKILL and only remove the pid file after death is confirmed (726d92f).
+- Changed occupied-session sets force history re-discovery, replacing stale fallback snapshots; pinned-context retain detects pane reuse by agent id (266fdc9, 726d92f).
+
 ## 0.6.3
 
 - History ownership: Pi fallback discovery now scans dispatched role session roots, requires an exact cwd match, and skips session files already owned by another agent, so a worker pane can no longer be attributed the orchestrator's own transcript (f47e9c1).
