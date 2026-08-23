@@ -44,10 +44,26 @@ export async function discoverAgentHistory(
   }
 
   const cwd = input.cwd ?? input.foregroundCwd;
+  const normalizedCwd = normalizeCwd(cwd);
   const homeDir = input.homeDir ?? process.env.HOME ?? "";
 
   if (input.agentSession?.kind === "id") {
     const source = historySourceFromSessionRef(input.agentSession);
+    if (source === "pi-jsonl") {
+      const roots = new Set([join(homeDir, ".pi", "agent", "sessions"), ...ALLOWED_SESSION_ROOTS]);
+      for (const root of roots) {
+        const matches = await scanRootById(root, input.agentSession.value, source);
+        const candidate = matches.find((item) => !input.occupiedSessionPaths?.has(item.path));
+        if (candidate) {
+          return {
+            kind: "agent_session",
+            path: candidate.path,
+            source,
+            value: input.agentSession.value,
+          };
+        }
+      }
+    }
     if (source === "opencode-sqlite") {
       const ref = discoverOpenCodeSession({ cwd, homeDir, sessionId: input.agentSession.value });
       if (ref) return { ...ref, kind: "agent_session" };
@@ -76,7 +92,7 @@ export async function discoverAgentHistory(
     if (ref) return ref;
   }
   const ranked = candidates
-    .filter((candidate) => cwd !== null && candidate.cwd === cwd)
+    .filter((candidate) => normalizedCwd !== null && normalizeCwd(candidate.cwd) === normalizedCwd)
     .filter((candidate) => !input.occupiedSessionPaths?.has(candidate.path))
     .filter(
       (candidate) =>
@@ -122,6 +138,35 @@ export function safeAllowedSessionPath(value: string, homeDir?: string): string 
   }
 }
 const CURRENT_EUID = process.geteuid?.() ?? -1;
+
+async function scanRootById(
+  root: string,
+  id: string,
+  source: AgentHistoryRef["source"],
+): Promise<Candidate[]> {
+  if (!existsSync(root)) return [];
+  const rootStats = await stat(root).catch(() => null);
+  if (!rootStats || rootStats.uid !== CURRENT_EUID || (rootStats.mode & 0o022) !== 0) {
+    console.warn(`Skipping unsafe discovery root: ${root}`);
+    return [];
+  }
+  const files = (await listJsonlFiles(root)).filter((path) => path.split("/").pop()?.includes(id));
+  const candidates: Candidate[] = [];
+  for (const path of files) {
+    const stats = await stat(path).catch(() => null);
+    const linkStats = await lstat(path).catch(() => null);
+    if (!stats?.isFile() || !linkStats?.isFile() || stats.uid !== CURRENT_EUID) continue;
+    candidates.push({ cwd: null, mtimeMs: stats.mtimeMs, path, source });
+  }
+  return candidates;
+}
+
+function normalizeCwd(value: string | null): string | null {
+  if (value === null) return null;
+  const compact = value.replace(/\/{2,}/g, "/");
+  if (compact === "/") return compact;
+  return compact.replace(/\/+$/, "");
+}
 
 async function scanRoot(root: string, source: AgentHistoryRef["source"]): Promise<Candidate[]> {
   if (!existsSync(root)) return [];

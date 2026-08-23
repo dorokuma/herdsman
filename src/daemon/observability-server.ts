@@ -75,6 +75,7 @@ export class ObservabilityRpcServer {
   readonly #clearTimeout: (handle: TimerHandle) => void;
   readonly #context: AgentContextService;
   readonly #connectionOrderBySocket = new Map<Socket, number>();
+  readonly #publishedContextFingerprintByScope = new Map<string, string>();
   readonly #disconnectGraceMs: number;
   readonly #disconnectTimers = new Map<string, GraceTimer>();
   readonly #history: AgentHistoryService;
@@ -179,6 +180,10 @@ export class ObservabilityRpcServer {
       ...scope,
       excludeTerminalId: owner.terminalId,
     });
+    const contextFingerprint = JSON.stringify(context);
+    const scopeKey = `${scope.herdrSessionName}\0${scope.workspaceId}`;
+    if (this.#publishedContextFingerprintByScope.get(scopeKey) === contextFingerprint) return;
+    this.#publishedContextFingerprintByScope.set(scopeKey, contextFingerprint);
     this.#write(socket, {
       method: "agent.context.changed",
       params: { context, herdrSessionName: scope.herdrSessionName, workspaceId: scope.workspaceId },

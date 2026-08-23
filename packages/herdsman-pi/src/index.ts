@@ -530,9 +530,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
               ? {
                   ...snapshot,
                   agents: snapshot.agents.filter((agent) => {
-                    const nextAgent = next?.agents.find((candidate) => candidate.paneId === agent.paneId);
-                    if (!nextAgent) return false;
-                    return !agent.id || !nextAgent.id || agent.id === nextAgent.id;
+                    const nextAgents = next?.agents.filter((candidate) => candidate.paneId === agent.paneId) ?? [];
+                    if (nextAgents.length === 0) return false;
+                    return nextAgents.some(
+                      (nextAgent) => !agent.id || !nextAgent.id || agent.id === nextAgent.id,
+                    );
                   }),
                 }
               : undefined;
