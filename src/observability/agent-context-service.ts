@@ -220,6 +220,9 @@ function historyLookup(
     cwd: agent.cwd,
     firstSeenAtMs: agent.firstSeenAt.getTime(),
     foregroundCwd: agent.foregroundCwd,
+    ...(agent.agent?.toLowerCase() === "grok" && agent.grokHome
+      ? { grokHome: agent.grokHome }
+      : {}),
     occupiedSessionPaths: occupiedSessionPaths ?? occupiedForAgent(agent, agents),
   };
 }

@@ -94,7 +94,7 @@ Default mode:
 - `before_agent_start` injects hidden context:
 
 ```text
-[SHEPHERD WORKER NOTIFICATIONS]
+[HERDSMAN WORKER NOTIFICATIONS]
 - worker.completed impl: completed tests. Evidence: pi-session:/path#entry=a2
 - worker.blocked reviewer: needs input on API shape. Evidence: event 42
 Use herdsman_worker_snapshot if details are needed.
@@ -185,7 +185,7 @@ command = ["node", "dist/index.js", "dashboard"]
 
 `dashboard` behavior:
 
-- read observed workspace id from `SHEPHERD_OBSERVED_WORKSPACE_ID`, or call `observe-workspace` first
+- read observed workspace id from `HERDSMAN_OBSERVED_WORKSPACE_ID`, or call `observe-workspace` first
 - call `herdsman snapshot <id> --json`
 - render compact rows: `status agent summary recommendedAction`
 - refresh every 5 seconds until process exits

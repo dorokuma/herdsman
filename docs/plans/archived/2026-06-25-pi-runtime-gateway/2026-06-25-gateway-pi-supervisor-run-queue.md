@@ -272,7 +272,7 @@ A dedicated table can be added later if querying by Pi session becomes common.
 
 Store a stable Gateway identity in Herdsman home/state. Options:
 
-- A small file under `SHEPHERD_HOME`, for example `gateway-id`.
+- A small file under `HERDSMAN_HOME`, for example `gateway-id`.
 - A DB metadata table if one is added.
 
 The identity is written into Pi session binding entries and checked during auto-attach.

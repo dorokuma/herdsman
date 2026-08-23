@@ -20,7 +20,7 @@
 - Ignore context streams whose `(herdrSessionName, workspaceId)` do not match current scope or when this Pi is not owner.
 - `agent_start` pins at most once until `agent_settled`; repeated low-level starts/retries do not replace the pin.
 - The `context` hook is synchronous and performs only in-memory filtering/formatting.
-- Legacy persisted messages with `customType === "herdsman-agent-context"` or marker `[SHEPHERD AGENT CONTEXT]` are removed from provider context before appending the current ephemeral message.
+- Legacy persisted messages with `customType === "herdsman-agent-context"` or marker `[HERDSMAN AGENT CONTEXT]` are removed from provider context before appending the current ephemeral message.
 - Do not filter `herdsman-wake-context`, visible `herdsman-wake`, or prior assistant wake responses.
 - If the pinned snapshot is absent, return only the legacy-filtered messages.
 - If a delivered batch is Herdsman-triggered, do not pin normal context for that run.
@@ -263,14 +263,14 @@ Cover:
 {
   role: "custom",
   customType: "herdsman-agent-context",
-  content: expect.stringContaining("[SHEPHERD AGENT CONTEXT]"),
+  content: expect.stringContaining("[HERDSMAN AGENT CONTEXT]"),
   display: false,
   timestamp: expect.any(Number),
 }
 ```
 
 4. Existing messages with `customType: "herdsman-agent-context"` are removed.
-5. Legacy user/custom content containing `[SHEPHERD AGENT CONTEXT]` is removed defensively.
+5. Legacy user/custom content containing `[HERDSMAN AGENT CONTEXT]` is removed defensively.
 6. `herdsman-wake-context` and unrelated custom messages remain.
 7. A snapshot stream update after `agent_start` does not change the pinned context on later context calls in the same run.
 8. A repeated `agent_start` before `agent_settled` does not repin.
@@ -329,7 +329,7 @@ pi.on("context", (event: { messages: PiAgentMessage[] }) => {
 });
 ```
 
-`isNormalHerdsmanContext()` matches `customType` first and the stable marker as a fallback across string/block content. It must not match `herdsman-wake-context` merely because both start with “SHEPHERD”.
+`isNormalHerdsmanContext()` matches `customType` first and the stable marker as a fallback across string/block content. It must not match `herdsman-wake-context` merely because both start with “HERDSMAN”.
 
 - [x] **Step 6: Remove prompt-time pull and persistent normal context**
 
@@ -385,8 +385,8 @@ await vi.advanceTimersByTimeAsync(250);
 Assert at 500 ms:
 
 - no wake custom message was sent;
-- normal context contains `[SHEPHERD AGENT CONTEXT]` if a cached snapshot exists;
-- normal context does **not** contain `[SHEPHERD AGENT UPDATES]`;
+- normal context contains `[HERDSMAN AGENT CONTEXT]` if a cached snapshot exists;
+- normal context does **not** contain `[HERDSMAN AGENT UPDATES]`;
 - no ack was sent.
 
 Then finish the normal run:
@@ -398,7 +398,7 @@ await pi.emit("agent_settled", {}, ctx);
 await vi.advanceTimersByTimeAsync(500);
 ```
 
-Assert one independent wake appears. Simulate its `agent_start`, verify provider context contains the persisted `herdsman-wake-context` but no normal `[SHEPHERD AGENT CONTEXT]`, finish with successful assistant/settled events, and only then expect `agent.notifications.ack` for event 101.
+Assert one independent wake appears. Simulate its `agent_start`, verify provider context contains the persisted `herdsman-wake-context` but no normal `[HERDSMAN AGENT CONTEXT]`, finish with successful assistant/settled events, and only then expect `agent.notifications.ack` for event 101.
 
 - [x] **Step 2: Update wake tests that manually emitted `before_agent_start`**
 

@@ -5,6 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test } from "vitest";
 import { CodexHistoryReader } from "@/agent-history/codex-reader.js";
 import { GeminiHistoryReader } from "@/agent-history/gemini-reader.js";
+import { GrokHistoryReader } from "@/agent-history/grok-reader.js";
 import { OpenCodeHistoryReader } from "@/agent-history/opencode-reader.js";
 import { createAgentHistoryService } from "@/agent-history/service.js";
 
@@ -19,6 +20,35 @@ async function tempHome(name: string) {
   tempDirs.push(dir);
   return dir;
 }
+
+describe("GrokHistoryReader", () => {
+  test("returns the last assistant message from JSONL", async () => {
+    const homeDir = await tempHome("herdsman-grok-reader-");
+    const path = join(homeDir, "chat_history.jsonl");
+    await writeFile(
+      path,
+      [
+        { type: "assistant", id: "a1", content: "old" },
+        { type: "user", content: "question" },
+        { type: "assistant", id: "a2", content: [{ text: "latest" }] },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n") + "\n",
+    );
+    await expect(
+      new GrokHistoryReader().read({
+        kind: "discovered_file",
+        path,
+        source: "grok-jsonl",
+        value: path,
+      }),
+    ).resolves.toMatchObject([
+      { role: "assistant", text: "old" },
+      { role: "user", text: "question" },
+      { role: "assistant", text: "latest" },
+    ]);
+  });
+});
 
 describe("CodexHistoryReader", () => {
   test("reads user, assistant, and tool output messages", async () => {

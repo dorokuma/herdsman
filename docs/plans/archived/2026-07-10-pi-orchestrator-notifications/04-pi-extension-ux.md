@@ -343,7 +343,7 @@ Add tests for:
 - owner self-terminal event is ignored defensively even though daemon filters it;
 - pending events returned during registration appear in next hidden update and are acked in ascending id order;
 - role switch before ack clears old local pending events so they transfer/replay to the new owner rather than being acked by the old owner;
-- ownerless/non-owner `before_agent_start` still calls `agent.list` and injects `[SHEPHERD AGENT CONTEXT]` with no update section;
+- ownerless/non-owner `before_agent_start` still calls `agent.list` and injects `[HERDSMAN AGENT CONTEXT]` with no update section;
 - telemetry is sent by owner and non-owner alike using authoritative moved `workspaceId`;
 - `before_agent_start` refreshes status with `agent.orchestrator.get` before `agent.list` when the connection is registered, so a non-owner moved pane receives current scope on its next turn;
 - daemon failure during get/list/ack returns `{}` or context already prepared without throwing into Pi;

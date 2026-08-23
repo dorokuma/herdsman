@@ -555,8 +555,8 @@ In `test/unit/cli.test.ts`, add:
 test("parses no args as local Pi startup", () => {
   expect(
     parseCliArgs([], {
-      SHEPHERD_DB_PATH: "/tmp/herdsman.sqlite",
-      SHEPHERD_GATEWAY_SOCKET_PATH: "/tmp/herdsman.sock",
+      HERDSMAN_DB_PATH: "/tmp/herdsman.sqlite",
+      HERDSMAN_GATEWAY_SOCKET_PATH: "/tmp/herdsman.sock",
       PWD: "/repo/herdsman",
     }),
   ).toEqual({
@@ -599,8 +599,8 @@ Change `parseCliArgs`:
 if (!command) {
   return {
     command: "start-local",
-    dbPath: environment.SHEPHERD_DB_PATH ?? "herdsman.sqlite",
-    socketPath: environment.SHEPHERD_GATEWAY_SOCKET_PATH ?? "/tmp/herdsman.sock",
+    dbPath: environment.HERDSMAN_DB_PATH ?? "herdsman.sqlite",
+    socketPath: environment.HERDSMAN_GATEWAY_SOCKET_PATH ?? "/tmp/herdsman.sock",
     workingContextPath: process.cwd(),
   };
 }
@@ -618,7 +618,7 @@ Add this exported helper. It always prints the same command shape and substitute
 
 ```ts
 export function gatewayStartHint(environment: NodeJS.ProcessEnv = env): string {
-  return `Herdsman Gateway is not reachable. Start the Gateway first:\n  herdsman gateway start --config ${environment.SHEPHERD_CONFIG ?? "<path>"}`;
+  return `Herdsman Gateway is not reachable. Start the Gateway first:\n  herdsman gateway start --config ${environment.HERDSMAN_CONFIG ?? "<path>"}`;
 }
 ```
 
@@ -836,7 +836,7 @@ Add a hint test:
 
 ```ts
 test("renders Gateway startup hint", () => {
-  expect(gatewayStartHint({ SHEPHERD_CONFIG: "/tmp/herdsman.yaml" })).toBe(
+  expect(gatewayStartHint({ HERDSMAN_CONFIG: "/tmp/herdsman.yaml" })).toBe(
     "Herdsman Gateway is not reachable. Start the Gateway first:\n  herdsman gateway start --config /tmp/herdsman.yaml",
   );
   expect(gatewayStartHint({})).toContain("herdsman gateway start --config <path>");
@@ -1033,7 +1033,7 @@ Update the existing create-session Node snippet to either remove it or label it 
 Open an existing Herdsman session, for example one created from Slack:
 
 ```bash
-herdsman open --session "$SHEPHERD_SESSION_ID"
+herdsman open --session "$HERDSMAN_SESSION_ID"
 ```
 ```
 
@@ -1112,9 +1112,9 @@ Only run this when a real Gateway and Pi are available in the developer environm
 Terminal 1:
 
 ```bash
-export SHEPHERD_DB_PATH=/tmp/herdsman.sqlite
-export SHEPHERD_GATEWAY_SOCKET_PATH=/tmp/herdsman.sock
-herdsman gateway start --db "$SHEPHERD_DB_PATH" --socket "$SHEPHERD_GATEWAY_SOCKET_PATH" --config /tmp/herdsman.local.yaml
+export HERDSMAN_DB_PATH=/tmp/herdsman.sqlite
+export HERDSMAN_GATEWAY_SOCKET_PATH=/tmp/herdsman.sock
+herdsman gateway start --db "$HERDSMAN_DB_PATH" --socket "$HERDSMAN_GATEWAY_SOCKET_PATH" --config /tmp/herdsman.local.yaml
 ```
 
 Terminal 2:
@@ -1124,7 +1124,7 @@ cd /path/inside/allowed/root
 herdsman
 ```
 
-Expected: Pi TUI opens without a preceding success log line; `/herdsman` reports an attached Herdsman session; `herdsman audit --session <id> --db "$SHEPHERD_DB_PATH"` can read events after interaction.
+Expected: Pi TUI opens without a preceding success log line; `/herdsman` reports an attached Herdsman session; `herdsman audit --session <id> --db "$HERDSMAN_DB_PATH"` can read events after interaction.
 
 - [ ] **Step 6: Commit validation-only fixes if needed**
 

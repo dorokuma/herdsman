@@ -80,7 +80,7 @@ function defaultDeps() {
 
 /** @param {NodeJS.ProcessEnv} env */
 function defaultSocketPath(env) {
-  const home = (env.SHEPHERD_HOME || `${env.HOME || ""}/.herdsman`).replace(/\/$/, "");
+  const home = (env.HERDSMAN_HOME || `${env.HOME || ""}/.herdsman`).replace(/\/$/, "");
   return `${home}/herdsman.sock`;
 }
 

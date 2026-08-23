@@ -1,4 +1,7 @@
-## 0.6.6
+## Unreleased
+
+- 接入 grok/agy 历史读取与发现，新增 `grokHome` 元数据及安全校验，移除 shepherd 命名残留。
+
 
 - Fix an infinite re-wake loop: acknowledging an invalidated orchestrator event is now rejected with a distinct "no longer pending" error, and the extension treats that as terminal - it prunes the outcome from its pending set and advances past the delivered batch instead of retrying forever. Acknowledged ids returned by the server also prune stale pending events on register and after each ack (1aa2612..cce0a5a).
 - Suggestion-tier improvements: Pi id-kind session refs resolve their file by id before falling back to discovery; candidate cwd comparison normalizes trailing/repeated slashes; pinned-context retain compares all entries sharing a pane id; snapshot excerpts are capped at 2000 characters; unchanged context snapshots are no longer re-pushed (1aa2612).
@@ -44,4 +47,4 @@ Full re-audit hardening (correctness / security / reliability), all findings ver
 
 ## 0.6.0
 
-Forked from @ryonakae/shepherd at v0.5.1 (dfdd3a2). Previous history is inherited from upstream.
+Forked from @ryonakae/herdsman at v0.5.1 (dfdd3a2). Previous history is inherited from upstream.

@@ -58,12 +58,12 @@ describe("herdsman-pi extension self-contained loading", () => {
 describe("herdsman-pi orchestrator bridge", () => {
   test("defaults to the Herdsman daemon socket", async () => {
     const { defaultSocketPath } = (await import(extensionModuleUrl)) as Module;
-    const previousHome = process.env.SHEPHERD_HOME;
-    process.env.SHEPHERD_HOME = "/tmp/herdsman-home";
+    const previousHome = process.env.HERDSMAN_HOME;
+    process.env.HERDSMAN_HOME = "/tmp/herdsman-home";
     try {
       expect(defaultSocketPath()).toBe("/tmp/herdsman-home/herdsman.sock");
     } finally {
-      process.env.SHEPHERD_HOME = previousHome;
+      process.env.HERDSMAN_HOME = previousHome;
     }
   });
 
@@ -236,7 +236,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("agent_start", {}, ctx);
       const messages = await pi.emitContext(
         [
-          { content: "[SHEPHERD AGENT CONTEXT]\nstale", role: "user" },
+          { content: "[HERDSMAN AGENT CONTEXT]\nstale", role: "user" },
           { content: "wake", customType: "herdsman-wake-context", role: "custom" },
           { content: "keep", customType: "other", role: "custom" },
         ],
@@ -398,10 +398,10 @@ describe("herdsman-pi orchestrator bridge", () => {
       expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 3 agent updates");
       expect(ctx.widgets.size).toBe(0);
       expect(formatHiddenAgentContext({ agents: [], workspaceId: "wB" })).toContain(
-        "[SHEPHERD AGENT CONTEXT]",
+        "[HERDSMAN AGENT CONTEXT]",
       );
       expect(formatHiddenAgentUpdates([event(1, "term_agent")])).toContain(
-        "[SHEPHERD AGENT UPDATES]",
+        "[HERDSMAN AGENT UPDATES]",
       );
 
       await vi.advanceTimersByTimeAsync(500);
@@ -1317,7 +1317,7 @@ describe("herdsman-pi orchestrator bridge", () => {
 
       expect(pi.customMessages).toEqual([]);
       expect(normalContext).toEqual([
-        expect.objectContaining({ content: expect.stringContaining("[SHEPHERD AGENT CONTEXT]") }),
+        expect.objectContaining({ content: expect.stringContaining("[HERDSMAN AGENT CONTEXT]") }),
       ]);
       expect(normalContext.some((message) => JSON.stringify(message).includes("UPDATES"))).toBe(
         false,

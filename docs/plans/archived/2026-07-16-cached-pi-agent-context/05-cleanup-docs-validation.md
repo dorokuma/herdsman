@@ -327,7 +327,7 @@ Expected: no generated runtime DB/dist/node_modules files, no whitespace errors,
 
 - [x] **Step 1: Prepare a safe topology**
 
-Use `/Users/ryo.nakae/Dev/_sandbox/herdsman-test` with local `.pi/settings.json`, one owner Pi A, one off Pi B, Claude, Codex, and a shell observer. Re-read current workspace/pane ids. Use normal `~/.herdsman` only for non-destructive read/interaction checks; use a disposable `SHEPHERD_HOME` for daemon restart/grace tests.
+Use `/Users/ryo.nakae/Dev/_sandbox/herdsman-test` with local `.pi/settings.json`, one owner Pi A, one off Pi B, Claude, Codex, and a shell observer. Re-read current workspace/pane ids. Use normal `~/.herdsman` only for non-destructive read/interaction checks; use a disposable `HERDSMAN_HOME` for daemon restart/grace tests.
 
 - [x] **Step 2: Capture cached CLI and background-refresh evidence**
 
@@ -361,7 +361,7 @@ Using the disposable Herdsman home where restart is required:
 
 Start a normal long-running Pi A turn, complete Claude while Pi is busy, and confirm:
 
-1. the normal turn is not interrupted and does not incorporate `[SHEPHERD AGENT UPDATES]`;
+1. the normal turn is not interrupted and does not incorporate `[HERDSMAN AGENT UPDATES]`;
 2. after normal settle, one visible Herdsman wake starts;
 3. the wake context contains the bounded final Claude result but not the normal all-agent context;
 4. ack/footer clearing occurs only after the wake produces a successful final response and settles;

@@ -173,7 +173,7 @@ Current defaults:
 - socket: `/tmp/herdsman.sock`
 - DB: `herdsman.sqlite` relative to cwd
 
-These defaults are weak for `cd && herdsman` because each project directory would get a separate DB unless the user configures `SHEPHERD_DB_PATH`. A shared daemon also needs one stable DB by default.
+These defaults are weak for `cd && herdsman` because each project directory would get a separate DB unless the user configures `HERDSMAN_DB_PATH`. A shared daemon also needs one stable DB by default.
 
 ### Reference behavior
 
@@ -188,7 +188,7 @@ Implications for Herdsman:
 
 - A cwd-relative DB should not be the default for the TUI/daemon experience.
 - Herdsman needs one per-user DB so Slack, TUI, and daemon restart recovery see the same event stream.
-- Herdsman should expose one root override like `SHEPHERD_HOME` for Hermes/Pi-style simplicity.
+- Herdsman should expose one root override like `HERDSMAN_HOME` for Hermes/Pi-style simplicity.
 - The default should be `~/.herdsman`, not split XDG directories. OpenCode and Herdr remain useful references for path separation and socket hygiene, but Herdsman should prioritize a single inspectable gateway home.
 - Socket path should be stable per user and protected with owner-only permissions. For MVP it should live under the Herdsman home as `daemon.sock`.
 
@@ -199,17 +199,17 @@ Use a single Herdsman home directory by default, following the Hermes/Pi style r
 Default:
 
 ```text
-SHEPHERD_HOME=${SHEPHERD_HOME:-~/.herdsman}
+HERDSMAN_HOME=${HERDSMAN_HOME:-~/.herdsman}
 ```
 
 Managed paths:
 
 ```text
-Config:  $SHEPHERD_HOME/config.yaml
-Env:     $SHEPHERD_HOME/.env
-DB:      $SHEPHERD_HOME/state.db
-Socket:  $SHEPHERD_HOME/daemon.sock
-Log:     $SHEPHERD_HOME/logs/daemon.log
+Config:  $HERDSMAN_HOME/config.yaml
+Env:     $HERDSMAN_HOME/.env
+DB:      $HERDSMAN_HOME/state.db
+Socket:  $HERDSMAN_HOME/daemon.sock
+Log:     $HERDSMAN_HOME/logs/daemon.log
 ```
 
 Example layout:
@@ -230,19 +230,19 @@ Rationale:
 - Keeps config, DB, socket, logs, and future auth/session support easy to inspect, back up, and move.
 - Avoids cwd-relative state while keeping the path model easy to explain.
 - `state.db` and `daemon.sock` avoid the awkward repetition of `~/.herdsman/herdsman.sqlite` and `~/.herdsman/herdsman.sock`.
-- `SHEPHERD_HOME` gives tests, sandboxes, and alternate installs one simple override.
+- `HERDSMAN_HOME` gives tests, sandboxes, and alternate installs one simple override.
 
 Existing explicit overrides still win:
 
 ```text
-SHEPHERD_CONFIG
-SHEPHERD_DB_PATH
-SHEPHERD_SOCKET_PATH
+HERDSMAN_CONFIG
+HERDSMAN_DB_PATH
+HERDSMAN_SOCKET_PATH
 ```
 
 Security and lifecycle requirements:
 
-- Create `$SHEPHERD_HOME` with owner-only permissions where the platform supports it.
+- Create `$HERDSMAN_HOME` with owner-only permissions where the platform supports it.
 - Create `.env`, `state.db`, and socket files with owner-only access where possible.
 - Prepare `daemon.sock` by removing stale sockets and rejecting live sockets, following Herdr's socket behavior.
 - Use one shared path resolver for all commands so `daemon`, TUI, `send`, `watch`, `rename`, and `audit` agree by default.

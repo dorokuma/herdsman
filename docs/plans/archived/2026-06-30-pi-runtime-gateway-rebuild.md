@@ -23,7 +23,7 @@ No implementation steps remain for this plan. Future changes should use a new ac
 ## Global Constraints
 
 - This repository is still in development. Do not preserve compatibility with existing Herdsman DB files, existing Drizzle migration history, old queued/running Gateway runs, old `gateway.run.*` events, old `gateway.message` naming, old `gateway.stream_*`/`gateway.complete_run` RPCs, or old provider config.
-- Reset `$SHEPHERD_HOME` during manual testing if an old DB blocks validation.
+- Reset `$HERDSMAN_HOME` during manual testing if an old DB blocks validation.
 - Replace `drizzle/0000` through `drizzle/0004` with a new `0000` baseline generated from the new `src/db/schema.ts`.
 - Pi session files are the canonical agent conversation history. Herdsman DB stores platform/orchestration/audit/recovery facts and must not reconstruct normal Pi LLM context from event history during normal operation.
 - Keep `session_summaries` table/store, but remove automatic provider-backed summary updates. Do not inject Herdsman summaries into normal Pi turns.
@@ -318,7 +318,7 @@ ensure_agent_pane
 `packages/herdsman-pi` should inject only identity and rules:
 
 ```text
-[SHEPHERD ATTACHED CONTEXT]
+[HERDSMAN ATTACHED CONTEXT]
 Herdsman session id: <sessionId>
 Current Pi turn id: <piTurnId if any>
 Pi owner kind: <headless_pi|tui_pi>
@@ -1551,7 +1551,7 @@ Run:
 
 ```bash
 pnpm db:check
-SHEPHERD_HOME=/tmp/herdsman-pi-runtime-rebuild pnpm db:migrate
+HERDSMAN_HOME=/tmp/herdsman-pi-runtime-rebuild pnpm db:migrate
 ```
 
 Expected: Drizzle check passes and migration applies to a fresh SQLite DB.
@@ -1597,13 +1597,13 @@ git commit -m "chore: validate pi runtime gateway rebuild"
 - `pnpm test test/unit/herdsman-pi-extension.test.ts` — extension hidden context/tool registration tests pass.
 - `pnpm pi-package:check` — package validation passes.
 - `pnpm db:check` — Drizzle schema/migration state passes.
-- `SHEPHERD_HOME=/tmp/herdsman-pi-runtime-rebuild pnpm db:migrate` — fresh DB migration succeeds.
+- `HERDSMAN_HOME=/tmp/herdsman-pi-runtime-rebuild pnpm db:migrate` — fresh DB migration succeeds.
 - `pnpm check` — repository validation passes.
 - `pnpm build` — compiled output resolves imports.
 
 ## Risks, Tradeoffs, and Open Questions
 
-- DB compatibility is intentionally dropped. Developers must reset old `$SHEPHERD_HOME` state when testing this rebuild.
+- DB compatibility is intentionally dropped. Developers must reset old `$HERDSMAN_HOME` state when testing this rebuild.
 - Headless Pi uses normal Pi configuration. If that configuration exposes raw Herdr mutation tools, Herdsman relies on prompt guidance rather than Gateway interception.
 - `worker_agent_bindings.agentStatus` and `bindingHealth` are best-effort cache fields. Strict current state must be confirmed with `herdsman_herdr_read` or a direct Herdr read when Herdsman tools are insufficient.
 - `events.subscribe` behavior should be verified against the installed Herdr version during implementation. If Herdr rejects filtered subscriptions, subscribe broadly and filter client-side.

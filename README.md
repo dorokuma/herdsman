@@ -3,9 +3,9 @@
 
 ## Credits / Acknowledgements
 
-herdsman is forked from ryonakae/shepherd at commit dfdd3a2 (v0.5.1). Thanks to the original author, Ryo Nakae, and the upstream project.
+herdsman is forked from ryonakae/herdsman at commit dfdd3a2 (v0.5.1). Thanks to the original author, Ryo Nakae, and the upstream project.
 
-Upstream: https://github.com/ryonakae/shepherd
+Upstream: https://github.com/ryonakae/herdsman
 
 # Herdsman
 
@@ -47,7 +47,7 @@ herdsman help
 
 ## Start the daemon
 
-Herdsman agent commands and Pi notifications require the daemon. The daemon watches all running Herdr sessions reported by `herdr session list --json`, rescans them every 60 seconds, and does not index stopped Herdr sessions. Runtime files live in `~/.herdsman` by default. Set `SHEPHERD_HOME` to use another directory.
+Herdsman agent commands and Pi notifications require the daemon. The daemon watches all running Herdr sessions reported by `herdr session list --json`, rescans them every 60 seconds, and does not index stopped Herdr sessions. Runtime files live in `~/.herdsman` by default. Set `HERDSMAN_HOME` to use another directory.
 
 ```bash
 herdsman daemon start

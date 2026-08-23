@@ -43,15 +43,18 @@ export type AgentIndexRecord = {
   tabId: string | null;
   terminalId: string | null;
   workspaceId: string;
+  grokHome?: string | null;
 };
 
 export type AgentHistoryRef = {
   kind: "agent_session" | "discovered_file";
   path?: string;
   source:
+    | "antigravity-sqlite"
     | "claude-jsonl"
     | "codex-jsonl"
     | "gemini-json"
+    | "grok-jsonl"
     | "opencode-sqlite"
     | "pi-jsonl"
     | "unknown";

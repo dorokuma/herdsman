@@ -449,7 +449,7 @@ export function defaultSocketPath() {
 }
 ```
 
-Then add a test that imports `defaultSocketPath`, sets `SHEPHERD_HOME` to `/tmp/herdsman-home`, and expects `/tmp/herdsman-home/herdsman.sock`.
+Then add a test that imports `defaultSocketPath`, sets `HERDSMAN_HOME` to `/tmp/herdsman-home`, and expects `/tmp/herdsman-home/herdsman.sock`.
 
 If exporting the helper would expose unnecessary API, instead test by injecting a fake `createConnection` only if the current module structure already supports that. Do not add a compatibility env var.
 
@@ -473,7 +473,7 @@ to:
 return `${defaultHerdsmanHome().replace(/\/$/, "")}/herdsman.sock`;
 ```
 
-Do not read `SHEPHERD_GATEWAY_SOCKET_PATH`, `SHEPHERD_SOCKET_PATH`, or `SHEPHERD_DAEMON_SOCKET_PATH`.
+Do not read `HERDSMAN_GATEWAY_SOCKET_PATH`, `HERDSMAN_SOCKET_PATH`, or `HERDSMAN_DAEMON_SOCKET_PATH`.
 
 - [ ] **Step 4: Rewrite the Pi skill**
 
@@ -572,8 +572,8 @@ In `test/unit/config-runtime.test.ts`:
 
 - Replace `SLACK_BOT_TOKEN=file-token` with `EXAMPLE_SERVICE_TOKEN=file-token`.
 - Replace assertions for `SLACK_BOT_TOKEN` with `EXAMPLE_SERVICE_TOKEN`.
-- Replace `SHEPHERD_GATEWAY_SOCKET_PATH=/tmp/ignored.sock` with `SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock`.
-- Replace assertions for `SHEPHERD_GATEWAY_SOCKET_PATH` with `SHEPHERD_INTERNAL_SOCKET_PATH`.
+- Replace `HERDSMAN_GATEWAY_SOCKET_PATH=/tmp/ignored.sock` with `HERDSMAN_INTERNAL_SOCKET_PATH=/tmp/ignored.sock`.
+- Replace assertions for `HERDSMAN_GATEWAY_SOCKET_PATH` with `HERDSMAN_INTERNAL_SOCKET_PATH`.
 - Replace every parse-error fixture string `gateway: [` with `runtime: [`.
 
 - [ ] **Step 2: Update naming and notification examples**

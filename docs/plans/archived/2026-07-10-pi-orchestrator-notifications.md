@@ -20,7 +20,7 @@
 - `/herdsman orchestrator off` releases the role only when the calling connection belongs to the current owner terminal. A non-owner call is a no-op and reports that this Pi is not the orchestrator.
 - `/herdsman orchestrator` and `/herdsman orchestrator status` both report current status and owner pane.
 - With no owner, no Pi receives pushed agent updates. Do not auto-select the first, focused, or any other Pi.
-- Non-owner Pi instances continue to connect for presence/role changes, send `agent.telemetry`, call `agent.list`, and receive `[SHEPHERD AGENT CONTEXT]` before turns.
+- Non-owner Pi instances continue to connect for presence/role changes, send `agent.telemetry`, call `agent.list`, and receive `[HERDSMAN AGENT CONTEXT]` before turns.
 - `agent.event` is sent only to the active owner connection. `agent.orchestrator.changed` is sent to every registered Pi connection in each affected scope.
 - Events whose `terminalId` equals the owner terminal are never pushed, replayed, injected, or used to auto-resume that owner. Other Pi terminals remain valid notification sources.
 - Each scope has one durable ack cursor. The first-ever claim initializes it to `AgentEventStore.latestEventId(scope)`; later claims preserve it. Events created while no owner exists remain pending after the scope has been initialized.
@@ -105,7 +105,7 @@ No further implementation work remains. Interactive Pi dogfood remains explicitl
 - A read-only implementation review found three P1 issues: skip/future ack, grace expiry after owner movement, and null-terminal delivery. Commit `1081ec9` added regression coverage and fixed all three; the repeated full check/build passed.
 - Pi package dry-run includes `src/index.ts`, `src/daemon-client.ts`, and `skills/herdsman/SKILL.md`; it excludes build output, dependencies, and SQLite data.
 - Real Herdr evidence: installed Herdr `0.7.2` returned `session.snapshot` with stable terminal ids; an isolated daemon migrated and indexed temporary workspace `default/wC`; direct JSONL registration resolved `wC:p1` / `term_6563c4179a105b` in scope `default/wC`.
-- Full interactive Pi dogfood remained unverified. Installed Pi `0.80.6` was launched through agent-safehouse `0.9.0`; its wrapper did not pass the disposable `SHEPHERD_HOME`. A policy-preserving nested launch ended with `sandbox-exec: sandbox_apply: Operation not permitted` (exit 71), so no bypass was attempted. The temporary workspace, daemon, socket, DB, and logs were removed; the pre-existing `w9` and `wB` workspaces remained.
+- Full interactive Pi dogfood remained unverified. Installed Pi `0.80.6` was launched through agent-safehouse `0.9.0`; its wrapper did not pass the disposable `HERDSMAN_HOME`. A policy-preserving nested launch ended with `sandbox-exec: sandbox_apply: Operation not permitted` (exit 71), so no bypass was attempted. The temporary workspace, daemon, socket, DB, and logs were removed; the pre-existing `w9` and `wB` workspaces remained.
 - Accepted residual risk: real footer/transient UI, `/new`/`/resume`/`/fork`, and live cross-workspace move behavior are covered by automated socket/Pi lifecycle tests but were not observed interactively in this sandboxed environment.
 
 ## Final Validation

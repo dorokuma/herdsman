@@ -68,7 +68,7 @@
 
 ## Completion notes
 
-Implemented through child plans 01-05, committed and pushed in multiple slices. Final validation passed with `pnpm check` and `pnpm build`. Dogfood with `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood` verified `agent list/get/read` for workspace `wB` and daemon-required CLI behavior.
+Implemented through child plans 01-05, committed and pushed in multiple slices. Final validation passed with `pnpm check` and `pnpm build`. Dogfood with `HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood` verified `agent list/get/read` for workspace `wB` and daemon-required CLI behavior.
 
 ## Validation
 

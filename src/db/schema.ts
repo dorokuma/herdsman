@@ -42,6 +42,7 @@ export const agents = sqliteTable(
     firstSeenAt: integer("first_seen_at", { mode: "timestamp_ms" }).notNull(),
     focused: integer("focused", { mode: "boolean" }).notNull(),
     foregroundCwd: text("foreground_cwd"),
+    grokHome: text("grok_home"),
     herdrSessionName: text("herdr_session_name")
       .notNull()
       .references(() => herdrSessions.name, { onDelete: "cascade" }),

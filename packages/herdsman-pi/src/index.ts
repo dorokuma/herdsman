@@ -153,7 +153,7 @@ const HERDR_REQUIRED_MESSAGE = "Herdsman requires a Herdr workspace";
 const RECONNECTING_MESSAGE = "Herdsman is reconnecting · try again shortly";
 
 function defaultHerdsmanHome() {
-  return process.env.SHEPHERD_HOME || `${process.env.HOME || ""}/${DEFAULT_HOME_NAME}`;
+  return process.env.HERDSMAN_HOME || `${process.env.HOME || ""}/${DEFAULT_HOME_NAME}`;
 }
 
 export function defaultSocketPath() {
@@ -816,7 +816,7 @@ export function formatHiddenAgentContext(input: {
   workspaceId: string;
 }): string {
   return [
-    "[SHEPHERD AGENT CONTEXT]",
+    "[HERDSMAN AGENT CONTEXT]",
     `Current Herdr workspace: ${input.workspaceId}`,
     ...input.agents.map((agent) => {
       const history = agent.history ?? {};
@@ -836,7 +836,7 @@ export function formatHiddenAgentContext(input: {
 
 export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string {
   return [
-    "[SHEPHERD AGENT UPDATES]",
+    "[HERDSMAN AGENT UPDATES]",
     ...events.map((event) => {
       const payload = record(event.payload);
       const history = event.compactHistory ?? {};
@@ -856,7 +856,7 @@ export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string
 function isNormalHerdsmanContext(message: PiAgentMessage): boolean {
   return (
     message.customType === "herdsman-agent-context" ||
-    contentIncludesMarker(message.content, "[SHEPHERD AGENT CONTEXT]")
+    contentIncludesMarker(message.content, "[HERDSMAN AGENT CONTEXT]")
   );
 }
 

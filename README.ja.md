@@ -40,7 +40,7 @@ herdsman help
 
 ## daemon を起動する
 
-Herdsman のagent commandとPi notificationはdaemonを必要とします。daemon は `herdr session list --json` に出る実行中の Herdr session を監視し、60 秒ごとに再スキャンします。停止した Herdr session は index しません。runtime file は標準で `~/.herdsman` に置きます。別の directory を使う場合は `SHEPHERD_HOME` を設定します。
+Herdsman のagent commandとPi notificationはdaemonを必要とします。daemon は `herdr session list --json` に出る実行中の Herdr session を監視し、60 秒ごとに再スキャンします。停止した Herdr session は index しません。runtime file は標準で `~/.herdsman` に置きます。別の directory を使う場合は `HERDSMAN_HOME` を設定します。
 
 ```bash
 herdsman daemon start

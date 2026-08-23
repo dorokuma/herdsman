@@ -160,7 +160,7 @@ Create tests for these cases:
 2. `bash` output containing repeated identical log lines returns a text that collapses repeats with counts and `mode: "grouped_matches"`.
 3. `web_search` or fetch/search tool output returns titles/URLs/snippets and `mode: "web_sources"`.
 4. JSON output longer than 2,000 chars returns top-level keys/types and `mode: "structured_summary"`.
-5. Unknown long output returns first bounded chars plus `[SHEPHERD:TRUNCATED_TOOL_RESULT]` and `mode: "truncated_passthrough"`.
+5. Unknown long output returns first bounded chars plus `[HERDSMAN:TRUNCATED_TOOL_RESULT]` and `mode: "truncated_passthrough"`.
 6. `originalChars` equals raw input length in characters and `returnedChars` equals compact text length in characters.
 7. Redaction replaces bearer tokens, `token=`, `password=`, `secret=`, and `api_key=` values before compaction.
 
@@ -187,7 +187,7 @@ Use constants:
 
 ```ts
 const maxToolResultChars = 1600;
-const passthroughMarker = "[SHEPHERD:TRUNCATED_TOOL_RESULT]";
+const passthroughMarker = "[HERDSMAN:TRUNCATED_TOOL_RESULT]";
 ```
 
 Compaction order:

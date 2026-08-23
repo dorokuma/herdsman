@@ -13,7 +13,7 @@ Herdsman は Herdr 管理の coding agent から agent snapshot、`agent.*` even
 - `pnpm package:check`: root npm packageをbuildし、tarballのfile allowlistを検証する。
 - `pnpm lint:fix`: Biome の lint/import/format fix を適用する。
 - `pnpm db:generate`: `src/db/schema.ts` から SQL migration を生成する。
-- `SHEPHERD_HOME=/tmp/herdsman pnpm db:migrate`: 指定した Herdsman home の SQLite DB に migration を適用する。
+- `HERDSMAN_HOME=/tmp/herdsman pnpm db:migrate`: 指定した Herdsman home の SQLite DB に migration を適用する。
 
 ## 検証手順
 

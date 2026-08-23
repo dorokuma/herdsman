@@ -21,7 +21,7 @@
 
 ## Current Context
 
-- `packages/herdsman-pi/src/index.ts` currently sends `workspace.observe`, `notification.subscribe`, and `runtime.telemetry`, listens for `worker.event`, and formats `[SHEPHERD WORKER NOTIFICATIONS]`.
+- `packages/herdsman-pi/src/index.ts` currently sends `workspace.observe`, `notification.subscribe`, and `runtime.telemetry`, listens for `worker.event`, and formats `[HERDSMAN WORKER NOTIFICATIONS]`.
 - `packages/herdsman-pi/skills/herdsman/SKILL.md` currently instructs agents to run `herdsman context --json`.
 - `packages/herdsman-herdr-plugin/index.mjs` currently exposes `context` and `dashboard` using `workspace.snapshot` and worker rows.
 - `packages/herdsman-herdr-plugin/herdr-plugin.toml` currently has action id `context` and pane id `dashboard` titled `Herdsman Workers`.
@@ -70,7 +70,7 @@ agent.telemetry params: {
 Hidden context shape:
 
 ```text
-[SHEPHERD AGENT CONTEXT]
+[HERDSMAN AGENT CONTEXT]
 Current Herdr workspace: wB
 - pi wB:p1 idle
   last user: ...
@@ -79,7 +79,7 @@ Current Herdr workspace: wB
   last user: ...
   last assistant: ...
 
-[SHEPHERD AGENT UPDATES]
+[HERDSMAN AGENT UPDATES]
 - agent.done claude wB:p2
   last assistant: ...
   event: 42
@@ -104,13 +104,13 @@ Current Herdr workspace: wB
 Update tests:
 
 1. On `session_start`, extension calls `agent.notifications.subscribe` with `workspaceId: HERDR_WORKSPACE_ID`, `subscriberKind: "pi"`, and no observed workspace id.
-2. On `before_agent_start`, extension calls `agent.list` for current workspace and returns `[SHEPHERD AGENT CONTEXT]` even when there are no unread events.
-3. When pending agent events exist, hidden context includes `[SHEPHERD AGENT UPDATES]` and each event's compact history.
+2. On `before_agent_start`, extension calls `agent.list` for current workspace and returns `[HERDSMAN AGENT CONTEXT]` even when there are no unread events.
+3. When pending agent events exist, hidden context includes `[HERDSMAN AGENT UPDATES]` and each event's compact history.
 4. `before_agent_start` acks pending events via `agent.notifications.ack` after preparing hidden context.
 5. Streamed `agent.event` increments UI status/widget and appends `herdsman.agent_event` entry.
 6. Tool result telemetry sends `agent.telemetry` with type `agent.tool.completed` and compact/redacted excerpt fields.
 7. Final message telemetry sends `agent.telemetry` with type `agent.message.final`.
-8. No output string contains `worker`, `snapshot`, or `[SHEPHERD WORKER NOTIFICATIONS]`.
+8. No output string contains `worker`, `snapshot`, or `[HERDSMAN WORKER NOTIFICATIONS]`.
 
 - [x] **Step 2: Run test to verify it fails**
 
@@ -363,8 +363,8 @@ Run:
 
 ```bash
 rm -rf /tmp/herdsman-agent-history-dogfood
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood pnpm build
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js daemon start
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood pnpm build
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js daemon start
 ```
 
 Expected: daemon starts and writes socket under `/tmp/herdsman-agent-history-dogfood`.
@@ -375,7 +375,7 @@ Run:
 
 ```bash
 herdr session list --json
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all --json
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all --json
 ```
 
 Expected:
@@ -388,9 +388,9 @@ Expected:
 From any shell, run:
 
 ```bash
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --workspace wB --json
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent get claude --workspace wB --json
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent read claude --workspace wB --limit 10 --json
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --workspace wB --json
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent get claude --workspace wB --json
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent read claude --workspace wB --limit 10 --json
 ```
 
 Expected:
@@ -404,8 +404,8 @@ Expected:
 Run with daemon stopped:
 
 ```bash
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js daemon stop
-SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js daemon stop
+HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all
 ```
 
 Expected: command fails with guidance to run `herdsman daemon start`; it does not auto-start.
@@ -418,10 +418,10 @@ If validation required fixes, commit them with a targeted message. If no fixes, 
 
 - `pnpm check`
 - `pnpm build`
-- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all --json`
-- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --workspace wB --json`
-- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent get claude --workspace wB --json`
-- `SHEPHERD_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent read claude --workspace wB --limit 10 --json`
+- `HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --all --json`
+- `HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent list --workspace wB --json`
+- `HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent get claude --workspace wB --json`
+- `HERDSMAN_HOME=/tmp/herdsman-agent-history-dogfood node dist/src/cli/herdsman.js agent read claude --workspace wB --limit 10 --json`
 
 ## Risks, Tradeoffs, and Open Questions
 

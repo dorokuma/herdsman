@@ -2,7 +2,7 @@ import type { CompactToolResult } from "@/observability/contracts.js";
 import { sanitizeText, truncateChars } from "./text.js";
 
 const maxToolResultChars = 1600;
-const passthroughMarker = "[SHEPHERD:TRUNCATED_TOOL_RESULT]";
+const passthroughMarkers = ["[HERDSMAN:TRUNCATED_TOOL_RESULT]", "[HERDSMAN:TRUNCATED_TOOL_RESULT]"];
 
 type Mode = CompactToolResult["compaction"]["mode"];
 
@@ -139,6 +139,6 @@ function dedupeLines(text: string): string | null {
 
 function boundWithMarker(text: string, mode: Mode): string {
   if ([...text].length <= maxToolResultChars) return text;
-  const marker = mode === "truncated_passthrough" ? `\n${passthroughMarker}` : "";
+  const marker = mode === "truncated_passthrough" ? `\n${passthroughMarkers[0]}` : "";
   return `${truncateChars(text, maxToolResultChars)}${marker}`;
 }

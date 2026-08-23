@@ -27,7 +27,7 @@ export type RuntimeResolution = {
 };
 
 export function getHerdsmanHome(environment: NodeJS.ProcessEnv = process.env): string {
-  const explicit = environment.SHEPHERD_HOME?.trim();
+  const explicit = environment.HERDSMAN_HOME?.trim();
   return resolve(explicit && explicit.length > 0 ? explicit : resolve(homedir(), ".herdsman"));
 }
 
@@ -78,10 +78,6 @@ export function loadHerdsmanDotEnv(input: {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
       continue;
     }
-    if (key.startsWith("SHEPHERD_")) {
-      continue;
-    }
-
     next[key] = unquoteEnvValue(line.slice(equalsIndex + 1).trim());
   }
 

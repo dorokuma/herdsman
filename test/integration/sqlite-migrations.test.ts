@@ -66,6 +66,23 @@ describe("SQLite migrations", () => {
       dflt_value: null,
       notnull: 0,
     });
+    expect(agentColumns.find((column) => column.name === "grok_home")).toMatchObject({
+      dflt_value: null,
+      notnull: 0,
+    });
+    sqlite
+      .prepare(
+        "insert into herdr_sessions (name, running, session_dir, socket_path, updated_at) values (?, ?, ?, ?, ?)",
+      )
+      .run("s", 1, "/tmp", "/tmp/s.sock", Date.now());
+    sqlite
+      .prepare(
+        "insert into agents (id, herdr_session_name, pane_id, workspace_id, agent_status, focused, first_seen_at, last_seen_at, grok_home) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      )
+      .run("a", "s", "p", "w", "idle", 0, Date.now(), Date.now(), "/tmp/grok");
+    expect(sqlite.prepare("select grok_home from agents where id = ?").get("a")).toMatchObject({
+      grok_home: "/tmp/grok",
+    });
     const contextColumns = sqlite
       .prepare("pragma table_info(agent_context_snapshots)")
       .all()

@@ -17,7 +17,7 @@
 - `/herdsman orchestrator ...` is a Pi extension command, not a `herdsman` shell CLI command.
 - Do not add orchestrator commands to root `SKILL.md` as shell commands. The skill may state when hidden updates are available.
 - README English/Japanese sections must remain semantically aligned.
-- Manual validation must use a disposable `SHEPHERD_HOME` when DB reset/restart behavior is exercised.
+- Manual validation must use a disposable `HERDSMAN_HOME` when DB reset/restart behavior is exercised.
 - Do not archive the plan during the implementation commit series. Archive it later in a separate docs-only commit after all work is accepted, per repository policy.
 
 ## Current Context
@@ -202,7 +202,7 @@ If full validation exposed a defect, add a regression test in the owning test fi
 
 ### Task 4: Dogfood in a Real Herdr Session
 
-**Result:** Blocked after partial environment validation. Herdr `0.7.2` exposed `session.snapshot`, pane movement, and stable terminal ids; Pi `0.80.6` loaded the command. The agent-safehouse `0.9.0` wrapper stripped the disposable `SHEPHERD_HOME`, and a policy-preserving nested launch failed with `sandbox-exec: sandbox_apply: Operation not permitted` (exit 71). Per sandbox policy, no bypass was attempted. Automated tests remain the evidence for Steps 2-9.
+**Result:** Blocked after partial environment validation. Herdr `0.7.2` exposed `session.snapshot`, pane movement, and stable terminal ids; Pi `0.80.6` loaded the command. The agent-safehouse `0.9.0` wrapper stripped the disposable `HERDSMAN_HOME`, and a policy-preserving nested launch failed with `sandbox-exec: sandbox_apply: Operation not permitted` (exit 71). Per sandbox policy, no bypass was attempted. Automated tests remain the evidence for Steps 2-9.
 
 **Objective:** Verify connection identity, Pi lifecycle, role UI, and real event delivery beyond mocks.
 
@@ -211,22 +211,22 @@ If full validation exposed a defect, add a regression test in the owning test fi
 - Installed Herdr supports `HERDR_SOCKET_PATH`, `HERDR_WORKSPACE_ID`, `HERDR_PANE_ID`, `terminal_id`, `pane.moved`, and `session.snapshot`.
 - Built Herdsman CLI/package points at this checkout.
 - Two Pi panes and one non-owner agent pane can run in the same Herdr workspace.
-- Every dogfood Pi process is launched with `SHEPHERD_HOME=/tmp/herdsman-orchestrator-dogfood` so its extension connects to the isolated daemon socket; setting the variable only on the daemon is insufficient.
+- Every dogfood Pi process is launched with `HERDSMAN_HOME=/tmp/herdsman-orchestrator-dogfood` so its extension connects to the isolated daemon socket; setting the variable only on the daemon is insufficient.
 
 - [x] **Step 1: Start isolated daemon**
 
 ```bash
 rm -rf /tmp/herdsman-orchestrator-dogfood
-SHEPHERD_HOME=/tmp/herdsman-orchestrator-dogfood herdsman daemon start
+HERDSMAN_HOME=/tmp/herdsman-orchestrator-dogfood herdsman daemon start
 ```
 
-Expected: daemon creates/migrates a new DB and listens without schema errors. If daemon start is foreground-only in the current build, run it in a dedicated Herdr pane instead of backgrounding it. Launch/relaunch Pi A, Pi B, and later Pi C as `SHEPHERD_HOME=/tmp/herdsman-orchestrator-dogfood pi` before continuing.
+Expected: daemon creates/migrates a new DB and listens without schema errors. If daemon start is foreground-only in the current build, run it in a dedicated Herdr pane instead of backgrounding it. Launch/relaunch Pi A, Pi B, and later Pi C as `HERDSMAN_HOME=/tmp/herdsman-orchestrator-dogfood pi` before continuing.
 
 - [ ] **Step 2: Verify no-owner state**
 
 In Pi A and Pi B, run `/herdsman orchestrator status`.
 
-Expected: both report no owner; neither footer shows `Herdsman: orchestrator`. Trigger a worker status transition in the same workspace; neither Pi gets unread updates, while each next normal turn still includes current `[SHEPHERD AGENT CONTEXT]`.
+Expected: both report no owner; neither footer shows `Herdsman: orchestrator`. Trigger a worker status transition in the same workspace; neither Pi gets unread updates, while each next normal turn still includes current `[HERDSMAN AGENT CONTEXT]`.
 
 - [ ] **Step 3: Claim and replace owner**
 

@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import { lstatSync, readFileSync, realpathSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
 import type { AgentEventStore } from "@/db/agent-events.js";
 import {
@@ -27,6 +28,7 @@ type AgentRow = {
   pane_id: string;
   pane_revision: number | null;
   pane_generation: string | null;
+  grok_home: string | null;
   tab_id: string | null;
   terminal_id: string | null;
   workspace_id: string;
@@ -105,6 +107,10 @@ export class AgentStore {
         const agent = stringValue(snapshot.agent.agent);
         const name = stringValue(snapshot.agent.name);
         const sessionHint = current?.agent === agent ? current.agent_session_hint_json : null;
+        const grokHome =
+          stringValue(snapshot.agent.agent)?.toLowerCase() === "grok"
+            ? grokHomeForAgent(snapshot.agent)
+            : null;
         const values = [
           snapshot.paneId,
           snapshot.terminalId,
@@ -117,6 +123,7 @@ export class AgentStore {
           sessionHint,
           integerValue(snapshot.agent.revision),
           paneGeneration(snapshot.agent) ?? current?.pane_generation ?? null,
+          grokHome ?? current?.grok_home ?? null,
           stringValue(snapshot.agent.cwd),
           stringValue(snapshot.agent.foreground_cwd) ?? stringValue(snapshot.agent.foregroundCwd),
           snapshot.agent.focused === true ? 1 : 0,
@@ -127,7 +134,7 @@ export class AgentStore {
             .prepare(
               `update agents
                set pane_id = ?, terminal_id = ?, tab_id = ?, workspace_id = ?, agent = ?, name = ?,
-                   agent_status = ?, agent_session_json = ?, agent_session_hint_json = ?, pane_revision = ?, pane_generation = ?,
+                   agent_status = ?, agent_session_json = ?, agent_session_hint_json = ?, pane_revision = ?, pane_generation = ?, grok_home = ?,
                    cwd = ?, foreground_cwd = ?, focused = ?, last_seen_at = ?
                where id = ?`,
             )
@@ -136,8 +143,8 @@ export class AgentStore {
           this.#sqlite
             .prepare(
               `insert into agents
-               (id, herdr_session_name, pane_id, terminal_id, tab_id, workspace_id, agent, name, agent_status, agent_session_json, agent_session_hint_json, pane_revision, pane_generation, cwd, foreground_cwd, focused, first_seen_at, last_seen_at)
-               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+               (id, herdr_session_name, pane_id, terminal_id, tab_id, workspace_id, agent, name, agent_status, agent_session_json, agent_session_hint_json, pane_revision, pane_generation, grok_home, cwd, foreground_cwd, focused, first_seen_at, last_seen_at)
+               values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
             )
             .run(id, input.herdrSessionName, ...values, now);
         }
@@ -339,7 +346,55 @@ function mapAgent(row: AgentRow): AgentIndexRecord {
     tabId: row.tab_id,
     terminalId: row.terminal_id,
     workspaceId: row.workspace_id,
+    grokHome: row.grok_home,
   };
+}
+
+function grokHomeForAgent(agent: HerdrAgentLike): string | null {
+  const env = agent.env;
+  const explicit =
+    typeof env === "object" && env !== null
+      ? stringValue((env as Record<string, unknown>).GROK_HOME)
+      : null;
+  // Proc fallback cannot prove the pid is the pane's agent; prefer explicit metadata.
+  const raw =
+    explicit ??
+    (() => {
+      const pid = agent.pid;
+      if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return null;
+      try {
+        return (
+          readFileSync(`/proc/${pid}/environ`)
+            .toString("utf8")
+            .split("\0")
+            .find((item) => item.startsWith("GROK_HOME="))
+            ?.slice(10) ?? null
+        );
+      } catch {
+        return null;
+      }
+    })();
+  return raw ? validateGrokHome(raw) : null;
+}
+
+function validateGrokHome(value: string): string | null {
+  if (!value.startsWith("/") || value.includes("..")) return null;
+  try {
+    const link = lstatSync(value);
+    if (
+      !link.isDirectory() ||
+      link.isSymbolicLink() ||
+      (link.mode & 0o022) !== 0 ||
+      link.uid !== (process.geteuid?.() ?? -1)
+    )
+      return null;
+    const real = realpathSync(value);
+    const relativeRoot = require("node:path").relative(value, real) as string;
+    if (relativeRoot.startsWith("..") || relativeRoot.includes("/")) return null;
+    return real;
+  } catch {
+    return null;
+  }
 }
 
 function paneGeneration(agent: HerdrAgentLike): string | null {

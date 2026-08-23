@@ -4,7 +4,7 @@
 
 **Goal:** Exercise Herdsman from `/Users/ryo.nakae/Dev/_sandbox/herdsman-test` as a real user would, covering structured agent history, the Herdsman Agent Skill, owner-only cached Pi context, and owner-only updates without risking the normal Herdsman runtime state.
 
-**Architecture:** Run one owner Pi, one off Pi, one Claude agent, and one shell observer in the same Herdr workspace. The owner receives a daemon-cached snapshot locally during normal prompts; an off Pi receives neither context nor updates. Use an isolated `SHEPHERD_HOME` for restart, disconnect, owner transfer, and unread-transfer scenarios so the normal `~/.herdsman` database is not changed by destructive tests.
+**Architecture:** Run one owner Pi, one off Pi, one Claude agent, and one shell observer in the same Herdr workspace. The owner receives a daemon-cached snapshot locally during normal prompts; an off Pi receives neither context nor updates. Use an isolated `HERDSMAN_HOME` for restart, disconnect, owner transfer, and unread-transfer scenarios so the normal `~/.herdsman` database is not changed by destructive tests.
 
 **Tech Stack:** Herdsman 0.2.0, Herdr 0.7.2, Pi 0.80.6, Claude Code or another supported agent runtime, JSON CLI output.
 
@@ -196,14 +196,14 @@ Expected:
 Stop using the Phase 1 Pi processes before switching homes. In a fresh shell:
 
 ```bash
-export SHEPHERD_HOME=/tmp/herdsman-test-dogfood
-rm -rf "$SHEPHERD_HOME"
+export HERDSMAN_HOME=/tmp/herdsman-test-dogfood
+rm -rf "$HERDSMAN_HOME"
 herdsman daemon start
 cd /Users/ryo.nakae/Dev/_sandbox/herdsman-test
 herdr --session herdsman-dogfood
 ```
 
-Expected: the daemon creates a clean runtime home, and processes launched from this Herdr session inherit the same `SHEPHERD_HOME`. Start Pi A, Pi B, Agent, and Observer only after the export is active.
+Expected: the daemon creates a clean runtime home, and processes launched from this Herdr session inherit the same `HERDSMAN_HOME`. Start Pi A, Pi B, Agent, and Observer only after the export is active.
 
 - [ ] **Step 2: Prove no-owner silence, then initialize the scope**
 
@@ -276,7 +276,7 @@ Create output while the agent is working and verify the owner's next normal run 
 
 Submit five short prompts in Pi A while history roots are large. Confirm the working indicator starts without the former visible hitch. Use a diagnostic connection log if available to confirm normal prompt lifecycle hooks make no daemon RPC or history read. Pi A must exclude itself from normal context and include Pi B. Pi B must receive no context, pending count, update, or wake while off.
 
-Start a long normal Pi A turn, complete the agent while Pi A is busy, and verify that the normal turn is neither interrupted nor given `[SHEPHERD AGENT UPDATES]`. After it settles, one visible Herdsman wake starts and acknowledges only after its successful final response settles. Confirm no tool-result or final-message telemetry call occurs during either turn.
+Start a long normal Pi A turn, complete the agent while Pi A is busy, and verify that the normal turn is neither interrupted nor given `[HERDSMAN AGENT UPDATES]`. After it settles, one visible Herdsman wake starts and acknowledges only after its successful final response settles. Confirm no tool-result or final-message telemetry call occurs during either turn.
 
 - [ ] **Step 8: Verify a cache gap does not block a prompt**
 
@@ -297,8 +297,8 @@ Expected: the same Herdr terminal regains or retains `◆ Herdsman` without anot
 From the Observer pane or an external shell using the same environment:
 
 ```bash
-SHEPHERD_HOME=/tmp/herdsman-test-dogfood herdsman daemon restart
-SHEPHERD_HOME=/tmp/herdsman-test-dogfood herdsman daemon status
+HERDSMAN_HOME=/tmp/herdsman-test-dogfood herdsman daemon restart
+HERDSMAN_HOME=/tmp/herdsman-test-dogfood herdsman daemon status
 ```
 
 Expected: the Pi extension reconnects automatically within startup grace, the owner's footer returns or remains, and subsequent Agent events are delivered without reclaiming.
@@ -352,7 +352,7 @@ Record one concise entry per failed or surprising check:
 ```text
 Time:
 Herdsman / Herdr / Pi versions:
-SHEPHERD_HOME: normal | /tmp/herdsman-test-dogfood
+HERDSMAN_HOME: normal | /tmp/herdsman-test-dogfood
 Herdr session / workspace / pane ids:
 Scenario and exact command or prompt:
 Expected:
@@ -367,7 +367,7 @@ Do not keep raw session files or databases in the repository. A screenshot is us
 
 ### 2026-07-16: Cached owner context and prompt path passed
 
-Environment: Herdsman 0.3.1 local build, Herdr 0.7.2, Pi 0.80.6, Node.js 24.18.0. Destructive checks used a disposable `SHEPHERD_HOME` under `/tmp`; the normal Herdsman daemon and database were not restarted or modified.
+Environment: Herdsman 0.3.1 local build, Herdr 0.7.2, Pi 0.80.6, Node.js 24.18.0. Destructive checks used a disposable `HERDSMAN_HOME` under `/tmp`; the normal Herdsman daemon and database were not restarted or modified.
 
 Observed topology in Herdr `default/wJ`:
 
@@ -509,5 +509,5 @@ A core failure blocks release confidence. An extended failure should include the
 ## Next Steps
 
 1. Review and commit the Phase 1 fixes and dogfood evidence.
-2. Schedule Phase 2 and Phase 3 in the disposable `SHEPHERD_HOME` session.
+2. Schedule Phase 2 and Phase 3 in the disposable `HERDSMAN_HOME` session.
 3. Run the compatibility matrix only for agent CLIs already available locally.

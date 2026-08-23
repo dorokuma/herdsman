@@ -530,11 +530,11 @@ pi.on("context", async (event) => ({
     if (message?.role !== "user") return true;
     const content = message.content;
     if (typeof content === "string") {
-      return !content.includes("[SHEPHERD ATTACHED CONTEXT]");
+      return !content.includes("[HERDSMAN ATTACHED CONTEXT]");
     }
     if (Array.isArray(content)) {
       return !content.some(
-        (part) => part?.type === "text" && part.text?.includes("[SHEPHERD ATTACHED CONTEXT]"),
+        (part) => part?.type === "text" && part.text?.includes("[HERDSMAN ATTACHED CONTEXT]"),
       );
     }
     return true;
@@ -549,7 +549,7 @@ Match the project’s plain JavaScript style. If Pi messages are not plain objec
 Change the `before_agent_start` hidden message content to start with a stable marker and include only concise B-scope guidance:
 
 ```text
-[SHEPHERD ATTACHED CONTEXT]
+[HERDSMAN ATTACHED CONTEXT]
 Herdsman session id: <id>
 Current Herdsman gateway run id: <id>    # only when present
 Herdsman is a Herdr orchestration control-plane. Pi owns the model conversation; Herdr owns terminal execution surfaces.
@@ -742,6 +742,6 @@ If validation required fixes, commit them with the relevant earlier task message
 - Removing alias tools is intentionally breaking. This is accepted because the current direction prioritizes a simple Pi-visible tool surface over backward compatibility.
 - `promptGuidelines` are flat in Pi’s system prompt. Long or duplicate guidelines can pollute every turn, so this plan keeps guidelines limited and tool-name-specific.
 - Skill text and extension hidden context intentionally overlap on three core principles. The overlap is limited so normal attached sessions are driven by extension/tool metadata while `/skill:herdsman` remains coherent when invoked manually.
-- Stale hidden context filtering depends on Pi preserving `customType` in messages. The fallback marker `[SHEPHERD ATTACHED CONTEXT]` reduces risk if message shape changes.
+- Stale hidden context filtering depends on Pi preserving `customType` in messages. The fallback marker `[HERDSMAN ATTACHED CONTEXT]` reduces risk if message shape changes.
 - There is no confirmed unit-test harness for `packages/herdsman-pi/extensions/index.js`. If none exists, do not build a large test framework in this slice; verify with syntax/package checks and local Pi dogfooding.
 - Archived plan files may still mention removed aliases. Leave archived history untouched unless the user asks for docs cleanup.

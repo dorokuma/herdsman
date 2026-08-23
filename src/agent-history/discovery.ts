@@ -21,6 +21,7 @@ export type AgentHistoryLookupInput = {
   cwd: string | null;
   foregroundCwd: string | null;
   firstSeenAtMs?: number;
+  grokHome?: string;
   homeDir?: string;
   occupiedSessionPaths?: ReadonlySet<string>;
 };
@@ -49,6 +50,26 @@ export async function discoverAgentHistory(
 
   if (input.agentSession?.kind === "id") {
     const source = historySourceFromSessionRef(input.agentSession);
+    if (source === "grok-jsonl") {
+      const matches = await discoverGrokSessions({
+        homeDir,
+        cwd,
+        sessionId: input.agentSession.value,
+        ...(input.grokHome === undefined ? {} : { grokHome: input.grokHome }),
+      });
+      const candidate = selectUniqueCandidate(matches, normalizedCwd, input.occupiedSessionPaths);
+      if (candidate)
+        return {
+          kind: "agent_session",
+          path: candidate.path,
+          source,
+          value: input.agentSession.value,
+        };
+    }
+    if (source === "antigravity-sqlite") {
+      const ref = discoverAntigravitySession(homeDir, input.agentSession.value);
+      if (ref) return { ...ref, kind: "agent_session" };
+    }
     if (source === "pi-jsonl") {
       const roots = new Set([join(homeDir, ".pi", "agent", "sessions"), ...ALLOWED_SESSION_ROOTS]);
       for (const root of roots) {
@@ -91,6 +112,19 @@ export async function discoverAgentHistory(
     const ref = discoverOpenCodeSession({ cwd, homeDir, sessionId: null });
     if (ref) return ref;
   }
+  if (agent === "grok") {
+    const matches = await discoverGrokSessions({
+      homeDir,
+      cwd,
+      sessionId: null,
+      ...(input.grokHome === undefined ? {} : { grokHome: input.grokHome }),
+    });
+    candidates.push(...matches);
+  }
+  if (agent === "agy" || agent === "antigravity" || agent === "antigravity_cli") {
+    const ref = discoverAntigravitySession(homeDir, null);
+    if (ref) return ref;
+  }
   const ranked = candidates
     .filter((candidate) => normalizedCwd !== null && normalizeCwd(candidate.cwd) === normalizedCwd)
     .filter((candidate) => !input.occupiedSessionPaths?.has(candidate.path))
@@ -112,6 +146,14 @@ export async function discoverAgentHistory(
 export function historySourceFromSessionRef(ref: AgentSessionRef): AgentHistoryRef["source"] {
   const agent = ref.agent.toLowerCase();
   const source = ref.source.toLowerCase();
+  if (
+    agent === "agy" ||
+    agent === "antigravity" ||
+    agent === "antigravity_cli" ||
+    source.includes("antigravity")
+  )
+    return "antigravity-sqlite";
+  if (agent === "grok" || source.includes("grok")) return "grok-jsonl";
   if (agent === "pi" || source.includes("pi")) return "pi-jsonl";
   if (agent === "claude" || source.includes("claude")) return "claude-jsonl";
   if (agent === "codex" || source.includes("codex")) return "codex-jsonl";
@@ -276,6 +318,99 @@ async function listGeminiSessionFiles(chatsDir: string): Promise<string[]> {
     .map((entry) => join(chatsDir, entry.name));
 }
 
+function discoverGrokSessions(input: {
+  homeDir: string;
+  cwd: string | null;
+  grokHome?: string;
+  sessionId?: string | null;
+}): Promise<Candidate[]> {
+  const root = join(
+    input.grokHome ?? process.env.GROK_HOME ?? join(input.homeDir, ".grok"),
+    "sessions",
+  );
+  return listGrokCandidates(root, input.cwd, input.sessionId);
+}
+
+async function listGrokCandidates(
+  root: string,
+  cwd: string | null,
+  sessionId?: string | null,
+): Promise<Candidate[]> {
+  if (!existsSync(root)) return [];
+  const rootStats = await stat(root).catch(() => null);
+  if (!rootStats || rootStats.uid !== CURRENT_EUID || (rootStats.mode & 0o022) !== 0) return [];
+  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
+  const result: Candidate[] = [];
+  for (const encoded of entries) {
+    if (!encoded.isDirectory()) continue;
+    let decodedCwd: string;
+    try {
+      decodedCwd = decodeURIComponent(encoded.name);
+    } catch {
+      continue;
+    }
+    if (cwd && normalizeCwd(decodedCwd) !== normalizeCwd(cwd)) continue;
+    const sessions = await readdir(join(root, encoded.name), { withFileTypes: true }).catch(
+      () => [],
+    );
+    for (const session of sessions) {
+      if (
+        !session.isDirectory() ||
+        !isUuid(session.name) ||
+        (sessionId && session.name !== sessionId)
+      )
+        continue;
+      const path = join(root, encoded.name, session.name, "chat_history.jsonl");
+      const link = await lstat(path).catch(() => null);
+      const stats = await stat(path).catch(() => null);
+      if (!link?.isFile() || !stats?.isFile() || stats.uid !== CURRENT_EUID) continue;
+      result.push({ cwd: decodedCwd, mtimeMs: stats.mtimeMs, path, source: "grok-jsonl" });
+    }
+  }
+  return result;
+}
+
+function selectUniqueCandidate(
+  candidates: Candidate[],
+  cwd: string | null,
+  occupied?: ReadonlySet<string>,
+): Candidate | null {
+  const filtered = candidates.filter((item) => !occupied?.has(item.path));
+  if (cwd) {
+    const matching = filtered.filter((item) => normalizeCwd(item.cwd) === normalizeCwd(cwd));
+    return matching.length === 1 ? (matching[0] ?? null) : null;
+  }
+  return filtered.length === 1 ? (filtered[0] ?? null) : null;
+}
+
+function isUuid(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
+}
+
+function discoverAntigravitySession(
+  homeDir: string,
+  sessionId: string | null,
+): AgentHistoryRef | null {
+  if (sessionId && !isUuid(sessionId)) return null;
+  const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
+  if (sessionId) {
+    const path = join(dir, `${sessionId}.db`);
+    return safeConversationDb(path, sessionId)
+      ? { kind: "discovered_file", path, source: "antigravity-sqlite", value: sessionId }
+      : null;
+  }
+  return null;
+}
+
+function safeConversationDb(path: string, sessionId: string): boolean {
+  if (!isUuid(sessionId) || !existsSync(path)) return false;
+  try {
+    const stats = lstatSync(path);
+    return stats.isFile() && (stats.mode & 0o077) === 0;
+  } catch {
+    return false;
+  }
+}
 function discoverOpenCodeSession(input: {
   cwd: string | null;
   homeDir: string;

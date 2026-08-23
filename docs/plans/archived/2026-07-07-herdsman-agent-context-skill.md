@@ -73,7 +73,7 @@ done	pi	wk_1	completed	review
 - `src/cli/herdsman.ts` currently has separate `observe` and `observe-current` commands.
 - `runCliCommand` already composes daemon RPC requests through `ObservabilityRpcClient`.
 - Existing RPC methods are enough for `context`: `workspace.observe`, `workspace.snapshot`, and `notification.subscribe`.
-- `packages/herdsman-herdr-plugin/index.mjs` already connects directly to the Herdsman daemon socket and reads `$SHEPHERD_HOME/runtime.json` to find the socket path.
+- `packages/herdsman-herdr-plugin/index.mjs` already connects directly to the Herdsman daemon socket and reads `$HERDSMAN_HOME/runtime.json` to find the socket path.
 - `packages/herdsman-herdr-plugin/herdr-plugin.toml` currently exposes `observe-workspace` and `dashboard`.
 - `packages/herdsman-pi/skills/herdsman/SKILL.md` currently describes Pi bridge behavior and has `disable-model-invocation: true`; it is not yet an agent workflow skill.
 - `README.md` and `README.ja.md` currently mention `observe-current`; both must move to `context`.
@@ -834,9 +834,9 @@ Run inside Herdr:
 
 ```bash
 rm -rf /tmp/herdsman-context-smoke
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js context --json
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js context --json
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
 ```
 
 Expected: `context --json` prints JSON with `observedWorkspace`, `workers`, and `notifications`; daemon stops after the test. If the implementer is not currently inside Herdr, skip this manual smoke and rely on Task 6 Step 3 plus unit/integration tests until a Herdr pane is available.
@@ -850,9 +850,9 @@ Run inside Herdr:
 ```bash
 herdr plugin link ./packages/herdsman-herdr-plugin
 rm -rf /tmp/herdsman-context-smoke
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node packages/herdsman-herdr-plugin/index.mjs context
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node packages/herdsman-herdr-plugin/index.mjs context
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
 herdr plugin list --plugin herdsman.observability --json
 ```
 
@@ -933,9 +933,9 @@ Run inside a Herdr-managed pane:
 ```bash
 PLUGIN_ROOT=$(herdr plugin list --plugin herdsman.observability --json | node -e 'let s=""; process.stdin.on("data", d => s += d); process.stdin.on("end", () => { const j = JSON.parse(s); console.log(j.result.plugins[0].plugin_root); });')
 rm -rf /tmp/herdsman-context-smoke
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node "$PLUGIN_ROOT/index.mjs" context
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node "$PLUGIN_ROOT/index.mjs" context
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
 ```
 
 Expected: installed plugin runtime output contains `Observed workspace:` and exits 0. Daemon stops.
@@ -959,9 +959,9 @@ From a Herdr-managed pane:
 
 ```bash
 rm -rf /tmp/herdsman-context-smoke
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js context --json
-SHEPHERD_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon start
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js context --json
+HERDSMAN_HOME=/tmp/herdsman-context-smoke node dist/src/cli/herdsman.js daemon stop
 ```
 
 From any shell:

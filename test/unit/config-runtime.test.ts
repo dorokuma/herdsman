@@ -20,18 +20,18 @@ afterEach(() => {
 });
 
 describe("Herdsman runtime resolver", () => {
-  test("uses ~/.herdsman when SHEPHERD_HOME is absent", () => {
+  test("uses ~/.herdsman when HERDSMAN_HOME is absent", () => {
     expect(getHerdsmanHome({})).toBe(resolve(homedir(), ".herdsman"));
   });
 
-  test("uses explicit SHEPHERD_HOME", () => {
-    expect(getHerdsmanHome({ SHEPHERD_HOME: "/tmp/herdsman-dev" })).toBe("/tmp/herdsman-dev");
+  test("uses explicit HERDSMAN_HOME", () => {
+    expect(getHerdsmanHome({ HERDSMAN_HOME: "/tmp/herdsman-dev" })).toBe("/tmp/herdsman-dev");
   });
 
   test("resolves default runtime paths under Herdsman home", () => {
     const homeDir = tempHome();
 
-    const runtime = resolveRuntime({ environment: { SHEPHERD_HOME: homeDir } });
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: homeDir } });
 
     expect(runtime.paths).toMatchObject({
       configPath: join(homeDir, "config.yaml"),
@@ -58,7 +58,7 @@ describe("Herdsman runtime resolver", () => {
 `,
     );
 
-    const runtime = resolveRuntime({ environment: { SHEPHERD_HOME: homeDir } });
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: homeDir } });
 
     expect(runtime.paths.dbPath).toBe(join(homeDir, "data/state.sqlite"));
     expect(runtime.paths.socketPath).toBe(join(homeDir, "sockets/dev.sock"));
@@ -78,7 +78,7 @@ describe("Herdsman runtime resolver", () => {
 `,
     );
 
-    const runtime = resolveRuntime({ environment: { SHEPHERD_HOME: homeDir } });
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: homeDir } });
 
     expect(runtime.paths.dbPath).toBe("/var/tmp/herdsman/state.sqlite");
     expect(runtime.paths.socketPath).toBe("/var/tmp/herdsman/herdsman.sock");
@@ -86,15 +86,15 @@ describe("Herdsman runtime resolver", () => {
     expect(runtime.paths.logPath).toBe("/var/tmp/herdsman/herdsman.log");
   });
 
-  test("loads .env values over shell values while ignoring SHEPHERD variables", () => {
+  test("loads .env values over shell values including HERDSMAN variables", () => {
     const homeDir = tempHome();
     const envPath = join(homeDir, "dotenv-test");
     writeFileSync(
       envPath,
       `EXAMPLE_SERVICE_TOKEN=file-token
 OPENAI_API_KEY="file-key"
-SHEPHERD_HOME=/tmp/ignored
-SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
+HERDSMAN_HOME=/tmp/ignored
+HERDSMAN_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
 `,
     );
 
@@ -102,7 +102,7 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
       baseEnvironment: {
         EXISTING: "kept",
         OPENAI_API_KEY: "shell-key",
-        SHEPHERD_HOME: homeDir,
+        HERDSMAN_HOME: homeDir,
       },
       envPath,
     });
@@ -110,21 +110,21 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
     expect(environment.EXAMPLE_SERVICE_TOKEN).toBe("file-token");
     expect(environment.OPENAI_API_KEY).toBe("file-key");
     expect(environment.EXISTING).toBe("kept");
-    expect(environment.SHEPHERD_HOME).toBe(homeDir);
-    expect(environment.SHEPHERD_INTERNAL_SOCKET_PATH).toBeUndefined();
+    expect(environment.HERDSMAN_HOME).toBe("/tmp/ignored");
+    expect(environment.HERDSMAN_INTERNAL_SOCKET_PATH).toBe("/tmp/ignored.sock");
   });
 
   test("throws on invalid config unless invalid config is allowed", () => {
     const homeDir = tempHome();
     writeFileSync(join(homeDir, "config.yaml"), "runtime: [");
 
-    expect(() => resolveRuntime({ environment: { SHEPHERD_HOME: homeDir } })).toThrow(
+    expect(() => resolveRuntime({ environment: { HERDSMAN_HOME: homeDir } })).toThrow(
       "Invalid Herdsman config",
     );
 
     const runtime = resolveRuntime({
       allowInvalidConfig: true,
-      environment: { SHEPHERD_HOME: homeDir },
+      environment: { HERDSMAN_HOME: homeDir },
     });
     expect(runtime.configErrors?.length).toBeGreaterThan(0);
     expect(runtime.paths.dbPath).toBe(join(homeDir, "state.db"));
@@ -149,7 +149,7 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
 
     const runtime = resolveRuntime({
       allowInvalidConfig: true,
-      environment: { SHEPHERD_HOME: homeDir },
+      environment: { HERDSMAN_HOME: homeDir },
     });
     const paths = runtimePathsFromRecordOrDefault({ environment: runtime.environment });
 
@@ -166,7 +166,7 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
 
     const runtime = resolveRuntime({
       allowInvalidConfig: true,
-      environment: { SHEPHERD_HOME: homeDir },
+      environment: { HERDSMAN_HOME: homeDir },
     });
     const paths = runtimePathsFromRecordOrDefault({ environment: runtime.environment });
 
@@ -187,7 +187,7 @@ SHEPHERD_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
       config: {
         runtime: { db_path: "data/state.db" },
       },
-      environment: { SHEPHERD_HOME: "/tmp/herdsman-home" },
+      environment: { HERDSMAN_HOME: "/tmp/herdsman-home" },
     });
 
     expect(paths.dbPath).toBe("/tmp/herdsman-home/data/state.db");

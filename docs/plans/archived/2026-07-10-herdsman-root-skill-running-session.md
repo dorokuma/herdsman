@@ -347,8 +347,8 @@ import sys
 from pathlib import Path
 
 args = sys.argv[1:]
-log_path = Path(os.environ["SHEPHERD_FAKE_LOG"])
-state_path = Path(os.environ["SHEPHERD_FAKE_STATE"])
+log_path = Path(os.environ["HERDSMAN_FAKE_LOG"])
+state_path = Path(os.environ["HERDSMAN_FAKE_STATE"])
 log_path.parent.mkdir(parents=True, exist_ok=True)
 with log_path.open("a") as log:
     log.write(json.dumps({"command": "herdsman", "args": args}) + "\n")
@@ -431,7 +431,7 @@ Create `../herdsman-workspace/behavior-evals/bin/herdr` as a guard so no run can
 
 ```bash
 #!/usr/bin/env bash
-printf '%s\n' "herdr $*" >> "$SHEPHERD_FAKE_LOG"
+printf '%s\n' "herdr $*" >> "$HERDSMAN_FAKE_LOG"
 echo "Herdr is intentionally unavailable in this eval" >&2
 exit 97
 ```
@@ -439,13 +439,13 @@ exit 97
 Run `chmod +x` on both adapters. Give every run unique environment paths inside that run directory:
 
 ```text
-SHEPHERD_FAKE_LOG=<run-directory>/outputs/command-log.jsonl
-SHEPHERD_FAKE_STATE=<run-directory>/daemon-state
+HERDSMAN_FAKE_LOG=<run-directory>/outputs/command-log.jsonl
+HERDSMAN_FAKE_STATE=<run-directory>/daemon-state
 ```
 
 Before launching each executor, create its `outputs/` directory, truncate its log, and write `stopped` to its state only for eval 3; write `running` for every other eval. Candidate and baseline never share a state or log file.
 
-Each executor prompt must require every shell command to set `PATH=/Users/ryo.nakae/Dev/private/herdsman-workspace/behavior-evals/bin:$PATH`, `SHEPHERD_FAKE_LOG`, and `SHEPHERD_FAKE_STATE` inline. This PATH shadows both real binaries with the fake Herdsman adapter and Herdr guard. For evals 1, 3, and 4, each command also sets `HERDR_ENV=1 HERDR_WORKSPACE_ID=wB`; for eval 2, use `env -u HERDR_ENV -u HERDR_WORKSPACE_ID` and require `--workspace wB --session nightly`.
+Each executor prompt must require every shell command to set `PATH=/Users/ryo.nakae/Dev/private/herdsman-workspace/behavior-evals/bin:$PATH`, `HERDSMAN_FAKE_LOG`, and `HERDSMAN_FAKE_STATE` inline. This PATH shadows both real binaries with the fake Herdsman adapter and Herdr guard. For evals 1, 3, and 4, each command also sets `HERDR_ENV=1 HERDR_WORKSPACE_ID=wB`; for eval 2, use `env -u HERDR_ENV -u HERDR_WORKSPACE_ID` and require `--workspace wB --session nightly`.
 
 Retrieve every executor with full tool-call history (`get_subagent_result` with `verbose: true`) and save that structured conversation as `transcript.md`. The grader must fail the run if any executed shell tool input lacks the fake-bin PATH prefix when invoking Herdsman/Herdr, invokes a real absolute Herdsman/Herdr path, or contains a Herdsman/Herdr command absent from that run's unique command log. This transcript-to-log audit is required evidence that no real binary ran.
 

@@ -226,7 +226,7 @@ The current CLI defaults `dbPath` to `herdsman.sqlite` and `socketPath` to `/tmp
 TUI MVP should use a stable per-user Herdsman home directory:
 
 ```text
-SHEPHERD_HOME=${SHEPHERD_HOME:-~/.herdsman}
+HERDSMAN_HOME=${HERDSMAN_HOME:-~/.herdsman}
 ```
 
 Default managed paths:
@@ -242,9 +242,9 @@ Log:     ~/.herdsman/logs/daemon.log
 Explicit overrides still win:
 
 ```text
-SHEPHERD_CONFIG
-SHEPHERD_DB_PATH
-SHEPHERD_SOCKET_PATH
+HERDSMAN_CONFIG
+HERDSMAN_DB_PATH
+HERDSMAN_SOCKET_PATH
 ```
 
 The first implementation should add a shared path resolver and move all commands toward these defaults so `daemon`, TUI, `send`, `watch`, `rename`, and `audit` agree by default.

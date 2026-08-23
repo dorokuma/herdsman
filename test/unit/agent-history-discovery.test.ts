@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -22,6 +22,62 @@ async function tempHome(name: string) {
 }
 
 describe("agent history discovery", () => {
+  test("discovers Grok sessions under the isolated Grok HOME", async () => {
+    const homeDir = await tempHome("herdsman-grok-home-");
+    const grokHome = join(homeDir, "isolated-grok");
+    const sessionDir = join(
+      grokHome,
+      "sessions",
+      encodeURIComponent("/repo"),
+      "12345678-1234-4123-8123-123456789abc",
+    );
+    await mkdir(sessionDir, { recursive: true });
+    const path = join(sessionDir, "chat_history.jsonl");
+    await writeFile(path, JSON.stringify({ type: "assistant", content: "done" }) + "\n");
+    await expect(
+      discoverAgentHistory({
+        agent: "grok",
+        agentSession: null,
+        cwd: "/repo",
+        foregroundCwd: null,
+        homeDir,
+        grokHome,
+      }),
+    ).resolves.toMatchObject({ source: "grok-jsonl", path });
+  });
+
+  test("resolves an existing Antigravity UUID to its database", async () => {
+    const homeDir = await tempHome("herdsman-agy-home-");
+    const id = "12345678-1234-4123-8123-123456789abc";
+    const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
+    const path = join(dir, `${id}.db`);
+    await mkdir(dir, { recursive: true });
+    await writeFile(path, "");
+    await chmod(path, 0o600);
+    await expect(
+      discoverAgentHistory({
+        agent: "agy",
+        agentSession: { agent: "agy", kind: "id", source: "agy", value: id },
+        cwd: null,
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toMatchObject({ source: "antigravity-sqlite", path, value: id });
+  });
+
+  test("returns empty for invalid Antigravity paths", async () => {
+    const homeDir = await tempHome("herdsman-agy-empty-home-");
+    await expect(
+      discoverAgentHistory({
+        agent: "agy",
+        agentSession: { agent: "agy", kind: "id", source: "agy", value: "not-a-uuid" },
+        cwd: null,
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toBeNull();
+  });
+
   test("maps session refs for new runtime sources", () => {
     expect(
       historySourceFromSessionRef({

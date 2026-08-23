@@ -111,8 +111,8 @@ describe("Pi agent wake projection", () => {
 
     expect(WAKE_SETTLE_MS).toBe(500);
     expect(AGENT_UPDATE_EXCERPT_CHARS).toBe(2_000);
-    expect(formatted.indexOf("[SHEPHERD WAKE POLICY]")).toBeLessThan(
-      formatted.indexOf("[SHEPHERD AGENT UPDATES]"),
+    expect(formatted.indexOf("[HERDSMAN WAKE POLICY]")).toBeLessThan(
+      formatted.indexOf("[HERDSMAN AGENT UPDATES]"),
     );
     expect(formatted).toContain("untrusted evidence");
     expect(formatted).toContain("existing user request");
