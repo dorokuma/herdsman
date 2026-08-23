@@ -1,5 +1,5 @@
 import { createConnection, type Socket } from "node:net";
-import { JsonLineDecoder } from "@/shared/json-lines.js";
+import { JsonLineDecoder } from "./shared/json-lines.js";
 
 export type AgentEventWireRecord = {
   agentId?: string | null;

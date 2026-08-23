@@ -28,6 +28,33 @@ type Module = {
 type FakeClient = ReturnType<typeof createFakeClient>;
 type FakePi = ReturnType<typeof createFakePi>;
 
+const daemonClientModuleUrl = new URL(
+  "../../packages/herdsman-pi/src/daemon-client.ts",
+  import.meta.url,
+).href;
+const jsonLinesModuleUrl = new URL(
+  "../../packages/herdsman-pi/src/shared/json-lines.ts",
+  import.meta.url,
+).href;
+
+describe("herdsman-pi extension self-contained loading", () => {
+  test("loads daemon-client independently and rejects frames larger than 1 MiB before handlers see them", async () => {
+    const { ReconnectingDaemonClient } = await import(daemonClientModuleUrl);
+    expect(typeof ReconnectingDaemonClient).toBe("function");
+
+    const { JsonLineDecoder, JsonLineFrameTooLargeError } = await import(jsonLinesModuleUrl);
+    const decoder = new JsonLineDecoder();
+    const handler = vi.fn();
+
+    expect(() => {
+      for (const message of decoder.push(`${"x".repeat(1024 * 1024 + 1)}\n`)) {
+        handler(message);
+      }
+    }).toThrow(JsonLineFrameTooLargeError);
+    expect(handler).not.toHaveBeenCalled();
+  });
+});
+
 describe("herdsman-pi orchestrator bridge", () => {
   test("defaults to the Herdsman daemon socket", async () => {
     const { defaultSocketPath } = (await import(extensionModuleUrl)) as Module;
