@@ -116,6 +116,21 @@ describe("ObservabilityRpcServer", () => {
         workspaceId: "wB",
       }),
     ).resolves.toEqual({ accepted: true });
+    const otherWaiter = registry.waitForSignal({
+      herdrSessionName: "default",
+      recordedAfterMs: 0,
+      terminalId: "term_2",
+    });
+    await expect(
+      client.request("agent.turn.completed", {
+        confirmed: true,
+        herdrSessionName: "default",
+        paneId: "wB:p2",
+        terminalId: "term_2",
+        workspaceId: "wB",
+      }),
+    ).resolves.toEqual({ accepted: true });
+    await expect(otherWaiter).resolves.toEqual({ confirmed: false, received: false });
     await expect(
       registry.waitForSignal({
         herdrSessionName: "default",
