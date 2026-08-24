@@ -2649,6 +2649,7 @@ describe("herdsman-pi turn completion signal", () => {
   test("signals turn completion with confirmed=true when the final message is already on disk", async () => {
     const dir = mkdtempSync(join(tmpdir(), "herdsman-pi-turn-"));
     const sessionPath = join(dir, "pi-session.jsonl");
+    const previous = withHerdrEnv();
     try {
       writeFileSync(
         sessionPath,
@@ -2674,6 +2675,7 @@ describe("herdsman-pi turn completion signal", () => {
         },
       ]);
     } finally {
+      restoreEnv(previous);
       rmSync(dir, { force: true, recursive: true });
     }
   });
@@ -2682,6 +2684,7 @@ describe("herdsman-pi turn completion signal", () => {
     vi.useFakeTimers();
     const dir = mkdtempSync(join(tmpdir(), "herdsman-pi-turn-"));
     const sessionPath = join(dir, "pi-session.jsonl");
+    const previous = withHerdrEnv();
     try {
       writeFileSync(sessionPath, "no final message here\n");
       const client = createFakeClient();
@@ -2698,6 +2701,7 @@ describe("herdsman-pi turn completion signal", () => {
       ]);
     } finally {
       vi.useRealTimers();
+      restoreEnv(previous);
       rmSync(dir, { force: true, recursive: true });
     }
   });
@@ -2706,11 +2710,16 @@ describe("herdsman-pi turn completion signal", () => {
     const client = createFakeClient();
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
-    await startExtension(client, pi, ctx);
-    await pi.emit("message_end", assistantMessage("toolUse"), ctx);
-    await pi.emit("message_end", { message: { role: "user" } }, ctx);
-    await pi.emit("message_end", assistantMessage("aborted"), ctx);
-    await tick();
-    expect(client.calls.filter(([method]) => method === "agent.turn.completed")).toEqual([]);
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      await pi.emit("message_end", assistantMessage("toolUse"), ctx);
+      await pi.emit("message_end", { message: { role: "user" } }, ctx);
+      await pi.emit("message_end", assistantMessage("aborted"), ctx);
+      await tick();
+      expect(client.calls.filter(([method]) => method === "agent.turn.completed")).toEqual([]);
+    } finally {
+      restoreEnv(previous);
+    }
   });
 });
