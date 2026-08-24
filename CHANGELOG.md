@@ -1,4 +1,4 @@
-## 0.8.3
+## 0.8.4
 
 - 增强 daemon 的 orchestrator ack 拒绝与事件投递结构化日志，记录拒绝原因、期望事件及投递批次摘要。
 - orchestrator 游标推进时批量清理游标以下遗留 pending/delivered 事件，避免垃圾行污染候选扫描。
