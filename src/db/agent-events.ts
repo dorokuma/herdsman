@@ -163,6 +163,18 @@ export class AgentEventStore {
     );
   }
 
+  ackSelfOwned(input: { herdrSessionName: string; workspaceId: string; paneId: string }): number {
+    return Number(
+      this.#sqlite
+        .prepare(
+          `update agent_events set status = 'acked', deliverable = 0
+           where herdr_session_name = ? and workspace_id = ? and pane_id = ?
+             and status in ('pending', 'delivered')`,
+        )
+        .run(input.herdrSessionName, input.workspaceId, input.paneId).changes,
+    );
+  }
+
   invalidateById(id: number, reason: string): boolean {
     return (
       Number(

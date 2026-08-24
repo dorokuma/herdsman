@@ -113,6 +113,15 @@ export class AgentEventReconciler {
       )
         released += 1;
     }
+    for (const scope of this.#scopes.listOwnedScopes()) {
+      if (scope.owner?.paneId) {
+        this.#events.ackSelfOwned({
+          herdrSessionName: scope.herdrSessionName,
+          workspaceId: scope.workspaceId,
+          paneId: scope.owner.paneId,
+        });
+      }
+    }
     return { invalidated, released };
   }
 }

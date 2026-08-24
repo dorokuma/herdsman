@@ -45,6 +45,7 @@ function setup() {
 function reconciler(
   harness: ReturnType<typeof openObservabilityDbHarness>,
   panes: unknown[] | (() => Promise<unknown[]>),
+  connectedTerminal = false,
 ) {
   return new AgentEventReconciler({
     events: harness.agentEvents,
@@ -57,11 +58,36 @@ function reconciler(
           snapshot: { panes: typeof panes === "function" ? await panes() : panes },
         }),
       }) as never,
-    connectedTerminal: () => false,
+    connectedTerminal: () => connectedTerminal,
   });
 }
 
 describe("startup reconcile dedicated coverage", () => {
+  test("cleans pending self-owned events while preserving external events", async () => {
+    const { harness, append } = setup();
+    harness.agentOrchestratorScopes.claim({
+      ...scope,
+      ackedEventId: 0,
+      paneId: "wA:live",
+      terminalId: "term-owner",
+    });
+    const self = append({ paneId: "wA:live", terminalId: "term-owner" });
+    const external = append({ paneId: "wA:external", terminalId: "term-external" });
+    await reconciler(
+      harness,
+      [
+        { pane_id: "wA:live", terminal_id: "term-owner" },
+        { pane_id: "wA:external", terminal_id: "term-external" },
+      ],
+      true,
+    ).reconcile();
+    expect(harness.agentEvents.get(self.id)).toMatchObject({ status: "acked", deliverable: 0 });
+    expect(harness.agentEvents.get(external.id)).toMatchObject({
+      status: "pending",
+      deliverable: 1,
+    });
+  });
+
   test("a: invalidates absent pending/delivered panes and releases stale owner, preserving ack", async () => {
     const { harness, append } = setup();
     const zombiePending = append({ paneId: "wA:gone", terminalId: "term-gone" });

@@ -486,7 +486,7 @@ export class AgentIndexService {
       }
     }
 
-    let lastEvent = this.#stores.agentEvents.append({
+    const lastEvent = this.#appendAndAckSelfEvent({
       agentId: input.agent.id,
       compactHistory,
       herdrSessionName: input.agent.herdrSessionName,
@@ -506,7 +506,7 @@ export class AgentIndexService {
     });
     const statusType = statusEventType(input.to);
     if (statusType) {
-      lastEvent = this.#stores.agentEvents.append({
+      return this.#appendAndAckSelfEvent({
         agentId: input.agent.id,
         compactHistory,
         herdrSessionName: input.agent.herdrSessionName,
@@ -517,7 +517,6 @@ export class AgentIndexService {
           input.to,
           `${observationId}:${input.herdrEventKey ?? "legacy"}:${statusType}`,
         ),
-
         paneId: input.agent.paneId,
         paneGeneration: input.agent.paneGeneration ?? null,
         payload: payload(input.agent, input.from, input.to),
@@ -527,6 +526,19 @@ export class AgentIndexService {
       });
     }
     return lastEvent;
+  }
+
+  #appendAndAckSelfEvent(input: Parameters<AgentEventStore["append"]>[0]): AgentEventRecord {
+    const event = this.#stores.agentEvents.append(input);
+    const owner = this.#stores.agentOrchestratorScopes?.get({
+      herdrSessionName: input.herdrSessionName,
+      workspaceId: input.workspaceId ?? "",
+    });
+    if (owner?.owner?.paneId && owner.owner.paneId === input.paneId) {
+      this.#stores.agentEvents.markAcked(event.id);
+      return this.#stores.agentEvents.get(event.id);
+    }
+    return event;
   }
 }
 
