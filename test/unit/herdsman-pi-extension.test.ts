@@ -2654,18 +2654,19 @@ describe("herdsman-pi turn completion signal", () => {
       const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
       await startExtension(client, pi, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
-      await vi.waitFor(() =>
-        expect(client.calls).toContainEqual([
-          "agent.turn.completed",
-          {
-            confirmed: true,
-            herdrSessionName: "default",
-            paneId: "wB:p1",
-            terminalId: "term_pi",
-            workspaceId: "wB",
-          },
-        ]),
-      );
+      for (let attempt = 0; attempt < 10 && client.calls.length === 0; attempt += 1) {
+        await Promise.resolve();
+      }
+      expect(client.calls).toContainEqual([
+        "agent.turn.completed",
+        {
+          confirmed: true,
+          herdrSessionName: "default",
+          paneId: "wB:p1",
+          terminalId: "term_pi",
+          workspaceId: "wB",
+        },
+      ]);
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }
@@ -2682,13 +2683,13 @@ describe("herdsman-pi turn completion signal", () => {
       const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
       await startExtension(client, pi, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await Promise.resolve();
       await vi.advanceTimersByTimeAsync(3_100);
-      await vi.waitFor(() =>
-        expect(client.calls).toContainEqual([
-          "agent.turn.completed",
-          expect.objectContaining({ confirmed: false }),
-        ]),
-      );
+      await Promise.resolve();
+      expect(client.calls).toContainEqual([
+        "agent.turn.completed",
+        expect.objectContaining({ confirmed: false }),
+      ]);
     } finally {
       vi.useRealTimers();
       rmSync(dir, { force: true, recursive: true });
