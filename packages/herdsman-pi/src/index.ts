@@ -166,6 +166,7 @@ type PiApi = {
 
 type ExtensionOptions = {
   clientFactory?: () => HerdsmanDaemonClient;
+  onTurnCompletionSignal?: (completion: Promise<void>) => void;
 };
 
 const DEFAULT_HOME_NAME = ".herdsman";
@@ -803,7 +804,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const scope = state.currentScope;
       const sessionPath = state.sessionRef?.value;
       if (!client || !state.connected || !scope || !sessionPath) return;
-      void (async () => {
+      const completion = (async () => {
         const check = await confirmSessionWrite({ expectedText, path: sessionPath });
         try {
           await client.request("agent.turn.completed", {
@@ -820,6 +821,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           );
         }
       })();
+      options.onTurnCompletionSignal?.(completion);
     };
 
     pi.on("message_end", (event: Record<string, unknown>) => {

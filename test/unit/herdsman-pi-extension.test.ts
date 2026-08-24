@@ -20,6 +20,7 @@ type Command = {
 type Module = {
   createHerdsmanPiExtension: (options?: {
     clientFactory?: () => FakeClient;
+    onTurnCompletionSignal?: (completion: Promise<void>) => void;
   }) => (pi: FakePi) => void;
   defaultSocketPath: () => string;
   formatHiddenAgentContext: (input: { agents: unknown[]; workspaceId: string }) => string;
@@ -2166,11 +2167,18 @@ async function startExtension(
   client: FakeClient,
   pi: FakePi,
   ctx: ReturnType<typeof fakeCtx>,
-): Promise<void> {
+): Promise<() => Promise<void>> {
+  const completions: Promise<void>[] = [];
   const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
-  createHerdsmanPiExtension({ clientFactory: () => client })(pi);
+  createHerdsmanPiExtension({
+    clientFactory: () => client,
+    onTurnCompletionSignal: (completion) => completions.push(completion),
+  })(pi);
   await pi.emit("session_start", {}, ctx);
   await client.connect();
+  return async () => {
+    await Promise.all(completions);
+  };
 }
 
 function createFakeClient() {
@@ -2652,11 +2660,9 @@ describe("herdsman-pi turn completion signal", () => {
       const client = createFakeClient();
       const pi = createFakePi();
       const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
-      await startExtension(client, pi, ctx);
+      const flushTurnCompletion = await startExtension(client, pi, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
-      for (let attempt = 0; attempt < 10 && client.calls.length === 0; attempt += 1) {
-        await Promise.resolve();
-      }
+      await flushTurnCompletion();
       expect(client.calls).toContainEqual([
         "agent.turn.completed",
         {
@@ -2681,11 +2687,11 @@ describe("herdsman-pi turn completion signal", () => {
       const client = createFakeClient();
       const pi = createFakePi();
       const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
-      await startExtension(client, pi, ctx);
+      const flushTurnCompletion = await startExtension(client, pi, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await Promise.resolve();
       await vi.advanceTimersByTimeAsync(3_100);
-      await Promise.resolve();
+      await flushTurnCompletion();
       expect(client.calls).toContainEqual([
         "agent.turn.completed",
         expect.objectContaining({ confirmed: false }),
