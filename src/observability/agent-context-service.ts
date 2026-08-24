@@ -19,6 +19,7 @@ import type {
 export type RefreshAgentContextInput = {
   agent: AgentIndexRecord;
   identityChanged: boolean;
+  forceRefresh?: boolean;
   occupiedSessionPaths?: ReadonlySet<string>;
 };
 
@@ -60,19 +61,22 @@ export class AgentContextService {
     const occupiedChanged =
       priorOccupiedFingerprint !== undefined && priorOccupiedFingerprint !== occupiedFingerprint;
     this.#occupiedFingerprintByAgent.set(input.agent.id, occupiedFingerprint);
-    const forceDiscovery = await shouldForceDiscovery({
-      agent: input.agent,
-      directAuthoritativeRef,
-      identityChanged: input.identityChanged || occupiedChanged,
-      preferredRef,
-      previous,
-    });
+    const forceDiscovery =
+      input.forceRefresh ||
+      (await shouldForceDiscovery({
+        agent: input.agent,
+        directAuthoritativeRef,
+        identityChanged: input.identityChanged || occupiedChanged,
+        preferredRef,
+        previous,
+      }));
     const resolved = bindAuthoritativeId(
       input.agent,
       await this.#history.resolveCompactHistory(
         historyLookup(input.agent, this.#stores.agents, occupiedSessionPaths),
         {
           forceDiscovery,
+          ...(input.forceRefresh === undefined ? {} : { forceRefresh: input.forceRefresh }),
           ...(preferredRef ? { preferredRef } : {}),
         },
       ),

@@ -96,6 +96,7 @@ type LaunchIdentity = {
 };
 
 type DeliveredBatch = {
+  abortedByUser: boolean;
   assistantFinalSucceeded: boolean;
   events: AgentEventWireRecord[];
   hasSubstantiveWork: boolean;
@@ -405,7 +406,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             return;
           }
           const current = batchOutcomes;
-          state.deliveredBatch = {
+          const deliveredBatch: DeliveredBatch = {
+            abortedByUser: false,
             assistantFinalSucceeded: false,
             events: batchEvents.filter((event) =>
               batchOutcomes.some((outcome) => outcome.eventId === event.id),
@@ -418,6 +420,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.wakeTimer = undefined;
           state.wakeRequested = true;
           state.wakeRequestedThroughEventId = current.at(-1)?.eventId ?? 0;
+          state.wakeRequested = false;
+          state.wakeRequestedThroughEventId = 0;
           pi.sendMessage?.(
             {
               content: formatAgentOutcomeUpdates(batchOutcomes),
@@ -439,6 +443,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             },
             { deliverAs: "followUp", triggerTurn: true },
           );
+          // Only expose the batch after both messages were accepted by pi. This
+          // keeps an injection failure eligible for daemon redelivery.
+          state.deliveredBatch = deliveredBatch;
           state.wakeRequested = false;
           state.wakeRequestedThroughEventId = 0;
         };
@@ -449,16 +456,20 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     const loseRole = (ctx: PiContext | undefined, options: { abort?: boolean } = {}) => {
       if (state.deliveredBatch) {
         state.deliveredBatch.invalidated = true;
-    if (options.abort) {
+        const abortedBatch = state.deliveredBatch;
+        if (options.abort) {
           state.failedWakeThroughEventId = Math.max(
             state.failedWakeThroughEventId,
-            ...state.deliveredBatch.events.map((event) => event.id),
+            ...abortedBatch.events.map((event) => event.id),
           );
+          // Owner lost mid-turn: drop the in-flight batch so it cannot gate the next wake.
+          state.deliveredBatch = undefined;
+          state.wakeDeferredUntilSettled = false;
         }
         if (
           options.abort &&
-          state.deliveredBatch.herdsmanTriggered &&
-          !state.deliveredBatch.hasSubstantiveWork
+          abortedBatch.herdsmanTriggered &&
+          !abortedBatch.hasSubstantiveWork
         ) {
           ctx?.abort?.();
         }
@@ -829,6 +840,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (message.role !== "assistant") return;
       const stopReason = stringValue(message.stopReason);
       if (state.deliveredBatch) {
+        state.deliveredBatch.abortedByUser = stopReason === "aborted";
         state.deliveredBatch.assistantFinalSucceeded =
           stopReason === "stop" || stopReason === "length";
         if (
@@ -907,7 +919,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       };
 
       if (
-        !batch.assistantFinalSucceeded ||
+        (!batch.assistantFinalSucceeded && !batch.abortedByUser) ||
         batch.invalidated ||
         !stillOwner ||
         !state.client ||

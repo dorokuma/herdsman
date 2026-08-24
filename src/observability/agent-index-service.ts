@@ -461,10 +461,23 @@ export class AgentIndexService {
         terminalId: input.agent.terminalId,
       });
       if (turn.received) {
-        const refreshed = await this.#context.refreshAgent({
+        let refreshed = await this.#context.refreshAgent({
           agent: input.agent,
           identityChanged: false,
+          forceRefresh: true,
         });
+        for (
+          let attempt = 0;
+          attempt < 3 && refreshed.snapshot.compactHistory.lastAssistantMessage === null;
+          attempt += 1
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          refreshed = await this.#context.refreshAgent({
+            agent: input.agent,
+            identityChanged: false,
+            forceRefresh: true,
+          });
+        }
         compactHistory = refreshed.snapshot.compactHistory;
         console.log(
           `Herdsman emitted pi agent.${input.to} after turn completion signal (confirmed=${turn.confirmed})`,
@@ -475,6 +488,19 @@ export class AgentIndexService {
           },
         );
       } else {
+        for (
+          let attempt = 0;
+          attempt < 3 && compactHistory.lastAssistantMessage === null;
+          attempt += 1
+        ) {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          const refreshed = await this.#context.refreshAgent({
+            agent: input.agent,
+            identityChanged: false,
+            forceRefresh: true,
+          });
+          compactHistory = refreshed.snapshot.compactHistory;
+        }
         console.warn(
           `Herdsman emitted pi agent.${input.to} without a turn completion signal after ${TURN_SIGNAL_WAIT_MS}ms`,
           {

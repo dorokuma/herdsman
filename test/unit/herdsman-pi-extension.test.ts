@@ -491,11 +491,11 @@ describe("herdsman-pi orchestrator bridge", () => {
   });
 
   test.each([
-    undefined,
-    "error",
-    "aborted",
-    "toolUse",
-  ])("retains delivered updates when the final assistant stop reason is %s", async (stopReason) => {
+    [undefined, false],
+    ["error", false],
+    ["aborted", true],
+    ["toolUse", false],
+  ])("handles final assistant stop reason %s", async (stopReason, abortedByUser) => {
     vi.useFakeTimers();
     const client = createFakeClient();
     client.response = (method) => {
@@ -520,12 +520,23 @@ describe("herdsman-pi orchestrator bridge", () => {
       else await pi.emit("message_end", { message: { role: "user" } }, ctx);
       await pi.emit("agent_settled", {}, ctx);
 
-      expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
-      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
-      expect(ctx.notifications.at(-1)).toEqual([
-        "Herdsman couldn’t acknowledge agent updates · updates remain pending",
-        "warning",
-      ]);
+      expect(ctx.statuses.get("herdsman")).toBe(
+        abortedByUser ? "◆ Herdsman" : "◆ Herdsman · 1 agent update",
+      );
+      if (abortedByUser) {
+        expect(
+          client.calls.filter(([method]) => method === "agent.notifications.ack"),
+        ).toHaveLength(1);
+        expect(ctx.notifications.at(-1)).not.toEqual([
+          "Herdsman couldn’t acknowledge agent updates · updates remain pending",
+          "warning",
+        ]);
+      } else {
+        expect(ctx.notifications.at(-1)).toEqual([
+          "Herdsman couldn’t acknowledge agent updates · updates remain pending",
+          "warning",
+        ]);
+      }
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1209,7 +1220,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("retries a failed batch when its event remains pending", async () => {
+  test("consumes an aborted batch instead of retrying its event", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
@@ -1223,12 +1234,17 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("message_end", assistantMessage("aborted"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toHaveLength(2);
-
+      expect(
+        client.calls.filter(
+          ([method, params]) =>
+            method === "agent.notifications.ack" && (params as { eventId: number }).eventId === 81,
+        ),
+      ).toHaveLength(1);
+      expect(pi.customMessages).toHaveLength(1);
       client.emitStream({ method: "agent.event", params: { event: event(82, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.customMessages).toHaveLength(2);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [81] } });
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [82] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

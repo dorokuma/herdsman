@@ -1,7 +1,7 @@
 import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryLookupInput } from "@/agent-history/discovery.js";
 import type { AgentHistoryReader } from "@/agent-history/readers.js";
 import {
@@ -36,7 +36,7 @@ function ref(path: string, source: AgentHistoryRef["source"] = "pi-jsonl"): Agen
   return { kind: "discovered_file", path, source, value: path };
 }
 
-function reader(input: { failCompact?: boolean; failRead?: boolean } = {}) {
+function reader(input: { failCompact?: boolean; failRead?: boolean; noAssistant?: boolean } = {}) {
   const compactRefs: AgentHistoryRef[] = [];
   const readRefs: AgentHistoryRef[] = [];
   const fake: AgentHistoryReader = {
@@ -53,7 +53,9 @@ function reader(input: { failCompact?: boolean; failRead?: boolean } = {}) {
       return {
         ...emptyCompactHistory(historyRef.source),
         historyRef,
-        lastAssistantMessage: { ref: "entry", text: "done", timestamp: null },
+        lastAssistantMessage: input.noAssistant
+          ? null
+          : { ref: "entry", text: "done", timestamp: null },
       };
     },
   };
@@ -146,6 +148,20 @@ describe("agent history service", () => {
     });
   });
 
+  test("does not cache compact history when no assistant message is present", async () => {
+    const path = await sourceFile("no-assistant.jsonl");
+    const put = vi.fn();
+    const fixture = service({
+      cache: { getFresh: () => undefined, put },
+      discovered: null,
+      reader: reader({ noAssistant: true }),
+    });
+
+    const result = await fixture.service.readCompactRef(ref(path));
+
+    expect(result.compactHistory.lastAssistantMessage).toBeNull();
+    expect(put).not.toHaveBeenCalled();
+  });
   test("uses the OpenCode DB path for fingerprints while preserving the session id", async () => {
     const path = await sourceFile("opencode.db");
     const preferred: AgentHistoryRef = {

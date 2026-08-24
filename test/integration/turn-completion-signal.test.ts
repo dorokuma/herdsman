@@ -135,6 +135,54 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   });
 
+  test("retries three times after a received turn signal when history is still empty", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    let calls = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          calls += 1;
+          return {
+            compactHistory: { ...emptyCompactHistory("pi-jsonl"), lastAssistantMessage: null },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    calls = 0;
+    const pending = index.handleHerdrEvent(doneEvent);
+    setTimeout(() => {
+      registry.record({
+        confirmed: true,
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        terminalId: "term_claude",
+        workspaceId: "wJ",
+      });
+    }, 10);
+
+    const result = await pending;
+    expect(calls).toBe(5);
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({ lastAssistantMessage: null }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  });
   test("generates agent.done as-is with a warning when no turn signal arrives (old extension)", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 20 });
@@ -162,10 +210,8 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
 
     await index.refreshHerdrSession(sessionInput());
     calls = 0;
-    // No extension signal: the bounded wait times out and the event is emitted
-    // exactly as today (empty final message), never hanging or dropping events.
     const result = await index.handleHerdrEvent(doneEvent);
-    expect(calls).toBe(1);
+    expect(calls).toBe(4);
     expect(result.events).toContainEqual(
       expect.objectContaining({
         compactHistory: expect.objectContaining({ lastAssistantMessage: null }),

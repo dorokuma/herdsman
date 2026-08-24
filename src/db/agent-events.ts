@@ -312,7 +312,15 @@ export class AgentEventStore {
     return this.#transaction(() => {
       const result = this.#sqlite
         .prepare(
-          `update agent_events set status = case when delivery_attempts >= 10 then 'failed' else 'pending' end, deliverable = case when delivery_attempts >= 10 then 0 else 1 end, last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end, delivered_to_terminal_id = null, next_attempt_at = null where status = 'delivered' and last_attempt_at < ?`,
+          `update agent_events set status = case when delivery_attempts >= 10 then 'failed' else 'pending' end, deliverable = case when delivery_attempts >= 10 then 0 else 1 end, last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end, delivered_to_terminal_id = null, next_attempt_at = null where status = 'delivered' and last_attempt_at < ?
+             and not exists (
+               select 1 from agents
+               inner join herdr_sessions on herdr_sessions.name = agents.herdr_session_name
+               where herdr_sessions.running = 1
+                 and agents.herdr_session_name = agent_events.herdr_session_name
+                 and agents.terminal_id = agent_events.delivered_to_terminal_id
+                 and agents.agent_status = 'working'
+             )`,
         )
         .run(Date.now() - timeoutMs);
       return Number(result.changes);

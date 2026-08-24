@@ -1,4 +1,4 @@
-import { readFile } from "node:fs/promises";
+import { readFile, stat } from "node:fs/promises";
 import type {
   AgentHistoryMessage,
   AgentHistoryRef,
@@ -7,6 +7,14 @@ import type {
 
 export type JsonlEntry = { line: number; value: Record<string, unknown> };
 
+/** A writer can leave a partial final record while message_end is firing. */
+export class UnstableJsonlError extends Error {
+  constructor(readonly details: { malformedLines: number; size: number; mtimeMs: number }) {
+    super(`JSONL tail is unstable (${details.malformedLines} malformed line(s))`);
+    this.name = "UnstableJsonlError";
+  }
+}
+
 export type AgentHistoryReader = {
   canRead(ref: AgentHistoryRef): boolean;
   read(ref: AgentHistoryRef, options: { limit?: number }): Promise<AgentHistoryMessage[]>;
@@ -14,9 +22,10 @@ export type AgentHistoryReader = {
 };
 
 export async function readJsonl(path: string): Promise<JsonlEntry[]> {
-  const content = await readFile(path, "utf8");
+  const [content, metadata] = await Promise.all([readFile(path, "utf8"), stat(path)]);
   const entries: JsonlEntry[] = [];
   const lines = content.split(/\r?\n/);
+  let malformedLines = 0;
   for (let index = 0; index < lines.length; index += 1) {
     const line = lines[index];
     if (!line || line.trim().length === 0) continue;
@@ -25,7 +34,23 @@ export async function readJsonl(path: string): Promise<JsonlEntry[]> {
       if (typeof parsed === "object" && parsed !== null) {
         entries.push({ line: index + 1, value: parsed as Record<string, unknown> });
       }
-    } catch {}
+    } catch {
+      malformedLines += 1;
+    }
+  }
+  // Only the tail can be transient: malformed historical records remain
+  // observable, but a malformed final record must not be mistaken for no data.
+  const tail = lines.findLastIndex((line) => line.trim().length > 0);
+  if (malformedLines > 0 && tail >= 0) {
+    try {
+      JSON.parse(lines[tail] ?? "");
+    } catch {
+      throw new UnstableJsonlError({
+        malformedLines,
+        size: metadata.size,
+        mtimeMs: metadata.mtimeMs,
+      });
+    }
   }
   return entries;
 }

@@ -83,6 +83,108 @@ function appendEvent(
 }
 
 describe("AgentOrchestratorService", () => {
+  test("does not reclaim a stale delivery while its owner agent is working", () => {
+    const { harness, service } = openService();
+    harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "codex",
+          agent_status: "working",
+          pane_id: "wB:p-owner",
+          terminal_id: "term_owner",
+          workspace_id: "wB",
+        },
+      ],
+    });
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_agent" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: event.id }),
+    ]);
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - 120_000, event.id);
+
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: event.id, deliveryAttempts: 1 }),
+    ]);
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: event.id, deliveryAttempts: 1 }),
+    ]);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "delivered",
+      deliveryAttempts: 1,
+      deliveredToTerminalId: "term_owner",
+    });
+  });
+
+  test("reclaims a stale delivery after the owner becomes idle", () => {
+    const { harness, service } = openService();
+    harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "codex",
+          agent_status: "working",
+          pane_id: "wB:p-owner",
+          terminal_id: "term_owner",
+          workspace_id: "wB",
+        },
+      ],
+    });
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_agent" });
+    service.pending({ ...scope, terminalId: "term_owner" });
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - 120_000, event.id);
+    harness.agents.updateStatus({
+      agentStatus: "idle",
+      herdrSessionName: "default",
+      paneId: "wB:p-owner",
+    });
+
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: event.id, deliveryAttempts: 2 }),
+    ]);
+    expect(harness.agentEvents.get(event.id).status).toBe("delivered");
+  });
+
+  test("reclaims a stale delivery after the owner disconnects", () => {
+    const { harness, service } = openService();
+    harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "codex",
+          agent_status: "working",
+          pane_id: "wB:p-owner",
+          terminal_id: "term_owner",
+          workspace_id: "wB",
+        },
+      ],
+    });
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_agent" });
+    service.pending({ ...scope, terminalId: "term_owner" });
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - 120_000, event.id);
+    harness.agents.retirePane({ herdrSessionName: "default", paneId: "wB:p-owner" });
+    service.release({ ...scope, reason: "disconnected", terminalId: "term_owner" });
+    service.claim({ ...scope, paneId: "wB:p-new-owner", terminalId: "term_new_owner" });
+    harness.sqlite
+      .prepare(
+        "update agent_orchestrator_scopes set acked_event_id = 0 where herdr_session_name = ? and workspace_id = ?",
+      )
+      .run(scope.herdrSessionName, scope.workspaceId);
+
+    expect(service.pending({ ...scope, terminalId: "term_new_owner" })).toEqual([
+      expect.objectContaining({ id: event.id, deliveryAttempts: 2 }),
+    ]);
+  });
+
   test("initializes once, replaces owners, and releases only the current owner", () => {
     const { harness, service } = openService();
     const baseline = appendEvent(harness, { terminalId: "term_agent" });

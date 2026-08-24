@@ -78,6 +78,15 @@ export function createAgentHistoryService(
 
     try {
       const compactHistory = await reader.readCompact(historyRef);
+      if (compactHistory.lastAssistantMessage === null) {
+        console.warn("Herdsman history read produced no assistant message", {
+          path,
+          source: historyRef.source,
+          size: sourceFingerprint.size,
+          mtimeMs: sourceFingerprint.mtimeMs,
+        });
+        return { compactHistory, historyRef, sourceFingerprint };
+      }
       options.cache?.put({
         compactHistory,
         formatterVersion: agentHistoryFormatterVersion,
@@ -87,21 +96,39 @@ export function createAgentHistoryService(
         sourceSize: sourceFingerprint.size,
       });
       return { compactHistory, historyRef, sourceFingerprint };
-    } catch {
+    } catch (error) {
+      console.warn("Herdsman could not read agent history", {
+        path,
+        source: historyRef.source,
+        error: error instanceof Error ? error.message : String(error),
+        size: sourceFingerprint.size,
+        mtimeMs: sourceFingerprint.mtimeMs,
+      });
       return unresolvedCompactHistory(historyRef.source);
     }
   }
 
   async function resolveCompactHistory(
     input: AgentHistoryLookupInput,
-    resolveOptions: { forceDiscovery?: boolean; preferredRef?: AgentHistoryRef | null } = {},
+    resolveOptions: {
+      forceDiscovery?: boolean;
+      forceRefresh?: boolean;
+      preferredRef?: AgentHistoryRef | null;
+    } = {},
   ): Promise<ResolvedCompactAgentHistory> {
-    if (resolveOptions.preferredRef && !resolveOptions.forceDiscovery) {
+    if (
+      !resolveOptions.forceRefresh &&
+      resolveOptions.preferredRef &&
+      !resolveOptions.forceDiscovery
+    ) {
       const preferred = await readCompactRef(resolveOptions.preferredRef);
       if (preferred.historyRef) return preferred;
     }
     const historyRef = await discover(input);
-    if (!historyRef) return unresolvedCompactHistory();
+    if (!historyRef) {
+      console.warn("Herdsman agent history discovery returned no reference", input);
+      return unresolvedCompactHistory();
+    }
     return readCompactRef(historyRef);
   }
 
@@ -111,10 +138,21 @@ export function createAgentHistoryService(
   ): Promise<{ historyRef: AgentHistoryRef | null; messages: AgentHistoryMessage[] }> {
     const reader = readers.find((candidate) => candidate.canRead(historyRef));
     const path = historyRef.path ?? historyRef.value;
-    if (!reader || !(await stat(path).catch(() => null))) return { historyRef: null, messages: [] };
+    if (!reader || !(await stat(path).catch(() => null))) {
+      console.warn("Herdsman history reference could not be resolved", {
+        path,
+        source: historyRef.source,
+      });
+      return { historyRef: null, messages: [] };
+    }
     try {
       return { historyRef, messages: await reader.read(historyRef, readOptions) };
-    } catch {
+    } catch (error) {
+      console.warn("Herdsman could not read agent history messages", {
+        path,
+        source: historyRef.source,
+        error: error instanceof Error ? error.message : String(error),
+      });
       return { historyRef: null, messages: [] };
     }
   }
