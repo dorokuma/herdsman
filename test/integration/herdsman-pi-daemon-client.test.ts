@@ -164,6 +164,90 @@ describe("ReconnectingDaemonClient", () => {
       "Herdsman daemon client is closed",
     );
   });
+
+  test("treats agent.turn.completed as optional so an old daemon keeps the connection", async () => {
+    const resource = createResource();
+    let connectionCount = 0;
+    resource.server = await startServer(
+      resource.socketPath,
+      (socket, message) => {
+        if (message.method === "agent.turn.completed") {
+          socket.write(
+            `${JSON.stringify({
+              error: { message: `Unknown method: ${message.method}` },
+              id: message.id,
+            })}\n`,
+          );
+          return;
+        }
+        socket.write(`${JSON.stringify({ id: message.id, result: { ok: true } })}\n`);
+      },
+      () => {
+        connectionCount += 1;
+      },
+    );
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [5],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+    let disconnected = 0;
+    client.onDisconnected = () => {
+      disconnected += 1;
+    };
+    await waitFor(() => connectionCount === 1);
+
+    await expect(client.request("agent.turn.completed", { confirmed: true })).rejects.toThrow(
+      "Unknown method: agent.turn.completed",
+    );
+    // The connection must survive and keep serving the required methods.
+    await expect(client.request("agent.list", {})).resolves.toEqual({ ok: true });
+    expect(disconnected).toBe(0);
+    expect(connectionCount).toBe(1);
+  });
+
+  test("still marks a daemon incompatible on an unknown required method", async () => {
+    const resource = createResource();
+    let connectionCount = 0;
+    resource.server = await startServer(
+      resource.socketPath,
+      (socket, message) => {
+        socket.write(
+          `${JSON.stringify({
+            error: { message: `Unknown method: ${message.method}` },
+            id: message.id,
+          })}\n`,
+        );
+      },
+      () => {
+        connectionCount += 1;
+      },
+    );
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [5],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+    let disconnected = 0;
+    client.onDisconnected = () => {
+      disconnected += 1;
+    };
+    await waitFor(() => connectionCount === 1);
+
+    const error = await client
+      .request("agent.orchestrator.get", {})
+      .catch((value: unknown) => value);
+    expect(error).toBeInstanceOf(Error);
+    expect((error as Error).message).toBe("Unknown method: agent.orchestrator.get");
+    // The unknown required method marks the daemon incompatible: the client
+    // reports the disconnect and stops reconnecting.
+    expect(disconnected).toBe(1);
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(connectionCount).toBe(1);
+    await expect(client.request("agent.list", {})).rejects.toThrow(
+      "Herdsman daemon client is not connected",
+    );
+  });
 });
 
 type Message = { id?: number | string; method?: string; params?: unknown };

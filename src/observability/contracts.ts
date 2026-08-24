@@ -213,6 +213,14 @@ export type PiPresenceRegistration = {
   workspaceId: string;
 };
 
+export type AgentTurnCompletedInput = {
+  confirmed: boolean;
+  herdrSessionName: string;
+  paneId: string;
+  terminalId: string;
+  workspaceId: string;
+};
+
 export type AgentQueryScope = {
   all?: boolean;
   herdrSessionName?: string;

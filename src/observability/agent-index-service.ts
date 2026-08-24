@@ -17,6 +17,8 @@ import {
   type AgentStatus,
   parseAgentStatus,
 } from "@/observability/contracts.js";
+import type { TurnCompletionRegistry } from "@/observability/turn-completion.js";
+import { TURN_SIGNAL_WAIT_MS } from "@/observability/turn-completion.js";
 
 export type AgentIndexRefreshResult = {
   agents: AgentIndexRecord[];
@@ -65,6 +67,7 @@ export class AgentIndexService {
     { epoch: number; promise: Promise<AgentIndexRefreshResult> }
   >();
   readonly #sessionOperationTail = new Map<string, Promise<void>>();
+  readonly #turnCompletions: TurnCompletionRegistry | undefined;
 
   constructor(options: {
     clientFactory?: (input: {
@@ -73,9 +76,11 @@ export class AgentIndexService {
     context?: AgentContextService;
     history?: AgentHistoryService;
     stores: AgentIndexServiceStores;
+    turnCompletions?: TurnCompletionRegistry;
   }) {
     this.#clientFactory = options.clientFactory ?? ((input) => new HerdrSocketClient(input));
     this.#stores = options.stores;
+    this.#turnCompletions = options.turnCompletions;
     if (options.context) {
       this.#context = options.context;
     } else {
@@ -245,7 +250,7 @@ export class AgentIndexService {
           addScope(scopes, scopeOf(agent));
         }
         if (prior && prior.agentStatus !== agent.agentStatus) {
-          const event = this.#appendStatusEvents({
+          const event = await this.#appendStatusEvents({
             agent,
             compactHistory:
               refreshed?.compactHistory ?? this.#context.getAgentSnapshot(agent.id)?.compactHistory,
@@ -359,7 +364,7 @@ export class AgentIndexService {
         (candidate.payload as { to?: AgentStatus }).to === to,
     );
     if (!equivalent) {
-      const statusEvent = this.#appendStatusEvents({
+      const statusEvent = await this.#appendStatusEvents({
         agent: current,
         compactHistory: refreshed.snapshot.compactHistory,
         from,
@@ -425,7 +430,7 @@ export class AgentIndexService {
     return result;
   }
 
-  #appendStatusEvents(input: {
+  async #appendStatusEvents(input: {
     agent: AgentIndexRecord;
     compactHistory:
       | NonNullable<ReturnType<AgentContextService["getAgentSnapshot"]>>["compactHistory"]
@@ -433,7 +438,7 @@ export class AgentIndexService {
     from: AgentStatus;
     herdrEventKey?: string;
     to: AgentStatus;
-  }): AgentEventRecord | undefined {
+  }): Promise<AgentEventRecord | undefined> {
     if (input.from === input.to || !input.compactHistory) return undefined;
     const latest = this.#stores.agentEvents.latestStatusTransition(
       input.agent.id,
@@ -442,9 +447,48 @@ export class AgentIndexService {
     if (latest && statusTransitionMatches(latest, input.from, input.to)) return undefined;
     const observationId = `transition:${latest?.id ?? 0}`;
 
+    let compactHistory = input.compactHistory;
+    if (
+      this.#turnCompletions !== undefined &&
+      (input.to === "done" || input.to === "blocked") &&
+      input.agent.agent === "pi" &&
+      input.agent.terminalId !== null
+    ) {
+      const turnWaitStartedAtMs = Date.now();
+      const turn = await this.#turnCompletions.waitForSignal({
+        herdrSessionName: input.agent.herdrSessionName,
+        recordedAfterMs: turnWaitStartedAtMs,
+        terminalId: input.agent.terminalId,
+      });
+      if (turn.received) {
+        const refreshed = await this.#context.refreshAgent({
+          agent: input.agent,
+          identityChanged: false,
+        });
+        compactHistory = refreshed.snapshot.compactHistory;
+        console.log(
+          `Herdsman emitted pi agent.${input.to} after turn completion signal (confirmed=${turn.confirmed})`,
+          {
+            agentId: input.agent.id,
+            herdrSessionName: input.agent.herdrSessionName,
+            terminalId: input.agent.terminalId,
+          },
+        );
+      } else {
+        console.warn(
+          `Herdsman emitted pi agent.${input.to} without a turn completion signal after ${TURN_SIGNAL_WAIT_MS}ms`,
+          {
+            agentId: input.agent.id,
+            herdrSessionName: input.agent.herdrSessionName,
+            terminalId: input.agent.terminalId,
+          },
+        );
+      }
+    }
+
     let lastEvent = this.#stores.agentEvents.append({
       agentId: input.agent.id,
-      compactHistory: input.compactHistory,
+      compactHistory,
       herdrSessionName: input.agent.herdrSessionName,
       idempotencyKey: idempotencyKey(
         "agent.status.changed",
@@ -464,7 +508,7 @@ export class AgentIndexService {
     if (statusType) {
       lastEvent = this.#stores.agentEvents.append({
         agentId: input.agent.id,
-        compactHistory: input.compactHistory,
+        compactHistory,
         herdrSessionName: input.agent.herdrSessionName,
         idempotencyKey: idempotencyKey(
           statusType,

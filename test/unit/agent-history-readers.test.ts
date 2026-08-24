@@ -27,13 +27,13 @@ describe("GrokHistoryReader", () => {
     const path = join(homeDir, "chat_history.jsonl");
     await writeFile(
       path,
-      [
+      `${[
         { type: "assistant", id: "a1", content: "old" },
         { type: "user", content: "question" },
         { type: "assistant", id: "a2", content: [{ text: "latest" }] },
       ]
         .map((entry) => JSON.stringify(entry))
-        .join("\n") + "\n",
+        .join("\n")}\n`,
     );
     await expect(
       new GrokHistoryReader().read({

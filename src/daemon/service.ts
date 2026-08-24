@@ -17,6 +17,7 @@ import { createHerdrSessionListRunner } from "@/herdr/session-list.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
+import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { AgentEventReconciler } from "./agent-event-reconciler.js";
 import { HerdrSessionWatchManager } from "./herdr-session-watch-manager.js";
 import { ObservabilityRpcServer } from "./observability-server.js";
@@ -63,6 +64,7 @@ export async function runObservabilityDaemonService(
     agents,
     scopes: agentOrchestratorScopes,
   });
+  const turnCompletions = new TurnCompletionRegistry();
   const index = new AgentIndexService({
     context: daemonServices.context,
     stores: {
@@ -73,6 +75,7 @@ export async function runObservabilityDaemonService(
       herdrSessions,
       herdrWorkspaces,
     },
+    turnCompletions,
   });
 
   let connectedTerminal = (_input: { herdrSessionName: string; terminalId: string }) => false;
@@ -90,6 +93,7 @@ export async function runObservabilityDaemonService(
     registerPiSessionRef: (registration) => index.registerPiSessionRef(registration),
     socketPath: runtime.paths.socketPath,
     stores: { agentEvents, agents, herdrSessions, herdrWorkspaces },
+    turnCompletions,
   });
   connectedTerminal = (input) => server.isTerminalConnected(input);
   const watchManager = new HerdrSessionWatchManager({

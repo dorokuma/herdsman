@@ -33,7 +33,7 @@ describe("agent history discovery", () => {
     );
     await mkdir(sessionDir, { recursive: true });
     const path = join(sessionDir, "chat_history.jsonl");
-    await writeFile(path, JSON.stringify({ type: "assistant", content: "done" }) + "\n");
+    await writeFile(path, `${JSON.stringify({ type: "assistant", content: "done" })}\n`);
     await expect(
       discoverAgentHistory({
         agent: "grok",

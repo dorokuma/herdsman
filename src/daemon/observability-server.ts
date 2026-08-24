@@ -20,6 +20,7 @@ import type {
   AgentOrchestratorWireState,
   AgentQueryScope,
   AgentScope,
+  AgentTurnCompletedInput,
   AgentWorkspaceContextSnapshot,
   PiPresenceRegistration,
 } from "@/observability/contracts.js";
@@ -33,7 +34,9 @@ import {
   agentOrchestratorRegisterInputSchema,
   agentOrchestratorSetInputSchema,
   agentReadInputSchema,
+  agentTurnCompletedInputSchema,
 } from "@/observability/schemas.js";
+import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import {
   encodeJsonLine,
   JsonLineDecoder,
@@ -109,6 +112,7 @@ export class ObservabilityRpcServer {
   readonly #startupReconnectGraceMs: number;
   readonly #startupTimers = new Map<string, GraceTimer>();
   readonly #stores: AgentStores;
+  readonly #turnCompletions: TurnCompletionRegistry;
   #connectionSequence = 0;
   #stopping = false;
 
@@ -137,6 +141,7 @@ export class ObservabilityRpcServer {
     startupReconnectGraceMs?: number;
     connectedTerminal?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
     stores: AgentStores;
+    turnCompletions?: TurnCompletionRegistry;
   }) {
     this.#clearInterval = options.clearInterval ?? clearInterval;
     this.#setInterval = options.setInterval ?? setInterval;
@@ -156,6 +161,7 @@ export class ObservabilityRpcServer {
     this.#socketPath = options.socketPath;
     this.#startupReconnectGraceMs = options.startupReconnectGraceMs ?? STARTUP_RECONNECT_GRACE_MS;
     this.#stores = options.stores;
+    this.#turnCompletions = options.turnCompletions ?? new TurnCompletionRegistry();
     this.#server = createServer((socket) => this.#handleConnection(socket));
   }
 
@@ -416,6 +422,19 @@ export class ObservabilityRpcServer {
           eventId: (params as { eventId: number }).eventId,
         });
         return { acknowledged: true, state: toWireState(state) };
+      }
+      case "agent.turn.completed": {
+        assertSchema(agentTurnCompletedInputSchema, params);
+        const presence = this.#requirePiPresence(socket);
+        const input = params as AgentTurnCompletedInput;
+        this.#turnCompletions.record({
+          confirmed: input.confirmed,
+          herdrSessionName: presence.herdrSessionName,
+          paneId: presence.paneId,
+          terminalId: presence.terminalId,
+          workspaceId: input.workspaceId,
+        });
+        return { accepted: true };
       }
       default:
         throw new Error(`Unknown method: ${method}`);

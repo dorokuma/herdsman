@@ -39,6 +39,7 @@ import {
   formatAgentOutcomeUpdates,
   WAKE_SETTLE_MS,
 } from "./wake.js";
+import { confirmSessionWrite } from "./turn-signal.js";
 
 type PiAgentMessage = {
   content?: unknown;
@@ -776,6 +777,51 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       activeContext = undefined;
     });
 
+    const assistantMessageText = (message: Record<string, unknown>): string => {
+      const content = message.content;
+      if (typeof content === "string") return content;
+      if (!Array.isArray(content)) return "";
+      const parts: string[] = [];
+      for (const block of content) {
+        if (typeof block === "string") {
+          if (block.length > 0) parts.push(block);
+          continue;
+        }
+        const value = record(block);
+        if (typeof value.text === "string" && value.text.length > 0) parts.push(value.text);
+      }
+      return parts.join("\n");
+    };
+
+    // Turn completion signal: after Pi's own final assistant message has been
+    // written to its session file, tell the daemon so the agent.done/blocked
+    // event it samples next captures a non-empty lastAssistantMessage. The
+    // write is confirmed through a bounded stat check; the signal is still sent
+    // on timeout so the daemon never waits on us forever.
+    const signalTurnCompletion = (expectedText: string) => {
+      const client = state.client;
+      const scope = state.currentScope;
+      const sessionPath = state.sessionRef?.value;
+      if (!client || !state.connected || !scope || !sessionPath) return;
+      void (async () => {
+        const check = await confirmSessionWrite({ expectedText, path: sessionPath });
+        try {
+          await client.request("agent.turn.completed", {
+            confirmed: check.confirmed,
+            herdrSessionName: scope.herdrSessionName,
+            paneId: scope.paneId,
+            terminalId: scope.terminalId,
+            workspaceId: scope.workspaceId,
+          });
+        } catch (error) {
+          logHerdsmanPi(
+            "warn",
+            `[herdsman-pi] turn completion signal failed reason=${check.reason} error=${error instanceof Error ? error.message : String(error)}`,
+          );
+        }
+      })();
+    };
+
     pi.on("message_end", (event: Record<string, unknown>) => {
       const message = record(event.message);
       if (message.role !== "assistant") return;
@@ -790,6 +836,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         ) {
           state.deliveredBatch.hasSubstantiveWork = true;
         }
+      }
+      if (stopReason === "stop" || stopReason === "length") {
+        signalTurnCompletion(assistantMessageText(message));
       }
     });
 

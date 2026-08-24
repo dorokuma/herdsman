@@ -95,7 +95,7 @@ Piからextensionをインストールします。
 pi install npm:@dorokuma/herdsman-pi
 ```
 
-extensionにはPi 0.80.6以降が必要です。PiがHerdr内で動くとHerdsman daemonに接続します。接続中のPiはoffの状態でも正確なPi session pathをpresence identityとして登録します。extensionはturnごとのtool resultや最終messageのtelemetryを送信しません。
+extensionにはPi 0.80.6以降が必要です。PiがHerdr内で動くとHerdsman daemonに接続します。接続中のPiはoffの状態でも正確なPi session pathをpresence identityとして登録します。extensionはturnごとのtool resultやmessageのtelemetryは送信しませんが、自身の最終assistant messageがsession fileに書き込まれた後にturn完了シグナルをdaemonへ送るため、completed/blocked outcomeには空でない最終応答が含まれます。
 
 Piで`/herdsman on`を入力すると、そのterminalが現在のHerdr sessionとworkspaceにおける唯一のHerdsman ownerになります。cached current-workspace agent context、pending件数、agent update、自動wakeを受け取るのはownerだけです。contextからowner自身のPi terminalを除き、ほかのPi terminalを含めます。通常のpromptではdaemon RPCや履歴読み込みを待たず、local cacheのsnapshotを挿入します。起動直後、reconnect直後、scope移動直後はsnapshotが届くまでcontextが一時的にない場合があります。
 

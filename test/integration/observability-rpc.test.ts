@@ -9,6 +9,7 @@ import { ObservabilityRpcClient } from "@/daemon/client.js";
 import { ObservabilityRpcServer } from "@/daemon/observability-server.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
+import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import {
   cleanupTempDirs,
   openObservabilityDbHarness,
@@ -85,6 +86,47 @@ describe("ObservabilityRpcServer", () => {
     ).rejects.toThrow(`Unknown method: ${removedMethod}`);
 
     await expect(client.request("legacy.method", {})).rejects.toThrow("Unknown method");
+    client.close();
+    harness.sqlite.close();
+  });
+
+  test("records pi turn completion signals and validates their params", async () => {
+    const registry = new TurnCompletionRegistry();
+    const { client, harness } = await openServer({ turnCompletions: registry });
+    seedAgent(harness);
+    await client.request("agent.orchestrator.register", {
+      herdrSocketPath: "/tmp/herdr/herdr.sock",
+      paneId: "wB:p1",
+      sessionRef: {
+        agent: "pi",
+        kind: "path",
+        source: "herdr:pi",
+        value: "/tmp/pi-session.jsonl",
+      },
+      subscriberId: "pi-session",
+      subscriberKind: "pi",
+      workspaceId: "wB",
+    });
+    await expect(
+      client.request("agent.turn.completed", {
+        confirmed: true,
+        herdrSessionName: "default",
+        paneId: "wB:p1",
+        terminalId: "term_1",
+        workspaceId: "wB",
+      }),
+    ).resolves.toEqual({ accepted: true });
+    await expect(
+      registry.waitForSignal({
+        herdrSessionName: "default",
+        recordedAfterMs: 0,
+        terminalId: "term_1",
+      }),
+    ).resolves.toEqual({ confirmed: true, received: true });
+
+    await expect(client.request("agent.turn.completed", { confirmed: true })).rejects.toThrow(
+      "Invalid RPC params",
+    );
     client.close();
     harness.sqlite.close();
   });
@@ -565,6 +607,7 @@ async function openServerWithoutClient(
       terminalId: string;
       workspaceId: string;
     }>;
+    turnCompletions?: TurnCompletionRegistry;
   } = {},
 ) {
   const dir = mkdtempSync(join(tmpdir(), "herdsman-agent-rpc-"));
@@ -588,6 +631,7 @@ async function openServerWithoutClient(
       scopes: harness.agentOrchestratorScopes,
     }),
     ...(options.resolvePaneIdentity ? { resolvePaneIdentity: options.resolvePaneIdentity } : {}),
+    ...(options.turnCompletions ? { turnCompletions: options.turnCompletions } : {}),
     socketPath,
     stores: {
       agentEvents: harness.agentEvents,

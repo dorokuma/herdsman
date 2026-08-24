@@ -81,3 +81,14 @@ export const agentOrchestratorAckInputSchema = Type.Object(
   { eventId: Type.Integer({ minimum: 1 }) },
   { additionalProperties: false },
 );
+
+export const agentTurnCompletedInputSchema = Type.Object(
+  {
+    confirmed: Type.Boolean(),
+    herdrSessionName: Type.String({ minLength: 1 }),
+    paneId: Type.String({ minLength: 1 }),
+    terminalId: Type.String({ minLength: 1 }),
+    workspaceId: Type.String({ minLength: 1 }),
+  },
+  { additionalProperties: false },
+);

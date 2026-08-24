@@ -1,3 +1,9 @@
+## 0.8.2
+
+- Turn completion signal (route 2): the Pi extension now notifies the daemon after its own final assistant message is written to the session file (bounded stat fallback, timeout still signals with actual status), and the daemon waits up to a bounded window for that signal before emitting `agent.done` / `agent.blocked` events for Pi agents, refreshing the agent right before appending so outcomes carry a non-empty `lastAssistantMessage`. Older extensions that never signal keep working: the daemon times out and generates events as before with a warning.
+- 修复陈旧 turn-completion 信号被下一轮等待错误命中的竞态，仅接受等待开始后记录的新信号。
+- 修复 turn-completion RPC 信任客户端自报身份的问题，服务端改用 socket 已注册的 Pi presence 身份记录信号。
+
 ## 0.7.0 (2026-08-23)
 
 - 接入 grok/agy 历史读取与发现，新增 `grokHome` 元数据及安全校验，移除 shepherd 命名残留。

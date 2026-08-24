@@ -29,6 +29,7 @@ export type AgentContextListItem = {
   agent?: string | null;
   agentStatus?: string;
   history?: CompactAgentHistory;
+  id?: string;
   name?: string | null;
   paneId?: string;
   terminalId?: string | null;
@@ -83,6 +84,7 @@ export type ReconnectingDaemonClientOptions = {
 type ClientState = "closed" | "connected" | "connecting" | "idle";
 
 type PendingRequest = {
+  method: string;
   reject(error: Error): void;
   resolve(value: unknown): void;
 };
@@ -150,7 +152,7 @@ export class ReconnectingDaemonClient {
     const id = `pi-${this.#nextId}`;
     this.#nextId += 1;
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { reject, resolve });
+      this.#pending.set(id, { method, reject, resolve });
       this.#socket?.write(`${JSON.stringify({ id, method, params })}\n`);
     });
   }
@@ -231,7 +233,13 @@ export class ReconnectingDaemonClient {
         code: message.error.code,
       });
       pending.reject(error);
-      if (/unknown|not found|unsupported|method/i.test(error.message)) {
+      // Optional methods (turn completion signaling) are rejected like any other
+      // failure but must not mark the daemon incompatible: an older daemon
+      // answers "Unknown method" and the connection has to stay alive.
+      if (
+        pending.method !== "agent.turn.completed" &&
+        /unknown|not found|unsupported|method/i.test(error.message)
+      ) {
         const incompatible = new Error("Herdsman daemon version is incompatible; restart the session");
         this.#incompatible = true;
         this.#state = "idle";

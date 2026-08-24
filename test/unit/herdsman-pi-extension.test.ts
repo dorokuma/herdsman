@@ -249,7 +249,22 @@ describe("herdsman-pi orchestrator bridge", () => {
           turnId: "turn-1",
         },
       });
-      expect(client.calls).toEqual(callsBeforeTurnEvents);
+      // The final assistant message ended, so the extension signals turn
+      // completion. With no session file present the write cannot be confirmed
+      // and the signal still goes out with confirmed=false.
+      expect(client.calls).toEqual([
+        ...callsBeforeTurnEvents,
+        [
+          "agent.turn.completed",
+          {
+            confirmed: false,
+            herdrSessionName: "default",
+            paneId: "wC:p3",
+            terminalId: "term_pi",
+            workspaceId: "wC",
+          },
+        ],
+      ]);
 
       await client.connect();
       expect(
@@ -2263,7 +2278,7 @@ function createFakePi() {
   };
 }
 
-function fakeCtx(options: { idle?: boolean; sessionId?: string } = {}) {
+function fakeCtx(options: { idle?: boolean; sessionFile?: string; sessionId?: string } = {}) {
   const runtime = { idle: options.idle ?? false };
   const ctx = {
     abort() {
@@ -2273,7 +2288,7 @@ function fakeCtx(options: { idle?: boolean; sessionId?: string } = {}) {
     isIdle: () => runtime.idle,
     notifications: [] as Array<[string, string | undefined]>,
     sessionManager: {
-      getSessionFile: () => "/tmp/pi-session.jsonl",
+      getSessionFile: () => options.sessionFile ?? "/tmp/pi-session.jsonl",
       getSessionId: () => options.sessionId ?? "pi-session",
     },
     setIdle(value: boolean) {
@@ -2619,5 +2634,73 @@ describe("herdsman-pi context intersection regressions (independent coverage)", 
     } finally {
       restoreEnv(previous);
     }
+  });
+});
+
+describe("herdsman-pi turn completion signal", () => {
+  test("signals turn completion with confirmed=true when the final message is already on disk", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-pi-turn-"));
+    const sessionPath = join(dir, "pi-session.jsonl");
+    try {
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          message: { content: [{ text: "completed", type: "text" }], role: "assistant" },
+          type: "message",
+        })}\n`,
+      );
+      const client = createFakeClient();
+      const pi = createFakePi();
+      const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
+      await startExtension(client, pi, ctx);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await tick();
+      expect(client.calls).toContainEqual([
+        "agent.turn.completed",
+        {
+          confirmed: true,
+          herdrSessionName: "default",
+          paneId: "wB:p1",
+          terminalId: "term_pi",
+          workspaceId: "wB",
+        },
+      ]);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("signals turn completion with confirmed=false when the write is not observed before the timeout", async () => {
+    vi.useFakeTimers();
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-pi-turn-"));
+    const sessionPath = join(dir, "pi-session.jsonl");
+    try {
+      writeFileSync(sessionPath, "no final message here\n");
+      const client = createFakeClient();
+      const pi = createFakePi();
+      const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
+      await startExtension(client, pi, ctx);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await vi.advanceTimersByTimeAsync(3_100);
+      expect(client.calls).toContainEqual([
+        "agent.turn.completed",
+        expect.objectContaining({ confirmed: false }),
+      ]);
+    } finally {
+      vi.useRealTimers();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("does not signal turn completion for intermediate or non-terminal messages", async () => {
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    await startExtension(client, pi, ctx);
+    await pi.emit("message_end", assistantMessage("toolUse"), ctx);
+    await pi.emit("message_end", { message: { role: "user" } }, ctx);
+    await pi.emit("message_end", assistantMessage("aborted"), ctx);
+    await tick();
+    expect(client.calls.filter(([method]) => method === "agent.turn.completed")).toEqual([]);
   });
 });
