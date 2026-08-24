@@ -2654,17 +2654,18 @@ describe("herdsman-pi turn completion signal", () => {
       const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
       await startExtension(client, pi, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
-      await tick();
-      expect(client.calls).toContainEqual([
-        "agent.turn.completed",
-        {
-          confirmed: true,
-          herdrSessionName: "default",
-          paneId: "wB:p1",
-          terminalId: "term_pi",
-          workspaceId: "wB",
-        },
-      ]);
+      await vi.waitFor(() =>
+        expect(client.calls).toContainEqual([
+          "agent.turn.completed",
+          {
+            confirmed: true,
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            terminalId: "term_pi",
+            workspaceId: "wB",
+          },
+        ]),
+      );
     } finally {
       rmSync(dir, { force: true, recursive: true });
     }
@@ -2682,10 +2683,12 @@ describe("herdsman-pi turn completion signal", () => {
       await startExtension(client, pi, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await vi.advanceTimersByTimeAsync(3_100);
-      expect(client.calls).toContainEqual([
-        "agent.turn.completed",
-        expect.objectContaining({ confirmed: false }),
-      ]);
+      await vi.waitFor(() =>
+        expect(client.calls).toContainEqual([
+          "agent.turn.completed",
+          expect.objectContaining({ confirmed: false }),
+        ]),
+      );
     } finally {
       vi.useRealTimers();
       rmSync(dir, { force: true, recursive: true });
