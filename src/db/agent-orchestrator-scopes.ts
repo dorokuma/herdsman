@@ -58,8 +58,73 @@ export class AgentOrchestratorScopeStore {
     return rows.map(mapScope);
   }
 
+  listOwnedScopes(): AgentOrchestratorState[] {
+    const rows = this.#sqlite
+      .prepare("select * from agent_orchestrator_scopes where owner_terminal_id is not null")
+      .all() as ScopeRow[];
+    return rows.map(mapScope);
+  }
+
+  releaseIfStaleOwner(input: {
+    herdrSessionName: string;
+    workspaceId: string;
+    livePaneIds: Set<string>;
+    liveTerminalIds: Set<string>;
+  }): boolean {
+    return this.#transaction(() => {
+      const row = this.#getRow(input);
+      if (!row?.owner_terminal_id || !row.owner_pane_id) return false;
+      if (
+        input.livePaneIds.has(row.owner_pane_id) &&
+        input.liveTerminalIds.has(row.owner_terminal_id)
+      )
+        return false;
+      const result = this.#sqlite
+        .prepare(`update agent_orchestrator_scopes
+                  set owner_pane_id = null, owner_terminal_id = null, updated_at = ?
+                  where herdr_session_name = ? and workspace_id = ?
+                    and owner_pane_id = ? and owner_terminal_id = ?`)
+        .run(
+          Date.now(),
+          input.herdrSessionName,
+          input.workspaceId,
+          row.owner_pane_id,
+          row.owner_terminal_id,
+        );
+      return Number(result.changes) > 0;
+    });
+  }
+
   claim(input: ClaimOrchestratorInput): ScopeChange {
     return this.#transaction(() => this.#claim(input));
+  }
+
+  releaseIfOwnerIdentity(
+    input: AgentOrchestratorScopeKey & { paneId: string; terminalId: string },
+  ): {
+    changed: boolean;
+    current: AgentOrchestratorState | undefined;
+    previous: AgentOrchestratorState | undefined;
+  } {
+    return this.#transaction(() => {
+      const row = this.#getRow(input);
+      if (
+        !row ||
+        row.owner_terminal_id !== input.terminalId ||
+        row.owner_pane_id !== input.paneId
+      ) {
+        return { changed: false, current: row ? mapScope(row) : undefined, previous: undefined };
+      }
+      const previous = mapScope(row);
+      this.#sqlite
+        .prepare(`update agent_orchestrator_scopes
+        set owner_pane_id = null, owner_terminal_id = null, updated_at = ?
+        where herdr_session_name = ? and workspace_id = ? and owner_pane_id = ? and owner_terminal_id = ?`)
+        .run(Date.now(), input.herdrSessionName, input.workspaceId, input.paneId, input.terminalId);
+      const current = this.get(input);
+      if (!current) throw new Error("Orchestrator scope disappeared during pane close");
+      return { changed: true, current, previous };
+    });
   }
 
   releaseIfOwner(input: AgentOrchestratorScopeKey & { terminalId: string }): {

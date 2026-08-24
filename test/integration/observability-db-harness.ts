@@ -28,9 +28,28 @@ export function openObservabilityDbHarness() {
     herdrSessions: new HerdrSessionStore(sqlite),
     herdrWorkspaces: new HerdrWorkspaceStore(sqlite),
     sqlite,
+    dbPath: join(dir, "test.sqlite"),
+    cleanup: () => {
+      sqlite.close();
+      rmSync(dir, { force: true, recursive: true });
+    },
   };
 }
 
+export function openObservabilityDbHarnessAt(dbPath: string) {
+  const { sqlite } = openSqlite(dbPath);
+  const agentEvents = new AgentEventStore(sqlite);
+  return {
+    agentContextSnapshots: new AgentContextSnapshotStore(sqlite),
+    agentEvents,
+    agentHistoryCache: new AgentHistoryCacheStore(sqlite),
+    agentOrchestratorScopes: new AgentOrchestratorScopeStore(sqlite),
+    agents: new AgentStore(sqlite, agentEvents),
+    herdrSessions: new HerdrSessionStore(sqlite),
+    herdrWorkspaces: new HerdrWorkspaceStore(sqlite),
+    sqlite,
+  };
+}
 export function cleanupTempDirs(): void {
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { force: true, recursive: true });

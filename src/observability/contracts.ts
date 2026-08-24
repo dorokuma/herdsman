@@ -151,6 +151,13 @@ export type AgentEventRecord = {
   paneId: string | null;
   paneGeneration?: string | null;
   deliverable: 0 | 1;
+  status?: "pending" | "delivered" | "acked" | "invalidated" | "failed";
+  deliveryAttempts?: number;
+  lastAttemptAt?: Date | null;
+  nextAttemptAt?: Date | null;
+  lastFailureCode?: string | null;
+  invalidatedReason?: string | null;
+  deliveredToTerminalId?: string | null;
   payload: unknown;
   terminalId: string | null;
   type: AgentEventType;

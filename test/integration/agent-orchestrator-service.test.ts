@@ -369,6 +369,85 @@ describe("AgentOrchestratorService", () => {
 });
 
 describe("AgentOrchestratorService ack regression", () => {
+  test("rejects non-owner acknowledgement with its structured contract", () => {
+    const { service } = openService();
+
+    expect(() => service.ack({ ...scope, eventId: 1, terminalId: "term_not_owner" })).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_NOT_OWNER",
+        retryable: false,
+        message: "Only the current orchestrator can acknowledge notifications",
+      }),
+    );
+  });
+
+  test("rejects an invalidated acknowledgement with its structured contract", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_worker" });
+    harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
+
+    expect(() => service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_EVENT_INVALIDATED",
+        retryable: false,
+        message: "orchestrator event is no longer pending (invalidated)",
+      }),
+    );
+  });
+
+  test("rejects an out-of-order acknowledgement with its structured contract", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    appendEvent(harness, { terminalId: "term_first" });
+    const later = appendEvent(harness, { terminalId: "term_second" });
+
+    expect(() => service.ack({ ...scope, eventId: later.id, terminalId: "term_owner" })).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+        retryable: false,
+        message: "Only the next pending orchestrator event can be acknowledged",
+      }),
+    );
+  });
+
+  test("not-found and out-of-scope rejections reuse the legacy retry wording (known compatibility behavior)", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const otherScopeEvent = appendEvent(harness, { terminalId: "term_other", workspaceId: "wC" });
+
+    // Legacy wording is reused from out-of-order; old clients treat these as retryable.
+    // This known compatibility behavior is covered by the subsequent state-machine batch.
+    expect(() => service.ack({ ...scope, eventId: 99_999, terminalId: "term_owner" })).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_EVENT_NOT_FOUND",
+        message: "Only the next pending orchestrator event can be acknowledged",
+      }),
+    );
+    expect(() =>
+      service.ack({ ...scope, eventId: otherScopeEvent.id, terminalId: "term_owner" }),
+    ).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_EVENT_NOT_IN_SCOPE",
+        message: "Only the next pending orchestrator event can be acknowledged",
+      }),
+    );
+  });
+
+  test("already acknowledged events are idempotent without side effects", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_worker" });
+    const first = service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" });
+    const eventCount = harness.sqlite.prepare("select count(*) as count from agent_events").get();
+
+    expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toEqual(first);
+    expect(harness.sqlite.prepare("select count(*) as count from agent_events").get()).toEqual(
+      eventCount,
+    );
+    expect(service.status(scope)).toEqual(first);
+  });
+
   test("rejects acknowledging an event invalidated with its retired worker pane", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });

@@ -89,6 +89,37 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
+  test("serializes structured acknowledgement errors through the real RPC server and client", async () => {
+    const { client, harness } = await openServer();
+    seedAgent(harness);
+    await client.request("agent.orchestrator.register", {
+      herdrSocketPath: "/tmp/herdr/herdr.sock",
+      paneId: "wB:p1",
+      sessionRef: {
+        agent: "pi",
+        kind: "path",
+        source: "herdr:pi",
+        value: "/tmp/pi-session.jsonl",
+      },
+      subscriberId: "pi-session",
+      subscriberKind: "pi",
+      workspaceId: "wB",
+    });
+
+    const error = await client
+      .request("agent.notifications.ack", { eventId: 99_999 })
+      .catch((value: unknown) => value);
+
+    expect(error).toBeInstanceOf(Error);
+    expect(error).toMatchObject({
+      code: "ORCHESTRATOR_NOT_OWNER",
+      retryable: false,
+      message: "Only the current orchestrator can acknowledge notifications",
+    });
+    client.close();
+    harness.sqlite.close();
+  });
+
   test("resolves identifiers before live names and live names before kinds", async () => {
     const { client, harness } = await openServer();
     seedTargetAgents(harness);

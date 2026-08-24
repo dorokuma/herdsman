@@ -7,6 +7,7 @@ import type {
   AgentOrchestratorState,
   AgentScope,
 } from "@/observability/contracts.js";
+import { ORCHESTRATOR_ACK_MESSAGES, OrchestratorAckError } from "@/observability/errors.js";
 
 export type AgentOrchestratorChange = {
   current: AgentOrchestratorState;
@@ -52,6 +53,7 @@ export class AgentOrchestratorService {
   }
 
   pending(input: AgentScope & { limit?: number; terminalId: string }): AgentEventRecord[] {
+    this.#agentEvents.reclaimDelivered(60_000);
     const state = this.#scopes.get(input);
     if (!state?.owner || state.owner.terminalId !== input.terminalId) return [];
 
@@ -64,6 +66,7 @@ export class AgentOrchestratorService {
       const batch = this.#agentEvents.listAfter({
         ...input,
         afterEventId,
+        ownerTerminalId: input.terminalId,
         limit: Math.min(100, 1_000 - scanned),
       });
       if (batch.length === 0) break;
@@ -82,33 +85,67 @@ export class AgentOrchestratorService {
         if (pending.length === limit) break;
       }
     }
-    return pending;
+    if (pending.length === 0) return [];
+    return this.#agentEvents.reservePending(
+      input.terminalId,
+      limit,
+      pending.map((event) => event.id),
+    );
   }
 
   ack(input: AgentScope & { eventId: number; terminalId: string }): AgentOrchestratorState {
     const state = this.#scopes.get(input);
     if (!state?.owner || state.owner.terminalId !== input.terminalId) {
-      throw new Error("Only the current orchestrator can acknowledge notifications");
+      throw new OrchestratorAckError({
+        code: "ORCHESTRATOR_NOT_OWNER",
+        message: ORCHESTRATOR_ACK_MESSAGES.notOwner,
+      });
     }
     if (input.eventId <= state.ackedEventId) return state;
     let event: AgentEventRecord;
     try {
       event = this.#agentEvents.get(input.eventId);
     } catch {
-      throw new Error("Only the next pending orchestrator event can be acknowledged");
+      throw new OrchestratorAckError({
+        code: "ORCHESTRATOR_EVENT_NOT_FOUND",
+        message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
+      });
     }
     if (
       event.herdrSessionName !== input.herdrSessionName ||
       event.workspaceId !== input.workspaceId
     ) {
-      throw new Error("Only the next pending orchestrator event can be acknowledged");
+      throw new OrchestratorAckError({
+        code: "ORCHESTRATOR_EVENT_NOT_IN_SCOPE",
+        message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
+      });
     }
-    if (event.deliverable !== 1) {
-      throw new Error("orchestrator event is no longer pending (invalidated)");
+    if (event.status === "delivered" && event.deliveredToTerminalId !== input.terminalId) {
+      throw new OrchestratorAckError({
+        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+        message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
+      });
+    }
+    if (event.status !== "pending" && event.status !== "delivered") {
+      throw new OrchestratorAckError({
+        code: "ORCHESTRATOR_EVENT_INVALIDATED",
+        message: ORCHESTRATOR_ACK_MESSAGES.invalidated,
+      });
     }
     const eventAgent = event.agentId ? this.#agents.get(event.agentId) : undefined;
-    if (eventAgent && !isDeliverableAgentEvent(event, eventAgent, input, input.terminalId)) {
-      throw new Error("Only the next pending orchestrator event can be acknowledged");
+    if (
+      eventAgent &&
+      !isDeliverableAgentEvent(
+        event.status === "delivered" ? { ...event, status: "pending" } : event,
+        eventAgent,
+        input,
+        input.terminalId,
+      )
+    ) {
+      throw new OrchestratorAckError({
+        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+        message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
+      });
     }
     const next = this.#agentEvents.nextDeliverableAfter({
       ...input,
@@ -117,8 +154,12 @@ export class AgentOrchestratorService {
       getAgent: (agentId) => this.#agents.get(agentId),
     });
     if (next && input.eventId > next.id) {
-      throw new Error("Only the next pending orchestrator event can be acknowledged");
+      throw new OrchestratorAckError({
+        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+        message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
+      });
     }
+    this.#agentEvents.markAcked(input.eventId);
     return this.#scopes.ack(input);
   }
 

@@ -3,6 +3,10 @@ import { JsonLineDecoder } from "./shared/json-lines.js";
 
 export type AgentEventWireRecord = {
   agentId?: string | null;
+  attempts?: number;
+  lastAttemptAt?: number;
+  nextAttemptAt?: number;
+  lastFailureCode?: string;
   compactHistory?: CompactAgentHistory | null;
   createdAt?: string;
   herdrSessionName?: string;
@@ -84,7 +88,7 @@ type PendingRequest = {
 };
 
 type RpcMessage = {
-  error?: { message?: string };
+  error?: { code?: string; message?: string };
   id?: number | string;
   method?: string;
   params?: unknown;
@@ -223,7 +227,9 @@ export class ReconnectingDaemonClient {
     if (!pending) return;
     this.#pending.delete(String(message.id));
     if (message.error) {
-      const error = new Error(message.error.message ?? "Herdsman RPC failed");
+      const error = Object.assign(new Error(message.error.message ?? "Herdsman RPC failed"), {
+        code: message.error.code,
+      });
       pending.reject(error);
       if (/unknown|not found|unsupported|method/i.test(error.message)) {
         const incompatible = new Error("Herdsman daemon version is incompatible; restart the session");

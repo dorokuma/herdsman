@@ -3,7 +3,11 @@ import { encodeJsonLine, JsonLineDecoder } from "@/shared/json-lines.js";
 
 type Pending = { reject(error: Error): void; resolve(value: unknown): void };
 
-type RpcResponse = { error?: { message?: string }; id?: number | string; result?: unknown };
+type RpcResponse = {
+  error?: { code?: string; message?: string; retryable?: boolean };
+  id?: number | string;
+  result?: unknown;
+};
 
 export class ObservabilityRpcClient {
   readonly #decoder = new JsonLineDecoder();
@@ -43,7 +47,13 @@ export class ObservabilityRpcClient {
       }
       this.#pending.delete(String(response.id));
       if (response.error) {
-        pending.reject(new Error(response.error.message ?? "Observability RPC failed"));
+        const error = new Error(response.error.message ?? "Observability RPC failed") as Error & {
+          code?: string;
+          retryable?: boolean;
+        };
+        if (response.error.code !== undefined) error.code = response.error.code;
+        if (response.error.retryable !== undefined) error.retryable = response.error.retryable;
+        pending.reject(error);
       } else {
         pending.resolve(response.result);
       }

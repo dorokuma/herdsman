@@ -17,6 +17,7 @@ import { createHerdrSessionListRunner } from "@/herdr/session-list.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
+import { AgentEventReconciler } from "./agent-event-reconciler.js";
 import { HerdrSessionWatchManager } from "./herdr-session-watch-manager.js";
 import { ObservabilityRpcServer } from "./observability-server.js";
 
@@ -74,6 +75,14 @@ export async function runObservabilityDaemonService(
     },
   });
 
+  let connectedTerminal = (_input: { herdrSessionName: string; terminalId: string }) => false;
+  const reconciler = new AgentEventReconciler({
+    connectedTerminal: (input) => connectedTerminal(input),
+    events: agentEvents,
+    scopes: agentOrchestratorScopes,
+    sessionList: createHerdrSessionListRunner({ env: runtime.environment }),
+  });
+
   const server = new ObservabilityRpcServer({
     context: daemonServices.context,
     history: daemonServices.history,
@@ -82,6 +91,7 @@ export async function runObservabilityDaemonService(
     socketPath: runtime.paths.socketPath,
     stores: { agentEvents, agents, herdrSessions, herdrWorkspaces },
   });
+  connectedTerminal = (input) => server.isTerminalConnected(input);
   const watchManager = new HerdrSessionWatchManager({
     agents,
     herdrSessions,
@@ -93,6 +103,7 @@ export async function runObservabilityDaemonService(
   });
 
   await server.start();
+  await reconciler.reconcile();
   await watchManager.start();
   console.log(`Herdsman daemon listening on ${runtime.paths.socketPath}`);
 

@@ -141,7 +141,9 @@ export class AgentIndexService {
     const client = this.#clientFactory({ socketPath: input.socketPath });
     try {
       const previous = this.#stores.agents.listForHerdrSession(input.herdrSessionName);
-      const previousByPane = new Map(previous.map((agent) => [agent.paneId, agent]));
+      const previousByPane = new Map(
+        previous.map((agent) => [paneIdentityKey(agent.paneId, agent.paneGeneration), agent]),
+      );
       const previousByTerminal = new Map(
         previous.flatMap((agent) =>
           agent.terminalId ? ([[agent.terminalId, agent]] as const) : [],
@@ -274,23 +276,39 @@ export class AgentIndexService {
     const paneId = stringValue(event.pane_id) ?? stringValue(event.paneId);
     if (!paneId) return { contextChangedScopes: [], events: [] };
     if (event.type === "pane.closed") {
-      this.#stores.agentEvents.invalidatePane({ herdrSessionName: input.herdrSessionName, paneId });
+      const closedGeneration = paneGenerationFromEvent(event);
+      this.#stores.agentEvents.invalidatePane({
+        herdrSessionName: input.herdrSessionName,
+        paneId,
+        paneGeneration: closedGeneration,
+        invalidatedReason: closedGeneration ? "PANE_CLOSED" : "LEGACY_CLOSE_WITHOUT_GENERATION",
+      });
+      if (!closedGeneration) {
+        console.warn("LEGACY_CLOSE_WITHOUT_GENERATION", {
+          sessionName: input.herdrSessionName,
+          paneId,
+        });
+      }
       const retired = this.#stores.agents.retirePane({
         herdrSessionName: input.herdrSessionName,
         paneId,
+        paneGeneration: closedGeneration,
       });
       const scopes = new Map<string, AgentScope>();
+      const closedTerminalId = stringValue(event.terminal_id) ?? stringValue(event.terminalId);
+      if (closedGeneration && closedTerminalId) {
+        for (const agent of retired) {
+          const scope = scopeOf(agent);
+          const change = this.#stores.agentOrchestratorScopes?.releaseIfOwnerIdentity({
+            ...scope,
+            paneId,
+            terminalId: closedTerminalId,
+          });
+          if (change?.changed) addScope(scopes, scope);
+        }
+      }
       for (const agent of retired) {
         const scope = scopeOf(agent);
-        const terminalId =
-          stringValue(event.terminal_id) ?? stringValue(event.terminalId) ?? agent.terminalId;
-        if (terminalId && this.#stores.agentOrchestratorScopes) {
-          const change = this.#stores.agentOrchestratorScopes.releaseIfOwner({
-            ...scope,
-            terminalId,
-          });
-          if (change.changed) addScope(scopes, scope);
-        }
         addScope(scopes, scope);
       }
       return {
@@ -299,14 +317,20 @@ export class AgentIndexService {
       };
     }
     if (event.type !== "pane.agent_status_changed") return { contextChangedScopes: [], events: [] };
+    const eventGeneration = paneGenerationFromEvent(event);
     let agent = this.#stores.agents.findByPane({
       herdrSessionName: input.herdrSessionName,
       paneId,
+      paneGeneration: eventGeneration,
     });
     let recovered: AgentIndexRefreshResult | undefined;
     if (!agent) {
       recovered = await this.#refreshHerdrSessionNow(input);
-      agent = this.#stores.agents.findByPane({ herdrSessionName: input.herdrSessionName, paneId });
+      agent = this.#stores.agents.findByPane({
+        herdrSessionName: input.herdrSessionName,
+        paneId,
+        paneGeneration: eventGeneration,
+      });
     }
     if (!agent) {
       return recovered
@@ -320,6 +344,7 @@ export class AgentIndexService {
       agentStatus: to,
       herdrSessionName: input.herdrSessionName,
       paneId,
+      paneGeneration: eventGeneration,
     });
     const current = updated ?? { ...agent, agentStatus: to };
     const refreshed = await this.#context.refreshAgent({ agent: current, identityChanged: false });
@@ -450,6 +475,7 @@ export class AgentIndexService {
         ),
 
         paneId: input.agent.paneId,
+        paneGeneration: input.agent.paneGeneration ?? null,
         payload: payload(input.agent, input.from, input.to),
         terminalId: input.agent.terminalId,
         type: statusType,
@@ -474,9 +500,15 @@ function matchingPrior(
   previousByPane: Map<string, AgentIndexRecord>,
 ): AgentIndexRecord | undefined {
   const terminalMatch = agent.terminalId ? previousByTerminal.get(agent.terminalId) : undefined;
-  const paneMatch = previousByPane.get(agent.paneId);
+  const generationMatches =
+    !agent.paneGeneration ||
+    !terminalMatch?.paneGeneration ||
+    terminalMatch.paneGeneration === agent.paneGeneration;
+  const paneMatch = previousByPane.get(paneIdentityKey(agent.paneId, agent.paneGeneration));
   const canUsePaneFallback = paneMatch && (!agent.terminalId || !paneMatch.terminalId);
-  return terminalMatch ?? (canUsePaneFallback ? paneMatch : undefined);
+  return (
+    (generationMatches ? terminalMatch : undefined) ?? (canUsePaneFallback ? paneMatch : undefined)
+  );
 }
 
 function sameIdentity(left: AgentIndexRecord, right: AgentIndexRecord): boolean {
@@ -589,6 +621,14 @@ function statusTransitionMatches(
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+function paneGenerationFromEvent(event: Record<string, unknown>): string | null {
+  return stringValue(event.pane_generation) ?? stringValue(event.paneGeneration);
+}
+
+function paneIdentityKey(paneId: string, paneGeneration: string | null | undefined): string {
+  return `${paneId}\0${paneGeneration ?? ""}`;
 }
 
 function stringValue(value: unknown): string | null {

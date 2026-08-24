@@ -23,6 +23,7 @@ import type {
   AgentWorkspaceContextSnapshot,
   PiPresenceRegistration,
 } from "@/observability/contracts.js";
+import { OrchestratorAckError } from "@/observability/errors.js";
 import {
   agentEventsInputSchema,
   agentGetInputSchema,
@@ -82,6 +83,7 @@ export class ObservabilityRpcServer {
   readonly #now: () => number;
   readonly #orchestrator: AgentOrchestratorService;
   readonly #piPresenceBySocket = new Map<Socket, PiPresence>();
+  readonly #socketsByTerminal = new Map<string, Set<Socket>>();
   readonly #registerPiSessionRef: (input: {
     herdrSessionName: string;
     sessionRef: PiPresenceRegistration["sessionRef"];
@@ -120,6 +122,7 @@ export class ObservabilityRpcServer {
     setTimeout?: (callback: () => void, delay: number) => TimerHandle;
     socketPath: string;
     startupReconnectGraceMs?: number;
+    connectedTerminal?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
     stores: AgentStores;
   }) {
     this.#clearTimeout = options.clearTimeout ?? clearTimeout;
@@ -160,6 +163,7 @@ export class ObservabilityRpcServer {
     for (const socket of this.#sockets) socket.destroy();
     this.#sockets.clear();
     this.#piPresenceBySocket.clear();
+    this.#socketsByTerminal.clear();
     this.#connectionOrderBySocket.clear();
     await new Promise<void>((resolve, reject) => {
       if (!this.#server.listening) {
@@ -284,7 +288,12 @@ export class ObservabilityRpcServer {
       this.#write(socket, { id: request.id, result });
     } catch (error) {
       this.#write(socket, {
-        error: { message: error instanceof Error ? error.message : String(error) },
+        error: {
+          ...(error instanceof OrchestratorAckError
+            ? { code: error.code, retryable: error.retryable }
+            : {}),
+          message: error instanceof Error ? error.message : String(error),
+        },
         id: request.id,
       });
     }
@@ -329,7 +338,9 @@ export class ObservabilityRpcServer {
         assertSchema(agentOrchestratorRegisterInputSchema, params);
         const previous = this.#piPresenceBySocket.get(socket);
         const presence = await this.#resolvePiPresence(params as PiPresenceRegistration);
+        if (previous) this.#unregisterTerminalSocket(socket, previous);
         this.#piPresenceBySocket.set(socket, presence);
+        this.#registerTerminalSocket(socket, presence);
         this.#cancelGraceForTerminal(presence);
         if (previous && terminalPresenceKey(previous) !== terminalPresenceKey(presence)) {
           this.#scheduleDisconnect(previous);
@@ -471,6 +482,9 @@ export class ObservabilityRpcServer {
     this.#connectionOrderBySocket.delete(socket);
     const presence = this.#piPresenceBySocket.get(socket);
     this.#piPresenceBySocket.delete(socket);
+    if (presence) this.#unregisterTerminalSocket(socket, presence);
+    // A socket that closes is no longer a trusted connected terminal. The
+    // grace timer remains only to tolerate a same-terminal reconnect.
     if (!this.#stopping && presence) this.#scheduleDisconnect(presence);
   }
 
@@ -538,16 +552,30 @@ export class ObservabilityRpcServer {
     this.#cancelTimer(this.#startupTimers, key);
   }
 
-  #hasTerminalPresence(input: AgentScope & { terminalId: string }): boolean {
-    for (const presence of this.#piPresenceBySocket.values()) {
-      if (
-        presence.herdrSessionName === input.herdrSessionName &&
-        presence.terminalId === input.terminalId
-      ) {
-        return true;
-      }
+  #hasTerminalPresence(input: { herdrSessionName: string; terminalId: string }): boolean {
+    return (this.#socketsByTerminal.get(terminalPresenceKey(input))?.size ?? 0) > 0;
+  }
+
+  #registerTerminalSocket(socket: Socket, presence: PiPresence): void {
+    const key = terminalPresenceKey(presence);
+    let sockets = this.#socketsByTerminal.get(key);
+    if (!sockets) {
+      sockets = new Set();
+      this.#socketsByTerminal.set(key, sockets);
     }
-    return false;
+    sockets.add(socket);
+  }
+
+  #unregisterTerminalSocket(socket: Socket, presence: PiPresence): void {
+    const key = terminalPresenceKey(presence);
+    const sockets = this.#socketsByTerminal.get(key);
+    sockets?.delete(socket);
+    if (sockets?.size === 0) this.#socketsByTerminal.delete(key);
+  }
+
+  /** Authoritative live Pi connection registry; intentionally empty after daemon startup. */
+  isTerminalConnected(input: { herdrSessionName: string; terminalId: string }): boolean {
+    return this.#hasTerminalPresence(input);
   }
 
   #cancelTimer(registry: Map<string, GraceTimer>, key: string): void {

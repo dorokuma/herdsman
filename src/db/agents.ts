@@ -182,11 +182,19 @@ export class AgentStore {
     });
   }
 
-  retirePane(input: { herdrSessionName: string; paneId: string }): AgentIndexRecord[] {
+  retirePane(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+  }): AgentIndexRecord[] {
     return this.#transaction(() => {
+      const generationClause = input.paneGeneration == null ? "" : " and pane_generation = ?";
+      const generationParams = input.paneGeneration == null ? [] : [input.paneGeneration];
       const agents = this.#sqlite
-        .prepare("select * from agents where herdr_session_name = ? and pane_id = ?")
-        .all(input.herdrSessionName, input.paneId) as AgentRow[];
+        .prepare(
+          `select * from agents where herdr_session_name = ? and pane_id = ?${generationClause}`,
+        )
+        .all(input.herdrSessionName, input.paneId, ...generationParams) as AgentRow[];
       if (agents.length === 0) return [];
       const ids = agents.map((agent) => agent.id);
       const placeholders = ids.map(() => "?").join(", ");
@@ -194,8 +202,10 @@ export class AgentStore {
         .prepare(`delete from agent_context_snapshots where agent_id in (${placeholders})`)
         .run(...ids);
       this.#sqlite
-        .prepare("delete from agents where herdr_session_name = ? and pane_id = ?")
-        .run(input.herdrSessionName, input.paneId);
+        .prepare(
+          `delete from agents where herdr_session_name = ? and pane_id = ?${generationClause}`,
+        )
+        .run(input.herdrSessionName, input.paneId, ...generationParams);
       return agents.map(mapAgent);
     });
   }
@@ -226,13 +236,16 @@ export class AgentStore {
     agentStatus: AgentStatus;
     herdrSessionName: string;
     paneId: string;
+    paneGeneration?: string | null;
   }): AgentIndexRecord | undefined {
     const now = Date.now();
+    const generationClause = input.paneGeneration == null ? "" : " and pane_generation = ?";
+    const generationParams = input.paneGeneration == null ? [] : [input.paneGeneration];
     this.#sqlite
       .prepare(
-        "update agents set agent_status = ?, last_seen_at = ? where herdr_session_name = ? and pane_id = ?",
+        `update agents set agent_status = ?, last_seen_at = ? where herdr_session_name = ? and pane_id = ?${generationClause}`,
       )
-      .run(input.agentStatus, now, input.herdrSessionName, input.paneId);
+      .run(input.agentStatus, now, input.herdrSessionName, input.paneId, ...generationParams);
     return this.findByPane(input);
   }
 
@@ -269,10 +282,21 @@ export class AgentStore {
     return this.list({ herdrSessionName });
   }
 
-  findByPane(input: { herdrSessionName: string; paneId: string }): AgentIndexRecord | undefined {
+  findByPane(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+  }): AgentIndexRecord | undefined {
+    const generationClause = input.paneGeneration == null ? "" : " and pane_generation = ?";
     const row = this.#sqlite
-      .prepare("select * from agents where herdr_session_name = ? and pane_id = ?")
-      .get(input.herdrSessionName, input.paneId) as AgentRow | undefined;
+      .prepare(
+        `select * from agents where herdr_session_name = ? and pane_id = ?${generationClause}`,
+      )
+      .get(
+        input.herdrSessionName,
+        input.paneId,
+        ...(input.paneGeneration == null ? [] : [input.paneGeneration]),
+      ) as AgentRow | undefined;
     return row ? mapAgent(row) : undefined;
   }
 

@@ -1,4 +1,11 @@
-import { integer, primaryKey, sqliteTable, text, uniqueIndex } from "drizzle-orm/sqlite-core";
+import {
+  index,
+  integer,
+  primaryKey,
+  sqliteTable,
+  text,
+  uniqueIndex,
+} from "drizzle-orm/sqlite-core";
 
 const agentStatusValues = ["blocked", "done", "idle", "unknown", "working"] as const;
 
@@ -89,7 +96,15 @@ export const agentEvents = sqliteTable(
     paneId: text("pane_id"),
     paneGeneration: text("pane_generation"),
     payloadJson: text("payload_json").notNull(),
+    /** Compatibility mirror; status is authoritative for delivery queries. */
     deliverable: integer("deliverable", { mode: "boolean" }).notNull().default(true),
+    status: text("status").notNull().default("pending"),
+    deliveryAttempts: integer("delivery_attempts").notNull().default(0),
+    lastAttemptAt: integer("last_attempt_at"),
+    nextAttemptAt: integer("next_attempt_at"),
+    lastFailureCode: text("last_failure_code"),
+    invalidatedReason: text("invalidated_reason"),
+    deliveredToTerminalId: text("delivered_to_terminal_id"),
     terminalId: text("terminal_id"),
     type: text("type").notNull(),
     workspaceId: text("workspace_id"),
@@ -99,6 +114,13 @@ export const agentEvents = sqliteTable(
       table.herdrSessionName,
       table.idempotencyKey,
     ),
+    index("agent_events_delivery_scope_idx").on(
+      table.herdrSessionName,
+      table.workspaceId,
+      table.status,
+      table.id,
+    ),
+    index("agent_events_delivery_retry_idx").on(table.status, table.nextAttemptAt),
   ],
 );
 

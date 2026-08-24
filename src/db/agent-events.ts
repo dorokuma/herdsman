@@ -16,12 +16,17 @@ export function isDeliverableAgentEvent(
   ownerTerminalId: string,
 ): boolean {
   return (
+    (event.status === "pending" || event.status === "delivered") &&
+    (event.status === "delivered" ||
+      event.nextAttemptAt === null ||
+      event.nextAttemptAt === undefined ||
+      event.nextAttemptAt <= new Date()) &&
+    (event.status === "pending" || event.deliveredToTerminalId === ownerTerminalId) &&
     event.agentId !== null &&
     agent !== undefined &&
     event.type !== "agent.status.changed" &&
     !(event.type === "agent.idle" && asRecord(event.payload).from !== "working") &&
     !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
-    event.deliverable === 1 &&
     agent.paneId === event.paneId &&
     (event.paneGeneration === null || agent.paneGeneration === event.paneGeneration) &&
     agent.workspaceId === scope.workspaceId &&
@@ -48,6 +53,13 @@ type AgentEventRow = {
   pane_id: string | null;
   pane_generation: string | null;
   payload_json: string;
+  delivery_attempts: number;
+  last_attempt_at: number | null;
+  next_attempt_at: number | null;
+  last_failure_code: string | null;
+  invalidated_reason: string | null;
+  delivered_to_terminal_id: string | null;
+  status: "pending" | "delivered" | "acked" | "invalidated" | "failed";
   deliverable: 0 | 1;
   terminal_id: string | null;
   type: AgentEventType;
@@ -85,8 +97,8 @@ export class AgentEventStore {
     const result = this.#sqlite
       .prepare(
         `insert into agent_events
-         (herdr_session_name, agent_id, pane_id, pane_generation, workspace_id, terminal_id, type, payload_json, compact_history_json, idempotency_key, deliverable, created_at)
-         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?)`,
+         (herdr_session_name, agent_id, pane_id, pane_generation, workspace_id, terminal_id, type, payload_json, compact_history_json, idempotency_key, deliverable, status, delivery_attempts, created_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'pending', 0, ?)`,
       )
       .run(
         input.herdrSessionName,
@@ -108,21 +120,44 @@ export class AgentEventStore {
     herdrSessionName: string;
     paneId: string;
     paneGeneration?: string | null;
+    invalidatedReason?: string;
   }): void {
+    const legacy = input.paneGeneration == null;
     this.#sqlite
       .prepare(
-        `update agent_events set deliverable = 0
+        `update agent_events set deliverable = 0, status = 'invalidated', invalidated_reason = ?
          where herdr_session_name = ? and pane_id = ?
-           and (? is null or pane_generation = ? or pane_generation is null)`,
+           and status not in ('acked', 'invalidated', 'failed')
+           and (${legacy ? "pane_generation is null" : "pane_generation = ?"})`,
       )
       .run(
+        input.invalidatedReason ?? (legacy ? "LEGACY_CLOSE_WITHOUT_GENERATION" : "PANE_CLOSED"),
         input.herdrSessionName,
         input.paneId,
-        input.paneGeneration ?? null,
-        input.paneGeneration ?? null,
+        ...(legacy ? [] : [input.paneGeneration ?? null]),
       );
   }
 
+  listReconcileCandidates(limit = 100, afterId = 0): AgentEventRecord[] {
+    const rows = this.#sqlite
+      .prepare(
+        `select * from agent_events where id > ? and status in ('pending', 'delivered') order by id asc limit ?`,
+      )
+      .all(afterId, limit) as AgentEventRow[];
+    return rows.map(mapAgentEvent);
+  }
+
+  invalidateById(id: number, reason: string): boolean {
+    return (
+      Number(
+        this.#sqlite
+          .prepare(
+            `update agent_events set deliverable = 0, status = 'invalidated', invalidated_reason = ? where id = ? and status in ('pending', 'delivered')`,
+          )
+          .run(reason, id).changes,
+      ) > 0
+    );
+  }
   latestStatusTransition(agentId: string, herdrSessionName: string): AgentEventRecord | undefined {
     const row = this.#sqlite
       .prepare(
@@ -135,10 +170,17 @@ export class AgentEventStore {
   }
 
   listAfter(
-    input: AgentQueryScope & { afterEventId?: number; limit?: number },
+    input: AgentQueryScope & { afterEventId?: number; limit?: number; ownerTerminalId?: string },
   ): AgentEventRecord[] {
-    const clauses = ["id > ?", "deliverable = 1"];
-    const params: Array<number | string | null> = [input.afterEventId ?? 0];
+    const clauses = [
+      "id > ?",
+      "(status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ?)",
+    ];
+    const params: Array<number | string | null> = [
+      input.afterEventId ?? 0,
+      Date.now(),
+      input.ownerTerminalId ?? null,
+    ];
     if (input.herdrSessionName) {
       clauses.push("herdr_session_name = ?");
       params.push(input.herdrSessionName);
@@ -175,6 +217,8 @@ export class AgentEventStore {
     for (let page = 0; page < 50; page += 1) {
       const params = [
         afterEventId,
+        Date.now(),
+        input.ownerTerminalId,
         input.herdrSessionName,
         input.workspaceId,
         input.ownerTerminalId,
@@ -182,7 +226,7 @@ export class AgentEventStore {
       const rows = this.#sqlite
         .prepare(
           `select * from agent_events
-           where id > ? and deliverable = 1 and herdr_session_name = ? and workspace_id = ?
+           where id > ? and ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ?)) and herdr_session_name = ? and workspace_id = ?
              and terminal_id is not null and terminal_id != ? and agent_id is not null
              ${agentFilter}
            order by id asc limit 1000`,
@@ -205,6 +249,59 @@ export class AgentEventStore {
     return undefined;
   }
 
+  reservePending(terminalId: string, limit = 100, ids?: number[]): AgentEventRecord[] {
+    return this.#transaction(() => {
+      const now = Date.now();
+      const idClause = ids && ids.length > 0 ? `and id in (${ids.map(() => "?").join(",")})` : "";
+      const params: Array<number | string> = [now, terminalId];
+      if (ids && ids.length > 0) params.push(...ids);
+      params.push(limit);
+      const rows = this.#sqlite
+        .prepare(
+          `select * from agent_events where ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ?)) ${idClause} order by id asc limit ?`,
+        )
+        .all(...params) as AgentEventRow[];
+      for (const row of rows) {
+        this.#sqlite
+          .prepare(
+            `update agent_events set status = 'delivered', deliverable = 1, delivery_attempts = ?, last_attempt_at = ?, delivered_to_terminal_id = ? where id = ? and status = 'pending'`,
+          )
+          .run(row.delivery_attempts + 1, now, terminalId, row.id);
+      }
+      return rows.map((row) => this.get(row.id));
+    });
+  }
+
+  reclaimDelivered(timeoutMs: number): number {
+    return this.#transaction(() => {
+      const result = this.#sqlite
+        .prepare(
+          `update agent_events set status = case when delivery_attempts >= 10 then 'failed' else 'pending' end, deliverable = case when delivery_attempts >= 10 then 0 else 1 end, last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end, delivered_to_terminal_id = null, next_attempt_at = null where status = 'delivered' and last_attempt_at < ?`,
+        )
+        .run(Date.now() - timeoutMs);
+      return Number(result.changes);
+    });
+  }
+
+  markAcked(id: number): void {
+    this.#sqlite
+      .prepare(
+        `update agent_events set status = 'acked', deliverable = 0 where id = ? and status in ('pending', 'delivered')`,
+      )
+      .run(id);
+  }
+
+  #transaction<T>(operation: () => T): T {
+    this.#sqlite.exec("begin immediate");
+    try {
+      const result = operation();
+      this.#sqlite.exec("commit");
+      return result;
+    } catch (error) {
+      this.#sqlite.exec("rollback");
+      throw error;
+    }
+  }
   latestEventId(scope: AgentQueryScope = {}): number {
     const clauses: string[] = [];
     const params: Array<number | string | null> = [];
@@ -241,7 +338,14 @@ export function mapAgentEvent(row: AgentEventRow): AgentEventRecord {
     id: row.id,
     paneId: row.pane_id,
     paneGeneration: row.pane_generation,
-    deliverable: row.deliverable,
+    deliverable: row.status === "pending" || row.status === "delivered" ? 1 : 0,
+    status: row.status,
+    deliveryAttempts: row.delivery_attempts,
+    lastAttemptAt: row.last_attempt_at === null ? null : new Date(row.last_attempt_at),
+    nextAttemptAt: row.next_attempt_at === null ? null : new Date(row.next_attempt_at),
+    lastFailureCode: row.last_failure_code,
+    invalidatedReason: row.invalidated_reason,
+    deliveredToTerminalId: row.delivered_to_terminal_id,
     payload: parseJson<unknown>(row.payload_json) ?? {},
     terminalId: row.terminal_id,
     type: row.type,

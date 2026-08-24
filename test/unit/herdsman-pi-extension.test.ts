@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
 import type {
   AgentEventWireRecord,
@@ -23,6 +26,10 @@ type Module = {
   formatHiddenAgentUpdates: (
     events: Array<{ id: number; type: string; payload: unknown }>,
   ) => string;
+  classifyAckFailure: (error: unknown) => "terminal" | "resync" | "transient";
+  logHerdsmanPi: (level: "info" | "warn" | "error", message: string) => void;
+  MAX_ACK_ATTEMPTS: number;
+  ACK_BACKOFF_CAP_MS: number;
 };
 
 type FakeClient = ReturnType<typeof createFakeClient>;
@@ -37,6 +44,45 @@ const jsonLinesModuleUrl = new URL(
   import.meta.url,
 ).href;
 
+describe("herdsman-pi acknowledgement failure classification", () => {
+  test.each([
+    ["invalidated", "terminal"],
+    ["no longer pending", "terminal"],
+    ["Only the current orchestrator can acknowledge notifications", "terminal"],
+    ["Only the next pending orchestrator event can be acknowledged", "resync"],
+    ["an unknown daemon failure", "transient"],
+  ])("classifies %s as %s", async (message, expected) => {
+    const { classifyAckFailure } = (await import(extensionModuleUrl)) as Module;
+    expect(classifyAckFailure(new Error(message))).toBe(expected);
+  });
+
+  test.each([
+    ["ORCHESTRATOR_NOT_OWNER", "terminal"],
+    ["ORCHESTRATOR_EVENT_INVALIDATED", "terminal"],
+    ["ORCHESTRATOR_EVENT_FAILED", "terminal"],
+    ["ORCHESTRATOR_EVENT_ALREADY_ACKED", "terminal"],
+    ["ORCHESTRATOR_EVENT_NOT_IN_SCOPE", "terminal"],
+    ["ORCHESTRATOR_EVENT_OUT_OF_ORDER", "resync"],
+    ["ORCHESTRATOR_OWNER_REPLACED", "terminal"],
+    ["ORCHESTRATOR_EVENT_NOT_FOUND", "terminal"],
+    ["ORCHESTRATOR_BUSY", "transient"],
+    ["ORCHESTRATOR_CONNECTION_LOST", "transient"],
+    ["ORCHESTRATOR_RECONCILING", "transient"],
+    ["ORCHESTRATOR_ACK_TIMEOUT", "transient"],
+  ])("maps structured code %s to %s", async (code, expected) => {
+    const { classifyAckFailure } = (await import(extensionModuleUrl)) as Module;
+    expect(classifyAckFailure(Object.assign(new Error("legacy"), { code }))).toBe(expected);
+  });
+  test("structured error codes take precedence over the message", async () => {
+    const { classifyAckFailure } = (await import(extensionModuleUrl)) as Module;
+    expect(
+      classifyAckFailure(Object.assign(new Error("invalidated"), { code: "temporary_failure" })),
+    ).toBe("transient");
+    expect(
+      classifyAckFailure(Object.assign(new Error("temporary"), { code: "event_invalidated" })),
+    ).toBe("terminal");
+  });
+});
 describe("herdsman-pi extension self-contained loading", () => {
   test("loads daemon-client independently and rejects frames larger than 1 MiB before handlers see them", async () => {
     const { ReconnectingDaemonClient } = await import(daemonClientModuleUrl);
@@ -1174,6 +1220,56 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
+  test("removes a NOT_OWNER event after rejection without retrying or waking again", async () => {
+    vi.useFakeTimers();
+    const eventId = 88;
+    const client = createWakeClient();
+    const baseResponse = client.response;
+    client.response = (method, params) => {
+      if (
+        method === "agent.notifications.ack" &&
+        (params as { eventId: number }).eventId === eventId
+      ) {
+        throw Object.assign(
+          new Error("Only the current orchestrator can acknowledge notifications"),
+          {
+            code: "ORCHESTRATOR_NOT_OWNER",
+            retryable: false,
+          },
+        );
+      }
+      return baseResponse(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      client.emitStream({ method: "agent.event", params: { event: event(eventId, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages).toHaveLength(1);
+
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      const ackCalls = () =>
+        client.calls.filter(
+          ([method, params]) =>
+            method === "agent.notifications.ack" &&
+            (params as { eventId: number }).eventId === eventId,
+        );
+      expect(ackCalls()).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(pi.customMessages).toHaveLength(1);
+      expect(ackCalls()).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
   test("retries acknowledgement failure on the next Herdsman round", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
@@ -1198,6 +1294,163 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.emitStream({ method: "agent.event", params: { event: event(87, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.customMessages).toHaveLength(2);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("stops resync retries at MAX_ACK_ATTEMPTS", async () => {
+    vi.useFakeTimers();
+    const { MAX_ACK_ATTEMPTS } = (await import(extensionModuleUrl)) as Module;
+    const eventId = 901;
+    const pending = event(eventId, "term_agent");
+    const client = createWakeClient();
+    const base = client.response;
+    client.response = (method, params) => {
+      if (
+        method === "agent.notifications.ack" &&
+        (params as { eventId: number }).eventId === eventId
+      )
+        throw new Error("Only the next pending orchestrator event can be acknowledged");
+      return base(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      for (let attempt = 1; attempt <= MAX_ACK_ATTEMPTS; attempt += 1) {
+        client.emitStream({ method: "agent.event", params: { event: pending } });
+        await vi.advanceTimersByTimeAsync(30_000);
+        await pi.emit("agent_start", {}, ctx);
+        await pi.emit("message_end", assistantMessage("stop"), ctx);
+        await pi.emit("agent_settled", {}, ctx);
+        expect(
+          client.calls.filter(
+            ([m, p]) =>
+              m === "agent.notifications.ack" && (p as { eventId: number }).eventId === eventId,
+          ),
+        ).toHaveLength(attempt);
+        if (attempt < MAX_ACK_ATTEMPTS)
+          expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
+      }
+      const count = client.calls.length;
+      const wakes = pi.customMessages.length;
+      const followUp = event(903, "term_agent");
+      client.emitStream({ method: "agent.event", params: { event: followUp } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages.length).toBe(wakes + 1);
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({
+        details: { eventIds: [followUp.id] },
+      });
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(
+        client.calls.filter(
+          ([m, p]) =>
+            m === "agent.notifications.ack" && (p as { eventId: number }).eventId === followUp.id,
+        ),
+      ).toHaveLength(1);
+      expect(
+        client.calls.filter(
+          ([m, p]) =>
+            m === "agent.notifications.ack" && (p as { eventId: number }).eventId === eventId,
+        ),
+      ).toHaveLength(MAX_ACK_ATTEMPTS);
+      expect(client.calls.length).toBeGreaterThan(count);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("stops transient retries and uses increasing capped backoff", async () => {
+    vi.useFakeTimers();
+    const { MAX_ACK_ATTEMPTS, ACK_BACKOFF_CAP_MS } = (await import(extensionModuleUrl)) as Module;
+    const eventId = 902;
+    const pending = event(eventId, "term_agent");
+    const client = createWakeClient();
+    const base = client.response;
+    client.response = (method, params) => {
+      if (
+        method === "agent.notifications.ack" &&
+        (params as { eventId: number }).eventId === eventId
+      )
+        throw new Error("unknown daemon failure");
+      return base(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      const ackCount = () =>
+        client.calls.filter(
+          ([m, p]) =>
+            m === "agent.notifications.ack" && (p as { eventId: number }).eventId === eventId,
+        ).length;
+      const settleWake = async () => {
+        await pi.emit("agent_start", {}, ctx);
+        await pi.emit("message_end", assistantMessage("stop"), ctx);
+        await pi.emit("agent_settled", {}, ctx);
+      };
+
+      client.emitStream({ method: "agent.event", params: { event: pending } });
+      await vi.advanceTimersByTimeAsync(500);
+      await settleWake();
+      expect(ackCount()).toBe(1);
+
+      await vi.advanceTimersByTimeAsync(249);
+      expect(ackCount()).toBe(1);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(500);
+      await settleWake();
+      expect(ackCount()).toBe(2);
+
+      await vi.advanceTimersByTimeAsync(499);
+      expect(ackCount()).toBe(2);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(500);
+      await settleWake();
+      expect(ackCount()).toBe(3);
+
+      await vi.advanceTimersByTimeAsync(999);
+      expect(ackCount()).toBe(3);
+      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(500);
+      await settleWake();
+      expect(ackCount()).toBe(4);
+
+      await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
+      await vi.advanceTimersByTimeAsync(500);
+      await settleWake();
+      expect(ackCount()).toBe(5);
+      const wakes = pi.customMessages.length;
+      await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
+      expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
+      expect(pi.customMessages.length).toBe(wakes);
+      const followUp = event(904, "term_agent");
+      client.emitStream({ method: "agent.event", params: { event: followUp } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({
+        details: { eventIds: [followUp.id] },
+      });
+      await settleWake();
+      expect(
+        client.calls.filter(
+          ([m, p]) =>
+            m === "agent.notifications.ack" && (p as { eventId: number }).eventId === followUp.id,
+        ),
+      ).toHaveLength(1);
+      expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
+      const wakesAfterFollowUp = pi.customMessages.length;
+      await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
+      expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
+      expect(pi.customMessages.length).toBe(wakesAfterFollowUp);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1742,6 +1995,11 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
   test("clears an invalidated event, advances through the delivered batch, and does not wake it again", async () => {
     vi.useFakeTimers();
     const invalidatedId = 301;
+    const logHome = mkdtempSync(join(tmpdir(), "herdsman-pi-log-"));
+    const previousHome = process.env.HERDSMAN_HOME;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    process.env.HERDSMAN_HOME = logHome;
     const client = createWakeClient([event(invalidatedId, "term_agent"), event(302, "term_agent")]);
     const baseResponse = client.response;
     client.response = (method, params) => {
@@ -1776,9 +2034,51 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
       vi.clearAllTimers();
       vi.useRealTimers();
       restoreEnv(previous);
+      warn.mockRestore();
+      error.mockRestore();
+      const log = readFileSync(
+        join(
+          logHome,
+          "logs",
+          `herdsman-pi-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}.log`,
+        ),
+        "utf8",
+      );
+      expect(log).toContain(`eventId=${invalidatedId}`);
+      expect(log).toContain("code=orchestrator event is no longer pending (invalidated)");
+      expect(warn).not.toHaveBeenCalled();
+      expect(error).not.toHaveBeenCalled();
+      rmSync(logHome, { recursive: true, force: true });
+      if (previousHome === undefined) delete process.env.HERDSMAN_HOME;
+      else process.env.HERDSMAN_HOME = previousHome;
     }
   });
 
+  test("silently ignores an unwritable diagnostic log and preserves acknowledgement behavior", async () => {
+    vi.useFakeTimers();
+    const logHome = mkdtempSync(join(tmpdir(), "herdsman-pi-log-blocked-"));
+    const blocker = join(logHome, "not-a-directory");
+    writeFileSync(blocker, "block");
+    const previousHome = process.env.HERDSMAN_HOME;
+    process.env.HERDSMAN_HOME = blocker;
+    const { logHerdsmanPi } = (await import(extensionModuleUrl)) as Module;
+    expect(() => logHerdsmanPi("warn", "diagnostic failure")).not.toThrow();
+    const client = createWakeClient([event(305, "term_agent")]);
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      expect(client.calls.some(([method]) => method === "agent.orchestrator.register")).toBe(true);
+    } finally {
+      restoreEnv(previous);
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      if (previousHome === undefined) delete process.env.HERDSMAN_HOME;
+      else process.env.HERDSMAN_HOME = previousHome;
+      rmSync(logHome, { recursive: true, force: true });
+    }
+  });
   test("retains a normal jump rejection and leaves the failed wake cursor unchanged", async () => {
     vi.useFakeTimers();
     const client = createWakeClient([event(311, "term_agent"), event(313, "term_agent")]);

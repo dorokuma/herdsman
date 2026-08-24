@@ -112,6 +112,177 @@ describe("event deduplication and pane generations", () => {
     expect(h.agentEvents.get(e.id).paneGeneration).toBe("gen-1");
     h.sqlite.close();
   });
+  test("retires only the closed pane generation when a pane id is reused", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const index = new AgentIndexService({ stores: h });
+    const old = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [agent("old", "gen-1")],
+    })[0];
+    if (!old) throw new Error("Expected old agent");
+    const oldEvent = h.agentEvents.append({
+      agentId: old.id,
+      ...scope,
+      paneId: old.paneId,
+      paneGeneration: old.paneGeneration ?? null,
+      payload: {},
+      terminalId: old.terminalId,
+      type: "agent.done",
+    });
+
+    await index.handleHerdrEvent({
+      event: { pane_id: old.paneId, pane_generation: old.paneGeneration, type: "pane.closed" },
+      ...session,
+    });
+    const fresh = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [agent("fresh", "gen-2")],
+    })[0];
+    if (!fresh) throw new Error("Expected fresh agent");
+    const freshEvent = h.agentEvents.append({
+      agentId: fresh.id,
+      ...scope,
+      paneId: fresh.paneId,
+      paneGeneration: fresh.paneGeneration ?? null,
+      payload: {},
+      terminalId: fresh.terminalId,
+      type: "agent.done",
+    });
+
+    await index.handleHerdrEvent({
+      event: { pane_id: fresh.paneId, pane_generation: "gen-1", type: "pane.closed" },
+      ...session,
+    });
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-1" }),
+    ).toBeUndefined();
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-2" }),
+    ).toMatchObject({
+      id: fresh.id,
+      agent: "fresh",
+      agentStatus: "working",
+    });
+    expect(h.agentEvents.get(oldEvent.id)).toMatchObject({
+      status: "invalidated",
+      invalidatedReason: "PANE_CLOSED",
+    });
+    expect(h.agentEvents.get(freshEvent.id)).toMatchObject({
+      status: "pending",
+      paneGeneration: "gen-2",
+    });
+    h.sqlite.close();
+  });
+
+  test("pane.closed retires and invalidates the matching generation", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const indexed = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [agent("claude", "gen-7")],
+    })[0];
+    if (!indexed) throw new Error("Expected agent");
+    const event = h.agentEvents.append({
+      agentId: indexed.id,
+      ...scope,
+      paneId: indexed.paneId,
+      paneGeneration: indexed.paneGeneration ?? null,
+      payload: {},
+      terminalId: indexed.terminalId,
+      type: "agent.done",
+    });
+    await new AgentIndexService({ stores: h }).handleHerdrEvent({
+      event: { pane_id: "wJ:p2", pane_generation: "gen-7", type: "pane.closed" },
+      ...session,
+    });
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-7" }),
+    ).toBeUndefined();
+    expect(h.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+      invalidatedReason: "PANE_CLOSED",
+    });
+    h.sqlite.close();
+  });
+
+  test("legacy pane.closed invalidates legacy events with an explicit reason", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const indexed = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [{ ...agent("claude", "legacy-gen"), pane_generation: undefined }],
+    })[0];
+    if (!indexed) throw new Error("Expected agent");
+    const event = h.agentEvents.append({
+      agentId: indexed.id,
+      ...scope,
+      paneId: indexed.paneId,
+      paneGeneration: null,
+      payload: {},
+      terminalId: indexed.terminalId,
+      type: "agent.done",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await new AgentIndexService({ stores: h }).handleHerdrEvent({
+      event: { pane_id: "wJ:p2", type: "pane.closed" },
+      ...session,
+    });
+    expect(h.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+      invalidatedReason: "LEGACY_CLOSE_WITHOUT_GENERATION",
+    });
+    expect(warn).toHaveBeenCalledWith("LEGACY_CLOSE_WITHOUT_GENERATION", expect.any(Object));
+    warn.mockRestore();
+    h.sqlite.close();
+  });
+
+  test("status-derived events persist the source agent pane generation", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const index = new AgentIndexService({
+      stores: h,
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("claude-jsonl"),
+              lastAssistantMessage: { ref: "x", text: "result", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as never,
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return {
+            snapshot: {
+              agents: [agent("claude", "gen-status")],
+              panes: [],
+              tabs: [],
+              workspaces: [],
+            },
+          };
+        },
+      }),
+    });
+    await index.refreshHerdrSession(session);
+    await index.handleHerdrEvent({
+      event: {
+        agent_status: "done",
+        pane_id: "wJ:p2",
+        pane_generation: "gen-status",
+        type: "pane.agent_status_changed",
+      },
+      ...session,
+    });
+    const generated = h.agentEvents.listAfter(scope).filter((event) => event.type === "agent.done");
+    expect(generated.length).toBeGreaterThan(0);
+    expect(generated.every((event) => event.paneGeneration === "gen-status")).toBe(true);
+    h.sqlite.close();
+  });
   test("advances cursor past an undeliverable old event", () => {
     const h = openObservabilityDbHarness();
     h.herdrSessions.upsertRunning(dbSession);

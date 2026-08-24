@@ -1,4 +1,24 @@
 import { agentIdentityLabel } from "./agent-display.js";
+import { appendFileSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, isAbsolute, join } from "node:path";
+
+export type HerdsmanPiLogLevel = "info" | "warn" | "error";
+
+export function logHerdsmanPi(level: HerdsmanPiLogLevel, message: string): void {
+  try {
+    const configuredHome = process.env.HERDSMAN_HOME?.trim();
+    const home = configuredHome && isAbsolute(configuredHome) ? configuredHome : join(homedir(), ".herdsman");
+    const now = new Date();
+    const date = now.toISOString().slice(0, 10).replaceAll("-", "");
+    const file = join(home, "logs", `herdsman-pi-${date}.log`);
+    mkdirSync(dirname(file), { recursive: true });
+    appendFileSync(file, `${now.toISOString()} [${level}] ${message}\n`, "utf8");
+  } catch {
+    // Diagnostics must never write to the terminal or interrupt the extension.
+  }
+}
+
 import {
   type AgentContextListItem,
   type AgentEventWireRecord,
@@ -151,6 +171,56 @@ const DEFAULT_HOME_NAME = ".herdsman";
 const COMMAND_USAGE = "Usage: /herdsman [on|off|status]";
 const HERDR_REQUIRED_MESSAGE = "Herdsman requires a Herdr workspace";
 const RECONNECTING_MESSAGE = "Herdsman is reconnecting · try again shortly";
+export const MAX_ACK_ATTEMPTS = 5;
+export const ACK_BACKOFF_CAP_MS = 30_000;
+
+type AckFailureClass = "terminal" | "resync" | "transient";
+
+type AckError = Error & { code?: string };
+
+const ACK_FAILURE_CLASS_BY_CODE: Record<string, AckFailureClass> = {
+  ORCHESTRATOR_NOT_OWNER: "terminal",
+  ORCHESTRATOR_EVENT_INVALIDATED: "terminal",
+  ORCHESTRATOR_EVENT_FAILED: "terminal",
+  ORCHESTRATOR_EVENT_ALREADY_ACKED: "terminal",
+  ORCHESTRATOR_EVENT_NOT_IN_SCOPE: "terminal",
+  ORCHESTRATOR_EVENT_OUT_OF_ORDER: "resync",
+  ORCHESTRATOR_OWNER_REPLACED: "terminal",
+  ORCHESTRATOR_EVENT_NOT_FOUND: "terminal",
+  ORCHESTRATOR_BUSY: "transient",
+  ORCHESTRATOR_CONNECTION_LOST: "transient",
+  ORCHESTRATOR_RECONCILING: "transient",
+  ORCHESTRATOR_ACK_TIMEOUT: "transient",
+  event_invalidated: "terminal",
+};
+
+export function classifyAckFailure(error: unknown): AckFailureClass {
+  const candidate = error as { code?: unknown; message?: unknown };
+  if (typeof candidate.code === "string" && candidate.code.length > 0) {
+    const classification = ACK_FAILURE_CLASS_BY_CODE[candidate.code];
+    if (classification) return classification;
+    return "transient";
+  }
+  const message = typeof candidate.message === "string" ? candidate.message : String(error);
+  if (/no longer pending|invalidated|Only the current orchestrator can acknowledge notifications/i.test(message)) {
+    return "terminal";
+  }
+  if (/Only the next pending orchestrator event can be acknowledged/i.test(message)) return "resync";
+  return "transient";
+}
+
+function ackFailureCode(error: unknown): string {
+  const candidate = error as { code?: unknown; message?: unknown };
+  return typeof candidate.code === "string" && candidate.code.length > 0
+    ? candidate.code
+    : typeof candidate.message === "string"
+      ? candidate.message
+      : String(error);
+}
+
+function ackBackoffMs(attempts: number): number {
+  return Math.min(250 * 2 ** Math.max(0, attempts - 1), ACK_BACKOFF_CAP_MS);
+}
 
 function defaultHerdsmanHome() {
   return process.env.HERDSMAN_HOME || `${process.env.HOME || ""}/${DEFAULT_HOME_NAME}`;
@@ -235,11 +305,29 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     const scheduleWake = (ctx: PiContext | undefined) => {
       if (!ctx || !state.isOrchestrator || !state.currentScope || !pi.sendMessage) return;
-      const outcomes = projectAgentOutcomes(state.pendingEvents).outcomes;
-      const wakeable = outcomes.filter(
+      if (state.wakeTimer || state.wakeRequested) return;
+      const outcomes = projectAgentOutcomes(state.pendingEvents).outcomes.filter(
         (outcome) => outcome.eventId > state.failedWakeThroughEventId,
       );
-      if (wakeable.length === 0 || state.wakeTimer || state.wakeRequested) return;
+
+      const wakeable = outcomes.filter((outcome) => {
+        const event = state.pendingEvents.find((pending) => pending.id === outcome.eventId);
+        return !event?.nextAttemptAt || event.nextAttemptAt <= Date.now();
+      });
+      if (wakeable.length === 0) {
+        const nextAttemptAt = outcomes
+          .map((outcome) => state.pendingEvents.find((event) => event.id === outcome.eventId)?.nextAttemptAt)
+          .filter((value): value is number => value !== undefined)
+          .sort((left, right) => left - right)[0];
+        if (nextAttemptAt !== undefined) {
+          state.wakeTimer = setTimeout(() => {
+            state.wakeTimer = undefined;
+            scheduleWake(ctx);
+          }, Math.max(0, nextAttemptAt - Date.now()));
+        }
+        return;
+      }
+
       if (state.deliveredBatch || ctx.isIdle?.() === false) {
         state.wakeDeferredUntilSettled = true;
         return;
@@ -414,9 +502,18 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     const addPendingEvents = (events: AgentEventWireRecord[], ctx: PiContext | undefined) => {
       const byId = new Map(state.pendingEvents.map((event) => [event.id, event]));
-      for (const event of events) byId.set(event.id, event);
-      state.pendingEvents = [...byId.values()].sort((left, right) => left.id - right.id);
+      let addedNewEvent = false;
+      for (const event of events) {
+        const previous = byId.get(event.id);
+        if (!previous) addedNewEvent = true;
+        byId.set(event.id, previous ? { ...event, ...previous } : event);
+      }
+      state.pendingEvents = [...byId.values()]
+        .filter((event) => event.id > state.failedWakeThroughEventId)
+        .sort((left, right) => left.id - right.id);
       setHerdsmanUi(ctx);
+      if (addedNewEvent && state.wakeTimer) cancelWakeTimer();
+      scheduleWake(ctx);
     };
 
     const applyConnectionStateResponse = (
@@ -777,29 +874,92 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           })) as { ackedEventId?: number; state?: { ackedEventId?: number } };
           pruneAcknowledgedEvents(ackResponse?.ackedEventId ?? ackResponse?.state?.ackedEventId);
           state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+          state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
           setHerdsmanUi(ctx);
         } catch (error) {
-          if (
-            error instanceof Error &&
-            /no longer pending|invalidated/i.test(error.message)
-          ) {
-            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id > event.id);
-            state.failedWakeThroughEventId = Math.max(
-              state.failedWakeThroughEventId,
-              ...batch.events.map((batchEvent) => batchEvent.id),
+          const failureCode = ackFailureCode(error);
+          const classification = classifyAckFailure(error);
+          const attempts = (event.attempts ?? 0) + 1;
+          const attemptedAt = Date.now();
+          const updatedEvent = {
+            ...event,
+            attempts,
+            lastAttemptAt: attemptedAt,
+            lastFailureCode: failureCode,
+          };
+          state.pendingEvents = state.pendingEvents.map((pending) =>
+            pending.id === event.id ? updatedEvent : pending,
+          );
+
+          if (classification === "terminal") {
+            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+            state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
+            if (/Only the current orchestrator can acknowledge notifications/i.test(failureCode)) {
+              state.isOrchestrator = false;
+              logHerdsmanPi(
+                "warn",
+                `[herdsman-pi] lost orchestrator ownership while acknowledging event ${event.id}`,
+              );
+            } else {
+              logHerdsmanPi(
+                "warn",
+                `[herdsman-pi] terminal acknowledgement failure eventId=${event.id} attempts=${attempts} code=${failureCode}`,
+              );
+            }
+            setHerdsmanUi(ctx);
+            continue;
+          }
+
+          if (attempts >= MAX_ACK_ATTEMPTS) {
+            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+            logHerdsmanPi(
+              "warn",
+              `[herdsman-pi] acknowledgement moved to dead-letter eventId=${event.id} attempts=${attempts} code=${failureCode}`,
             );
             setHerdsmanUi(ctx);
             continue;
           }
-          // Keep the event pending so the next Herdsman round retries the acknowledgement.
-          // Acknowledgement failure must not block delivery of the main turn.
+
+          if (classification === "resync") {
+            const resyncEvent = {
+              ...updatedEvent,
+              nextAttemptAt: attemptedAt + ackBackoffMs(attempts),
+            };
+            state.pendingEvents = state.pendingEvents.map((pending) =>
+              pending.id === event.id ? resyncEvent : pending,
+            );
+            try {
+              const response = (await state.client.request(
+                "agent.orchestrator.get",
+                {},
+              )) as ConnectionStateResponse;
+              // Refresh pending data without applying the full connection response: that
+              // helper schedules a new wake, which would make this failed batch race
+              // with the current settlement and can replay an earlier event. The
+              // failed event remains pending and the next wake is scheduled by
+              // finishBatch(), so this round performs no additional acknowledgements.
+              addPendingEvents(response.events ?? [], ctx);
+              pruneAcknowledgedEvents(response.state?.ackedEventId ?? response.ackedEventId);
+              setHerdsmanUi(ctx);
+            } catch (resyncError) {
+              logHerdsmanPi(
+                "warn",
+                `[herdsman-pi] acknowledgement resync failed eventId=${event.id} attempts=${attempts} code=${ackFailureCode(resyncError)}`,
+              );
+            }
+            break;
+          }
+
+          state.pendingEvents = state.pendingEvents.map((pending) =>
+            pending.id === event.id
+              ? { ...pending, nextAttemptAt: attemptedAt + ackBackoffMs(attempts) }
+              : pending,
+          );
           ctx.ui.notify?.(
             "Herdsman couldn’t acknowledge agent updates · updates remain pending",
             "warning",
           );
-          // Keep the event pending so a later delivery can retry it. A server-side
-          // rejection may mean the pane was invalidated; advancing the wake cursor
-          // here would make a reconnect skip a still-pending event.
+          setHerdsmanUi(ctx);
           break;
         }
       }
