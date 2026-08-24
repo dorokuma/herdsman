@@ -284,6 +284,14 @@ export class AgentEventStore {
           )
           .run(row.delivery_attempts + 1, now, terminalId, row.id);
       }
+      if (rows.length > 0) {
+        console.info("Herdsman agent event delivery reserved", {
+          firstEventId: rows[0]?.id,
+          lastEventId: rows.at(-1)?.id,
+          count: rows.length,
+          terminal: terminalId,
+        });
+      }
       return rows.map((row) => this.get(row.id));
     });
   }
@@ -299,7 +307,16 @@ export class AgentEventStore {
     });
   }
 
-  markAcked(id: number): void {
+  markAcked(id: number, scope?: { herdrSessionName: string; workspaceId: string }): void {
+    if (scope) {
+      this.#sqlite
+        .prepare(
+          `update agent_events set status = 'acked', deliverable = 0
+           where herdr_session_name = ? and workspace_id = ? and id <= ? and status in ('pending', 'delivered')`,
+        )
+        .run(scope.herdrSessionName, scope.workspaceId, id);
+      return;
+    }
     this.#sqlite
       .prepare(
         `update agent_events set status = 'acked', deliverable = 0 where id = ? and status in ('pending', 'delivered')`,

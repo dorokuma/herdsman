@@ -99,6 +99,20 @@ describe("agent event delivery lifecycle", () => {
     sqlite.close();
   });
 
+  test("acking a cursor marks older pending rows in the scope as acked", () => {
+    const harness = prepareHarness();
+    const low = appendEvent(harness);
+    const cursor = appendEvent(harness);
+    const high = appendEvent(harness);
+    harness.agentEvents.markAcked(cursor.id, { herdrSessionName: "default", workspaceId: "wA" });
+    expect(harness.sqlite.prepare("select id, status from agent_events order by id").all()).toEqual(
+      [
+        { id: low.id, status: "acked" },
+        { id: cursor.id, status: "acked" },
+        { id: high.id, status: "pending" },
+      ],
+    );
+  });
   test("two connections reserve the same pending batch without duplicate delivery", () => {
     const harness = prepareHarness();
     const event = appendEvent(harness);

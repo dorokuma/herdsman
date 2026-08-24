@@ -94,6 +94,35 @@ export class AgentOrchestratorService {
   }
 
   ack(input: AgentScope & { eventId: number; terminalId: string }): AgentOrchestratorState {
+    try {
+      return this.#ack(input);
+    } catch (error) {
+      if (error instanceof OrchestratorAckError) {
+        const state = this.#scopes.get(input);
+        let expectedNextEventId: number | null = null;
+        if (state?.owner?.terminalId === input.terminalId) {
+          expectedNextEventId =
+            this.#agentEvents.nextDeliverableAfter({
+              ...input,
+              afterEventId: state.ackedEventId,
+              ownerTerminalId: input.terminalId,
+              getAgent: (agentId) => this.#agents.get(agentId),
+            })?.id ?? null;
+        }
+        console.warn("Herdsman orchestrator ack rejected", {
+          eventId: input.eventId,
+          requestTerminal: input.terminalId,
+          expectedNextEventId,
+          code: error.code,
+          herdrSessionName: input.herdrSessionName,
+          workspaceId: input.workspaceId,
+        });
+      }
+      throw error;
+    }
+  }
+
+  #ack(input: AgentScope & { eventId: number; terminalId: string }): AgentOrchestratorState {
     const state = this.#scopes.get(input);
     if (!state?.owner || state.owner.terminalId !== input.terminalId) {
       throw new OrchestratorAckError({
@@ -159,7 +188,10 @@ export class AgentOrchestratorService {
         message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
       });
     }
-    this.#agentEvents.markAcked(input.eventId);
+    this.#agentEvents.markAcked(input.eventId, {
+      herdrSessionName: input.herdrSessionName,
+      workspaceId: input.workspaceId,
+    });
     return this.#scopes.ack(input);
   }
 

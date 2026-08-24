@@ -1,4 +1,9 @@
-## 0.8.2
+## 0.8.3
+
+- 增强 daemon 的 orchestrator ack 拒绝与事件投递结构化日志，记录拒绝原因、期望事件及投递批次摘要。
+- orchestrator 游标推进时批量清理游标以下遗留 pending/delivered 事件，避免垃圾行污染候选扫描。
+- 调查 register 重放、pending 列表来源及 AgentIndexService 上下文快照路径；未发现服务端缓存或重放已删除事件的路径。
+
 
 - Turn completion signal (route 2): the Pi extension now notifies the daemon after its own final assistant message is written to the session file (bounded stat fallback, timeout still signals with actual status), and the daemon waits up to a bounded window for that signal before emitting `agent.done` / `agent.blocked` events for Pi agents, refreshing the agent right before appending so outcomes carry a non-empty `lastAssistantMessage`. Older extensions that never signal keep working: the daemon times out and generates events as before with a warning.
 - 修复陈旧 turn-completion 信号被下一轮等待错误命中的竞态，仅接受等待开始后记录的新信号。
