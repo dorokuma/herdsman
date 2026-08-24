@@ -258,6 +258,16 @@ describe("empty database migration chain", () => {
     expect(sqlite.prepare("select count(*) as count from __drizzle_migrations").get()).toEqual({
       count: 8,
     });
+    const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
+      version: string;
+      entries: Array<{ tag: string; version: string }>;
+    };
+    expect(journal.entries.every((entry, index) => entry.version === (index < 6 ? "6" : "7"))).toBe(
+      true,
+    );
+    expect(journal.entries.find((entry) => entry.tag === "0007_moaning_guardian")?.version).toBe(
+      "7",
+    );
     sqlite.close();
   });
 });

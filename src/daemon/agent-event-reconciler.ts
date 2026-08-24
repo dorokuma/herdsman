@@ -85,9 +85,10 @@ export class AgentEventReconciler {
             pane.paneId === event.paneId &&
             (event.paneGeneration === null || pane.generation === event.paneGeneration),
         );
-        if (!present && this.#events.invalidateById(event.id, RECONCILE_REASON)) invalidated += 1;
+        if (!present && this.#events.deleteReconcileCandidate(event.id)) invalidated += 1;
       }
     }
+    invalidated += this.#events.deleteInvalidated();
     let released = 0;
     for (const scope of this.#scopes.listOwnedScopes()) {
       const panes = live.get(scope.herdrSessionName);

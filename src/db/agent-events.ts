@@ -147,6 +147,22 @@ export class AgentEventStore {
     return rows.map(mapAgentEvent);
   }
 
+  deleteReconcileCandidate(id: number): boolean {
+    return (
+      Number(
+        this.#sqlite
+          .prepare("delete from agent_events where id = ? and status in ('pending', 'delivered')")
+          .run(id).changes,
+      ) > 0
+    );
+  }
+
+  deleteInvalidated(): number {
+    return Number(
+      this.#sqlite.prepare("delete from agent_events where status = 'invalidated'").run().changes,
+    );
+  }
+
   invalidateById(id: number, reason: string): boolean {
     return (
       Number(

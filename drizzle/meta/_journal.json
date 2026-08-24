@@ -53,7 +53,7 @@
     },
     {
       "idx": 7,
-      "version": "6",
+      "version": "7",
       "when": 1787540446239,
       "tag": "0007_moaning_guardian",
       "breakpoints": true

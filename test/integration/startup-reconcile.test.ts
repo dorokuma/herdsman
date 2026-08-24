@@ -78,14 +78,11 @@ describe("startup reconcile dedicated coverage", () => {
       { pane_id: "wA:live", terminal_id: "term-live" },
     ]).reconcile();
     expect(result).toEqual({ invalidated: 2, released: 1 });
-    expect(harness.agentEvents.get(zombiePending.id)).toMatchObject({
-      status: "invalidated",
-      invalidatedReason: "PANE_NOT_PRESENT_RECONCILE",
-    });
-    expect(harness.agentEvents.get(zombieDelivered.id)).toMatchObject({
-      status: "invalidated",
-      invalidatedReason: "PANE_NOT_PRESENT_RECONCILE",
-    });
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id in (?, ?)")
+        .get(zombiePending.id, zombieDelivered.id),
+    ).toEqual({ count: 0 });
     expect(harness.agentEvents.get(liveEvent.id)).toMatchObject({ status: "pending" });
     expect(harness.agentOrchestratorScopes.get(scope)).toMatchObject({
       ackedEventId: 77,
@@ -93,6 +90,23 @@ describe("startup reconcile dedicated coverage", () => {
     });
   });
 
+  test("reconcile physically removes existing invalidated rows but preserves acked rows", async () => {
+    const { harness, append } = setup();
+    const invalidatedOne = append({ paneId: "wA:gone-1", terminalId: "term-1" });
+    const invalidatedTwo = append({ paneId: "wA:gone-2", terminalId: "term-2" });
+    const acked = append({ paneId: "wA:gone-acked", terminalId: "term-acked" });
+    harness.sqlite
+      .prepare("update agent_events set status = 'invalidated' where id in (?, ?)")
+      .run(invalidatedOne.id, invalidatedTwo.id);
+    harness.sqlite.prepare("update agent_events set status = 'acked' where id = ?").run(acked.id);
+    await reconciler(harness, []).reconcile();
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where status = 'invalidated'")
+        .get(),
+    ).toEqual({ count: 0 });
+    expect(harness.agentEvents.get(acked.id)).toMatchObject({ status: "acked" });
+  });
   test("b: snapshot failure makes no database changes and logs the skip", async () => {
     const { harness, append } = setup();
     const event = append({ paneId: "wA:gone", terminalId: "term-gone" });
@@ -170,7 +184,7 @@ describe("startup reconcile dedicated coverage", () => {
       harness.sqlite
         .prepare("select count(*) as count from agent_events where status = 'invalidated'")
         .get(),
-    ).toEqual({ count: 250 });
+    ).toEqual({ count: 0 });
   });
   test("c: reconciling the same state twice is idempotent", async () => {
     const { harness, append } = setup();

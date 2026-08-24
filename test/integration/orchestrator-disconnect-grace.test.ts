@@ -23,6 +23,49 @@ afterEach(async () => {
 const scope = { herdrSessionName: "default", workspaceId: "wB" };
 
 describe("orchestrator connection grace", () => {
+  test("heartbeat timeout destroys an idle terminal and releases its owner", async () => {
+    const scheduler = new ManualScheduler();
+    const { harness, orchestrator, server, socketPath } = await openServer(scheduler, {
+      heartbeatScanIntervalMs: 10,
+      heartbeatTimeoutMs: 1,
+    });
+    const owner = await RpcTestClient.connect(socketPath);
+    await register(owner, "owner");
+    await owner.request("agent.orchestrator.set", { enabled: true });
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    await new Promise((resolve) => setTimeout(resolve, 30));
+    expect(
+      server.isTerminalConnected({ herdrSessionName: "default", terminalId: "term_owner" }),
+    ).toBe(false);
+    expect(owner.socketDestroyed()).toBe(true);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    scheduler.advance(50);
+    expect(orchestrator.status(scope)?.owner).toBeNull();
+    owner.close();
+    harness.sqlite.close();
+  });
+
+  test("heartbeat activity keeps a terminal connected", async () => {
+    const scheduler = new ManualScheduler();
+    const { harness, orchestrator, server, socketPath } = await openServer(scheduler, {
+      heartbeatScanIntervalMs: 1,
+      heartbeatTimeoutMs: 30,
+    });
+    const owner = await RpcTestClient.connect(socketPath);
+    await register(owner, "owner");
+    await owner.request("agent.orchestrator.set", { enabled: true });
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    await owner.request("agent.orchestrator.get", {});
+    await new Promise((resolve) => setTimeout(resolve, 15));
+    expect(
+      server.isTerminalConnected({ herdrSessionName: "default", terminalId: "term_owner" }),
+    ).toBe(true);
+    expect(orchestrator.status(scope)?.owner?.terminalId).toBe("term_owner");
+    expect(owner.socketDestroyed()).toBe(false);
+    owner.close();
+    harness.sqlite.close();
+  });
+
   test("expires an absent owner and broadcasts after the disconnect grace", async () => {
     const scheduler = new ManualScheduler();
     const { harness, orchestrator, socketPath } = await openServer(scheduler);
@@ -144,10 +187,13 @@ describe("orchestrator connection grace", () => {
   });
 });
 
-async function openServer(scheduler: ManualScheduler) {
+async function openServer(
+  scheduler: ManualScheduler,
+  heartbeat?: { heartbeatScanIntervalMs: number; heartbeatTimeoutMs: number },
+) {
   const setup = createHarness();
   const orchestrator = createOrchestrator(setup.harness);
-  const started = await startServer(setup, orchestrator, scheduler);
+  const started = await startServer(setup, orchestrator, scheduler, heartbeat);
   return { ...setup, ...started, orchestrator };
 }
 
@@ -214,6 +260,7 @@ async function startServer(
   setup: ReturnType<typeof createHarness>,
   orchestrator: AgentOrchestratorService,
   scheduler: ManualScheduler,
+  heartbeat?: { heartbeatScanIntervalMs: number; heartbeatTimeoutMs: number },
 ) {
   const history = createAgentHistoryService({ cache: setup.harness.agentHistoryCache });
   const context = new AgentContextService({
@@ -225,8 +272,11 @@ async function startServer(
   });
   const server = new ObservabilityRpcServer({
     clearTimeout: (handle) => scheduler.clear(handle),
+    setInterval: (callback, delay) => setInterval(callback, delay),
     context,
     disconnectGraceMs: 50,
+    ...(heartbeat ? { heartbeatScanIntervalMs: heartbeat.heartbeatScanIntervalMs } : {}),
+    ...(heartbeat ? { heartbeatTimeoutMs: heartbeat.heartbeatTimeoutMs } : {}),
     history,
     orchestrator,
     setTimeout: (callback, delay) => scheduler.set(callback, delay),

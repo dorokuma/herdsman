@@ -37,6 +37,10 @@ export class RpcTestClient {
     return client;
   }
 
+  socketDestroyed(): boolean {
+    return this.#socket.destroyed;
+  }
+
   close(): void {
     this.#socket.destroy();
   }

@@ -42,6 +42,8 @@ import {
 
 export const DISCONNECT_GRACE_MS = 5_000;
 export const STARTUP_RECONNECT_GRACE_MS = 10_000;
+export const TERMINAL_HEARTBEAT_TIMEOUT_MS = 90_000;
+export const TERMINAL_HEARTBEAT_SCAN_INTERVAL_MS = 30_000;
 
 type RpcRequest = { id?: number | string; method?: string; params?: unknown };
 
@@ -67,12 +69,15 @@ type AgentOrchestratorConnectionStateResult = {
 };
 
 type TimerHandle = ReturnType<typeof setTimeout>;
+type IntervalHandle = ReturnType<typeof setInterval>;
 
 type GraceTimer = {
   handle: TimerHandle;
 };
 
 export class ObservabilityRpcServer {
+  readonly #clearInterval: (handle: IntervalHandle) => void;
+  readonly #setInterval: (callback: () => void, delay: number) => IntervalHandle;
   readonly #clearTimeout: (handle: TimerHandle) => void;
   readonly #context: AgentContextService;
   readonly #connectionOrderBySocket = new Map<Socket, number>();
@@ -80,6 +85,10 @@ export class ObservabilityRpcServer {
   readonly #disconnectGraceMs: number;
   readonly #disconnectTimers = new Map<string, GraceTimer>();
   readonly #history: AgentHistoryService;
+  readonly #heartbeatScanIntervalMs: number;
+  readonly #heartbeatTimeoutMs: number;
+  readonly #lastActivityByTerminal = new Map<string, number>();
+  #heartbeatTimer: IntervalHandle | undefined;
   readonly #now: () => number;
   readonly #orchestrator: AgentOrchestratorService;
   readonly #piPresenceBySocket = new Map<Socket, PiPresence>();
@@ -104,9 +113,13 @@ export class ObservabilityRpcServer {
   #stopping = false;
 
   constructor(options: {
+    clearInterval?: (handle: IntervalHandle) => void;
+    setInterval?: (callback: () => void, delay: number) => IntervalHandle;
     clearTimeout?: (handle: TimerHandle) => void;
     context: AgentContextService;
     disconnectGraceMs?: number;
+    heartbeatScanIntervalMs?: number;
+    heartbeatTimeoutMs?: number;
     history: AgentHistoryService;
     now?: () => number;
     orchestrator: AgentOrchestratorService;
@@ -125,9 +138,14 @@ export class ObservabilityRpcServer {
     connectedTerminal?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
     stores: AgentStores;
   }) {
+    this.#clearInterval = options.clearInterval ?? clearInterval;
+    this.#setInterval = options.setInterval ?? setInterval;
     this.#clearTimeout = options.clearTimeout ?? clearTimeout;
     this.#context = options.context;
     this.#disconnectGraceMs = options.disconnectGraceMs ?? DISCONNECT_GRACE_MS;
+    this.#heartbeatScanIntervalMs =
+      options.heartbeatScanIntervalMs ?? TERMINAL_HEARTBEAT_SCAN_INTERVAL_MS;
+    this.#heartbeatTimeoutMs = options.heartbeatTimeoutMs ?? TERMINAL_HEARTBEAT_TIMEOUT_MS;
     this.#history = options.history;
     this.#now = options.now ?? Date.now;
     this.#orchestrator = options.orchestrator;
@@ -153,11 +171,19 @@ export class ObservabilityRpcServer {
         resolve();
       });
     });
+    this.#heartbeatTimer = this.#setInterval(
+      () => this.#scanHeartbeats(),
+      this.#heartbeatScanIntervalMs,
+    );
     this.#armStartupGrace();
   }
 
   async stop(): Promise<void> {
     this.#stopping = true;
+    if (this.#heartbeatTimer) {
+      this.#clearInterval(this.#heartbeatTimer);
+      this.#heartbeatTimer = undefined;
+    }
     this.#clearGraceTimers(this.#disconnectTimers);
     this.#clearGraceTimers(this.#startupTimers);
     for (const socket of this.#sockets) socket.destroy();
@@ -268,6 +294,7 @@ export class ObservabilityRpcServer {
     socket.on("data", (chunk) => {
       try {
         for (const message of decoder.push(chunk.toString("utf8"))) {
+          this.#markTerminalActivity(socket);
           void this.#handleRequest(socket, message as RpcRequest);
         }
       } catch (error) {
@@ -341,6 +368,7 @@ export class ObservabilityRpcServer {
         if (previous) this.#unregisterTerminalSocket(socket, previous);
         this.#piPresenceBySocket.set(socket, presence);
         this.#registerTerminalSocket(socket, presence);
+        this.#lastActivityByTerminal.set(terminalPresenceKey(presence), this.#now());
         this.#cancelGraceForTerminal(presence);
         if (previous && terminalPresenceKey(previous) !== terminalPresenceKey(presence)) {
           this.#scheduleDisconnect(previous);
@@ -570,7 +598,24 @@ export class ObservabilityRpcServer {
     const key = terminalPresenceKey(presence);
     const sockets = this.#socketsByTerminal.get(key);
     sockets?.delete(socket);
-    if (sockets?.size === 0) this.#socketsByTerminal.delete(key);
+    if (sockets?.size === 0) {
+      this.#socketsByTerminal.delete(key);
+      this.#lastActivityByTerminal.delete(key);
+    }
+  }
+
+  #markTerminalActivity(socket: Socket): void {
+    const presence = this.#piPresenceBySocket.get(socket);
+    if (presence) this.#lastActivityByTerminal.set(terminalPresenceKey(presence), this.#now());
+  }
+
+  #scanHeartbeats(): void {
+    if (this.#stopping) return;
+    const cutoff = this.#now() - this.#heartbeatTimeoutMs;
+    for (const [key, lastActivity] of this.#lastActivityByTerminal) {
+      if (lastActivity >= cutoff) continue;
+      for (const socket of this.#socketsByTerminal.get(key) ?? []) socket.destroy();
+    }
   }
 
   /** Authoritative live Pi connection registry; intentionally empty after daemon startup. */
