@@ -1,6 +1,6 @@
 {
   "name": "herdsman-herdr-plugin",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "description": "Herdr companion plugin for Herdsman agent history. Forked from @ryonakae/herdsman.",
   "private": true,
   "license": "MIT",
