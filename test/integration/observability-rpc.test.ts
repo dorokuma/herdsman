@@ -91,7 +91,7 @@ describe("ObservabilityRpcServer", () => {
   });
 
   test("records pi turn completion signals and validates their params", async () => {
-    const registry = new TurnCompletionRegistry();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 1_000 });
     const { client, harness } = await openServer({ turnCompletions: registry });
     seedAgent(harness);
     await client.request("agent.orchestrator.register", {

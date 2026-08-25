@@ -183,7 +183,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     );
     harness.sqlite.close();
   });
-  test("retries three times after a received turn signal when history is still empty", async () => {
+  test("retries eight times after a received turn signal when history is still empty", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
     let calls = 0;
@@ -222,7 +222,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     }, 10);
 
     const result = await pending;
-    expect(calls).toBe(5);
+    expect(calls).toBe(10);
     expect(result.events).toContainEqual(
       expect.objectContaining({
         compactHistory: expect.objectContaining({ lastAssistantMessage: null }),
@@ -259,7 +259,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     await index.refreshHerdrSession(sessionInput());
     calls = 0;
     const result = await index.handleHerdrEvent(doneEvent);
-    expect(calls).toBe(4);
+    expect(calls).toBe(9);
     expect(result.events).toContainEqual(
       expect.objectContaining({
         compactHistory: expect.objectContaining({ lastAssistantMessage: null }),

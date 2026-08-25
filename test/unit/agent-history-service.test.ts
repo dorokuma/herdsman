@@ -104,7 +104,12 @@ describe("agent history service", () => {
   test("returns a fresh cached compact history without reading its preferred ref", async () => {
     const path = await sourceFile("cached.jsonl");
     const preferred = ref(path);
-    const cached = { ...emptyCompactHistory("pi-jsonl"), historyRef: preferred, messageCount: 4 };
+    const cached = {
+      ...emptyCompactHistory("pi-jsonl"),
+      historyRef: preferred,
+      lastAssistantMessage: { ref: "cached", text: "cached result", timestamp: null },
+      messageCount: 4,
+    };
     const fixture = service({
       cache: {
         getFresh: () => ({ compactHistory: cached }) as never,
@@ -148,19 +153,45 @@ describe("agent history service", () => {
     });
   });
 
-  test("does not cache compact history when no assistant message is present", async () => {
+  test("does not cache compact history when no assistant message is present, then rereads after the file is complete", async () => {
     const path = await sourceFile("no-assistant.jsonl");
     const put = vi.fn();
+    const readerOptions = { noAssistant: true };
     const fixture = service({
       cache: { getFresh: () => undefined, put },
       discovered: null,
-      reader: reader({ noAssistant: true }),
+      reader: reader(readerOptions),
+    });
+
+    const first = await fixture.service.readCompactRef(ref(path));
+    readerOptions.noAssistant = false;
+    const second = await fixture.service.readCompactRef(ref(path));
+
+    expect(first.compactHistory.lastAssistantMessage).toBeNull();
+    expect(second.compactHistory.lastAssistantMessage).toEqual(
+      expect.objectContaining({ text: "done" }),
+    );
+    expect(put).toHaveBeenCalledTimes(1);
+    expect(fixture.reader.compactRefs).toHaveLength(2);
+  });
+
+  test("ignores a cached compact history without an assistant message", async () => {
+    const path = await sourceFile("cached-no-assistant.jsonl");
+    const cached = { ...emptyCompactHistory("pi-jsonl"), historyRef: ref(path) };
+    const fixture = service({
+      cache: {
+        getFresh: () => ({ compactHistory: cached }) as never,
+        put: () => undefined as never,
+      },
+      discovered: null,
     });
 
     const result = await fixture.service.readCompactRef(ref(path));
 
-    expect(result.compactHistory.lastAssistantMessage).toBeNull();
-    expect(put).not.toHaveBeenCalled();
+    expect(result.compactHistory.lastAssistantMessage).toEqual(
+      expect.objectContaining({ text: "done" }),
+    );
+    expect(fixture.reader.compactRefs).toHaveLength(1);
   });
   test("uses the OpenCode DB path for fingerprints while preserving the session id", async () => {
     const path = await sourceFile("opencode.db");

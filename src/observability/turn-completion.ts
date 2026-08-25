@@ -1,4 +1,4 @@
-export const TURN_SIGNAL_WAIT_MS = 3_000;
+export const TURN_SIGNAL_WAIT_MS = 5_000;
 export const TURN_SIGNAL_RETENTION_MS = 10 * 60_000;
 
 export type TurnCompletionSignal = {

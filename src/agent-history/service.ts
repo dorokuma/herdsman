@@ -72,7 +72,7 @@ export function createAgentHistoryService(
       sourcePath: cacheSourcePath,
       sourceSize: sourceFingerprint.size,
     });
-    if (cached) {
+    if (cached && cached.compactHistory.lastAssistantMessage !== null) {
       return { compactHistory: cached.compactHistory, historyRef, sourceFingerprint };
     }
 

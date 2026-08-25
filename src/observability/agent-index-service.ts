@@ -467,10 +467,10 @@ export class AgentIndexService {
         });
         for (
           let attempt = 0;
-          attempt < 3 && refreshed.snapshot.compactHistory.lastAssistantMessage === null;
+          attempt < 8 && refreshed.snapshot.compactHistory.lastAssistantMessage === null;
           attempt += 1
         ) {
-          await new Promise((resolve) => setTimeout(resolve, 300));
+          await new Promise((resolve) => setTimeout(resolve, 500));
           refreshed = await this.#context.refreshAgent({
             agent: input.agent,
             identityChanged: false,
@@ -489,10 +489,10 @@ export class AgentIndexService {
       } else {
         for (
           let attempt = 0;
-          attempt < 3 && compactHistory.lastAssistantMessage === null;
+          attempt < 8 && compactHistory.lastAssistantMessage === null;
           attempt += 1
         ) {
-          await new Promise((resolve) => setTimeout(resolve, 300));
+          await new Promise((resolve) => setTimeout(resolve, 500));
           const refreshed = await this.#context.refreshAgent({
             agent: input.agent,
             identityChanged: false,
