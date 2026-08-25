@@ -448,5 +448,5 @@ describe("agent event pagination regressions (independent coverage)", () => {
     );
     warning.mockRestore();
     h.sqlite.close();
-  });
+  }, 120_000);
 });

@@ -1064,32 +1064,9 @@ describe("herdsman-pi orchestrator bridge", () => {
       });
 
       await vi.advanceTimersByTimeAsync(499);
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
       await vi.advanceTimersByTimeAsync(1);
-      expect(pi.customMessages).toEqual([
-        [
-          {
-            content: "Herdsman received 1 agent update.",
-            customType: "herdsman-wake",
-            details: {
-              eventIds: [43],
-              outcomes: [
-                {
-                  agent: "claude",
-                  eventId: 43,
-                  kind: type === "agent.blocked" ? "blocked" : "completed",
-                  name: "reviewer",
-                  paneId: "wB:p-agent",
-                  terminalId: "term_agent",
-                  text: "done",
-                },
-              ],
-            },
-            display: true,
-          },
-          { deliverAs: "followUp" },
-        ],
-      ]);
+      expect(pi.customMessages).toEqual([]);
       expect(pi.hiddenMessages).toEqual([
         [
           {
@@ -1119,7 +1096,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       const send = pi.sendMessage;
       pi.sendMessage = (message, options) => {
         send?.call(pi, message, options);
-        if ((message as { customType?: string }).customType === "herdsman-wake") {
+        if ((message as { customType?: string }).customType === "herdsman-wake-context") {
           client.emitStream({
             method: "agent.event",
             params: {
@@ -1135,7 +1112,7 @@ describe("herdsman-pi orchestrator bridge", () => {
         },
       });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1161,7 +1138,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       }
       await vi.advanceTimersByTimeAsync(1_000);
 
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1169,7 +1146,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("coalesces multiple outcomes into one visible wake", async () => {
+  test("coalesces multiple outcomes into one hidden wake context", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
@@ -1184,15 +1161,15 @@ describe("herdsman-pi orchestrator bridge", () => {
       });
       await vi.advanceTimersByTimeAsync(500);
 
-      expect(pi.customMessages).toMatchObject([
+      expect(pi.hiddenMessages).toMatchObject([
         [
           {
-            content: "Herdsman received 2 agent updates.",
-            customType: "herdsman-wake",
-            details: { eventIds: [51, 52], outcomes: [{ eventId: 51 }, { eventId: 52 }] },
-            display: true,
+            content: expect.stringContaining("HERDSMAN AGENT UPDATES"),
+            customType: "herdsman-wake-context",
+            details: { eventIds: [51, 52] },
+            display: false,
           },
-          { deliverAs: "followUp" },
+          { deliverAs: "followUp", triggerTurn: true },
         ],
       ]);
     } finally {
@@ -1218,7 +1195,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.emitStream({ method: "agent.event", params: { event: event(53, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
 
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
       expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
       expect(ctx.notifications.at(-1)).toEqual([
         "Herdsman couldn’t load agent updates · updates remain pending",
@@ -1241,12 +1218,12 @@ describe("herdsman-pi orchestrator bridge", () => {
       await startExtension(client, pi, ctx);
       client.emitStream({ method: "agent.event", params: { event: event(61, "term_agent") } });
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
 
       ctx.setIdle(true);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1271,7 +1248,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       await vi.advanceTimersByTimeAsync(500);
 
       expect(
-        pi.customMessages.map(([message]) => (message.details as { eventIds: number[] }).eventIds),
+        pi.hiddenMessages.map(([message]) => (message.details as { eventIds: number[] }).eventIds),
       ).toEqual([[71], [72]]);
     } finally {
       vi.clearAllTimers();
@@ -1300,11 +1277,11 @@ describe("herdsman-pi orchestrator bridge", () => {
             method === "agent.notifications.ack" && (params as { eventId: number }).eventId === 81,
         ),
       ).toHaveLength(1);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
       client.emitStream({ method: "agent.event", params: { event: event(82, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(2);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [82] } });
+      expect(pi.hiddenMessages).toHaveLength(2);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [82] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1339,7 +1316,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       await startExtension(client, pi, ctx);
       client.emitStream({ method: "agent.event", params: { event: event(eventId, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
 
       await pi.emit("agent_start", {}, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
@@ -1353,7 +1330,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       expect(ackCalls()).toHaveLength(1);
 
       await vi.advanceTimersByTimeAsync(30_000);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
       expect(ackCalls()).toHaveLength(1);
     } finally {
       vi.clearAllTimers();
@@ -1381,11 +1358,11 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toHaveLength(2);
+      expect(pi.hiddenMessages).toHaveLength(2);
 
       client.emitStream({ method: "agent.event", params: { event: event(87, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(2);
+      expect(pi.hiddenMessages).toHaveLength(2);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1426,15 +1403,15 @@ describe("herdsman-pi orchestrator bridge", () => {
           ),
         ).toHaveLength(attempt);
         if (attempt < MAX_ACK_ATTEMPTS)
-          expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
+          expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
       }
       const count = client.calls.length;
-      const wakes = pi.customMessages.length;
+      const wakes = pi.hiddenMessages.length;
       const followUp = event(903, "term_agent");
       client.emitStream({ method: "agent.event", params: { event: followUp } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages.length).toBe(wakes + 1);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({
+      expect(pi.hiddenMessages.length).toBe(wakes + 1);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({
         details: { eventIds: [followUp.id] },
       });
       await pi.emit("agent_start", {}, ctx);
@@ -1521,14 +1498,14 @@ describe("herdsman-pi orchestrator bridge", () => {
       await vi.advanceTimersByTimeAsync(500);
       await settleWake();
       expect(ackCount()).toBe(5);
-      const wakes = pi.customMessages.length;
+      const wakes = pi.hiddenMessages.length;
       await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
       expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
-      expect(pi.customMessages.length).toBe(wakes);
+      expect(pi.hiddenMessages.length).toBe(wakes);
       const followUp = event(904, "term_agent");
       client.emitStream({ method: "agent.event", params: { event: followUp } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({
         details: { eventIds: [followUp.id] },
       });
       await settleWake();
@@ -1539,10 +1516,10 @@ describe("herdsman-pi orchestrator bridge", () => {
         ),
       ).toHaveLength(1);
       expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
-      const wakesAfterFollowUp = pi.customMessages.length;
+      const wakesAfterFollowUp = pi.hiddenMessages.length;
       await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
       expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
-      expect(pi.customMessages.length).toBe(wakesAfterFollowUp);
+      expect(pi.hiddenMessages.length).toBe(wakesAfterFollowUp);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1571,18 +1548,18 @@ describe("herdsman-pi orchestrator bridge", () => {
       await startExtension(client, pi, ctx);
       client.emitStream({ method: "agent.event", params: { event: pending } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
 
       client.disconnect();
       await client.connect();
       await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
       await pi.emit("agent_settled", {}, ctx);
 
       client.emitStream({ method: "agent.event", params: { event: event(89, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(2);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [88, 89] } });
+      expect(pi.hiddenMessages).toHaveLength(2);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [88, 89] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1600,8 +1577,8 @@ describe("herdsman-pi orchestrator bridge", () => {
       await startExtension(client, pi, ctx);
       await vi.advanceTimersByTimeAsync(500);
 
-      expect(pi.customMessages).toHaveLength(1);
-      expect(pi.customMessages[0]?.[0]).toMatchObject({ details: { eventIds: [91] } });
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({ details: { eventIds: [91] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1632,8 +1609,8 @@ describe("herdsman-pi orchestrator bridge", () => {
 
       await startExtension(secondClient, secondPi, secondCtx);
       await vi.advanceTimersByTimeAsync(500);
-      expect(secondPi.customMessages).toHaveLength(1);
-      expect(secondPi.customMessages[0]?.[0]).toMatchObject({ details: { eventIds: [96] } });
+      expect(secondPi.hiddenMessages).toHaveLength(1);
+      expect(secondPi.hiddenMessages[0]?.[0]).toMatchObject({ details: { eventIds: [96] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1660,7 +1637,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       const normalContext = await pi.emitContext([], ctx);
       await vi.advanceTimersByTimeAsync(250);
 
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
       expect(normalContext).toEqual([
         expect.objectContaining({ content: expect.stringContaining("[HERDSMAN AGENT CONTEXT]") }),
       ]);
@@ -1673,7 +1650,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       ctx.setIdle(true);
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
 
       await pi.emit("agent_start", {}, ctx);
       expect(
@@ -1714,8 +1691,8 @@ describe("herdsman-pi orchestrator bridge", () => {
       await vi.advanceTimersByTimeAsync(500);
       await vi.advanceTimersByTimeAsync(500);
 
-      expect(pi.customMessages).toHaveLength(1);
-      expect(pi.customMessages[0]?.[0]).toMatchObject({ details: { eventIds: [104] } });
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({ details: { eventIds: [104] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1759,7 +1736,7 @@ describe("herdsman-pi orchestrator bridge", () => {
 
       expect(client.calls).not.toContainEqual(["agent.notifications.ack", { eventId: 105 }]);
       expect(
-        pi.customMessages.map(([message]) => (message.details as { eventIds: number[] }).eventIds),
+        pi.hiddenMessages.map(([message]) => (message.details as { eventIds: number[] }).eventIds),
       ).toEqual([[105], [106]]);
     } finally {
       vi.clearAllTimers();
@@ -1800,8 +1777,8 @@ describe("herdsman-pi orchestrator bridge", () => {
       });
       await vi.advanceTimersByTimeAsync(500);
 
-      expect(pi.customMessages).toHaveLength(1);
-      expect(pi.customMessages[0]?.[0]).toMatchObject({ details: { eventIds: [108] } });
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({ details: { eventIds: [108] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1847,7 +1824,7 @@ describe("herdsman-pi orchestrator bridge", () => {
 
       expect(ctx.aborts).toBe(0);
       expect(
-        pi.customMessages.map(([message]) => (message.details as { eventIds: number[] }).eventIds),
+        pi.hiddenMessages.map(([message]) => (message.details as { eventIds: number[] }).eventIds),
       ).toEqual([[109], [110]]);
     } finally {
       vi.clearAllTimers();
@@ -1871,7 +1848,7 @@ describe("herdsman-pi orchestrator bridge", () => {
         params: { change: roleChange("term_pi", "term_other", "wB:p-other") },
       });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
       expect(ctx.aborts).toBe(0);
 
       client.emitStream({
@@ -1934,7 +1911,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       await vi.advanceTimersByTimeAsync(500);
 
       expect(ctx.statuses.get("herdsman")).toBeUndefined();
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1981,8 +1958,8 @@ describe("herdsman-pi disconnect regression (independent coverage)", () => {
       await startExtension(client, pi, ctx);
       client.emitStream({ method: "agent.event", params: { event: event(201, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
-      expect(pi.customMessages[0]?.[0]).toMatchObject({ details: { eventIds: [201] } });
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({ details: { eventIds: [201] } });
 
       client.disconnect(new Error("transient disconnect"));
       expect(ctx.aborts).toBe(0);
@@ -1990,7 +1967,7 @@ describe("herdsman-pi disconnect regression (independent coverage)", () => {
       await client.connect();
       client.emitStream({ method: "agent.event", params: { event: event(202, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -2020,10 +1997,10 @@ describe("pi transient reconnect cursor regression (independent coverage)", () =
     try {
       await startExtension(client, pi, ctx);
       client.disconnect(new Error("transient disconnect"));
-      expect(pi.customMessages).toEqual([]);
+      expect(pi.hiddenMessages).toEqual([]);
       await client.connect();
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages).toHaveLength(1);
+      expect(pi.hiddenMessages).toHaveLength(1);
       await pi.emit("agent_start", {}, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
@@ -2032,7 +2009,7 @@ describe("pi transient reconnect cursor regression (independent coverage)", () =
       ]);
       client.emitStream({ method: "agent.event", params: { event: event(221, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [221] } });
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [221] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -2072,7 +2049,7 @@ describe("pi transient reconnect cursor regression (independent coverage)", () =
       ]);
       client.emitStream({ method: "agent.event", params: { event: event(204, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({
         details: { eventIds: [202, 203, 204] },
       });
     } finally {
@@ -2120,7 +2097,7 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
 
       client.emitStream({ method: "agent.event", params: { event: event(303, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [303] } });
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [303] } });
       expect(pi.hiddenMessages.some(([, options]) => options?.triggerTurn)).toBe(true);
     } finally {
       vi.clearAllTimers();
@@ -2192,7 +2169,7 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
 
       client.emitStream({ method: "agent.event", params: { event: event(314, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [313, 314] } });
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [313, 314] } });
       expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
         ["agent.notifications.ack", { eventId: 311 }],
         ["agent.notifications.ack", { eventId: 313 }],
@@ -2213,8 +2190,8 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
     try {
       await startExtension(client, pi, ctx);
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [322] } });
-      expect(pi.customMessages.at(-1)?.[0]).not.toMatchObject({ details: { eventIds: [321] } });
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [322] } });
+      expect(pi.hiddenMessages.at(-1)?.[0]).not.toMatchObject({ details: { eventIds: [321] } });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

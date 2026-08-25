@@ -290,9 +290,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.wakeRequestedThroughEventId = 0;
     };
 
-    const wakeLabel = (count: number) =>
-      `Herdsman received ${count} agent update${count === 1 ? "" : "s"}.`;
-
     const clearAgentContext = () => {
       state.latestContext = undefined;
       state.pinnedContext = undefined;
@@ -436,22 +433,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
               },
               { deliverAs: "followUp", triggerTurn: true },
             );
-            // Keep the visible receipt passive: the hidden, substantive update
-            // above is the single message that starts the turn. This prevents a
-            // shell receipt from becoming an independent wake.
-            pi.sendMessage?.(
-              {
-                content: wakeLabel(current.length),
-                customType: "herdsman-wake",
-                details: {
-                  eventIds: current.map((outcome) => outcome.eventId),
-                  outcomes: current,
-                } satisfies AgentUpdateMessageDetails,
-                display: true,
-              },
-              { deliverAs: "followUp" },
-            );
-            // Only expose the batch after both messages were accepted by pi. This
+            // Only expose the batch after the hidden context was accepted by pi. This
             // keeps an injection failure eligible for daemon redelivery.
             state.deliveredBatch = deliveredBatch;
             state.wakeRequested = false;

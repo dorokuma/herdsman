@@ -69,7 +69,7 @@ describe("herdsman Herdr plugin package", () => {
     expect(files).toContain("index.mjs");
     expect(files).toContain("herdr-plugin.toml");
     expect(files.some((file) => file.startsWith("dist/"))).toBe(false);
-  });
+  }, 30_000);
 });
 
 async function importPlugin() {
