@@ -1,3 +1,8 @@
+## 0.8.6
+
+- 修复事件查询 SQL 括号与 legacy close 全量失效；持久化隔离 Grok HOME，并加强 runtime record、session 路径所有权校验。
+- 修复 wake 请求发送空窗与 turn 信号重复消费；启动 reconcile 不释放 owner，补齐 runtime record 与 session 校验回归测试。
+
 ## 0.8.5
 
 - 修复空 assistant 历史回传、用户 ESC 后事件无限重传，以及收敛前重复 reclaim 投递。
