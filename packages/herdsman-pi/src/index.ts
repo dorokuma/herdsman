@@ -302,6 +302,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.pendingEvents = state.pendingEvents.filter((event) => event.id > ackedEventId);
     };
 
+    const isWakeableEvent = (event: AgentEventWireRecord | undefined) =>
+      !event?.nextAttemptAt || event.nextAttemptAt <= Date.now();
+
     const applyOwnerContext = (response: ConnectionStateResponse) => {
       state.latestContext = isLocalOwner(response) ? response.context ?? undefined : undefined;
     };
@@ -313,10 +316,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         (outcome) => outcome.eventId > state.failedWakeThroughEventId,
       );
 
-      const wakeable = outcomes.filter((outcome) => {
-        const event = state.pendingEvents.find((pending) => pending.id === outcome.eventId);
-        return !event?.nextAttemptAt || event.nextAttemptAt <= Date.now();
-      });
+      const wakeable = outcomes.filter((outcome) =>
+        isWakeableEvent(state.pendingEvents.find((pending) => pending.id === outcome.eventId)),
+      );
       if (wakeable.length === 0) {
         const nextAttemptAt = outcomes
           .map((outcome) => state.pendingEvents.find((event) => event.id === outcome.eventId)?.nextAttemptAt)
@@ -399,7 +401,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
           const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
           const batchOutcomes = projectAgentOutcomes(batchEvents).outcomes.filter(
-            (outcome) => outcome.eventId > state.failedWakeThroughEventId,
+            (outcome) =>
+              outcome.eventId > state.failedWakeThroughEventId &&
+              isWakeableEvent(batchEvents.find((event) => event.id === outcome.eventId)),
           );
           if (batchOutcomes.length === 0) {
             state.wakeTimer = undefined;
@@ -977,6 +981,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
           if (attempts >= MAX_ACK_ATTEMPTS) {
             state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+            state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
             logHerdsmanPi(
               "warn",
               `[herdsman-pi] acknowledgement moved to dead-letter eventId=${event.id} attempts=${attempts} code=${failureCode}`,

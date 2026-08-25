@@ -230,6 +230,9 @@ export class ObservabilityRpcServer {
     if (!event.workspaceId || !event.terminalId || !event.agentId) return;
     // Status changes are persisted for history but never routed as worker wake events.
     if (event.type === "agent.status.changed") return;
+    if ((event.status !== "pending" && event.status !== "delivered") || event.deliverable !== 1) {
+      return;
+    }
     const scope = { herdrSessionName: event.herdrSessionName, workspaceId: event.workspaceId };
     const owner = this.#orchestrator.status(scope)?.owner;
     if (!owner || event.terminalId === owner.terminalId) return;
