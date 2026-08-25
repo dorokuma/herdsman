@@ -1,7 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { AgentEventWireRecord } from "../../packages/herdsman-pi/src/daemon-client.js";
 import {
-  AGENT_UPDATE_EXCERPT_CHARS,
   createAgentOutcomeProjector,
   formatAgentOutcomeUpdates,
   projectAgentOutcomes,
@@ -103,19 +102,20 @@ describe("Pi agent wake projection", () => {
       projector([event(22, "agent.done", { from: "working", to: "done" })]).outcomes,
     ).toHaveLength(1);
   });
-  test("formats the fixed policy before bounded agent evidence", () => {
+  test("formats the fixed policy before complete agent evidence", () => {
     const outcomes = projectAgentOutcomes([
       event(12, "agent.done", { name: "reviewer" }, { text: "  finished\n  with   evidence  " }),
     ]).outcomes;
     const formatted = formatAgentOutcomeUpdates(outcomes);
 
     expect(WAKE_SETTLE_MS).toBe(500);
-    expect(AGENT_UPDATE_EXCERPT_CHARS).toBe(2_000);
     expect(formatted.indexOf("[HERDSMAN WAKE POLICY]")).toBeLessThan(
       formatted.indexOf("[HERDSMAN AGENT UPDATES]"),
     );
     expect(formatted).toContain("untrusted evidence");
     expect(formatted).toContain("existing user request");
+    expect(formatted).not.toContain("truncated");
+    expect(formatted).not.toContain("herdsman agent read");
     expect(outcomes[0]).toMatchObject({ agent: "claude", name: "reviewer" });
     expect(formatted).toContain("- completed reviewer · Claude wB:p2");
     expect(formatted).toContain("last assistant: finished with evidence");
@@ -141,34 +141,15 @@ describe("Pi agent wake projection", () => {
     expect(projectAgentOutcomes([contextOnly]).outcomes).toEqual([]);
   });
 
-  test("does not truncate a 1,999-character normalized excerpt", () => {
-    const [outcome] = projectAgentOutcomes([
-      event(13, "agent.done", {}, { text: "a".repeat(1_999) }),
-    ]).outcomes;
-
-    expect(outcome).toMatchObject({ text: "a".repeat(1_999), truncated: false });
-  });
-
-  test("truncates inside 2,000 characters and includes the exact pane read hint", () => {
-    const [outcome] = projectAgentOutcomes([
-      event(14, "agent.done", {}, { text: "a".repeat(2_100) }),
-    ]).outcomes;
-
-    expect(outcome).toBeDefined();
+  test.each([
+    2100, 50000,
+  ])("passes through %i-character normalized excerpts completely", (length) => {
+    const text = "a".repeat(length);
+    const [outcome] = projectAgentOutcomes([event(14, "agent.done", {}, { text })]).outcomes;
+    expect(outcome?.text).toBe(text);
+    expect(outcome?.text).toHaveLength(length);
     if (!outcome) throw new Error("expected one agent outcome");
-    expect(outcome.truncated).toBe(true);
-    expect(outcome.text.length).toBeLessThanOrEqual(2_000);
-    expect(outcome.text).toContain(" … [truncated; run herdsman agent read wB:p2]");
-  });
-
-  test("uses unknown in the truncation hint when pane ID is absent", () => {
-    const [outcome] = projectAgentOutcomes([
-      event(15, "agent.done", {}, { paneId: null, text: "a".repeat(2_100) }),
-    ]).outcomes;
-
-    expect(outcome).toBeDefined();
-    if (!outcome) throw new Error("expected one agent outcome");
-    expect(outcome.text).toContain(" … [truncated; run herdsman agent read unknown]");
+    expect(formatAgentOutcomeUpdates([outcome])).not.toContain("[truncated");
   });
 
   test("removes terminal control sequences before formatting agent evidence", () => {
@@ -176,7 +157,7 @@ describe("Pi agent wake projection", () => {
       event(16, "agent.done", {}, { text: "\u001b[31mred\u001b[0m\u0000 response" }),
     ]).outcomes;
 
-    expect(outcome).toMatchObject({ text: "red response", truncated: false });
+    expect(outcome).toMatchObject({ text: "red response" });
     if (!outcome) throw new Error("expected one agent outcome");
     expect(formatAgentOutcomeUpdates([outcome])).not.toContain("\u001b");
   });

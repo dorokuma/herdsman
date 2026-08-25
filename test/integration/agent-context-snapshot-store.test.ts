@@ -109,20 +109,21 @@ describe("AgentContextSnapshotStore", () => {
     expect(snapshot.compactHistory.historyRef).toBeNull();
   });
 
-  test("truncates excerpts over 2000 characters while preserving shorter excerpts", () => {
+  test("round-trips long excerpts without truncation", () => {
     const { agent, agentContextSnapshots } = createAgent();
     const input = snapshotInput(agent.id);
-    const longText = "x".repeat(2001);
+    const assistantText = "x".repeat(50000);
+    const userText = "y".repeat(2100);
     const snapshot = agentContextSnapshots.put({
       ...input,
       compactHistory: {
         ...input.compactHistory,
-        lastAssistantMessage: { ref: "long", text: longText, timestamp: null },
-        lastUserMessage: { ref: "short", text: "y".repeat(2000), timestamp: null },
+        lastAssistantMessage: { ref: "long", text: assistantText, timestamp: null },
+        lastUserMessage: { ref: "long-user", text: userText, timestamp: null },
       },
     });
-    expect(snapshot.compactHistory.lastAssistantMessage?.text).toBe(`${"x".repeat(2000)}…`);
-    expect(snapshot.compactHistory.lastUserMessage?.text).toBe("y".repeat(2000));
+    expect(snapshot.compactHistory.lastAssistantMessage?.text).toBe(assistantText);
+    expect(snapshot.compactHistory.lastUserMessage?.text).toBe(userText);
   });
   test("rejects partial history metadata", () => {
     const { agent, agentContextSnapshots } = createAgent();

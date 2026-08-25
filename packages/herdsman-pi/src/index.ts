@@ -1133,5 +1133,5 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function oneLine(value: string): string {
-  return value.replace(/\s+/g, " ").slice(0, 240);
+  return value.replace(/\s+/g, " ");
 }

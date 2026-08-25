@@ -153,6 +153,33 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(updates).toContain("reviewer · Claude");
   });
 
+  test("passes through very long assistant messages in hidden agent context without truncation", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const longChunk = "response ".repeat(7000); // 63,000 chars with multiple whitespaces
+    const rawAssistantText = `  first section \n\n  ${longChunk} \n  final section  `;
+    const collapsedExcerpt = rawAssistantText.replace(/\s+/g, " ");
+
+    const output = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: rawAssistantText },
+            lastUserMessage: { text: "user prompt" },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+
+    expect(collapsedExcerpt.length).toBeGreaterThan(50000);
+    expect(output).toContain(`  last assistant: ${collapsedExcerpt}`);
+    expect(output).not.toContain("truncated");
+    expect(output).not.toContain("240");
+  });
+
   test("does not connect outside a complete Herdr environment", async () => {
     const pi = createFakePi();
     let clients = 0;
@@ -1055,7 +1082,6 @@ describe("herdsman-pi orchestrator bridge", () => {
                   paneId: "wB:p-agent",
                   terminalId: "term_agent",
                   text: "done",
-                  truncated: false,
                 },
               ],
             },

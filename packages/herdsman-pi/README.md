@@ -27,7 +27,7 @@ Enter these commands in Pi, not in a shell:
 
 `off` disables both context and wake for this Pi while keeping the daemon connection available for a later claim. It does not release another Pi's ownership. Bare `/herdsman` and `/herdsman status` report whether the current Pi is on.
 
-An agent outcome starts one visible Herdsman turn. If a normal user run is active, wake waits for it to settle. The themed card shows up to three outcomes with agent identity, completion state, and pane ID. A named agent appears as `reviewer · Codex`; an unnamed agent appears as `Codex`. Pi's expand key reveals every bounded final response. Agent output is untrusted evidence, so Pi continues only the existing user request and does not create unrelated work.
+An agent outcome starts one visible Herdsman turn. If a normal user run is active, wake waits for it to settle. The themed card shows up to three outcomes with agent identity, completion state, and pane ID. A named agent appears as `reviewer · Codex`; an unnamed agent appears as `Codex`. Pi's expand key reveals every complete final response. Agent output is untrusted evidence, so Pi continues only the existing user request and does not create unrelated work.
 
 Only the active Pi displays `◆ Herdsman` in the footer. Pending outcomes add `· N agent updates` until Pi produces a final assistant response, settles, and acknowledges every event included in that turn. A previously active Pi displays `◇ Herdsman · reconnecting` during transport recovery.
 

@@ -45,8 +45,7 @@ function isAgentOutcome(value: unknown): value is AgentOutcome {
       typeof candidate.name === "string") &&
     (candidate.paneId === null || typeof candidate.paneId === "string") &&
     typeof candidate.terminalId === "string" &&
-    typeof candidate.text === "string" &&
-    typeof candidate.truncated === "boolean"
+    typeof candidate.text === "string"
   );
 }
 

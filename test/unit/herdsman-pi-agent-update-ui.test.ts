@@ -30,7 +30,6 @@ function outcome(eventId: number, options: Partial<AgentOutcome> = {}): AgentOut
     paneId: "wB:p2",
     terminalId: "term_agent",
     text: `response ${eventId}`,
-    truncated: false,
     ...options,
   };
 }
@@ -113,7 +112,7 @@ describe("Herdsman Pi agent update UI", () => {
     expect(text).toContain("… 2 more");
   });
 
-  test("expands every outcome with its bounded final response", () => {
+  test("expands every outcome with its complete final response", () => {
     const text = render(
       [
         outcome(61, { paneId: "wB:p1", text: "first response" }),

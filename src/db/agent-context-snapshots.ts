@@ -63,7 +63,7 @@ export class AgentContextSnapshotStore {
       )
       .run(
         input.agentId,
-        JSON.stringify(compactHistoryForStorage(input.compactHistory)),
+        JSON.stringify(input.compactHistory),
         input.historyRef === null ? null : JSON.stringify(input.historyRef),
         input.paneRevision,
         input.sourceFingerprint?.path ?? null,
@@ -79,20 +79,6 @@ export class AgentContextSnapshotStore {
   delete(agentId: string): void {
     this.#sqlite.prepare("delete from agent_context_snapshots where agent_id = ?").run(agentId);
   }
-}
-
-const SNAPSHOT_EXCERPT_CHARS = 2000;
-
-function compactHistoryForStorage(history: CompactAgentHistory): CompactAgentHistory {
-  const truncate = (value: CompactAgentHistory["lastAssistantMessage"]) =>
-    value && value.text.length > SNAPSHOT_EXCERPT_CHARS
-      ? { ...value, text: `${value.text.slice(0, SNAPSHOT_EXCERPT_CHARS)}…` }
-      : value;
-  return {
-    ...history,
-    lastAssistantMessage: truncate(history.lastAssistantMessage),
-    lastUserMessage: truncate(history.lastUserMessage),
-  };
 }
 
 function mapSnapshot(row: AgentContextSnapshotRow): AgentContextSnapshotRecord {
