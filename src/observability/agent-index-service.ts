@@ -454,10 +454,9 @@ export class AgentIndexService {
       input.agent.agent === "pi" &&
       input.agent.terminalId !== null
     ) {
-      const turnWaitStartedAtMs = Date.now();
       const turn = await this.#turnCompletions.waitForSignal({
         herdrSessionName: input.agent.herdrSessionName,
-        recordedAfterMs: turnWaitStartedAtMs,
+        recordedAfterMs: Date.now() - TURN_SIGNAL_WAIT_MS,
         terminalId: input.agent.terminalId,
       });
       if (turn.received) {

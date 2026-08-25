@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { resolveRuntimeForCommand } from "@/cli/herdsman.js";
 import {
   getHerdsmanHome,
   loadHerdsmanDotEnv,
@@ -12,8 +13,11 @@ import {
 } from "@/config/runtime.js";
 
 const tempDirs: string[] = [];
+const originalHerdsmanHome = process.env.HERDSMAN_HOME;
 
 afterEach(() => {
+  if (originalHerdsmanHome === undefined) delete process.env.HERDSMAN_HOME;
+  else process.env.HERDSMAN_HOME = originalHerdsmanHome;
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { force: true, recursive: true });
   }
@@ -130,6 +134,34 @@ HERDSMAN_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
     expect(runtime.paths.dbPath).toBe(join(homeDir, "state.db"));
   });
 
+  test("resolveRuntimeForCommand uses the runtime record before parsing invalid config", () => {
+    const homeDir = tempHome();
+    process.env.HERDSMAN_HOME = homeDir;
+    writeFileSync(join(homeDir, "config.yaml"), "runtime: [");
+    const record = {
+      dbPath: join(homeDir, "record-state.db"),
+      homeDir,
+      logPath: join(homeDir, "record.log"),
+      pid: 1234,
+      pidPath: join(homeDir, "record.pid"),
+      socketPath: join(homeDir, "record.sock"),
+      startedAt: "2026-06-29T00:00:00.000Z",
+      version: 1,
+    } as const;
+    writeFileSync(join(homeDir, "runtime.json"), JSON.stringify(record));
+
+    expect(() => resolveRuntimeForCommand()).not.toThrow();
+    const runtime = resolveRuntimeForCommand();
+    expect(runtime.homeDir).toBe(record.homeDir);
+    expect(runtime.paths).toMatchObject({
+      dbPath: record.dbPath,
+      pidPath: record.pidPath,
+      socketPath: record.socketPath,
+    });
+
+    rmSync(join(homeDir, "runtime.json"));
+    expect(() => resolveRuntimeForCommand()).toThrow("Invalid Herdsman config");
+  });
   test("falls back to runtime record paths for management commands", () => {
     const homeDir = tempHome();
     writeFileSync(join(homeDir, "config.yaml"), "runtime: [");

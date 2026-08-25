@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, readFileSync, realpathSync } from "node:fs";
+import { relative } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { AgentEventStore } from "@/db/agent-events.js";
 import {
@@ -374,7 +375,7 @@ function mapAgent(row: AgentRow): AgentIndexRecord {
   };
 }
 
-function grokHomeForAgent(agent: HerdrAgentLike): string | null {
+export function grokHomeForAgent(agent: HerdrAgentLike): string | null {
   const env = agent.env;
   const explicit =
     typeof env === "object" && env !== null
@@ -401,7 +402,7 @@ function grokHomeForAgent(agent: HerdrAgentLike): string | null {
   return raw ? validateGrokHome(raw) : null;
 }
 
-function validateGrokHome(value: string): string | null {
+export function validateGrokHome(value: string): string | null {
   if (!value.startsWith("/") || value.includes("..")) return null;
   try {
     const link = lstatSync(value);
@@ -413,7 +414,7 @@ function validateGrokHome(value: string): string | null {
     )
       return null;
     const real = realpathSync(value);
-    const relativeRoot = require("node:path").relative(value, real) as string;
+    const relativeRoot = relative(value, real);
     if (relativeRoot.startsWith("..") || relativeRoot.includes("/")) return null;
     return real;
   } catch {

@@ -20,6 +20,41 @@ function signal(
 }
 
 describe("TurnCompletionRegistry", () => {
+  test("recorded signal is immediately consumed when wait starts at record time", async () => {
+    vi.useFakeTimers();
+    const current = 1_000;
+    const registry = new TurnCompletionRegistry({ now: () => current, timeoutMs: 3_000 });
+    registry.record(signal());
+    await expect(
+      registry.waitForSignal({
+        herdrSessionName: "default",
+        terminalId: "term_pi",
+        recordedAfterMs: current,
+      }),
+    ).resolves.toEqual({ confirmed: true, received: true });
+    vi.useRealTimers();
+  });
+  test("same recorded signal is consumed only once", async () => {
+    vi.useFakeTimers();
+    const current = 1_000;
+    const registry = new TurnCompletionRegistry({ now: () => current, timeoutMs: 3_000 });
+    registry.record(signal());
+    await expect(
+      registry.waitForSignal({
+        herdrSessionName: "default",
+        terminalId: "term_pi",
+        recordedAfterMs: current,
+      }),
+    ).resolves.toEqual({ confirmed: true, received: true });
+    const second = registry.waitForSignal({
+      herdrSessionName: "default",
+      terminalId: "term_pi",
+      recordedAfterMs: current,
+    });
+    await vi.advanceTimersByTimeAsync(3_000);
+    await expect(second).resolves.toEqual({ confirmed: false, received: false });
+    vi.useRealTimers();
+  });
   test("resolves immediately when a signal was already recorded for the terminal", async () => {
     const registry = new TurnCompletionRegistry();
     registry.record(signal());
@@ -39,7 +74,7 @@ describe("TurnCompletionRegistry", () => {
     registry.record(signal({ confirmed: true }));
     const pending = registry.waitForSignal({
       herdrSessionName: "default",
-      recordedAfterMs: current,
+      recordedAfterMs: current + 1,
       terminalId: "term_pi",
     });
     await Promise.resolve();

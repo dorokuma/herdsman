@@ -135,6 +135,54 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   });
 
+  test("emits agent.done promptly when the turn signal was recorded first", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 50 });
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    registry.record({
+      confirmed: true,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    const startedAt = Date.now();
+    const result = await index.handleHerdrEvent(doneEvent);
+    expect(Date.now() - startedAt).toBeLessThan(50 + 100);
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: expect.objectContaining({ text: "final answer" }),
+        }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  });
   test("retries three times after a received turn signal when history is still empty", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });

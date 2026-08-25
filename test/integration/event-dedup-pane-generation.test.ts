@@ -237,6 +237,33 @@ describe("event deduplication and pane generations", () => {
     h.sqlite.close();
   });
 
+  test("legacy pane.closed invalidates pending events from every pane generation", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const indexed = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [agent("claude", "gen-1")],
+    })[0];
+    if (!indexed) throw new Error("Expected agent");
+    const event = h.agentEvents.append({
+      agentId: indexed.id,
+      ...scope,
+      paneId: indexed.paneId,
+      paneGeneration: "gen-1",
+      payload: {},
+      terminalId: indexed.terminalId,
+      type: "agent.done",
+    });
+    await new AgentIndexService({ stores: h }).handleHerdrEvent({
+      event: { pane_id: indexed.paneId, type: "pane.closed" },
+      ...session,
+    });
+    expect(h.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+      invalidatedReason: "LEGACY_CLOSE_WITHOUT_GENERATION",
+    });
+    h.sqlite.close();
+  });
   test("status-derived events persist the source agent pane generation", async () => {
     const h = openObservabilityDbHarness();
     h.herdrSessions.upsertRunning(dbSession);

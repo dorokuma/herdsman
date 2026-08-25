@@ -31,7 +31,9 @@ export class AgentEventReconciler {
     this.#connectedTerminal = options.connectedTerminal ?? (() => true);
   }
 
-  async reconcile(): Promise<{ invalidated: number; released: number }> {
+  async reconcile(
+    options: { releaseStaleOwners?: boolean } = {},
+  ): Promise<{ invalidated: number; released: number }> {
     let sessions: HerdrSessionListEntry[];
     try {
       sessions = await this.#sessionList();
@@ -90,28 +92,31 @@ export class AgentEventReconciler {
     }
     invalidated += this.#events.deleteInvalidated();
     let released = 0;
-    for (const scope of this.#scopes.listOwnedScopes()) {
-      const panes = live.get(scope.herdrSessionName);
-      if (!panes) continue;
-      if (
-        this.#scopes.releaseIfStaleOwner({
-          herdrSessionName: scope.herdrSessionName,
-          workspaceId: scope.workspaceId,
-          livePaneIds: new Set(panes.map((pane) => pane.paneId)),
-          liveTerminalIds: new Set(
-            panes.flatMap((pane) =>
-              pane.terminalId &&
-              this.#connectedTerminal({
-                herdrSessionName: scope.herdrSessionName,
-                terminalId: pane.terminalId,
-              })
-                ? [pane.terminalId]
-                : [],
+    if (options.releaseStaleOwners !== false) {
+      for (const scope of this.#scopes.listOwnedScopes()) {
+        const panes = live.get(scope.herdrSessionName);
+        if (!panes) continue;
+        if (
+          this.#scopes.releaseIfStaleOwner({
+            herdrSessionName: scope.herdrSessionName,
+            workspaceId: scope.workspaceId,
+            livePaneIds: new Set(panes.map((pane) => pane.paneId)),
+            liveTerminalIds: new Set(
+              panes.flatMap((pane) =>
+                pane.terminalId &&
+                this.#connectedTerminal({
+                  herdrSessionName: scope.herdrSessionName,
+                  terminalId: pane.terminalId,
+                })
+                  ? [pane.terminalId]
+                  : [],
+              ),
             ),
-          ),
-        })
-      )
-        released += 1;
+          })
+        ) {
+          released += 1;
+        }
+      }
     }
     for (const scope of this.#scopes.listOwnedScopes()) {
       if (scope.owner?.paneId) {

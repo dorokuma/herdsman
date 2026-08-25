@@ -420,34 +420,36 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.wakeTimer = undefined;
           state.wakeRequested = true;
           state.wakeRequestedThroughEventId = current.at(-1)?.eventId ?? 0;
-          state.wakeRequested = false;
-          state.wakeRequestedThroughEventId = 0;
-          pi.sendMessage?.(
-            {
-              content: formatAgentOutcomeUpdates(batchOutcomes),
-              customType: "herdsman-wake-context",
-              details: { eventIds: batchEvents.map((event) => event.id) },
-              display: false,
-            },
-            { deliverAs: "followUp" },
-          );
-          pi.sendMessage?.(
-            {
-              content: wakeLabel(current.length),
-              customType: "herdsman-wake",
-              details: {
-                eventIds: current.map((outcome) => outcome.eventId),
-                outcomes: current,
-              } satisfies AgentUpdateMessageDetails,
-              display: true,
-            },
-            { deliverAs: "followUp", triggerTurn: true },
-          );
-          // Only expose the batch after both messages were accepted by pi. This
-          // keeps an injection failure eligible for daemon redelivery.
-          state.deliveredBatch = deliveredBatch;
-          state.wakeRequested = false;
-          state.wakeRequestedThroughEventId = 0;
+          try {
+            pi.sendMessage?.(
+              {
+                content: formatAgentOutcomeUpdates(batchOutcomes),
+                customType: "herdsman-wake-context",
+                details: { eventIds: batchEvents.map((event) => event.id) },
+                display: false,
+              },
+              { deliverAs: "followUp" },
+            );
+            pi.sendMessage?.(
+              {
+                content: wakeLabel(current.length),
+                customType: "herdsman-wake",
+                details: {
+                  eventIds: current.map((outcome) => outcome.eventId),
+                  outcomes: current,
+                } satisfies AgentUpdateMessageDetails,
+                display: true,
+              },
+              { deliverAs: "followUp", triggerTurn: true },
+            );
+            // Only expose the batch after both messages were accepted by pi. This
+            // keeps an injection failure eligible for daemon redelivery.
+            state.deliveredBatch = deliveredBatch;
+            state.wakeRequested = false;
+            state.wakeRequestedThroughEventId = 0;
+          } catch {
+            state.wakeRequested = false;
+          }
         };
         void startWake();
       }, WAKE_SETTLE_MS);

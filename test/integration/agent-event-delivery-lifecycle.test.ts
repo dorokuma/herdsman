@@ -150,6 +150,42 @@ describe("agent event delivery lifecycle", () => {
       first.sqlite.close();
     }
   });
+  test("listAfter excludes delivered rows before the cursor and filters scope", () => {
+    const harness = prepareHarness();
+    const delivered = appendEvent(harness);
+    const pending = appendEvent(harness, "term-agent-2");
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'delivered', delivered_to_terminal_id = ? where id = ?",
+      )
+      .run("term-owner", delivered.id);
+    expect(
+      harness.agentEvents
+        .listAfter({
+          afterEventId: delivered.id,
+          ownerTerminalId: "term-owner",
+          herdrSessionName: "default",
+          workspaceId: "wA",
+        })
+        .map((row) => row.id),
+    ).toEqual([pending.id]);
+    expect(
+      harness.agentEvents.listAfter({
+        afterEventId: 0,
+        ownerTerminalId: "term-owner",
+        herdrSessionName: "other",
+        workspaceId: "wA",
+      }),
+    ).toEqual([]);
+    expect(
+      harness.agentEvents.listAfter({
+        afterEventId: 0,
+        ownerTerminalId: "term-owner",
+        herdrSessionName: "default",
+        workspaceId: "other",
+      }),
+    ).toEqual([]);
+  });
   test("repeated reserve for the same delivered event is idempotent", () => {
     const harness = prepareHarness();
     const event = appendEvent(harness);

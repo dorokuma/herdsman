@@ -7,6 +7,7 @@ import { resolveRuntime, runtimePathsFromRecordOrDefault } from "@/config/runtim
 import { ObservabilityRpcClient } from "@/daemon/client.js";
 import {
   getDaemonStatus,
+  readDaemonRuntimeRecord,
   startDaemonProcess,
   stopDaemonProcess,
 } from "@/daemon/process-manager.js";
@@ -328,14 +329,11 @@ async function runDaemonCommand(
   console.log(JSON.stringify({ ...result, socketPath: runtime.paths.socketPath }));
 }
 
-function resolveRuntimeForCommand() {
-  return runtimePathsFromRecordOrDefault({ environment: process.env })
-    ? {
-        environment: process.env,
-        homeDir: resolveRuntime({ environment: process.env }).homeDir,
-        paths: runtimePathsFromRecordOrDefault({ environment: process.env }),
-      }
-    : resolveRuntime({ environment: process.env });
+export function resolveRuntimeForCommand() {
+  const paths = runtimePathsFromRecordOrDefault({ environment: process.env });
+  const record = readDaemonRuntimeRecord(paths.runtimeRecordPath);
+  if (record) return { environment: process.env, homeDir: record.homeDir, paths };
+  return resolveRuntime({ environment: process.env });
 }
 
 function takeFlag(args: string[], name: string): boolean {

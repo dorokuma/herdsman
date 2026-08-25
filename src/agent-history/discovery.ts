@@ -12,7 +12,7 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
 // Herdr observation delay is on the second scale, so a 10-minute grace window
 // is far more generous than needed; it only discards sessions that had already
 // stopped being written well before the agent appeared.
-export const ALLOWED_SESSION_ROOTS = ["/root/.pi/agent/sessions", "/tmp/pi-role-sessions"] as const;
+export const ALLOWED_SESSION_ROOTS = ["/tmp/pi-role-sessions"] as const;
 
 export const DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
 export type AgentHistoryLookupInput = {
@@ -167,6 +167,14 @@ export function safeAllowedSessionPath(value: string, homeDir?: string): string 
   const resolved = normalize(value);
   try {
     const real = realpathSync(resolved);
+    const target = lstatSync(real);
+    if (
+      !target.isFile() ||
+      target.isSymbolicLink() ||
+      target.uid !== CURRENT_EUID ||
+      (target.mode & 0o022) !== 0
+    )
+      return null;
     const homeSessionRoot = join(homeDir ?? process.env.HOME ?? "/root", ".pi/agent/sessions");
     const roots = [homeSessionRoot, ...ALLOWED_SESSION_ROOTS];
     return roots.some((root) => {
@@ -251,6 +259,7 @@ async function listJsonlFiles(root: string, depth = 0, state = { count: 0 }): Pr
 
 async function readCandidateCwd(path: string): Promise<string | null> {
   const input = createReadStream(path, { encoding: "utf8", start: 0, end: 256 * 1024 - 1 });
+  input.on("error", () => {});
   const lines = createInterface({ input, crlfDelay: Infinity });
   let inspected = 0;
   try {

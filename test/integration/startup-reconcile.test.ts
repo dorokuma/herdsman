@@ -116,6 +116,28 @@ describe("startup reconcile dedicated coverage", () => {
     });
   });
 
+  test("releaseStaleOwners=false preserves stale owners but invalidates absent panes", async () => {
+    const { harness, append } = setup();
+    const absent = append({ paneId: "wA:gone", terminalId: "term-gone" });
+    harness.agentOrchestratorScopes.claim({
+      ...scope,
+      ackedEventId: 0,
+      paneId: "wA:live",
+      terminalId: "term-owner",
+    });
+    const result = await reconciler(harness, [
+      { pane_id: "wA:live", terminal_id: "term-owner" },
+    ]).reconcile({ releaseStaleOwners: false });
+    expect(result).toEqual({ invalidated: 1, released: 0 });
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id = ?")
+        .get(absent.id),
+    ).toEqual({ count: 0 });
+    expect(harness.agentOrchestratorScopes.get(scope)).toMatchObject({
+      owner: { paneId: "wA:live", terminalId: "term-owner" },
+    });
+  });
   test("reconcile physically removes existing invalidated rows but preserves acked rows", async () => {
     const { harness, append } = setup();
     const invalidatedOne = append({ paneId: "wA:gone-1", terminalId: "term-1" });

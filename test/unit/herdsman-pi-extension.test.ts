@@ -1082,6 +1082,40 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
+  test("does not reenter wake scheduling from synchronous sendMessage callbacks", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      const send = pi.sendMessage;
+      pi.sendMessage = (message, options) => {
+        send?.call(pi, message, options);
+        if ((message as { customType?: string }).customType === "herdsman-wake") {
+          client.emitStream({
+            method: "agent.event",
+            params: {
+              event: event(44, "term_agent", { payload: { name: "nested" }, type: "agent.done" }),
+            },
+          });
+        }
+      };
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(43, "term_agent", { payload: { name: "reviewer" }, type: "agent.done" }),
+        },
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.customMessages).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
   test("ignores non-outcomes, done-to-idle duplicates, null-terminal, and self events", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();

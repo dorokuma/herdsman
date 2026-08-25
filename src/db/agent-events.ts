@@ -128,7 +128,7 @@ export class AgentEventStore {
         `update agent_events set deliverable = 0, status = 'invalidated', invalidated_reason = ?
          where herdr_session_name = ? and pane_id = ?
            and status not in ('acked', 'invalidated', 'failed')
-           and (${legacy ? "pane_generation is null" : "pane_generation = ?"})`,
+           and (${legacy ? "1 = 1" : "pane_generation = ?"})`,
       )
       .run(
         input.invalidatedReason ?? (legacy ? "LEGACY_CLOSE_WITHOUT_GENERATION" : "PANE_CLOSED"),
@@ -202,12 +202,13 @@ export class AgentEventStore {
   ): AgentEventRecord[] {
     const clauses = [
       "id > ?",
-      "(status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ?)",
+      "((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and id > ?))",
     ];
     const params: Array<number | string | null> = [
       input.afterEventId ?? 0,
       Date.now(),
       input.ownerTerminalId ?? null,
+      input.afterEventId ?? 0,
     ];
     if (input.herdrSessionName) {
       clauses.push("herdr_session_name = ?");

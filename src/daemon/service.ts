@@ -107,7 +107,7 @@ export async function runObservabilityDaemonService(
   });
 
   await server.start();
-  await reconciler.reconcile();
+  await reconciler.reconcile({ releaseStaleOwners: false });
   await watchManager.start();
   console.log(`Herdsman daemon listening on ${runtime.paths.socketPath}`);
 

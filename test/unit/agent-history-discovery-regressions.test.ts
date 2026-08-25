@@ -26,6 +26,17 @@ async function session(root: string, name: string, cwd: string) {
 }
 
 describe("agent history discovery regressions (independent coverage)", () => {
+  test("safeAllowedSessionPath accepts only owned files in allowed roots", async () => {
+    const root = await roleRoot();
+    const path = await session(root, "safe", "/repo");
+    const { safeAllowedSessionPath } = await import("@/agent-history/discovery.js");
+    expect(safeAllowedSessionPath(path, "/nonexistent")).toBe(path);
+    expect(safeAllowedSessionPath("relative/session.jsonl", "/nonexistent")).toBeNull();
+    expect(safeAllowedSessionPath(join(root, "..", "escape"), "/nonexistent")).toBeNull();
+    expect(
+      safeAllowedSessionPath("/tmp/not-an-allowed-root/session.jsonl", "/nonexistent"),
+    ).toBeNull();
+  });
   test("role 会话会被 pi fallback 发现", async () => {
     const root = await roleRoot();
     const path = await session(root, "role-x", "/repo");

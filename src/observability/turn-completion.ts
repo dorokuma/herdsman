@@ -71,9 +71,12 @@ export class TurnCompletionRegistry {
     const isNewSignal = (
       signal: TurnCompletionSignal | undefined,
     ): signal is TurnCompletionSignal =>
-      signal !== undefined && signal.recordedAtMs > input.recordedAfterMs;
+      signal !== undefined && signal.recordedAtMs >= input.recordedAfterMs;
     const existing = this.#latestByTerminal.get(key);
-    if (isNewSignal(existing)) return { confirmed: existing.confirmed, received: true };
+    if (isNewSignal(existing)) {
+      this.#latestByTerminal.delete(key);
+      return { confirmed: existing.confirmed, received: true };
+    }
     return new Promise((resolve) => {
       let timer: TimerHandle | undefined;
       const finish = (timedOut = false) => {
@@ -81,8 +84,10 @@ export class TurnCompletionRegistry {
         if (!timedOut && !isNewSignal(latest)) return;
         if (timer !== undefined) this.#clearTimeout(timer);
         this.#waitersByTerminal.get(key)?.delete(finish);
+        const received = latest && isNewSignal(latest);
+        if (received) this.#latestByTerminal.delete(key);
         resolve(
-          latest && isNewSignal(latest)
+          received
             ? { confirmed: latest.confirmed, received: true }
             : { confirmed: false, received: false },
         );
