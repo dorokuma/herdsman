@@ -110,6 +110,7 @@ type HerdsmanState = {
   connected: boolean;
   currentScope: CurrentScope | undefined;
   deliveredBatch: DeliveredBatch | undefined;
+  ackInFlight: boolean;
   failedWakeThroughEventId: number;
   isOrchestrator: boolean;
   launchIdentity: LaunchIdentity | undefined;
@@ -258,6 +259,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       wakeRequested: false,
       wakeRequestedThroughEventId: 0,
       wakeTimer: undefined,
+      ackInFlight: false,
     };
     let activeContext: PiContext | undefined;
     let wakeGeneration = 0;
@@ -333,7 +335,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         return;
       }
 
-      if (state.deliveredBatch || ctx.isIdle?.() === false) {
+      if (state.deliveredBatch || state.ackInFlight || ctx.isIdle?.() === false) {
         state.wakeDeferredUntilSettled = true;
         return;
       }
@@ -432,8 +434,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
                 details: { eventIds: batchEvents.map((event) => event.id) },
                 display: false,
               },
-              { deliverAs: "followUp" },
+              { deliverAs: "followUp", triggerTurn: true },
             );
+            // Keep the visible receipt passive: the hidden, substantive update
+            // above is the single message that starts the turn. This prevents a
+            // shell receipt from becoming an independent wake.
             pi.sendMessage?.(
               {
                 content: wakeLabel(current.length),
@@ -444,7 +449,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
                 } satisfies AgentUpdateMessageDetails,
                 display: true,
               },
-              { deliverAs: "followUp", triggerTurn: true },
+              { deliverAs: "followUp" },
             );
             // Only expose the batch after both messages were accepted by pi. This
             // keeps an injection failure eligible for daemon redelivery.
@@ -452,6 +457,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             state.wakeRequested = false;
             state.wakeRequestedThroughEventId = 0;
           } catch {
+            state.deliveredBatch = undefined;
             state.wakeRequested = false;
           }
         };
@@ -910,6 +916,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         return;
       }
       state.deliveredBatch = undefined;
+      state.ackInFlight = true;
       const stillOwner =
         state.isOrchestrator && state.currentScope?.terminalId === batch.ownerTerminalId;
       const failBatch = () => {
@@ -919,6 +926,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         );
       };
       const finishBatch = () => {
+        state.ackInFlight = false;
         state.wakeDeferredUntilSettled = false;
         setHerdsmanUi(ctx);
         scheduleWake(ctx);

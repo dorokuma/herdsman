@@ -1087,7 +1087,7 @@ describe("herdsman-pi orchestrator bridge", () => {
             },
             display: true,
           },
-          { deliverAs: "followUp", triggerTurn: true },
+          { deliverAs: "followUp" },
         ],
       ]);
       expect(pi.hiddenMessages).toEqual([
@@ -1098,7 +1098,7 @@ describe("herdsman-pi orchestrator bridge", () => {
             details: { eventIds: [43] },
             display: false,
           },
-          { deliverAs: "followUp" },
+          { deliverAs: "followUp", triggerTurn: true },
         ],
       ]);
     } finally {
@@ -1192,7 +1192,7 @@ describe("herdsman-pi orchestrator bridge", () => {
             details: { eventIds: [51, 52], outcomes: [{ eventId: 51 }, { eventId: 52 }] },
             display: true,
           },
-          { deliverAs: "followUp", triggerTurn: true },
+          { deliverAs: "followUp" },
         ],
       ]);
     } finally {
@@ -2121,7 +2121,7 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
       client.emitStream({ method: "agent.event", params: { event: event(303, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.customMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [303] } });
-      expect(pi.customMessages.some(([, options]) => options?.triggerTurn)).toBe(true);
+      expect(pi.hiddenMessages.some(([, options]) => options?.triggerTurn)).toBe(true);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
