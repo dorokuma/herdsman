@@ -27,6 +27,21 @@ function agent(name: string, generation: string) {
   };
 }
 
+function historyStub() {
+  return {
+    async resolveCompactHistory() {
+      return {
+        compactHistory: {
+          ...emptyCompactHistory("claude-jsonl"),
+          lastAssistantMessage: { ref: "x", text: "result", timestamp: null },
+        },
+        historyRef: null,
+        sourceFingerprint: null,
+      };
+    },
+  } as never;
+}
+
 describe("event deduplication and pane generations", () => {
   test("does not persist the same Herdr input event twice", async () => {
     const h = openObservabilityDbHarness();
@@ -254,7 +269,7 @@ describe("event deduplication and pane generations", () => {
       terminalId: indexed.terminalId,
       type: "agent.done",
     });
-    await new AgentIndexService({ stores: h }).handleHerdrEvent({
+    const result = await new AgentIndexService({ stores: h }).handleHerdrEvent({
       event: { pane_id: indexed.paneId, type: "pane.closed" },
       ...session,
     });
@@ -262,6 +277,254 @@ describe("event deduplication and pane generations", () => {
       status: "invalidated",
       invalidatedReason: "LEGACY_CLOSE_WITHOUT_GENERATION",
     });
+    // A legacy close invalidates pending done events but never emits done events.
+    expect(result.events).toEqual([]);
+    h.sqlite.close();
+  });
+  test("pane.closed tombstone: late done does not refresh or append new events", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    let snapshots = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          snapshots += 1;
+          return {
+            snapshot: {
+              agents: [agent("claude", "gen-1")],
+              panes: [{ pane_id: "wJ:p2", revision: 1 }],
+              tabs: [],
+              workspaces: [],
+            },
+          };
+        },
+      }),
+      history: historyStub(),
+      stores: h,
+    });
+    await index.refreshHerdrSession(session);
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-1" }),
+    ).toBeDefined();
+    await index.handleHerdrEvent({
+      event: { pane_id: "wJ:p2", pane_generation: "gen-1", type: "pane.closed" },
+      ...session,
+    });
+    const snapshotsAfterClose = snapshots;
+    const late = await index.handleHerdrEvent({
+      event: {
+        agent_status: "done",
+        pane_id: "wJ:p2",
+        pane_generation: "gen-1",
+        type: "pane.agent_status_changed",
+      },
+      ...session,
+    });
+    expect(snapshots).toBe(snapshotsAfterClose);
+    expect(late).toEqual({ contextChangedScopes: [], events: [] });
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-1" }),
+    ).toBeUndefined();
+    expect(h.agentEvents.listAfter(scope).filter((e) => e.type === "agent.done")).toHaveLength(0);
+    h.sqlite.close();
+  });
+  test("pane.closed tombstone: refresh with a stale snapshot does not restore the retired agent", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return {
+            snapshot: {
+              agents: [agent("claude", "gen-1")],
+              panes: [{ pane_id: "wJ:p2", revision: 1 }],
+              tabs: [],
+              workspaces: [],
+            },
+          };
+        },
+      }),
+      history: historyStub(),
+      stores: h,
+    });
+    await index.refreshHerdrSession(session);
+    await index.handleHerdrEvent({
+      event: { pane_id: "wJ:p2", pane_generation: "gen-1", type: "pane.closed" },
+      ...session,
+    });
+    const refreshed = await index.refreshHerdrSession(session);
+    expect(refreshed.agents).toHaveLength(0);
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-1" }),
+    ).toBeUndefined();
+    expect(h.agents.listForHerdrSession("default")).toHaveLength(0);
+    h.sqlite.close();
+  });
+  test("legacy pane.closed releases an owner matching the closed pane and terminal", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    h.agentOrchestratorScopes.claim({
+      ...scope,
+      ackedEventId: 0,
+      paneId: "wJ:p2",
+      terminalId: "term-owner",
+    });
+    h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [agent("claude", "gen-1")],
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await new AgentIndexService({ stores: h }).handleHerdrEvent({
+      event: { pane_id: "wJ:p2", terminal_id: "term-owner", type: "pane.closed" },
+      ...session,
+    });
+    expect(h.agentOrchestratorScopes.get(scope)?.owner).toBeNull();
+    warn.mockRestore();
+    h.sqlite.close();
+  });
+  test("isPaneClosed: a legacy tombstone matches every pane generation", () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    // Fix the semantics: markPaneClosed(paneGeneration: "gen-1") tombstones only
+    // gen-1, while markPaneClosed(paneGeneration: null) (a legacy close) matches
+    // any generation — including a later gen-2 — mirroring
+    // AgentEventStore.invalidatePane legacy semantics.
+    h.agents.markPaneClosed({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      paneGeneration: "gen-1",
+    });
+    h.agents.markPaneClosed({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      paneGeneration: null,
+    });
+    expect(
+      h.agents.isPaneClosed({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        paneGeneration: "gen-1",
+      }),
+    ).toBe(true);
+    expect(
+      h.agents.isPaneClosed({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        paneGeneration: "gen-2",
+      }),
+    ).toBe(true);
+    // Dropping the legacy tombstone unblocks other generations while the
+    // generation-scoped tombstone still closes only its own generation.
+    h.agents.clearLegacyPaneTombstone({ herdrSessionName: "default", paneId: "wJ:p2" });
+    expect(
+      h.agents.isPaneClosed({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        paneGeneration: "gen-2",
+      }),
+    ).toBe(false);
+    expect(
+      h.agents.isPaneClosed({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        paneGeneration: "gen-1",
+      }),
+    ).toBe(true);
+    h.sqlite.close();
+  });
+  test("legacy pane.closed tombstone is cleared when a new generation pane is indexed", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return {
+            snapshot: {
+              agents: [agent("fresh", "gen-2")],
+              panes: [{ pane_id: "wJ:p2", revision: 1 }],
+              tabs: [],
+              workspaces: [],
+            },
+          };
+        },
+      }),
+      history: historyStub(),
+      stores: h,
+    });
+    // A legacy (generation-less) close tombstones the pane for every generation.
+    await index.handleHerdrEvent({
+      event: { pane_id: "wJ:p2", type: "pane.closed" },
+      ...session,
+    });
+    expect(
+      h.agents.isPaneClosed({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        paneGeneration: "gen-2",
+      }),
+    ).toBe(true);
+    // Indexing a live gen-2 agent clears the legacy tombstone and restores it.
+    const refreshed = await index.refreshHerdrSession(session);
+    expect(refreshed.agents).toHaveLength(1);
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-2" }),
+    ).toMatchObject({ agent: "fresh", agentStatus: "working" });
+    expect(
+      h.agents.isPaneClosed({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        paneGeneration: "gen-2",
+      }),
+    ).toBe(false);
+    h.sqlite.close();
+  });
+  test("legacy pane.closed does not block a live generation-carrying late status", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return {
+            snapshot: {
+              agents: [agent("fresh", "gen-2")],
+              panes: [{ pane_id: "wJ:p2", revision: 1 }],
+              tabs: [],
+              workspaces: [],
+            },
+          };
+        },
+      }),
+      history: historyStub(),
+      stores: h,
+    });
+    await index.handleHerdrEvent({
+      event: { pane_id: "wJ:p2", type: "pane.closed" },
+      ...session,
+    });
+    const late = await index.handleHerdrEvent({
+      event: {
+        agent_status: "done",
+        pane_id: "wJ:p2",
+        pane_generation: "gen-2",
+        type: "pane.agent_status_changed",
+      },
+      ...session,
+    });
+    expect(late.events.filter((event) => event.type === "agent.done")).toHaveLength(1);
+    expect(
+      h.agents.findByPane({ ...scope, paneId: "wJ:p2", paneGeneration: "gen-2" }),
+    ).toMatchObject({ agent: "fresh", agentStatus: "done" });
+    expect(
+      h.agents.isPaneClosed({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        paneGeneration: "gen-2",
+      }),
+    ).toBe(false);
     h.sqlite.close();
   });
   test("status-derived events persist the source agent pane generation", async () => {

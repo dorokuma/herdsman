@@ -22,8 +22,81 @@ import { AgentEventReconciler } from "./agent-event-reconciler.js";
 import { HerdrSessionWatchManager } from "./herdr-session-watch-manager.js";
 import { ObservabilityRpcServer } from "./observability-server.js";
 
+/**
+ * Periodic reconcile cadence. The 7-day (settled events) and 30-day (released
+ * scopes) TTLs only converge when AgentEventReconciler.reconcile runs, so the
+ * daemon drives it on a fixed 15-minute cycle instead of only at startup.
+ * 15 minutes is deliberately coarser than the watch manager's 10s/60s refresh
+ * ticks: reconcile opens sockets to every running Herdr session, while the TTLs
+ * it enforces are days long, so a 15-minute cycle converges promptly without
+ * per-tick socket traffic.
+ */
+export const RECONCILE_INTERVAL_MS = 15 * 60 * 1000;
+
+type ReconcileRun = () => Promise<unknown>;
+type IntervalHandle = ReturnType<typeof setInterval>;
+
+/**
+ * Runs the reconcile cycle on a fixed cadence while guaranteeing at most one
+ * in-flight run: a tick that fires while the previous run is still executing is
+ * skipped. This mirrors HerdrSessionWatchManager's in-flight tick guard. SQLite
+ * writes on the daemon's single shared connection are synchronous, so the only
+ * concurrency hazard between periodic reconcile and live event writes would be
+ * two reconcile loops interleaving at their await points; the in-flight guard
+ * prevents that, keeping event writes and reconcile serialized exactly like the
+ * rest of the daemon.
+ */
+export class PeriodicReconcileScheduler {
+  readonly #clearInterval: (handle: IntervalHandle) => void;
+  readonly #intervalMs: number;
+  readonly #run: ReconcileRun;
+  readonly #setInterval: (callback: () => void, delay: number) => IntervalHandle;
+  #handle: IntervalHandle | undefined;
+  #inFlight: Promise<unknown> | undefined;
+
+  constructor(options: {
+    clearInterval?: (handle: IntervalHandle) => void;
+    intervalMs: number;
+    run: ReconcileRun;
+    setInterval?: (callback: () => void, delay: number) => IntervalHandle;
+  }) {
+    this.#clearInterval = options.clearInterval ?? clearInterval;
+    this.#intervalMs = options.intervalMs;
+    this.#run = options.run;
+    this.#setInterval = options.setInterval ?? setInterval;
+  }
+
+  start(): void {
+    if (this.#handle !== undefined) return;
+    this.#handle = this.#setInterval(() => {
+      if (this.#inFlight) return;
+      this.#inFlight = Promise.resolve()
+        .then(this.#run)
+        .catch((error) => {
+          console.warn("Herdsman periodic reconcile failed", error);
+        })
+        .finally(() => {
+          this.#inFlight = undefined;
+        });
+    }, this.#intervalMs);
+  }
+
+  async stop(): Promise<void> {
+    if (this.#handle !== undefined) {
+      this.#clearInterval(this.#handle);
+      this.#handle = undefined;
+    }
+    await this.#inFlight?.catch(() => undefined);
+  }
+}
+
 export async function runObservabilityDaemonService(
-  input: { environment?: NodeJS.ProcessEnv | undefined } = {},
+  input: {
+    environment?: NodeJS.ProcessEnv | undefined;
+    reconcileClearInterval?: (handle: ReturnType<typeof setInterval>) => void;
+    reconcileIntervalMs?: number;
+    reconcileSetInterval?: (callback: () => void, delay: number) => ReturnType<typeof setInterval>;
+  } = {},
 ): Promise<void> {
   const runtime = resolveRuntime({ environment: input.environment });
   applyEnvironment(runtime.environment);
@@ -108,10 +181,24 @@ export async function runObservabilityDaemonService(
 
   await server.start();
   await reconciler.reconcile({ releaseStaleOwners: false });
+  // Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
+  // daemons; the in-flight guard inside the scheduler prevents overlapping runs.
+  const reconcileScheduler = new PeriodicReconcileScheduler({
+    ...(input.reconcileClearInterval === undefined
+      ? {}
+      : { clearInterval: input.reconcileClearInterval }),
+    intervalMs: input.reconcileIntervalMs ?? RECONCILE_INTERVAL_MS,
+    run: () => reconciler.reconcile({ releaseStaleOwners: false }),
+    ...(input.reconcileSetInterval === undefined
+      ? {}
+      : { setInterval: input.reconcileSetInterval }),
+  });
+  reconcileScheduler.start();
   await watchManager.start();
   console.log(`Herdsman daemon listening on ${runtime.paths.socketPath}`);
 
   const stop = async () => {
+    await reconcileScheduler.stop();
     await watchManager.stop();
     await server.stop();
     sqlite.close();

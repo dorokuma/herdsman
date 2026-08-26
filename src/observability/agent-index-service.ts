@@ -184,6 +184,22 @@ export class AgentIndexService {
       const snapshotAgents = snapshot.agents.map((agent) =>
         withPaneRevision(agent, revisionByPane),
       );
+      // A live pane that reports a pane_generation overrides any generation-less
+      // (legacy) close: drop the legacy tombstone before consulting
+      // isPaneClosed so the generation-carrying agent is indexed instead of
+      // being swallowed by the phantom close. Generation-scoped tombstones stay.
+      for (const agent of snapshotAgents) {
+        const paneId = stringValue(agent.pane_id) ?? stringValue(agent.paneId);
+        if (paneId && paneGenerationOf(agent)) {
+          this.#stores.agents.clearLegacyPaneTombstone({
+            herdrSessionName: input.herdrSessionName,
+            paneId,
+          });
+        }
+      }
+      const liveSnapshotAgents = snapshotAgents.filter(
+        (agent) => !this.#isClosedPaneAgent(input.herdrSessionName, agent),
+      );
       this.#stores.herdrSessions.upsertRunning({
         name: input.herdrSessionName,
         sessionDir: input.sessionDir,
@@ -194,7 +210,7 @@ export class AgentIndexService {
         workspaces: snapshot.workspaces.map(record),
       });
       const indexedAgents = this.#stores.agents.replaceForSession({
-        agents: snapshotAgents,
+        agents: liveSnapshotAgents,
         herdrSessionName: input.herdrSessionName,
       });
       const agents = indexedAgents.map((agent) => {
@@ -301,7 +317,7 @@ export class AgentIndexService {
       });
       const scopes = new Map<string, AgentScope>();
       const closedTerminalId = stringValue(event.terminal_id) ?? stringValue(event.terminalId);
-      if (closedGeneration && closedTerminalId) {
+      if (closedTerminalId) {
         for (const agent of retired) {
           const scope = scopeOf(agent);
           const change = this.#stores.agentOrchestratorScopes?.releaseIfOwnerIdentity({
@@ -330,6 +346,30 @@ export class AgentIndexService {
     });
     let recovered: AgentIndexRefreshResult | undefined;
     if (!agent) {
+      if (eventGeneration) {
+        // A generation-scoped tombstone still closes its own generation.
+        if (
+          this.#stores.agents.hasGenerationScopedTombstone({
+            herdrSessionName: input.herdrSessionName,
+            paneId,
+            paneGeneration: eventGeneration,
+          })
+        ) {
+          return { contextChangedScopes: [], events: [] };
+        }
+        // No generation-scoped close: a live generation-carrying status
+        // overrides a generation-less close, so recover the pane (the refresh
+        // below clears the legacy tombstone only when the agent is actually
+        // present in the snapshot).
+      } else if (
+        this.#stores.agents.isPaneClosed({
+          herdrSessionName: input.herdrSessionName,
+          paneId,
+          paneGeneration: null,
+        })
+      ) {
+        return { contextChangedScopes: [], events: [] };
+      }
       recovered = await this.#refreshHerdrSessionNow(input);
       agent = this.#stores.agents.findByPane({
         herdrSessionName: input.herdrSessionName,
@@ -430,6 +470,16 @@ export class AgentIndexService {
     return result;
   }
 
+  #isClosedPaneAgent(herdrSessionName: string, agent: HerdrAgentLike): boolean {
+    const paneId = stringValue(agent.pane_id) ?? stringValue(agent.paneId);
+    if (!paneId) return false;
+    return this.#stores.agents.isPaneClosed({
+      herdrSessionName,
+      paneId,
+      paneGeneration: paneGenerationOf(agent),
+    });
+  }
+
   async #appendStatusEvents(input: {
     agent: AgentIndexRecord;
     compactHistory:
@@ -440,6 +490,15 @@ export class AgentIndexService {
     to: AgentStatus;
   }): Promise<AgentEventRecord | undefined> {
     if (input.from === input.to || !input.compactHistory) return undefined;
+    if (
+      this.#stores.agents.isPaneClosed({
+        herdrSessionName: input.agent.herdrSessionName,
+        paneId: input.agent.paneId,
+        paneGeneration: input.agent.paneGeneration ?? null,
+      })
+    ) {
+      return undefined;
+    }
     const latest = this.#stores.agentEvents.latestStatusTransition(
       input.agent.id,
       input.agent.herdrSessionName,
@@ -575,6 +634,15 @@ function withPaneRevision(agent: unknown, revisionByPane: Map<string, number>): 
   const paneId = stringValue(raw.pane_id) ?? stringValue(raw.paneId);
   const revision = paneId ? revisionByPane.get(paneId) : undefined;
   return revision === undefined ? raw : { ...raw, revision };
+}
+
+function paneGenerationOf(agent: HerdrAgentLike): string | null {
+  return (
+    stringValue(agent.pane_generation) ??
+    stringValue(agent.paneGeneration) ??
+    stringValue(agent.creation_id) ??
+    stringValue(agent.creationId)
+  );
 }
 
 function matchingPrior(

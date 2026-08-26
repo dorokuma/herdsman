@@ -163,6 +163,19 @@ export class AgentEventStore {
     );
   }
 
+  /**
+   * Physically removes terminal events (acked/failed) older than the given age.
+   * These statuses are never redelivered or reconciled, so a periodic TTL bounds
+   * the table's growth without touching pending/delivered/invalidated rows.
+   */
+  deleteSettledOlderThan(ageMs: number): number {
+    return Number(
+      this.#sqlite
+        .prepare(`delete from agent_events where status in ('acked', 'failed') and created_at < ?`)
+        .run(Date.now() - ageMs).changes,
+    );
+  }
+
   ackSelfOwned(input: { herdrSessionName: string; workspaceId: string; paneId: string }): number {
     return Number(
       this.#sqlite
@@ -311,20 +324,49 @@ export class AgentEventStore {
 
   reclaimDelivered(timeoutMs: number): number {
     return this.#transaction(() => {
-      const result = this.#sqlite
+      const cutoff = Date.now() - timeoutMs;
+      // The delivered event's own agent row (matched by pane) is the pane-open
+      // guard: it decides whether branch (a) and branch (b) apply.
+      const agentPaneOpen = `exists (
+        select 1 from agents
+        where agents.id = agent_events.agent_id
+          and agents.herdr_session_name = agent_events.herdr_session_name
+          and agents.workspace_id = agent_events.workspace_id
+          and agents.pane_id = agent_events.pane_id
+      )`;
+      // Branch (b): the agent pane is closed/retired, so the delivered event is
+      // invalidated instead of being reclaimed and redelivered.
+      const invalidated = this.#sqlite
         .prepare(
-          `update agent_events set status = case when delivery_attempts >= 10 then 'failed' else 'pending' end, deliverable = case when delivery_attempts >= 10 then 0 else 1 end, last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end, delivered_to_terminal_id = null, next_attempt_at = null where status = 'delivered' and last_attempt_at < ?
+          `update agent_events
+           set deliverable = 0, status = 'invalidated', invalidated_reason = 'PANE_CLOSED_RECLAIM'
+           where status = 'delivered' and last_attempt_at < ? and not ${agentPaneOpen}`,
+        )
+        .run(cutoff).changes;
+      // Branch (c): the pane is still open but the delivery terminal no longer
+      // holds the orchestrator scope, so reclaim (failed at the attempt limit,
+      // pending otherwise). Branch (a) — pane open and the scope still owned by
+      // the delivery terminal — is a valid in-flight delivery left untouched by
+      // this WHERE guard.
+      const reclaimed = this.#sqlite
+        .prepare(
+          `update agent_events
+           set status = case when delivery_attempts >= 10 then 'failed' else 'pending' end,
+               deliverable = case when delivery_attempts >= 10 then 0 else 1 end,
+               last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end,
+               delivered_to_terminal_id = null,
+               next_attempt_at = null
+           where status = 'delivered' and last_attempt_at < ?
+             and ${agentPaneOpen}
              and not exists (
-               select 1 from agents
-               inner join herdr_sessions on herdr_sessions.name = agents.herdr_session_name
-               where herdr_sessions.running = 1
-                 and agents.herdr_session_name = agent_events.herdr_session_name
-                 and agents.terminal_id = agent_events.delivered_to_terminal_id
-                 and agents.agent_status = 'working'
+               select 1 from agent_orchestrator_scopes
+               where agent_orchestrator_scopes.herdr_session_name = agent_events.herdr_session_name
+                 and agent_orchestrator_scopes.workspace_id = agent_events.workspace_id
+                 and agent_orchestrator_scopes.owner_terminal_id = agent_events.delivered_to_terminal_id
              )`,
         )
-        .run(Date.now() - timeoutMs);
-      return Number(result.changes);
+        .run(cutoff).changes;
+      return Number(invalidated) + Number(reclaimed);
     });
   }
 

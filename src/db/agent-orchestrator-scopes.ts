@@ -65,6 +65,24 @@ export class AgentOrchestratorScopeStore {
     return rows.map(mapScope);
   }
 
+  /**
+   * Physically removes released (ownerless) scope rows whose last update is older
+   * than the given age. Owner release leaves the row behind with
+   * owner_pane_id/owner_terminal_id null, so this bounds the table's growth while
+   * never touching rows that still have an owner (active scopes) or rows that
+   * were released recently enough to be reclaimed.
+   */
+  purgeReleasedOlderThan(ageMs: number): number {
+    return Number(
+      this.#sqlite
+        .prepare(
+          `delete from agent_orchestrator_scopes
+           where owner_terminal_id is null and updated_at < ?`,
+        )
+        .run(Date.now() - ageMs).changes,
+    );
+  }
+
   releaseIfStaleOwner(input: {
     herdrSessionName: string;
     workspaceId: string;

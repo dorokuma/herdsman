@@ -151,6 +151,18 @@ export class AgentStore {
         }
       }
 
+      // A live snapshot that carries a pane_generation proves the pane is open
+      // again: drop any generation-less (legacy) close tombstone for that pane
+      // so it can no longer block this pane. Generation-scoped tombstones stay.
+      for (const { snapshot } of matched) {
+        if (paneGeneration(snapshot.agent)) {
+          this.clearLegacyPaneTombstone({
+            herdrSessionName: input.herdrSessionName,
+            paneId: snapshot.paneId,
+          });
+        }
+      }
+
       const removedIds = existing
         .map((agent) => agent.id)
         .filter((id) => !retainedIds.includes(id));
@@ -189,6 +201,7 @@ export class AgentStore {
     paneGeneration?: string | null;
   }): AgentIndexRecord[] {
     return this.#transaction(() => {
+      this.markPaneClosed(input);
       const generationClause = input.paneGeneration == null ? "" : " and pane_generation = ?";
       const generationParams = input.paneGeneration == null ? [] : [input.paneGeneration];
       const agents = this.#sqlite
@@ -209,6 +222,91 @@ export class AgentStore {
         .run(input.herdrSessionName, input.paneId, ...generationParams);
       return agents.map(mapAgent);
     });
+  }
+
+  /**
+   * Records a persistent "pane closed" tombstone so that any later path
+   * (stale refresh snapshots, late status events) can tell the pane has been
+   * retired and must not be resurrected.
+   */
+  markPaneClosed(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+  }): void {
+    this.#sqlite
+      .prepare(
+        `delete from agent_pane_tombstones
+         where herdr_session_name = ? and pane_id = ? and pane_generation is ?`,
+      )
+      .run(input.herdrSessionName, input.paneId, input.paneGeneration ?? null);
+    this.#sqlite
+      .prepare(
+        `insert into agent_pane_tombstones
+         (herdr_session_name, pane_id, pane_generation, closed_at)
+         values (?, ?, ?, ?)`,
+      )
+      .run(input.herdrSessionName, input.paneId, input.paneGeneration ?? null, Date.now());
+  }
+
+  /**
+   * True when the pane is recorded as closed. A generation-scoped tombstone
+   * matches only the same generation; a legacy tombstone (no generation, i.e.
+   * LEGACY_CLOSE_WITHOUT_GENERATION) matches any generation, mirroring
+   * AgentEventStore.invalidatePane legacy semantics.
+   */
+  isPaneClosed(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+  }): boolean {
+    const row = this.#sqlite
+      .prepare(
+        `select 1 from agent_pane_tombstones
+         where herdr_session_name = ? and pane_id = ?
+           and (pane_generation is ? or pane_generation is null)
+         limit 1`,
+      )
+      .get(input.herdrSessionName, input.paneId, input.paneGeneration ?? null);
+    return row !== undefined;
+  }
+
+  /**
+   * Drops the legacy (generation-less) tombstone for a pane. A live pane that
+   * reports a pane_generation proves the pane is open again, so an earlier
+   * LEGACY_CLOSE_WITHOUT_GENERATION tombstone must not keep blocking it
+   * (active generation beats a generation-less close). Generation-scoped
+   * tombstones are untouched.
+   */
+  clearLegacyPaneTombstone(input: { herdrSessionName: string; paneId: string }): void {
+    this.#sqlite
+      .prepare(
+        `delete from agent_pane_tombstones
+         where herdr_session_name = ? and pane_id = ? and pane_generation is null`,
+      )
+      .run(input.herdrSessionName, input.paneId);
+  }
+
+  /**
+   * True when a generation-scoped tombstone exactly matching paneGeneration
+   * exists. Unlike isPaneClosed this ignores legacy (generation-less)
+   * tombstones, so callers can tell "closed for this generation" apart from
+   * "closed without a generation" (which a live generation-carrying agent
+   * overrides).
+   */
+  hasGenerationScopedTombstone(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration: string;
+  }): boolean {
+    const row = this.#sqlite
+      .prepare(
+        `select 1 from agent_pane_tombstones
+         where herdr_session_name = ? and pane_id = ? and pane_generation = ?
+         limit 1`,
+      )
+      .get(input.herdrSessionName, input.paneId, input.paneGeneration);
+    return row !== undefined;
   }
 
   setSessionRefByTerminal(input: {

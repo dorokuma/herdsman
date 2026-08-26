@@ -119,7 +119,7 @@ describe("AgentOrchestratorService", () => {
     });
   });
 
-  test("reclaims a stale delivery after the owner becomes idle", () => {
+  test("keeps a stale delivery with its owner across a turn boundary while the scope is held", () => {
     const { harness, service } = openService();
     harness.agents.replaceForSession({
       herdrSessionName: "default",
@@ -146,9 +146,13 @@ describe("AgentOrchestratorService", () => {
     });
 
     expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
-      expect.objectContaining({ id: event.id, deliveryAttempts: 2 }),
+      expect.objectContaining({ id: event.id, deliveryAttempts: 1 }),
     ]);
-    expect(harness.agentEvents.get(event.id).status).toBe("delivered");
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "delivered",
+      deliveryAttempts: 1,
+      deliveredToTerminalId: "term_owner",
+    });
   });
 
   test("reclaims a stale delivery after the owner disconnects", () => {
@@ -296,35 +300,52 @@ describe("AgentOrchestratorService", () => {
     expect(service.pending({ ...scope, terminalId: "term_agent" })).toEqual([]);
   });
 
-  test("drops ownerless events but preserves direct replacement events", () => {
+  test("preserves ownerless gap events across release and re-claim", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p1", terminalId: "term_a" });
     service.release({ ...scope, reason: "released", terminalId: "term_a" });
-    appendEvent(harness, { terminalId: "term_agent" });
+    const firstGap = appendEvent(harness, { terminalId: "term_agent" });
     const ownerlessLater = appendEvent(harness, { terminalId: "term_agent_2" });
     const reclaimed = service.claim({ ...scope, paneId: "wB:p2", terminalId: "term_b" });
 
-    expect(reclaimed.current.ackedEventId).toBe(ownerlessLater.id);
-    expect(service.pending({ ...scope, terminalId: "term_b" })).toEqual([]);
+    // claimCursor keeps the scope's acked cursor while the row exists (owner null),
+    // so events appended during the ownerless gap are picked up after the re-claim
+    // instead of being skipped by a jump to latestEventId.
+    expect(reclaimed.current.ackedEventId).toBe(0);
+    expect(service.pending({ ...scope, terminalId: "term_b" })).toMatchObject([
+      { id: firstGap.id },
+      { id: ownerlessLater.id },
+    ]);
 
+    // The reclaimed owner acknowledges the preserved gap events in order.
+    expect(service.ack({ ...scope, eventId: firstGap.id, terminalId: "term_b" }).ackedEventId).toBe(
+      firstGap.id,
+    );
+    expect(
+      service.ack({ ...scope, eventId: ownerlessLater.id, terminalId: "term_b" }).ackedEventId,
+    ).toBe(ownerlessLater.id);
+
+    // Subsequent replacement claims keep advancing from the acked cursor.
     const pending = appendEvent(harness, { terminalId: "term_agent" });
     const later = appendEvent(harness, { terminalId: "term_agent_2" });
     service.claim({ ...scope, paneId: "wB:p3", terminalId: "term_c" });
-    expect(service.pending({ ...scope, terminalId: "term_c" })).toMatchObject([
-      { id: pending.id },
-      { id: later.id },
-    ]);
+    // While both are still undelivered, an out-of-order ack is rejected.
     expect(() => service.ack({ ...scope, eventId: later.id, terminalId: "term_c" })).toThrow(
       "Only the next pending orchestrator event can be acknowledged",
     );
     expect(() =>
       service.ack({ ...scope, eventId: later.id + 10_000, terminalId: "term_c" }),
     ).toThrow("Only the next pending orchestrator event can be acknowledged");
-    expect(service.ack({ ...scope, eventId: pending.id, terminalId: "term_c" }).ackedEventId).toBe(
-      pending.id,
+    // Once delivered to the owner, the batch ack may skip the intermediate event.
+    expect(service.pending({ ...scope, terminalId: "term_c" })).toMatchObject([
+      { id: pending.id },
+      { id: later.id },
+    ]);
+    expect(service.ack({ ...scope, eventId: later.id, terminalId: "term_c" }).ackedEventId).toBe(
+      later.id,
     );
-    expect(service.ack({ ...scope, eventId: pending.id, terminalId: "term_c" }).ackedEventId).toBe(
-      pending.id,
+    expect(service.ack({ ...scope, eventId: later.id, terminalId: "term_c" }).ackedEventId).toBe(
+      later.id,
     );
     expect(() => service.ack({ ...scope, eventId: later.id, terminalId: "term_b" })).toThrow(
       "Only the current orchestrator can acknowledge notifications",
@@ -401,7 +422,7 @@ describe("AgentOrchestratorService", () => {
     expect(event.id).toBeGreaterThan(0);
   });
 
-  test("moves ownership with target ownerless-drop and active-owner preservation", () => {
+  test("moves ownership with target gap-event preservation and active-owner preservation", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p1", terminalId: "term_a" });
     const sourceEvent = appendEvent(harness, { terminalId: "term_agent" });
@@ -425,14 +446,18 @@ describe("AgentOrchestratorService", () => {
       { current: { ackedEventId: sourceEvent.id, owner: null }, reason: "moved" },
       {
         current: {
-          ackedEventId: ownerlessTargetEvent.id,
+          ackedEventId: 0,
           owner: { paneId: "wC:p2", terminalId: "term_a" },
         },
         previous: { owner: null },
         reason: "moved",
       },
     ]);
-    expect(service.pending({ ...target, terminalId: "term_a" })).toEqual([]);
+    // The target scope row exists (owner null), so claimCursor preserves its acked
+    // cursor instead of jumping to latestEventId: the ownerless gap event survives.
+    expect(service.pending({ ...target, terminalId: "term_a" })).toEqual([
+      expect.objectContaining({ id: ownerlessTargetEvent.id }),
+    ]);
 
     const ownedTarget = { herdrSessionName: "default", workspaceId: "wD" };
     service.claim({ ...ownedTarget, paneId: "wD:p1", terminalId: "term_d" });
@@ -614,6 +639,45 @@ describe("AgentOrchestratorService ack regression", () => {
     const first = service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" });
 
     expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toEqual(first);
+  });
+
+  test("allows a batch ack to skip a stuck delivered event (M1)", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const stuck = appendEvent(harness, { terminalId: "term_first" });
+    const second = appendEvent(harness, { terminalId: "term_second" });
+    const third = appendEvent(harness, { terminalId: "term_third" });
+    // Deliver the first event to the owner but never ack it (stuck delivery).
+    service.pending({ ...scope, terminalId: "term_owner" });
+    expect(harness.agentEvents.get(stuck.id)).toMatchObject({ status: "delivered" });
+
+    // Acking a later event is allowed now: the next candidate is already delivered
+    // to this owner, and markAcked's id <= cursor semantics acknowledges the
+    // intermediate delivered/pending events too.
+    expect(service.ack({ ...scope, eventId: third.id, terminalId: "term_owner" })).toMatchObject({
+      ackedEventId: third.id,
+    });
+    expect(harness.agentEvents.get(stuck.id)).toMatchObject({ status: "acked" });
+    expect(harness.agentEvents.get(second.id)).toMatchObject({ status: "acked" });
+    expect(harness.agentEvents.get(third.id)).toMatchObject({ status: "acked" });
+  });
+
+  test("still rejects an out-of-order ack that skips an undelivered pending event (M1)", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const first = appendEvent(harness, { terminalId: "term_first" });
+    const second = appendEvent(harness, { terminalId: "term_second" });
+
+    expect(() => service.ack({ ...scope, eventId: second.id, terminalId: "term_owner" })).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+        retryable: false,
+        message: "Only the next pending orchestrator event can be acknowledged",
+      }),
+    );
+    expect(first.id).toBeLessThan(second.id);
+    expect(harness.agentEvents.get(first.id)).toMatchObject({ status: "pending" });
+    expect(harness.agentEvents.get(second.id)).toMatchObject({ status: "pending" });
   });
 });
 

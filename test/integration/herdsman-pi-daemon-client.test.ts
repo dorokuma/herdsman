@@ -2,7 +2,7 @@ import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { JsonLineDecoder } from "@/shared/json-lines.js";
 import {
   type DaemonStreamMessage,
@@ -247,6 +247,45 @@ describe("ReconnectingDaemonClient", () => {
     await expect(client.request("agent.list", {})).rejects.toThrow(
       "Herdsman daemon client is not connected",
     );
+  });
+
+  test("rejects a request the daemon never answers and ignores a late response", async () => {
+    const resource = createResource();
+    resource.server = await startServer(resource.socketPath, (socket, message) => {
+      if (message.method === "hang") {
+        // Deliberately never answer the hung request.
+        return;
+      }
+      socket.write(`${JSON.stringify({ id: message.id, result: { ok: true } })}\n`);
+    });
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [5],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+    let connected = 0;
+    client.onConnected = () => {
+      connected += 1;
+    };
+    await waitFor(() => connected === 1);
+
+    vi.useFakeTimers();
+    try {
+      const hung = client.request("hang", {});
+      const rejection = expect(hung).rejects.toThrow("Herdsman daemon request timed out");
+      await vi.advanceTimersByTimeAsync(15_000);
+      await rejection;
+
+      // The timed-out slot was removed, so the connection still serves later
+      // requests normally (and any response that arrives for the old id is
+      // ignored because it is no longer pending).
+      const later = client.request("agent.list", {});
+      const resolution = expect(later).resolves.toEqual({ ok: true });
+      await vi.advanceTimersByTimeAsync(0);
+      await resolution;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });
 

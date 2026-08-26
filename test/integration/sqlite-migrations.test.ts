@@ -27,6 +27,7 @@ describe("SQLite migrations", () => {
       "agent_events",
       "agent_history_cache",
       "agent_orchestrator_scopes",
+      "agent_pane_tombstones",
       "agents",
       "herdr_sessions",
       "herdr_workspaces",
@@ -106,6 +107,17 @@ describe("SQLite migrations", () => {
     expect(foreignKeys).toEqual(
       expect.arrayContaining([expect.objectContaining({ on_delete: "CASCADE", table: "agents" })]),
     );
+    const tombstoneColumns = sqlite
+      .prepare("pragma table_info(agent_pane_tombstones)")
+      .all()
+      .map((row) => row as { name: string; notnull: number });
+    expect(tombstoneColumns.map((column) => column.name)).toEqual([
+      "closed_at",
+      "herdr_session_name",
+      "pane_generation",
+      "pane_id",
+    ]);
+    expect(tombstoneColumns.find((column) => column.name === "pane_generation")?.notnull).toBe(0);
     sqlite.close();
   });
 });

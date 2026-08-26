@@ -69,6 +69,19 @@ export const agents = sqliteTable(
   ],
 );
 
+export const agentPaneTombstones = sqliteTable(
+  "agent_pane_tombstones",
+  {
+    closedAt: integer("closed_at", { mode: "timestamp_ms" }).notNull(),
+    herdrSessionName: text("herdr_session_name")
+      .notNull()
+      .references(() => herdrSessions.name, { onDelete: "cascade" }),
+    paneGeneration: text("pane_generation"),
+    paneId: text("pane_id").notNull(),
+  },
+  (table) => [index("agent_pane_tombstones_pane_idx").on(table.herdrSessionName, table.paneId)],
+);
+
 export const agentContextSnapshots = sqliteTable("agent_context_snapshots", {
   agentId: text("agent_id")
     .primaryKey()

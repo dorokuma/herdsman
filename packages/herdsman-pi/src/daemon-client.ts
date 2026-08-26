@@ -87,6 +87,7 @@ type PendingRequest = {
   method: string;
   reject(error: Error): void;
   resolve(value: unknown): void;
+  timer: ReturnType<typeof setTimeout>;
 };
 
 type RpcMessage = {
@@ -98,6 +99,7 @@ type RpcMessage = {
 };
 
 const DEFAULT_RECONNECT_DELAYS_MS = [100, 250, 500, 1_000] as const;
+const REQUEST_TIMEOUT_MS = 15_000;
 
 export class ReconnectingDaemonClient {
   onConnected: (() => Promise<void> | void) | undefined;
@@ -152,7 +154,16 @@ export class ReconnectingDaemonClient {
     const id = `pi-${this.#nextId}`;
     this.#nextId += 1;
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { method, reject, resolve });
+      // A request that gets no reply within the timeout is rejected and its
+      // pending slot is removed; a response arriving later is ignored because
+      // the id is no longer tracked. This keeps acks from hanging forever when
+      // the socket stays open but the daemon is unresponsive.
+      const timer = setTimeout(() => {
+        if (this.#pending.delete(id)) {
+          reject(new Error("Herdsman daemon request timed out"));
+        }
+      }, REQUEST_TIMEOUT_MS);
+      this.#pending.set(id, { method, reject, resolve, timer });
       this.#socket?.write(`${JSON.stringify({ id, method, params })}\n`);
     });
   }
@@ -228,6 +239,7 @@ export class ReconnectingDaemonClient {
     const pending = this.#pending.get(String(message.id));
     if (!pending) return;
     this.#pending.delete(String(message.id));
+    clearTimeout(pending.timer);
     if (message.error) {
       const error = Object.assign(new Error(message.error.message ?? "Herdsman RPC failed"), {
         code: message.error.code,
@@ -252,7 +264,10 @@ export class ReconnectingDaemonClient {
   }
 
   #rejectAll(error: Error): void {
-    for (const pending of this.#pending.values()) pending.reject(error);
+    for (const pending of this.#pending.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(error);
+    }
     this.#pending.clear();
   }
 }

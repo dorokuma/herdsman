@@ -182,7 +182,12 @@ export class AgentOrchestratorService {
       ownerTerminalId: input.terminalId,
       getAgent: (agentId) => this.#agents.get(agentId),
     });
-    if (next && input.eventId > next.id) {
+    // Only an undelivered (pending) later event blocks an out-of-order ack. If the
+    // next candidate is already delivered to this owner, or there is no candidate
+    // (acked/invalidated/failed/null), let the batch ack through: markAcked uses an
+    // id <= cursor so the intermediate delivered events get acknowledged too. This
+    // keeps one stuck delivered event from blocking the whole trailing batch.
+    if (next && next.status === "pending" && input.eventId > next.id) {
       throw new OrchestratorAckError({
         code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
         message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
@@ -212,6 +217,10 @@ export class AgentOrchestratorService {
 
   #claimCursor(scope: AgentScope): number {
     const current = this.#scopes.get(scope);
-    return current?.owner ? current.ackedEventId : this.#agentEvents.latestEventId(scope);
+    // Once a scope row exists, keep its acked cursor even when the owner has been
+    // released (owner null): pending events appended during the ownerless gap are
+    // then picked up by pending() after the next claim. Only a truly first claim
+    // (no row at all) advances to latestEventId to avoid redelivering history.
+    return current ? current.ackedEventId : this.#agentEvents.latestEventId(scope);
   }
 }

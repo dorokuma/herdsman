@@ -7,6 +7,12 @@ import { HerdrSocketClient } from "@/herdr/socket-client.js";
 export const RECONCILE_BATCH_LIMIT = 100;
 export const RECONCILE_REASON = "PANE_NOT_PRESENT_RECONCILE";
 
+/** Release rows are ownerless scopes; keep them reclaimable for 30 days, then drop them. */
+export const SCOPE_RELEASE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** Terminal agent events (acked/failed) are purged after 7 days in the reconcile cycle. */
+export const RECONCILE_SETTLED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
 type LivePane = { paneId: string; generation: string | null; terminalId: string | null };
 
 export class AgentEventReconciler {
@@ -33,13 +39,13 @@ export class AgentEventReconciler {
 
   async reconcile(
     options: { releaseStaleOwners?: boolean } = {},
-  ): Promise<{ invalidated: number; released: number }> {
+  ): Promise<{ invalidated: number; purged: number; released: number }> {
     let sessions: HerdrSessionListEntry[];
     try {
       sessions = await this.#sessionList();
     } catch (error) {
       console.warn("Herdsman reconcile skipped: Herdr session list unavailable", error);
-      return { invalidated: 0, released: 0 };
+      return { invalidated: 0, purged: 0, released: 0 };
     }
     const live = new Map<string, LivePane[]>();
     const clients: HerdrSocketClient[] = [];
@@ -68,7 +74,7 @@ export class AgentEventReconciler {
     } catch (error) {
       for (const client of clients) client.close();
       console.warn("Herdsman reconcile skipped: incomplete Herdr pane snapshot", error);
-      return { invalidated: 0, released: 0 };
+      return { invalidated: 0, purged: 0, released: 0 };
     } finally {
       for (const client of clients) client.close();
     }
@@ -91,6 +97,7 @@ export class AgentEventReconciler {
       }
     }
     invalidated += this.#events.deleteInvalidated();
+    this.#events.deleteSettledOlderThan(RECONCILE_SETTLED_TTL_MS);
     let released = 0;
     if (options.releaseStaleOwners !== false) {
       for (const scope of this.#scopes.listOwnedScopes()) {
@@ -118,6 +125,7 @@ export class AgentEventReconciler {
         }
       }
     }
+    const purged = this.#scopes.purgeReleasedOlderThan(SCOPE_RELEASE_TTL_MS);
     for (const scope of this.#scopes.listOwnedScopes()) {
       if (scope.owner?.paneId) {
         this.#events.ackSelfOwned({
@@ -127,7 +135,7 @@ export class AgentEventReconciler {
         });
       }
     }
-    return { invalidated, released };
+    return { invalidated, purged, released };
   }
 }
 

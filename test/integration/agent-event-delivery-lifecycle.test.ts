@@ -224,6 +224,73 @@ describe("agent event delivery lifecycle", () => {
     expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(0);
   });
 
+  test("keeps a delivered event with the owner while the pane is open and the scope is still held", () => {
+    const harness = prepareHarness();
+    harness.agentOrchestratorScopes.claim({
+      herdrSessionName: "default",
+      workspaceId: "wA",
+      ackedEventId: 0,
+      paneId: "wA:owner",
+      terminalId: "term-owner",
+    });
+    const event = appendEvent(harness);
+    harness.agentEvents.reservePending("term-owner");
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - 100_000, event.id);
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(0);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "delivered",
+      deliverable: 1,
+      deliveryAttempts: 1,
+      deliveredToTerminalId: "term-owner",
+      invalidatedReason: null,
+    });
+  });
+
+  test("invalidates a delivered event whose agent pane is closed instead of redelivering it", () => {
+    const harness = prepareHarness();
+    const event = appendEvent(harness);
+    harness.agentEvents.reservePending("term-owner");
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - 100_000, event.id);
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("Expected indexed agent");
+    // Simulate the pane being closed/retired: the agents row disappears.
+    harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(1);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+      deliverable: 0,
+      invalidatedReason: "PANE_CLOSED_RECLAIM",
+    });
+    expect(harness.agentEvents.reservePending("term-owner")).toEqual([]);
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(0);
+  });
+
+  test("reclaims a delivered event when the scope moved to another terminal", () => {
+    const harness = prepareHarness();
+    harness.agentOrchestratorScopes.claim({
+      herdrSessionName: "default",
+      workspaceId: "wA",
+      ackedEventId: 0,
+      paneId: "wA:owner",
+      terminalId: "term-new-owner",
+    });
+    const event = appendEvent(harness);
+    harness.agentEvents.reservePending("term-old-owner");
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - 100_000, event.id);
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(1);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "pending",
+      deliverable: 1,
+      deliveredToTerminalId: null,
+    });
+  });
+
   test("keeps deliverable and status equivalent after every transition", () => {
     const harness = prepareHarness();
     const event = appendEvent(harness);
@@ -284,7 +351,7 @@ describe("agent event delivery lifecycle", () => {
 });
 
 describe("empty database migration chain", () => {
-  test("applies 0000 through 0007 and matches schema columns", () => {
+  test("applies 0000 through 0008 and matches schema columns", () => {
     const dir = mkdtempSync(join(tmpdir(), "herdsman-empty-chain-"));
     tempDirs.push(dir);
     const { sqlite } = openSqlite(join(dir, "state.db"));
@@ -306,17 +373,22 @@ describe("empty database migration chain", () => {
       ]),
     );
     expect(sqlite.prepare("select count(*) as count from __drizzle_migrations").get()).toEqual({
-      count: 8,
+      count: 9,
     });
     const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
       version: string;
       entries: Array<{ tag: string; version: string }>;
     };
-    expect(journal.entries.every((entry, index) => entry.version === (index < 6 ? "6" : "7"))).toBe(
-      true,
-    );
+    expect(
+      journal.entries.every(
+        (entry, index) => entry.version === (index < 6 || index === 8 ? "6" : "7"),
+      ),
+    ).toBe(true);
     expect(journal.entries.find((entry) => entry.tag === "0007_moaning_guardian")?.version).toBe(
       "7",
+    );
+    expect(journal.entries.find((entry) => entry.tag === "0008_pane_tombstones")?.version).toBe(
+      "6",
     );
     sqlite.close();
   });

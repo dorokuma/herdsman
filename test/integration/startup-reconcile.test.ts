@@ -103,7 +103,7 @@ describe("startup reconcile dedicated coverage", () => {
     const result = await reconciler(harness, [
       { pane_id: "wA:live", terminal_id: "term-live" },
     ]).reconcile();
-    expect(result).toEqual({ invalidated: 2, released: 1 });
+    expect(result).toEqual({ invalidated: 2, purged: 0, released: 1 });
     expect(
       harness.sqlite
         .prepare("select count(*) as count from agent_events where id in (?, ?)")
@@ -128,7 +128,7 @@ describe("startup reconcile dedicated coverage", () => {
     const result = await reconciler(harness, [
       { pane_id: "wA:live", terminal_id: "term-owner" },
     ]).reconcile({ releaseStaleOwners: false });
-    expect(result).toEqual({ invalidated: 1, released: 0 });
+    expect(result).toEqual({ invalidated: 1, purged: 0, released: 0 });
     expect(
       harness.sqlite
         .prepare("select count(*) as count from agent_events where id = ?")
@@ -155,6 +155,38 @@ describe("startup reconcile dedicated coverage", () => {
     ).toEqual({ count: 0 });
     expect(harness.agentEvents.get(acked.id)).toMatchObject({ status: "acked" });
   });
+  test("reconcile purges acked and failed events older than the 7-day TTL", async () => {
+    const { harness, append } = setup();
+    const staleAcked = append({ paneId: "wA:live", terminalId: "term-a" });
+    const freshAcked = append({ paneId: "wA:live", terminalId: "term-b" });
+    const staleFailed = append({ paneId: "wA:live", terminalId: "term-c" });
+    const freshFailed = append({ paneId: "wA:live", terminalId: "term-d" });
+    const stalePending = append({ paneId: "wA:live", terminalId: "term-e" });
+    const old = Date.now() - 8 * 24 * 60 * 60 * 1000;
+    harness.sqlite
+      .prepare("update agent_events set status = 'acked', created_at = ? where id = ?")
+      .run(old, staleAcked.id);
+    harness.sqlite
+      .prepare("update agent_events set status = 'failed', created_at = ? where id = ?")
+      .run(old, staleFailed.id);
+    harness.sqlite
+      .prepare("update agent_events set status = 'acked' where id = ?")
+      .run(freshAcked.id);
+    harness.sqlite
+      .prepare("update agent_events set status = 'failed' where id = ?")
+      .run(freshFailed.id);
+    harness.sqlite
+      .prepare("update agent_events set created_at = ? where id = ?")
+      .run(old, stalePending.id);
+    await reconciler(harness, [{ pane_id: "wA:live", terminal_id: "term-live" }]).reconcile();
+    expect(harness.sqlite.prepare("select id, status from agent_events order by id").all()).toEqual(
+      [
+        { id: freshAcked.id, status: "acked" },
+        { id: freshFailed.id, status: "failed" },
+        { id: stalePending.id, status: "pending" },
+      ],
+    );
+  });
   test("b: snapshot failure makes no database changes and logs the skip", async () => {
     const { harness, append } = setup();
     const event = append({ paneId: "wA:gone", terminalId: "term-gone" });
@@ -169,7 +201,7 @@ describe("startup reconcile dedicated coverage", () => {
     const result = await reconciler(harness, async () => {
       throw new Error("snapshot unavailable");
     }).reconcile();
-    expect(result).toEqual({ invalidated: 0, released: 0 });
+    expect(result).toEqual({ invalidated: 0, purged: 0, released: 0 });
     expect(harness.agentEvents.get(event.id)).toMatchObject({ status: "pending" });
     expect(harness.agentOrchestratorScopes.get(scope)).toEqual(before);
     expect(warning).toHaveBeenCalledWith(
@@ -196,7 +228,7 @@ describe("startup reconcile dedicated coverage", () => {
           },
         }) as never,
     }).reconcile();
-    expect(result).toEqual({ invalidated: 0, released: 0 });
+    expect(result).toEqual({ invalidated: 0, purged: 0, released: 0 });
     expect(harness.agentEvents.get(event.id)).toMatchObject({ status: "pending" });
     expect(warning).toHaveBeenCalledWith(
       "Herdsman reconcile skipped: incomplete Herdr pane snapshot",
@@ -214,7 +246,7 @@ describe("startup reconcile dedicated coverage", () => {
         throw new Error("list unavailable");
       },
     }).reconcile();
-    expect(result).toEqual({ invalidated: 0, released: 0 });
+    expect(result).toEqual({ invalidated: 0, purged: 0, released: 0 });
     expect(harness.agentEvents.get(event.id)).toMatchObject({ status: "pending" });
     expect(warning).toHaveBeenCalledWith(
       "Herdsman reconcile skipped: Herdr session list unavailable",
@@ -238,8 +270,52 @@ describe("startup reconcile dedicated coverage", () => {
     const { harness, append } = setup();
     append({ paneId: "wA:gone", terminalId: "term-gone" });
     const instance = reconciler(harness, []);
-    expect(await instance.reconcile()).toEqual({ invalidated: 1, released: 0 });
-    expect(await instance.reconcile()).toEqual({ invalidated: 0, released: 0 });
+    expect(await instance.reconcile()).toEqual({ invalidated: 1, purged: 0, released: 0 });
+    expect(await instance.reconcile()).toEqual({ invalidated: 0, purged: 0, released: 0 });
+  });
+
+  test("g: purges released scopes older than the 30-day TTL but keeps recent and active ones", async () => {
+    const { harness } = setup();
+    harness.agentOrchestratorScopes.claim({
+      ...scope,
+      ackedEventId: 0,
+      paneId: "wA:live",
+      terminalId: "term-owner",
+    });
+    harness.agentOrchestratorScopes.releaseIfOwner({ ...scope, terminalId: "term-owner" });
+    const recent = { herdrSessionName: "default", workspaceId: "wA-recent" };
+    harness.agentOrchestratorScopes.claim({
+      ...recent,
+      ackedEventId: 0,
+      paneId: "wA:live",
+      terminalId: "term-owner",
+    });
+    harness.agentOrchestratorScopes.releaseIfOwner({ ...recent, terminalId: "term-owner" });
+    const active = { herdrSessionName: "default", workspaceId: "wA-active" };
+    harness.agentOrchestratorScopes.claim({
+      ...active,
+      ackedEventId: 0,
+      paneId: "wA:live",
+      terminalId: "term-live",
+    });
+    // Age only the first released row past the 30-day TTL.
+    harness.sqlite
+      .prepare(
+        "update agent_orchestrator_scopes set updated_at = ? where herdr_session_name = ? and workspace_id = ?",
+      )
+      .run(Date.now() - 31 * 24 * 60 * 60 * 1000, scope.herdrSessionName, scope.workspaceId);
+
+    const result = await reconciler(
+      harness,
+      [{ pane_id: "wA:live", terminal_id: "term-live" }],
+      true,
+    ).reconcile();
+    expect(result).toEqual({ invalidated: 0, purged: 1, released: 0 });
+    expect(harness.agentOrchestratorScopes.get(scope)).toBeUndefined();
+    expect(harness.agentOrchestratorScopes.get(recent)).toMatchObject({ owner: null });
+    expect(harness.agentOrchestratorScopes.get(active)).toMatchObject({
+      owner: { paneId: "wA:live", terminalId: "term-live" },
+    });
   });
 
   test("d: registry handoff permits closed-owner takeover but rejects an online owner", () => {

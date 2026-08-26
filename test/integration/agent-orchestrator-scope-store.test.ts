@@ -148,6 +148,37 @@ describe("AgentOrchestratorScopeStore", () => {
     });
   });
 
+  test("purges only released scopes older than the given age (TTL)", () => {
+    const harness = openObservabilityDbHarness();
+    harness.herdrSessions.upsertRunning({
+      name: "default",
+      sessionDir: "/tmp/herdr",
+      socketPath: "/tmp/herdr.sock",
+    });
+    const store = harness.agentOrchestratorScopes;
+    store.claim({ ...defaultScope, ackedEventId: 1, paneId: "wB:p1", terminalId: "term_1" });
+    store.releaseIfOwner({ ...defaultScope, terminalId: "term_1" });
+    const recent = { herdrSessionName: "default", workspaceId: "wC" };
+    store.claim({ ...recent, ackedEventId: 1, paneId: "wC:p1", terminalId: "term_2" });
+    store.releaseIfOwner({ ...recent, terminalId: "term_2" });
+    const active = { herdrSessionName: "default", workspaceId: "wD" };
+    store.claim({ ...active, ackedEventId: 1, paneId: "wD:p1", terminalId: "term_3" });
+    harness.sqlite
+      .prepare(
+        "update agent_orchestrator_scopes set updated_at = ? where herdr_session_name = ? and workspace_id = ?",
+      )
+      .run(
+        Date.now() - 31 * 24 * 60 * 60 * 1000,
+        defaultScope.herdrSessionName,
+        defaultScope.workspaceId,
+      );
+
+    expect(store.purgeReleasedOlderThan(30 * 24 * 60 * 60 * 1000)).toBe(1);
+    expect(store.get(defaultScope)).toBeUndefined();
+    expect(store.get(recent)).toMatchObject({ owner: null });
+    expect(store.get(active)).toMatchObject({ owner: { paneId: "wD:p1", terminalId: "term_3" } });
+  });
+
   test("lists only owned scopes for the requested Herdr session", () => {
     const store = openStore();
     store.claim({ ...defaultScope, ackedEventId: 1, paneId: "wB:p1", terminalId: "term_1" });
