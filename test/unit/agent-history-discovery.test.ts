@@ -53,7 +53,7 @@ describe("agent history discovery", () => {
     const path = join(dir, `${id}.db`);
     await mkdir(dir, { recursive: true });
     await writeFile(path, "");
-    await chmod(path, 0o600);
+    await chmod(path, 0o644);
     await expect(
       discoverAgentHistory({
         agent: "agy",

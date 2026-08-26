@@ -415,7 +415,7 @@ function safeConversationDb(path: string, sessionId: string): boolean {
   if (!isUuid(sessionId) || !existsSync(path)) return false;
   try {
     const stats = lstatSync(path);
-    return stats.isFile() && (stats.mode & 0o077) === 0;
+    return stats.isFile() && (stats.mode & 0o022) === 0;
   } catch {
     return false;
   }

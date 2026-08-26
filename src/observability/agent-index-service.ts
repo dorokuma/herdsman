@@ -451,15 +451,17 @@ export class AgentIndexService {
     if (
       this.#turnCompletions !== undefined &&
       (input.to === "done" || input.to === "blocked") &&
-      input.agent.agent === "pi" &&
       input.agent.terminalId !== null
     ) {
-      const turn = await this.#turnCompletions.waitForSignal({
-        herdrSessionName: input.agent.herdrSessionName,
-        recordedAfterMs: Date.now() - TURN_SIGNAL_WAIT_MS,
-        terminalId: input.agent.terminalId,
-      });
-      if (turn.received) {
+      const turn =
+        input.agent.agent === "pi"
+          ? await this.#turnCompletions.waitForSignal({
+              herdrSessionName: input.agent.herdrSessionName,
+              recordedAfterMs: Date.now() - TURN_SIGNAL_WAIT_MS,
+              terminalId: input.agent.terminalId,
+            })
+          : undefined;
+      if (turn?.received) {
         let refreshed = await this.#context.refreshAgent({
           agent: input.agent,
           identityChanged: false,

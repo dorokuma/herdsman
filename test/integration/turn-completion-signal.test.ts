@@ -11,12 +11,12 @@ function sessionInput() {
   return { herdrSessionName: "default", sessionDir: "/tmp/herdr", socketPath: "/tmp/herdr.sock" };
 }
 
-function piAgentSnapshot(status: string) {
+function piAgentSnapshot(status: string, agent = "pi") {
   return {
     snapshot: {
       agents: [
         {
-          agent: "pi",
+          agent,
           agent_status: status,
           cwd: "/repo",
           pane_id: "wJ:p2",
@@ -128,6 +128,56 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       expect.objectContaining({
         compactHistory: expect.objectContaining({
           lastAssistantMessage: expect.objectContaining({ text: "final answer" }),
+        }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  });
+
+  test("retries for agy without waiting for a turn signal", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    let calls = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working", "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          calls += 1;
+          return {
+            compactHistory:
+              calls < 3
+                ? { ...emptyCompactHistory("antigravity-sqlite"), lastAssistantMessage: null }
+                : {
+                    ...emptyCompactHistory("antigravity-sqlite"),
+                    lastAssistantMessage: {
+                      ref: "history",
+                      text: "agy final answer",
+                      timestamp: null,
+                    },
+                  },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    calls = 0;
+    const result = await index.handleHerdrEvent(doneEvent);
+    expect(calls).toBe(3);
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: expect.objectContaining({ text: "agy final answer" }),
         }),
         type: "agent.done",
       }),
