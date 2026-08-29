@@ -10,6 +10,7 @@ import {
   readDaemonRuntimeRecord,
   startDaemonProcess,
   stopDaemonProcess,
+  withDaemonLock,
 } from "@/daemon/process-manager.js";
 import type { AgentGetResult, AgentListItem, AgentReadResult } from "@/observability/contracts.js";
 
@@ -280,6 +281,7 @@ async function runDaemonCommand(
   command: Extract<CliCommand, { command: "daemon" }>,
   runtime: ReturnType<typeof resolveRuntimeForCommand>,
 ): Promise<void> {
+  const lockPath = `${runtime.paths.pidPath}.lock`;
   if (command.action === "status") {
     console.log(
       JSON.stringify(
@@ -292,40 +294,61 @@ async function runDaemonCommand(
     return;
   }
   if (command.action === "stop") {
-    console.log(
-      JSON.stringify(
-        await stopDaemonProcess({
-          pidPath: runtime.paths.pidPath,
-          socketPath: runtime.paths.socketPath,
-          timeoutMs: 10_000,
-        }),
-      ),
+    const result = await withDaemonLock(lockPath, () =>
+      stopDaemonProcess({
+        pidPath: runtime.paths.pidPath,
+        socketPath: runtime.paths.socketPath,
+        timeoutMs: 10_000,
+      }),
     );
+    console.log(JSON.stringify(result));
     return;
   }
   if (command.action === "restart") {
-    await stopDaemonProcess({
-      pidPath: runtime.paths.pidPath,
-      socketPath: runtime.paths.socketPath,
-      timeoutMs: 10_000,
+    const result = await withDaemonLock(lockPath, async () => {
+      await stopDaemonProcess({
+        pidPath: runtime.paths.pidPath,
+        socketPath: runtime.paths.socketPath,
+        timeoutMs: 10_000,
+      });
+      return await startDaemonProcess({
+        entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "herdsman-daemon.js"),
+        env: runtime.environment,
+        logPath: runtime.paths.logPath,
+        nodePath: process.execPath,
+        pidPath: runtime.paths.pidPath,
+        runtimeRecord: {
+          dbPath: runtime.paths.dbPath,
+          homeDir: runtime.homeDir,
+          logPath: runtime.paths.logPath,
+          pidPath: runtime.paths.pidPath,
+          socketPath: runtime.paths.socketPath,
+        },
+        runtimeRecordPath: runtime.paths.runtimeRecordPath,
+        socketPath: runtime.paths.socketPath,
+      });
     });
+    console.log(JSON.stringify({ ...result, socketPath: runtime.paths.socketPath }));
+    return;
   }
-  const result = await startDaemonProcess({
-    entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "herdsman-daemon.js"),
-    env: runtime.environment,
-    logPath: runtime.paths.logPath,
-    nodePath: process.execPath,
-    pidPath: runtime.paths.pidPath,
-    runtimeRecord: {
-      dbPath: runtime.paths.dbPath,
-      homeDir: runtime.homeDir,
+  const result = await withDaemonLock(lockPath, () =>
+    startDaemonProcess({
+      entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "herdsman-daemon.js"),
+      env: runtime.environment,
       logPath: runtime.paths.logPath,
+      nodePath: process.execPath,
       pidPath: runtime.paths.pidPath,
+      runtimeRecord: {
+        dbPath: runtime.paths.dbPath,
+        homeDir: runtime.homeDir,
+        logPath: runtime.paths.logPath,
+        pidPath: runtime.paths.pidPath,
+        socketPath: runtime.paths.socketPath,
+      },
+      runtimeRecordPath: runtime.paths.runtimeRecordPath,
       socketPath: runtime.paths.socketPath,
-    },
-    runtimeRecordPath: runtime.paths.runtimeRecordPath,
-    socketPath: runtime.paths.socketPath,
-  });
+    }),
+  );
   console.log(JSON.stringify({ ...result, socketPath: runtime.paths.socketPath }));
 }
 

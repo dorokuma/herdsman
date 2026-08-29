@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { env, exit } from "node:process";
 import { fileURLToPath } from "node:url";
@@ -202,6 +202,16 @@ export async function runObservabilityDaemonService(
     await watchManager.stop();
     await server.stop();
     sqlite.close();
+    try {
+      if (existsSync(runtime.paths.pidPath)) {
+        const content = readFileSync(runtime.paths.pidPath, "utf8").trim();
+        if (Number(content) === process.pid) {
+          rmSync(runtime.paths.pidPath, { force: true });
+        }
+      }
+    } catch {
+      // Ignore clean-up error on shutdown
+    }
     exit(0);
   };
   process.once("SIGINT", stop);

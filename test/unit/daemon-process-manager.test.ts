@@ -1,15 +1,27 @@
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
+  acquireDaemonLock,
   type DaemonRuntimeRecord,
   getDaemonStatus,
   isProcessRunning,
   prepareDaemonSocketPath,
+  readDaemonProcessIdentity,
   readDaemonRuntimeRecord,
+  releaseDaemonLock,
   startDaemonProcess,
   stopDaemonProcess,
+  withDaemonLock,
   writeDaemonRuntimeRecord,
 } from "@/daemon/process-manager.js";
 
@@ -83,6 +95,7 @@ describe("daemon process manager", () => {
       getDaemonStatus({
         deps: {
           connectSocket: async () => true,
+          identityProbe: () => true,
           isProcessRunning: (pid) => pid === 1234,
         },
         pidPath,
@@ -176,6 +189,7 @@ describe("daemon process manager", () => {
       startDaemonProcess({
         deps: {
           connectSocket: async () => true,
+          identityProbe: () => true,
           isProcessRunning: (pid) => pid === 1234,
           spawnProcess: () => ({ pid: 5678, unref() {} }),
         },
@@ -308,6 +322,7 @@ describe("daemon process manager", () => {
     const result = await stopDaemonProcess({
       deps: {
         connectSocket: async () => true,
+        identityProbe: () => true,
         isProcessRunning: (pid) => pid === 1234 && running,
         killProcess: (pid, signal) => {
           signals.push({ pid, signal });
@@ -323,6 +338,367 @@ describe("daemon process manager", () => {
     expect(result).toEqual({ alreadyStopped: false, pid: 1234 });
     expect(signals).toEqual([{ pid: 1234, signal: "SIGTERM" }]);
     expect(existsSync(pidPath)).toBe(false);
+  });
+
+  test("reports stopped with stalePid when PID is live but identity probe returns false (PID reuse)", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+
+    const status = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => false,
+        identityProbe: () => false,
+        isProcessRunning: () => true,
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(status).toEqual({
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+      stalePid: 1234,
+      state: "stopped",
+    });
+  });
+
+  test("stopDaemonProcess does not send signals, removes pid file, and returns alreadyStopped when PID is reused by another process", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+    const signals: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+
+    const result = await stopDaemonProcess({
+      deps: {
+        connectSocket: async () => false,
+        identityProbe: () => false,
+        isProcessRunning: () => true,
+        killProcess: (pid, signal) => signals.push({ pid, signal }),
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+      timeoutMs: 100,
+    });
+
+    expect(result).toEqual({ alreadyStopped: true });
+    expect(signals).toHaveLength(0);
+    expect(existsSync(pidPath)).toBe(false);
+  });
+
+  test("startDaemonProcess cleans stale PID file and starts daemon when old PID was reused by another process", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+
+    const result = await startDaemonProcess({
+      deps: {
+        connectSocket: async () => false,
+        identityProbe: () => false,
+        isProcessRunning: () => true,
+        readinessProbe: async () => true,
+        spawnProcess: () => ({ pid: 5678, unref() {} }),
+      },
+      entrypointPath: "/repo/dist/src/cli/herdsman-daemon.js",
+      env: {},
+      logPath: join(dir, "herdsman.log"),
+      nodePath: "/usr/bin/node",
+      pidPath,
+      runtimeRecord: runtimeRecord(dir),
+      runtimeRecordPath: join(dir, "runtime.json"),
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(result).toEqual({ pid: 5678 });
+    expect(readFileSync(pidPath, "utf8")).toBe("5678\n");
+  });
+
+  test("reports orphaned when PID is reused but socket is reachable, and stop/start throw without killing", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+    const signals: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+    let spawned = false;
+
+    const status = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => true,
+        identityProbe: () => false,
+        isProcessRunning: () => true,
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(status).toEqual({
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+      socketReachable: true,
+      stalePid: 1234,
+      state: "orphaned",
+    });
+
+    await expect(
+      stopDaemonProcess({
+        deps: {
+          connectSocket: async () => true,
+          identityProbe: () => false,
+          isProcessRunning: () => true,
+          killProcess: (pid, signal) => signals.push({ pid, signal }),
+        },
+        pidPath,
+        socketPath: "/tmp/herdsman.sock",
+        timeoutMs: 100,
+      }),
+    ).rejects.toThrow("Herdsman daemon socket is reachable but its PID is stale");
+    expect(signals).toHaveLength(0);
+
+    await expect(
+      startDaemonProcess({
+        deps: {
+          connectSocket: async () => true,
+          identityProbe: () => false,
+          isProcessRunning: () => true,
+          spawnProcess: () => {
+            spawned = true;
+            return { pid: 5678, unref() {} };
+          },
+        },
+        entrypointPath: "/repo/dist/src/cli/herdsman-daemon.js",
+        env: {},
+        logPath: join(dir, "herdsman.log"),
+        nodePath: "/usr/bin/node",
+        pidPath,
+        runtimeRecord: runtimeRecord(dir),
+        runtimeRecordPath: join(dir, "runtime.json"),
+        socketPath: "/tmp/herdsman.sock",
+      }),
+    ).rejects.toThrow("Herdsman daemon socket is reachable but its PID is stale");
+    expect(spawned).toBe(false);
+  });
+
+  test("probe undefined degrades to running with console.warn (throttled)", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const status1 = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => true,
+        identityProbe: () => undefined,
+        isProcessRunning: () => true,
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(status1).toEqual({
+      pid: 1234,
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+      socketReachable: true,
+      state: "running",
+    });
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    // Calling again with the same PID should not log another warning
+    const status2 = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => true,
+        identityProbe: () => undefined,
+        isProcessRunning: () => true,
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+    expect(status2.state).toBe("running");
+    expect(warnSpy).toHaveBeenCalledTimes(1);
+
+    warnSpy.mockRestore();
+  });
+
+  test("readDaemonProcessIdentity safely returns false on non-existent PID or read failure", () => {
+    const result = readDaemonProcessIdentity(999999999);
+    if (process.platform === "linux" && existsSync("/proc")) {
+      expect(result).toBe(false);
+    } else {
+      expect(result).toBeUndefined();
+    }
+  });
+
+  test("daemon identity probe narrows to herdsman-daemon.js and rejects non-daemon entrypoints", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, `${process.pid}\n`);
+    const signals: Array<{ pid: number; signal: NodeJS.Signals }> = [];
+
+    // Current test runner process is not "herdsman-daemon.js"
+    // When getDaemonStatus runs without mock probe on Linux, identity probe returns false
+    const status = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => false,
+        isProcessRunning: () => true,
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    if (process.platform === "linux" && existsSync("/proc")) {
+      expect(status).toEqual({
+        pidPath,
+        socketPath: "/tmp/herdsman.sock",
+        stalePid: process.pid,
+        state: "stopped",
+      });
+    }
+
+    const stopResult = await stopDaemonProcess({
+      deps: {
+        connectSocket: async () => false,
+        identityProbe: (_pid, expectedNames) => {
+          // If argv contains herdsman but expectedNames is DAEMON_ENTRYPOINT_NAMES (["herdsman-daemon.js"]), reject
+          if (
+            expectedNames &&
+            !expectedNames.includes("herdsman.js") &&
+            !expectedNames.includes("herdsman")
+          ) {
+            return false;
+          }
+          return true;
+        },
+        isProcessRunning: () => true,
+        killProcess: (pid, signal) => signals.push({ pid, signal }),
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+      timeoutMs: 100,
+    });
+
+    expect(stopResult).toEqual({ alreadyStopped: true });
+    expect(signals).toHaveLength(0);
+    expect(existsSync(pidPath)).toBe(false);
+  });
+
+  test("daemon lock enforces mutual exclusion and owner tracking with manual disposal guidance", () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    const release = acquireDaemonLock(lockPath, {
+      identityProbe: () => true,
+      isProcessRunning: () => true,
+    });
+    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(join(lockPath, "owner.json"))).toBe(true);
+
+    expect(() =>
+      acquireDaemonLock(lockPath, {
+        identityProbe: () => true,
+        isProcessRunning: () => true,
+      }),
+    ).toThrow(/Herdsman daemon operation lock is held.*确认无 daemon 操作在跑后可删除/);
+
+    release();
+    expect(existsSync(lockPath)).toBe(false);
+
+    acquireDaemonLock(lockPath, {
+      identityProbe: () => true,
+      isProcessRunning: () => true,
+    });
+    expect(existsSync(lockPath)).toBe(true);
+    releaseDaemonLock(lockPath);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("daemon lock breaks stale locks when owner is dead or foreign PID", () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(
+      join(lockPath, "owner.json"),
+      JSON.stringify({ pid: 9999, startedAt: new Date().toISOString() }),
+    );
+
+    const release = acquireDaemonLock(lockPath, {
+      identityProbe: () => false,
+      isProcessRunning: () => false,
+    });
+    expect(existsSync(lockPath)).toBe(true);
+    release();
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("daemon lock does not break fresh lock directory when owner.json is missing (< 1s)", () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    // Fresh lock dir with no owner.json yet (simulating window right after mkdir)
+    mkdirSync(lockPath, { recursive: true });
+
+    expect(() =>
+      acquireDaemonLock(lockPath, {
+        identityProbe: () => true,
+        isProcessRunning: () => true,
+      }),
+    ).toThrow(/Herdsman daemon operation lock is held/);
+
+    // Lock dir should still exist and not be removed
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  test("releaseDaemonLock does not remove lock if owner PID is another process", () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(
+      join(lockPath, "owner.json"),
+      JSON.stringify({ pid: process.pid + 1000, startedAt: new Date().toISOString() }),
+    );
+
+    // Calling releaseDaemonLock with our PID should NOT delete someone else's lock
+    releaseDaemonLock(lockPath, process.pid);
+    expect(existsSync(lockPath)).toBe(true);
+
+    // Calling releaseDaemonLock with matching PID should delete it
+    releaseDaemonLock(lockPath, process.pid + 1000);
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("withDaemonLock releases lock even when action throws", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    await expect(
+      withDaemonLock(lockPath, async () => {
+        expect(existsSync(lockPath)).toBe(true);
+        throw new Error("action error");
+      }),
+    ).rejects.toThrow("action error");
+
+    expect(existsSync(lockPath)).toBe(false);
+  });
+
+  test("restart lock prevents concurrent stop with clear error", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    await withDaemonLock(
+      lockPath,
+      async () => {
+        expect(() =>
+          acquireDaemonLock(lockPath, {
+            identityProbe: () => true,
+            isProcessRunning: () => true,
+          }),
+        ).toThrow("Herdsman daemon operation lock is held by PID");
+      },
+      {
+        identityProbe: () => true,
+        isProcessRunning: () => true,
+      },
+    );
   });
 });
 

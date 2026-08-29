@@ -11,7 +11,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createConnection } from "node:net";
-import { dirname } from "node:path";
+import { basename, dirname, join } from "node:path";
 
 export type DaemonRuntimeRecord = {
   dbPath: string;
@@ -59,10 +59,16 @@ type DaemonSpawnProcess = (
   },
 ) => { pid: number | undefined; unref(): void };
 
+export const DAEMON_ENTRYPOINT_NAMES = ["herdsman-daemon.js"] as const;
+export const CLI_ENTRYPOINT_NAMES = ["herdsman-daemon.js", "herdsman.js", "herdsman"] as const;
+
+const warnedUnknownIdentityPids = new Set<number>();
+
 export type DaemonProcessDependencies = {
   connectSocket?: (socketPath: string) => Promise<boolean>;
   readinessProbe?: (socketPath: string) => Promise<boolean>;
   isProcessRunning?: (pid: number) => boolean;
+  identityProbe?: (pid: number, expectedNames?: readonly string[]) => boolean | undefined;
   killProcess?: (pid: number, signal: NodeJS.Signals) => void;
   spawnProcess?: DaemonSpawnProcess;
   waitMs?: (ms: number) => Promise<void>;
@@ -122,6 +128,7 @@ export async function getDaemonStatus(input: {
   socketPath: string;
 }): Promise<DaemonStatus> {
   const processIsRunning = input.deps?.isProcessRunning ?? isProcessRunning;
+  const identityProbe = input.deps?.identityProbe ?? readDaemonProcessIdentity;
   const connectSocket = input.deps?.connectSocket ?? defaultConnectSocket;
 
   if (!existsSync(input.pidPath)) {
@@ -156,6 +163,30 @@ export async function getDaemonStatus(input: {
     };
   }
 
+  const isIdentified = identityProbe(pid, DAEMON_ENTRYPOINT_NAMES);
+  if (isIdentified === false) {
+    if (await connectSocket(input.socketPath)) {
+      return {
+        pidPath: input.pidPath,
+        socketPath: input.socketPath,
+        socketReachable: true,
+        stalePid: pid,
+        state: "orphaned",
+      };
+    }
+    return {
+      pidPath: input.pidPath,
+      socketPath: input.socketPath,
+      stalePid: pid,
+      state: "stopped",
+    };
+  }
+
+  if (isIdentified === undefined && !warnedUnknownIdentityPids.has(pid)) {
+    warnedUnknownIdentityPids.add(pid);
+    console.warn(`Unable to verify daemon process identity for PID ${pid}: /proc unavailable`);
+  }
+
   return {
     pid,
     pidPath: input.pidPath,
@@ -187,7 +218,7 @@ export async function startDaemonProcess(input: {
     throw new Error(`Herdsman daemon is already running with pid ${existing.pid}`);
   if (existing.state === "orphaned")
     throw new Error(
-      `Herdsman daemon socket is reachable but its PID is stale: ${existing.socketPath}`,
+      `Herdsman daemon socket is reachable but its PID is stale: ${existing.socketPath}. Remove the stale socket or stop the listening process before restarting.`,
     );
   if (existing.stalePid !== undefined) rmSync(input.pidPath, { force: true });
   let pidFd: number;
@@ -286,7 +317,7 @@ export async function stopDaemonProcess(input: {
   }
   if (status.state === "orphaned") {
     throw new Error(
-      `Herdsman daemon socket is reachable but its PID is stale: ${status.socketPath}`,
+      `Herdsman daemon socket is reachable but its PID is stale: ${status.socketPath}. Remove the stale socket or stop the listening process before stopping.`,
     );
   }
 
@@ -335,12 +366,188 @@ function spawnDaemonProcess(
 
 type ProcessProbe = (pid: number, signal: 0) => unknown;
 
+export function readDaemonProcessIdentity(
+  pid: number,
+  expectedNames: readonly string[] = DAEMON_ENTRYPOINT_NAMES,
+): boolean | undefined {
+  if (!existsSync("/proc")) {
+    return undefined;
+  }
+  try {
+    const cmdline = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+    const parts = cmdline.split("\0").filter(Boolean);
+    return parts.some((part) => expectedNames.includes(basename(part)));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ENOENT" || code === "ESRCH") {
+      return false;
+    }
+    if (code === "EACCES" || code === "EPERM") {
+      return undefined;
+    }
+    // Other read errors (e.g. EINVAL, EIO): safe fallback is undefined (unknown/cannot verify)
+    return undefined;
+  }
+}
+
 export function isProcessRunning(pid: number, probe: ProcessProbe = process.kill): boolean {
   try {
     probe(pid, 0);
     return true;
   } catch (error) {
     return typeof error === "object" && error !== null && "code" in error && error.code === "EPERM";
+  }
+}
+
+export type DaemonLockOwner = {
+  pid: number;
+  startedAt: string;
+};
+
+export function releaseDaemonLock(lockPath: string, expectedPid: number = process.pid): void {
+  try {
+    const ownerPath = join(lockPath, "owner.json");
+    if (existsSync(ownerPath)) {
+      try {
+        const data = JSON.parse(readFileSync(ownerPath, "utf8")) as Partial<DaemonLockOwner>;
+        if (typeof data.pid === "number" && data.pid !== expectedPid) {
+          return;
+        }
+      } catch {
+        // If owner.json is corrupted, do not remove lock belonging to others
+      }
+    }
+    rmSync(lockPath, { force: true, recursive: true });
+  } catch {
+    // Ignore lock release error
+  }
+}
+
+function sleepSync(ms: number): void {
+  try {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  } catch {
+    const start = Date.now();
+    while (Date.now() - start < ms) {
+      // fallback busy-wait
+    }
+  }
+}
+
+export function acquireDaemonLock(lockPath: string, deps?: DaemonProcessDependencies): () => void {
+  mkdirSync(dirname(lockPath), { mode: 0o700, recursive: true });
+  const processIsRunning = deps?.isProcessRunning ?? isProcessRunning;
+  const identityProbe = deps?.identityProbe ?? readDaemonProcessIdentity;
+
+  const writeAndVerifyOwner = (): boolean => {
+    const ownerPath = join(lockPath, "owner.json");
+    const owner: DaemonLockOwner = {
+      pid: process.pid,
+      startedAt: new Date().toISOString(),
+    };
+    try {
+      writeFileSync(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600 });
+      const content = readFileSync(ownerPath, "utf8");
+      const data = JSON.parse(content) as Partial<DaemonLockOwner>;
+      return data.pid === process.pid;
+    } catch {
+      return false;
+    }
+  };
+
+  const checkOwnerAlive = (): { alive: boolean; pid?: number } => {
+    const ownerPath = join(lockPath, "owner.json");
+    if (!existsSync(ownerPath)) {
+      try {
+        const stat = statSync(lockPath);
+        const ageMs = Date.now() - stat.mtimeMs;
+        if (ageMs < 1000) {
+          // Grace period: lock directory is fresh (< 1s), back off briefly and recheck
+          sleepSync(50);
+          if (!existsSync(ownerPath)) {
+            // Still missing, but lock directory is < 1s old; do not break!
+            return { alive: true };
+          }
+        } else {
+          // Directory is older than 1s and owner.json is missing -> stale lock
+          return { alive: false };
+        }
+      } catch {
+        return { alive: false };
+      }
+    }
+
+    try {
+      const data = JSON.parse(readFileSync(ownerPath, "utf8")) as Partial<DaemonLockOwner>;
+      const ownerPid = data.pid;
+      if (typeof ownerPid !== "number" || !Number.isInteger(ownerPid) || ownerPid <= 0) {
+        return { alive: false };
+      }
+      if (!processIsRunning(ownerPid)) {
+        return { alive: false, pid: ownerPid };
+      }
+      const probe = identityProbe(ownerPid, CLI_ENTRYPOINT_NAMES);
+      if (probe === false) {
+        return { alive: false, pid: ownerPid };
+      }
+      return { alive: true, pid: ownerPid };
+    } catch {
+      try {
+        const stat = statSync(lockPath);
+        if (Date.now() - stat.mtimeMs < 1000) {
+          return { alive: true };
+        }
+      } catch {}
+      return { alive: false };
+    }
+  };
+
+  const formatLockHeldError = (pid?: number) => {
+    const ownerInfo = pid !== undefined ? ` by PID ${pid}` : "";
+    return `Herdsman daemon operation lock is held${ownerInfo}: ${lockPath}. 确认无 daemon 操作在跑后可删除: ${lockPath}`;
+  };
+
+  const tryAcquire = (): boolean => {
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+        return false;
+      }
+      throw error;
+    }
+    return writeAndVerifyOwner();
+  };
+
+  if (tryAcquire()) {
+    return () => releaseDaemonLock(lockPath, process.pid);
+  }
+
+  const ownerStatus = checkOwnerAlive();
+  if (ownerStatus.alive) {
+    throw new Error(formatLockHeldError(ownerStatus.pid));
+  }
+
+  rmSync(lockPath, { force: true, recursive: true });
+
+  if (tryAcquire()) {
+    return () => releaseDaemonLock(lockPath, process.pid);
+  }
+
+  const retryOwner = checkOwnerAlive();
+  throw new Error(formatLockHeldError(retryOwner.pid));
+}
+
+export async function withDaemonLock<T>(
+  lockPath: string,
+  action: () => Promise<T>,
+  deps?: DaemonProcessDependencies,
+): Promise<T> {
+  const release = acquireDaemonLock(lockPath, deps);
+  try {
+    return await action();
+  } finally {
+    release();
   }
 }
 
