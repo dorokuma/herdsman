@@ -41,6 +41,13 @@ export class RpcTestClient {
     return this.#socket.destroyed;
   }
 
+  waitForClose(): Promise<void> {
+    if (this.#socket.destroyed) return Promise.resolve();
+    return new Promise((resolve) => {
+      this.#socket.once("close", () => resolve());
+    });
+  }
+
   close(): void {
     this.#socket.destroy();
   }

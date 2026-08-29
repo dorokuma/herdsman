@@ -27,20 +27,27 @@ describe("orchestrator connection grace", () => {
     const scheduler = new ManualScheduler();
     const { harness, orchestrator, server, socketPath } = await openServer(scheduler, {
       heartbeatScanIntervalMs: 10,
-      heartbeatTimeoutMs: 1,
+      heartbeatTimeoutMs: 30,
     });
     const owner = await RpcTestClient.connect(socketPath);
     await register(owner, "owner");
     await owner.request("agent.orchestrator.set", { enabled: true });
-    await new Promise((resolve) => setTimeout(resolve, 300));
-    await new Promise((resolve) => setTimeout(resolve, 30));
+
+    const closed = owner.waitForClose();
+    scheduler.advance(40);
+    await closed;
+    await socketTick();
+
     expect(
       server.isTerminalConnected({ herdrSessionName: "default", terminalId: "term_owner" }),
     ).toBe(false);
     expect(owner.socketDestroyed()).toBe(true);
-    await new Promise((resolve) => setTimeout(resolve, 20));
-    scheduler.advance(50);
+
+    scheduler.advance(49);
+    expect(orchestrator.status(scope)?.owner?.terminalId).toBe("term_owner");
+    scheduler.advance(1);
     expect(orchestrator.status(scope)?.owner).toBeNull();
+
     owner.close();
     harness.sqlite.close();
   });
@@ -48,20 +55,23 @@ describe("orchestrator connection grace", () => {
   test("heartbeat activity keeps a terminal connected", async () => {
     const scheduler = new ManualScheduler();
     const { harness, orchestrator, server, socketPath } = await openServer(scheduler, {
-      heartbeatScanIntervalMs: 1,
+      heartbeatScanIntervalMs: 10,
       heartbeatTimeoutMs: 30,
     });
     const owner = await RpcTestClient.connect(socketPath);
     await register(owner, "owner");
     await owner.request("agent.orchestrator.set", { enabled: true });
-    await new Promise((resolve) => setTimeout(resolve, 15));
+
+    scheduler.advance(20);
     await owner.request("agent.orchestrator.get", {});
-    await new Promise((resolve) => setTimeout(resolve, 15));
+    scheduler.advance(20);
+
     expect(
       server.isTerminalConnected({ herdrSessionName: "default", terminalId: "term_owner" }),
     ).toBe(true);
     expect(orchestrator.status(scope)?.owner?.terminalId).toBe("term_owner");
     expect(owner.socketDestroyed()).toBe(false);
+
     owner.close();
     harness.sqlite.close();
   });
@@ -271,14 +281,16 @@ async function startServer(
     },
   });
   const server = new ObservabilityRpcServer({
+    clearInterval: (handle) => scheduler.clearInterval(handle),
     clearTimeout: (handle) => scheduler.clear(handle),
-    setInterval: (callback, delay) => setInterval(callback, delay),
     context,
     disconnectGraceMs: 50,
     ...(heartbeat ? { heartbeatScanIntervalMs: heartbeat.heartbeatScanIntervalMs } : {}),
     ...(heartbeat ? { heartbeatTimeoutMs: heartbeat.heartbeatTimeoutMs } : {}),
     history,
+    now: () => scheduler.now(),
     orchestrator,
+    setInterval: (callback, delay) => scheduler.setInterval(callback, delay),
     setTimeout: (callback, delay) => scheduler.set(callback, delay),
     socketPath: setup.socketPath,
     startupReconnectGraceMs: 100,
@@ -317,7 +329,11 @@ async function socketTick(): Promise<void> {
 class ManualScheduler {
   #nextId = 1;
   #now = 0;
-  readonly #timers = new Map<number, { callback: () => void; due: number }>();
+  readonly #timers = new Map<number, { callback: () => void; due: number; interval?: number }>();
+
+  now(): number {
+    return this.#now;
+  }
 
   set(callback: () => void, delay: number): ReturnType<typeof setTimeout> {
     const id = this.#nextId;
@@ -330,6 +346,17 @@ class ManualScheduler {
     this.#timers.delete(handle as unknown as number);
   }
 
+  setInterval(callback: () => void, delay: number): ReturnType<typeof setInterval> {
+    const id = this.#nextId;
+    this.#nextId += 1;
+    this.#timers.set(id, { callback, due: this.#now + delay, interval: delay });
+    return id as unknown as ReturnType<typeof setInterval>;
+  }
+
+  clearInterval(handle: ReturnType<typeof setInterval>): void {
+    this.#timers.delete(handle as unknown as number);
+  }
+
   advance(milliseconds: number): void {
     this.#now += milliseconds;
     while (true) {
@@ -338,7 +365,12 @@ class ManualScheduler {
         .sort((left, right) => left[1].due - right[1].due);
       if (ready.length === 0) return;
       for (const [id, timer] of ready) {
-        this.#timers.delete(id);
+        if (!this.#timers.has(id)) continue;
+        if (timer.interval !== undefined) {
+          timer.due += timer.interval;
+        } else {
+          this.#timers.delete(id);
+        }
         timer.callback();
       }
     }
