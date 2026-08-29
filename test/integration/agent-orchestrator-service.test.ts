@@ -1,5 +1,8 @@
 import { afterEach, describe, expect, test } from "vitest";
+import { emptyCompactHistory } from "@/agent-history/service.js";
+import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
+import type { CompactAgentHistory } from "@/observability/contracts.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
 afterEach(cleanupTempDirs);
@@ -25,6 +28,7 @@ function appendEvent(
   harness: ReturnType<typeof openObservabilityDbHarness>,
   input: {
     agent?: string;
+    compactHistory?: CompactAgentHistory | null;
     terminalId: string;
     type?: "agent.done" | "agent.idle" | "agent.status.changed";
     from?: "working" | "unknown" | "blocked";
@@ -73,6 +77,7 @@ function appendEvent(
   if (!agent) throw new Error("Expected indexed agent");
   return harness.agentEvents.append({
     agentId: agent.id,
+    compactHistory: input.compactHistory ?? null,
     herdrSessionName: "default",
     paneId,
     payload: input.type === "agent.idle" ? { from: input.from ?? "working" } : {},
@@ -253,21 +258,28 @@ describe("AgentOrchestratorService", () => {
 
   test("filters idle events unless they transition from working", () => {
     const { harness, service } = openService();
+    const compactHistory = {
+      ...emptyCompactHistory("codex-jsonl"),
+      lastAssistantMessage: { ref: "history", text: "codex completed task", timestamp: null },
+    };
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
     const working = appendEvent(harness, {
       agent: "codex",
+      compactHistory,
       terminalId: "term_other",
       from: "working",
       type: "agent.idle",
     });
     const unknown = appendEvent(harness, {
       agent: "codex",
+      compactHistory,
       terminalId: "term_unknown",
       from: "unknown",
       type: "agent.idle",
     });
     const blocked = appendEvent(harness, {
       agent: "codex",
+      compactHistory,
       terminalId: "term_blocked",
       from: "blocked",
       type: "agent.idle",
@@ -816,5 +828,168 @@ describe("AgentOrchestratorService invalidated acknowledgement wording (independ
     expect(harness.agentEvents.get(event.id)).toMatchObject({
       status: "invalidated",
     });
+  });
+});
+
+describe("AgentOrchestratorService ack and redelivery freshness (duplicate-return guard)", () => {
+  test("ack then immediate orchestrator.get does not return the acked event", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_agent" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" }).map((e) => e.id)).toEqual([
+      event.id,
+    ]);
+    service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([]);
+  });
+
+  test("pending does not return a delivered event beyond the redelivery freshness window", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_agent" });
+    expect(service.pending({ ...scope, terminalId: "term_owner" }).map((e) => e.id)).toEqual([
+      event.id,
+    ]);
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - REDELIVERY_FRESHNESS_MS - 1, event.id);
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([]);
+  });
+});
+
+describe("Non-Pi agent completed delivery conditions", () => {
+  test("agy (non-pi): working -> idle with empty or missing lastAssistantMessage is not delivered", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
+    // Case 1: compactHistory is null
+    const nullHistoryEvent = appendEvent(harness, {
+      agent: "agy",
+      terminalId: "term_agy_1",
+      from: "working",
+      type: "agent.idle",
+    });
+
+    // Case 2: lastAssistantMessage is null
+    const emptyHistoryEvent = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: null,
+      },
+      terminalId: "term_agy_2",
+      from: "working",
+      type: "agent.idle",
+    });
+
+    // Case 3: lastAssistantMessage is whitespace only
+    const whitespaceHistoryEvent = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "history", text: "   \n\t  ", timestamp: null },
+      },
+      terminalId: "term_agy_3",
+      from: "working",
+      type: "agent.idle",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    const pendingIds = pending.map((e) => e.id);
+    expect(pendingIds).not.toContain(nullHistoryEvent.id);
+    expect(pendingIds).not.toContain(emptyHistoryEvent.id);
+    expect(pendingIds).not.toContain(whitespaceHistoryEvent.id);
+
+    // Out-of-order / deliverable checks for ack
+    expect(() =>
+      service.ack({ ...scope, eventId: nullHistoryEvent.id, terminalId: "term_owner" }),
+    ).toThrow("Only the next pending orchestrator event can be acknowledged");
+  });
+
+  test("agy (non-pi): working -> idle with non-empty lastAssistantMessage is delivered", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
+    const validEvent = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: {
+          ref: "history",
+          text: "Task completed successfully",
+          timestamp: null,
+        },
+      },
+      terminalId: "term_agy_worker",
+      from: "working",
+      type: "agent.idle",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    expect(pending.map((e) => e.id)).toContain(validEvent.id);
+
+    expect(
+      service.ack({ ...scope, eventId: validEvent.id, terminalId: "term_owner" }),
+    ).toMatchObject({
+      ackedEventId: validEvent.id,
+    });
+  });
+
+  test("agy (non-pi): done (terminal state) is delivered even if lastAssistantMessage is null or empty", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
+    const doneWithoutMessage = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: null,
+      },
+      terminalId: "term_agy_done_null",
+      type: "agent.done",
+    });
+
+    const doneWithMessage = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "history", text: "Final result", timestamp: null },
+      },
+      terminalId: "term_agy_done_msg",
+      type: "agent.done",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    const pendingIds = pending.map((e) => e.id);
+    expect(pendingIds).toContain(doneWithoutMessage.id);
+    expect(pendingIds).toContain(doneWithMessage.id);
+  });
+
+  test("pi agent: delivery semantics remain unchanged for dispatched roles and interactive observers", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
+    // Dispatched role pi agent can deliver agent.idle (from working)
+    const dispatchedPi = appendEvent(harness, {
+      agent: "pi",
+      sessionPath: "/tmp/pi-role-sessions/role-scout-123/session.jsonl",
+      terminalId: "term_scout",
+      from: "working",
+      type: "agent.idle",
+    });
+
+    // Interactive pi agent observer cannot deliver agent.idle
+    const interactivePi = appendEvent(harness, {
+      agent: "pi",
+      sessionPath: "/root/.pi/agent/sessions/interactive.jsonl",
+      terminalId: "term_interactive",
+      from: "working",
+      type: "agent.idle",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    const pendingIds = pending.map((e) => e.id);
+    expect(pendingIds).toContain(dispatchedPi.id);
+    expect(pendingIds).not.toContain(interactivePi.id);
   });
 });

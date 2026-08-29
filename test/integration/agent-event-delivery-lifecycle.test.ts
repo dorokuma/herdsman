@@ -2,6 +2,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
 import {
@@ -193,6 +194,36 @@ describe("agent event delivery lifecycle", () => {
     const before = harness.agentEvents.get(event.id);
     expect(harness.agentEvents.reservePending("term-owner")).toHaveLength(1);
     expect(harness.agentEvents.get(event.id)).toEqual(before);
+  });
+
+  test("does not re-list a delivered event after the redelivery freshness window", () => {
+    const harness = prepareHarness();
+    const event = appendEvent(harness);
+    expect(harness.agentEvents.reservePending("term-owner")).toHaveLength(1);
+    // Age the delivery beyond the redelivery freshness window.
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - REDELIVERY_FRESHNESS_MS - 1, event.id);
+    // The same terminal is no longer re-served the stale delivered event.
+    expect(harness.agentEvents.reservePending("term-owner")).toEqual([]);
+    expect(
+      harness.agentEvents.listAfter({
+        afterEventId: 0,
+        ownerTerminalId: "term-owner",
+        herdrSessionName: "default",
+        workspaceId: "wA",
+      }),
+    ).toEqual([]);
+    // A crash-redelivery path still works: an event reset to pending is
+    // reserved again (the freshness window only bounds the delivered re-list).
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'pending', deliverable = 1, delivered_to_terminal_id = null, last_attempt_at = null where id = ?",
+      )
+      .run(event.id);
+    expect(harness.agentEvents.reservePending("term-owner").map((row) => row.id)).toEqual([
+      event.id,
+    ]);
   });
 
   test("reclaims timed-out deliveries and fails events at the attempt limit", () => {

@@ -21,7 +21,10 @@ type Module = {
   createHerdsmanPiExtension: (options?: {
     clientFactory?: () => FakeClient;
     onTurnCompletionSignal?: (completion: Promise<void>) => void;
-    onStateExposed?: (state: { presentedEventIds: Set<number> }) => void;
+    onStateExposed?: (state: {
+      pendingEvents: AgentEventWireRecord[];
+      presentedEventIds: Set<number>;
+    }) => void;
   }) => (pi: FakePi) => void;
   defaultSocketPath: () => string;
   formatHiddenAgentContext: (input: { agents: unknown[]; workspaceId: string }) => string;
@@ -1341,7 +1344,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("retries acknowledgement failure on the next Herdsman round", async () => {
+  test("does not re-present an event whose acknowledgement failed; only new events wake", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const baseResponse = client.response;
@@ -1359,12 +1362,23 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("agent_start", {}, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
-      await vi.advanceTimersByTimeAsync(1_000);
-      expect(pi.hiddenMessages).toHaveLength(2);
+      // The failed acknowledgement does not replay the same event on any retry
+      // timer: the presentation guard is monotonic until scope reset.
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(pi.hiddenMessages).toHaveLength(1);
 
+      // A genuinely new event still wakes normally.
       client.emitStream({ method: "agent.event", params: { event: event(87, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.hiddenMessages).toHaveLength(2);
+      const lastWake = pi.hiddenMessages.at(-1)?.[0] as {
+        content: string;
+        details?: { eventIds: number[] };
+      };
+      // The wake content carries only the new event (the failed event stays in
+      // the pending projection, so details.eventIds lists it too).
+      expect(lastWake.content).toContain("event: 87");
+      expect(lastWake.content).not.toContain("event: 86");
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1372,50 +1386,60 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("stops resync retries at MAX_ACK_ATTEMPTS", async () => {
+  test("does not re-present a resync-failed event and converges it via the ack cursor sweep", async () => {
     vi.useFakeTimers();
-    const { MAX_ACK_ATTEMPTS } = (await import(extensionModuleUrl)) as Module;
     const eventId = 901;
     const pending = event(eventId, "term_agent");
     const client = createWakeClient();
     const base = client.response;
     client.response = (method, params) => {
-      if (
-        method === "agent.notifications.ack" &&
-        (params as { eventId: number }).eventId === eventId
-      )
+      const body = params as { eventId?: number } | undefined;
+      if (method === "agent.notifications.ack" && body?.eventId === eventId)
         throw new Error("Only the next pending orchestrator event can be acknowledged");
+      if (method === "agent.notifications.ack" && body?.eventId === 903)
+        return { acknowledged: true, ackedEventId: 903, state: { ackedEventId: 903 } };
       return base(method, params);
     };
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
     const previous = withHerdrEnv();
+    let extensionState:
+      | { presentedEventIds: Set<number>; pendingEvents: Array<{ id: number }> }
+      | undefined;
     try {
-      await startExtension(client, pi, ctx);
-      for (let attempt = 1; attempt <= MAX_ACK_ATTEMPTS; attempt += 1) {
-        client.emitStream({ method: "agent.event", params: { event: pending } });
-        await vi.advanceTimersByTimeAsync(30_000);
-        await pi.emit("agent_start", {}, ctx);
-        await pi.emit("message_end", assistantMessage("stop"), ctx);
-        await pi.emit("agent_settled", {}, ctx);
-        expect(
-          client.calls.filter(
-            ([m, p]) =>
-              m === "agent.notifications.ack" && (p as { eventId: number }).eventId === eventId,
-          ),
-        ).toHaveLength(attempt);
-        if (attempt < MAX_ACK_ATTEMPTS)
-          expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
-      }
-      const count = client.calls.length;
-      const wakes = pi.hiddenMessages.length;
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      client.emitStream({ method: "agent.event", params: { event: pending } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(
+        client.calls.filter(
+          ([m, p]) =>
+            m === "agent.notifications.ack" && (p as { eventId: number }).eventId === eventId,
+        ),
+      ).toHaveLength(1);
+      // The resync-failed event is not re-presented on any retry timer...
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      // ...but it stays in the pending projection, guarded by presentedEventIds.
+      expect(extensionState?.presentedEventIds.has(eventId)).toBe(true);
+      expect(extensionState?.pendingEvents.some((item) => item.id === eventId)).toBe(true);
+
       const followUp = event(903, "term_agent");
       client.emitStream({ method: "agent.event", params: { event: followUp } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.hiddenMessages.length).toBe(wakes + 1);
-      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({
-        details: { eventIds: [followUp.id] },
-      });
+      const followUpWake = pi.hiddenMessages.at(-1)?.[0] as {
+        content: string;
+        details?: { eventIds: number[] };
+      };
+      expect(followUpWake.content).toContain("event: 903");
+      expect(followUpWake.content).not.toContain("event: 901");
       await pi.emit("agent_start", {}, ctx);
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
@@ -1425,13 +1449,11 @@ describe("herdsman-pi orchestrator bridge", () => {
             m === "agent.notifications.ack" && (p as { eventId: number }).eventId === followUp.id,
         ),
       ).toHaveLength(1);
-      expect(
-        client.calls.filter(
-          ([m, p]) =>
-            m === "agent.notifications.ack" && (p as { eventId: number }).eventId === eventId,
-        ),
-      ).toHaveLength(MAX_ACK_ATTEMPTS);
-      expect(client.calls.length).toBeGreaterThan(count);
+      // The follow-up ack's cursor sweep prunes the failed event from the
+      // pending projection; the guard remains (the daemon never re-lists acked
+      // events, so keeping the id cannot suppress a future delivery).
+      expect(extensionState?.pendingEvents.some((item) => item.id === eventId)).toBe(false);
+      expect(extensionState?.presentedEventIds.has(eventId)).toBe(true);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1439,26 +1461,33 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("stops transient retries and uses increasing capped backoff", async () => {
+  test("does not re-present a transient-failed event and converges it via the ack cursor sweep", async () => {
     vi.useFakeTimers();
-    const { MAX_ACK_ATTEMPTS, ACK_BACKOFF_CAP_MS } = (await import(extensionModuleUrl)) as Module;
+    const { ACK_BACKOFF_CAP_MS } = (await import(extensionModuleUrl)) as Module;
     const eventId = 902;
     const pending = event(eventId, "term_agent");
     const client = createWakeClient();
     const base = client.response;
     client.response = (method, params) => {
-      if (
-        method === "agent.notifications.ack" &&
-        (params as { eventId: number }).eventId === eventId
-      )
+      const body = params as { eventId?: number } | undefined;
+      if (method === "agent.notifications.ack" && body?.eventId === eventId)
         throw new Error("unknown daemon failure");
+      if (method === "agent.notifications.ack" && body?.eventId === 904)
+        return { acknowledged: true, ackedEventId: 904, state: { ackedEventId: 904 } };
       return base(method, params);
     };
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
     const previous = withHerdrEnv();
+    let extensionState:
+      | { presentedEventIds: Set<number>; pendingEvents: Array<{ id: number }> }
+      | undefined;
     try {
-      await startExtension(client, pi, ctx);
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
       const ackCount = () =>
         client.calls.filter(
           ([m, p]) =>
@@ -1474,42 +1503,27 @@ describe("herdsman-pi orchestrator bridge", () => {
       await vi.advanceTimersByTimeAsync(500);
       await settleWake();
       expect(ackCount()).toBe(1);
-
-      await vi.advanceTimersByTimeAsync(249);
+      // No backoff retry re-presents the failed event: the backoff window passes
+      // without any additional wake or ack attempt.
+      await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS + 30_000);
       expect(ackCount()).toBe(1);
-      await vi.advanceTimersByTimeAsync(1);
-      await vi.advanceTimersByTimeAsync(500);
-      await settleWake();
-      expect(ackCount()).toBe(2);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      // The failed event stays in the pending projection, guarded by
+      // presentedEventIds, until the ack cursor sweeps it.
+      expect(extensionState?.presentedEventIds.has(eventId)).toBe(true);
+      expect(extensionState?.pendingEvents.some((item) => item.id === eventId)).toBe(true);
 
-      await vi.advanceTimersByTimeAsync(499);
-      expect(ackCount()).toBe(2);
-      await vi.advanceTimersByTimeAsync(1);
-      await vi.advanceTimersByTimeAsync(500);
-      await settleWake();
-      expect(ackCount()).toBe(3);
-
-      await vi.advanceTimersByTimeAsync(999);
-      expect(ackCount()).toBe(3);
-      await vi.advanceTimersByTimeAsync(1);
-      await vi.advanceTimersByTimeAsync(500);
-      await settleWake();
-      expect(ackCount()).toBe(4);
-
-      await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
-      await vi.advanceTimersByTimeAsync(500);
-      await settleWake();
-      expect(ackCount()).toBe(5);
-      const wakes = pi.hiddenMessages.length;
-      await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
-      expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
-      expect(pi.hiddenMessages.length).toBe(wakes);
+      // A follow-up event wakes; its ack sweeps the failed event out of the
+      // pending projection.
       const followUp = event(904, "term_agent");
       client.emitStream({ method: "agent.event", params: { event: followUp } });
       await vi.advanceTimersByTimeAsync(500);
-      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({
-        details: { eventIds: [followUp.id] },
-      });
+      const followUpWake = pi.hiddenMessages.at(-1)?.[0] as {
+        content: string;
+        details?: { eventIds: number[] };
+      };
+      expect(followUpWake.content).toContain("event: 904");
+      expect(followUpWake.content).not.toContain("event: 902");
       await settleWake();
       expect(
         client.calls.filter(
@@ -1517,11 +1531,8 @@ describe("herdsman-pi orchestrator bridge", () => {
             m === "agent.notifications.ack" && (p as { eventId: number }).eventId === followUp.id,
         ),
       ).toHaveLength(1);
-      expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
-      const wakesAfterFollowUp = pi.hiddenMessages.length;
-      await vi.advanceTimersByTimeAsync(ACK_BACKOFF_CAP_MS);
-      expect(ackCount()).toBe(MAX_ACK_ATTEMPTS);
-      expect(pi.hiddenMessages.length).toBe(wakesAfterFollowUp);
+      expect(extensionState?.pendingEvents.some((item) => item.id === eventId)).toBe(false);
+      expect(extensionState?.presentedEventIds.has(eventId)).toBe(true);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1529,9 +1540,8 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("dead-letters K0 at MAX_ACK_ATTEMPTS and lets K1 ack through with a cursor sweep (R2 no cascade)", async () => {
+  test("a resync-failed event is not re-presented and K1's ack cursor sweeps it (no cascade)", async () => {
     vi.useFakeTimers();
-    const { MAX_ACK_ATTEMPTS } = (await import(extensionModuleUrl)) as Module;
     const k0 = event(910, "term_agent");
     const k1 = event(911, "term_agent");
     const client = createWakeClient();
@@ -1540,7 +1550,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.calls.filter(
         ([m, p]) => m === "agent.notifications.ack" && (p as { eventId: number }).eventId === id,
       ).length;
-    // The server keeps the dead-lettered K0 delivered. Because delivered events
+    // The server keeps the failed K0 delivered. Because delivered events
     // do not trip the ordering guard, acking K1 passes and the server's markAcked
     // (id <= cursor) sweeps K0: the client observes ackedEventId = K1.id.
     client.response = (method, params) => {
@@ -1554,8 +1564,13 @@ describe("herdsman-pi orchestrator bridge", () => {
     const pi = createFakePi();
     const ctx = fakeCtx({ idle: true });
     const previous = withHerdrEnv();
+    let extensionState: { pendingEvents: Array<{ id: number }> } | undefined;
     try {
-      await startExtension(client, pi, ctx);
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
       const settleWake = async () => {
         await pi.emit("agent_start", {}, ctx);
         await pi.emit("message_end", assistantMessage("stop"), ctx);
@@ -1563,28 +1578,33 @@ describe("herdsman-pi orchestrator bridge", () => {
       };
 
       client.emitStream({ method: "agent.event", params: { event: k0 } });
-      for (let attempt = 1; attempt <= MAX_ACK_ATTEMPTS; attempt += 1) {
-        client.emitStream({ method: "agent.event", params: { event: k0 } });
-        await vi.advanceTimersByTimeAsync(30_000);
-        await settleWake();
-        expect(ackCount(k0.id)).toBe(attempt);
-      }
-      // K0 is dead-lettered: its ack count stops at MAX_ACK_ATTEMPTS and even a
-      // daemon re-emission is not re-presented (failedWakeThroughEventId barrier).
+      await vi.advanceTimersByTimeAsync(500);
+      await settleWake();
+      expect(ackCount(k0.id)).toBe(1);
+
+      // K0 is not re-presented: even a daemon re-emission stays guarded.
       client.emitStream({ method: "agent.event", params: { event: k0 } });
       client.emitStream({ method: "agent.event", params: { event: k1 } });
       await vi.advanceTimersByTimeAsync(500);
-      const k1Wake = pi.hiddenMessages.at(-1)?.[0] as { details?: { eventIds: number[] } };
-      expect(k1Wake.details?.eventIds).toEqual([k1.id]);
-      expect(k1Wake.details?.eventIds).not.toContain(k0.id);
+      const k1Wake = pi.hiddenMessages.at(-1)?.[0] as {
+        content: string;
+        details?: { eventIds: number[] };
+      };
+      // K0 stays in the pending projection (details.eventIds lists every pending
+      // id), but the wake content carries only the new event K1.
+      expect(k1Wake.details?.eventIds).toEqual([k0.id, k1.id]);
+      expect(k1Wake.content).toContain("event: 911");
+      expect(k1Wake.content).not.toContain("event: 910");
 
       // K1's ack passes the delivered K0 and the cursor sweep prunes the client
-      // state: neither K1 nor K0 are retried afterwards (no cascade).
+      // state: K0 leaves the pending projection without any retry (no cascade).
       await settleWake();
       expect(ackCount(k1.id)).toBe(1);
+      expect(ackCount(k0.id)).toBe(1);
+      expect(extensionState?.pendingEvents.some((item) => item.id === k0.id)).toBe(false);
       await vi.advanceTimersByTimeAsync(120_000);
       expect(ackCount(k1.id)).toBe(1);
-      expect(ackCount(k0.id)).toBe(MAX_ACK_ATTEMPTS);
+      expect(ackCount(k0.id)).toBe(1);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1592,9 +1612,8 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("documents the cascade trigger: a server that keeps dead-lettered K0 pending rejects K1 and K2 until each dead-letters (R2 boundary)", async () => {
+  test("resync-failed events stay guarded and later events still wake (no cascade)", async () => {
     vi.useFakeTimers();
-    const { MAX_ACK_ATTEMPTS } = (await import(extensionModuleUrl)) as Module;
     const k0 = event(912, "term_agent");
     const k1 = event(913, "term_agent");
     const k2 = event(914, "term_agent");
@@ -1604,9 +1623,9 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.calls.filter(
         ([m, p]) => m === "agent.notifications.ack" && (p as { eventId: number }).eventId === id,
       ).length;
-    // Worst case the oracle feared: the server keeps the dead-lettered K0 pending
-    // (never re-reserves it), so the ordering guard rejects every later ack with
-    // a resync until each event independently dead-letters.
+    // Worst case the oracle feared: the server keeps the head event pending and
+    // rejects every later ack with a resync. The extension must not enter a
+    // re-presentation/retry storm for the failed events.
     client.response = (method, params) => {
       const eventId = (params as { eventId?: number } | undefined)?.eventId;
       if (
@@ -1626,27 +1645,28 @@ describe("herdsman-pi orchestrator bridge", () => {
         await pi.emit("message_end", assistantMessage("stop"), ctx);
         await pi.emit("agent_settled", {}, ctx);
       };
-      const deadLetterThrough = async (eventId: number) => {
-        for (let attempt = 1; attempt <= MAX_ACK_ATTEMPTS; attempt += 1) {
-          client.emitStream({
-            method: "agent.event",
-            params: { event: event(eventId, "term_agent") },
-          });
-          await vi.advanceTimersByTimeAsync(30_000);
-          await settleWake();
-          expect(ackCount(eventId)).toBe(attempt);
-        }
-        expect(ackCount(eventId)).toBe(MAX_ACK_ATTEMPTS);
-      };
 
-      // K0 dead-letters while the server keeps it pending.
-      await deadLetterThrough(k0.id);
-      // K1 is rejected (resync) and independently dead-letters at MAX_ACK_ATTEMPTS.
-      await deadLetterThrough(k1.id);
-      // K2 follows the same fate: the stream stays stuck until the server-side
-      // head is cleared (the guard rejection is real, this test pins the boundary).
-      await deadLetterThrough(k2.id);
-      expect(pi.hiddenMessages.length).toBeGreaterThan(0);
+      // All three events arrive; they wake together once.
+      for (const event of [k0, k1, k2]) {
+        client.emitStream({ method: "agent.event", params: { event } });
+      }
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({
+        details: { eventIds: [k0.id, k1.id, k2.id] },
+      });
+      await settleWake();
+      // Each ack is attempted once and rejected; nothing is re-presented and no
+      // retry storm follows (the presentation guard is monotonic until scope
+      // reset, and the failed events converge via the ack cursor sweep).
+      expect(ackCount(k0.id)).toBe(1);
+      expect(ackCount(k1.id)).toBe(1);
+      expect(ackCount(k2.id)).toBe(1);
+      await vi.advanceTimersByTimeAsync(120_000);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(ackCount(k0.id)).toBe(1);
+      expect(ackCount(k1.id)).toBe(1);
+      expect(ackCount(k2.id)).toBe(1);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1654,9 +1674,8 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("does not churn: the server re-listing a dead-lettered K0 on every get no longer stalls K1's wake (R2 fix)", async () => {
+  test("does not churn: the server re-listing a failed K0 on every get no longer stalls K1's wake", async () => {
     vi.useFakeTimers();
-    const { MAX_ACK_ATTEMPTS } = (await import(extensionModuleUrl)) as Module;
     const k0 = event(915, "term_agent");
     const k1 = event(916, "term_agent");
     const client = createWakeClient();
@@ -1675,10 +1694,10 @@ describe("herdsman-pi orchestrator bridge", () => {
       if (method === "agent.notifications.ack" && eventId === k1.id)
         return { acknowledged: true, ackedEventId: k1.id, state: { ackedEventId: k1.id } };
       if (method === "agent.orchestrator.get" && reListK0) {
-        // Faithful to the real server: every get re-lists the dead-lettered K0
-        // (it stays pending/delivered in the scope until acked). Before the fix
-        // this made addPendingEvents count K0 as new on every wake, cancelling
-        // the in-flight wake and stalling the stream forever.
+        // Faithful to the real server: every get re-lists the failed K0
+        // (it stays pending/delivered in the scope until acked). The extension
+        // must not count it as a new event (which would cancel the in-flight
+        // wake and stall the stream forever), and must not re-present it.
         return connectionResponse({ events: [k0] });
       }
       return base(method, params);
@@ -1694,31 +1713,32 @@ describe("herdsman-pi orchestrator bridge", () => {
         await pi.emit("agent_settled", {}, ctx);
       };
 
-      // K0 dead-letters after MAX_ACK_ATTEMPTS resync failures.
+      // K0 is presented once; its ack fails (resync) and it is never re-presented.
       client.emitStream({ method: "agent.event", params: { event: k0 } });
-      for (let attempt = 1; attempt <= MAX_ACK_ATTEMPTS; attempt += 1) {
-        client.emitStream({ method: "agent.event", params: { event: k0 } });
-        await vi.advanceTimersByTimeAsync(30_000);
-        await settleWake();
-        expect(ackCount(k0.id)).toBe(attempt);
-      }
-      expect(ackCount(k0.id)).toBe(MAX_ACK_ATTEMPTS);
+      await vi.advanceTimersByTimeAsync(500);
+      await settleWake();
+      expect(ackCount(k0.id)).toBe(1);
 
-      // K1 arrives; every subsequent get re-lists the dead-lettered K0.
+      // K1 arrives; every subsequent get re-lists the failed K0.
       reListK0 = true;
       client.emitStream({ method: "agent.event", params: { event: k1 } });
       await vi.advanceTimersByTimeAsync(500);
-      // K1 is presented on the first wake: the dead-lettered K0 no longer counts
-      // as a new event, so the in-flight wake is not cancelled by its own get.
-      const k1Wake = pi.hiddenMessages.at(-1)?.[0] as { details?: { eventIds: number[] } };
-      expect(k1Wake.details?.eventIds).toEqual([k1.id]);
+      // K1 is presented on the first wake: the failed K0 no longer counts as a
+      // new event, so the in-flight wake is not cancelled by its own get, and
+      // K0 itself is not re-presented.
+      const k1Wake = pi.hiddenMessages.at(-1)?.[0] as {
+        content: string;
+        details?: { eventIds: number[] };
+      };
+      expect(k1Wake.content).toContain("event: 916");
+      expect(k1Wake.content).not.toContain("event: 915");
       await settleWake();
       expect(ackCount(k1.id)).toBe(1);
-      // No wake churn and no re-presentation of the dead-lettered K0 afterwards.
+      // No wake churn and no re-presentation of the failed K0 afterwards: its
+      // ack count stays at the single first attempt.
       await vi.advanceTimersByTimeAsync(120_000);
       expect(ackCount(k1.id)).toBe(1);
-      expect(ackCount(k0.id)).toBe(MAX_ACK_ATTEMPTS);
-      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [k1.id] } });
+      expect(ackCount(k0.id)).toBe(1);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -1726,7 +1746,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("re-wakes a still-pending batch after reconnect clears the invalidated batch", async () => {
+  test("does not re-present an already-presented event after a reconnect clears its unstarted batch", async () => {
     vi.useFakeTimers();
     const pending = event(88, "term_agent");
     const client = createFakeClient();
@@ -1752,19 +1772,19 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.disconnect();
       await client.connect();
       await vi.advanceTimersByTimeAsync(1_000);
-      // The invalidated batch no longer gates the replayed pending event: the
-      // fresh connection clears it and re-wakes the still-unacknowledged event
-      // once, without a duplicate-presentation loop.
-      expect(pi.hiddenMessages).toHaveLength(2);
-      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [88] } });
+      // The batch's wake turn never started, so the fresh connection clears it
+      // and the daemon re-lists the still-unacknowledged event — but the event
+      // was already presented this session, so it is not presented a second
+      // time (the presentation guard is monotonic until scope reset).
+      expect(pi.hiddenMessages).toHaveLength(1);
 
       await pi.emit("agent_settled", {}, ctx);
       client.emitStream({ method: "agent.event", params: { event: event(89, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
-      // The re-presented event is deduplicated: the next wake's batch content
-      // contains only the new event (details.eventIds still lists every pending
-      // id, including the already-presented one).
-      expect(pi.hiddenMessages).toHaveLength(3);
+      // The next wake's batch content contains only the new event
+      // (details.eventIds still lists every pending id, including the
+      // already-presented one).
+      expect(pi.hiddenMessages).toHaveLength(2);
       const lastWake = pi.hiddenMessages.at(-1)?.[0] as {
         content: string;
         details?: { eventIds: number[] };
@@ -2511,6 +2531,185 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
     }
   });
 
+  test("successful ACK keeps the event id in presentedEventIds so a redelivered event is never re-presented", async () => {
+    vi.useFakeTimers();
+    const eventId = 401;
+    const client = createWakeClient([event(eventId, "term_agent")]);
+    const baseResponse = client.response;
+    client.response = (method, params) => {
+      if (method === "agent.notifications.ack") {
+        return {
+          acknowledged: true,
+          state: {
+            ackedEventId: eventId,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_pi" },
+            updatedAt: "2026-07-10T00:00:01.000Z",
+            workspaceId: "wB",
+          },
+        };
+      }
+      return baseResponse(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState:
+      | { presentedEventIds: Set<number>; pendingEvents: Array<{ id: number }> }
+      | undefined;
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
+
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+
+      // ACK succeeded and the cursor advanced through the event.
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId }],
+      ]);
+      // The event left the pending projection after the ack...
+      expect(extensionState?.pendingEvents.some((pending) => pending.id === eventId)).toBe(false);
+      // ...but the presentation guard retains the id (old code deleted it here
+      // and failed this assertion).
+      expect(extensionState?.presentedEventIds.has(eventId)).toBe(true);
+
+      // A daemon replay of the same event arrives; no wake is constructed.
+      client.emitStream({ method: "agent.event", params: { event: event(eventId, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toHaveLength(1);
+
+      // A genuinely new event still wakes.
+      client.emitStream({ method: "agent.event", params: { event: event(402, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [402] } });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("retryable ACK failure keeps the event in presentedEventIds so a redelivered event is not re-presented", async () => {
+    vi.useFakeTimers();
+    const eventId = 411;
+    const client = createWakeClient([event(eventId, "term_agent")]);
+    const baseResponse = client.response;
+    client.response = (method, params) => {
+      if (
+        method === "agent.notifications.ack" &&
+        (params as { eventId: number }).eventId === eventId
+      ) {
+        throw Object.assign(new Error("temporary failure"), { code: "ORCHESTRATOR_BUSY" });
+      }
+      return baseResponse(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState:
+      | { presentedEventIds: Set<number>; pendingEvents: Array<{ id: number }> }
+      | undefined;
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
+      const hiddenCount = pi.hiddenMessages.length;
+
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId }],
+      ]);
+      // The failed event stays in the pending projection (for cursor-sweep
+      // convergence) and its presentation guard is retained (old code deleted
+      // the id on the retryable failure path and re-presented the event).
+      expect(extensionState?.pendingEvents.some((pending) => pending.id === eventId)).toBe(true);
+      expect(extensionState?.presentedEventIds.has(eventId)).toBe(true);
+
+      // The daemon re-delivers the same event together with a new one.
+      client.emitStream({ method: "agent.event", params: { event: event(eventId, "term_agent") } });
+      client.emitStream({ method: "agent.event", params: { event: event(412, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(1_000);
+
+      // Only the new event is presented; the failed one is not re-presented.
+      expect(pi.hiddenMessages.length).toBe(hiddenCount + 1);
+      const lastWake = pi.hiddenMessages.at(-1)?.[0] as {
+        content: string;
+        details?: { eventIds: number[] };
+      };
+      expect(lastWake.content).toContain("event: 412");
+      expect(lastWake.content).not.toContain("event: 411");
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("reconnect preserves the in-flight batch and the presentation guard so the settle acks without a duplicate wake", async () => {
+    vi.useFakeTimers();
+    const eventId = 421;
+    const client = createFakeClient();
+    client.response = (method) => {
+      if (method === "agent.orchestrator.register")
+        return connectionResponse({ events: [event(eventId, "term_agent")] });
+      if (method === "agent.orchestrator.get") return connectionResponse();
+      if (method === "agent.list") return agentListResponse();
+      return { acknowledged: true };
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState: { presentedEventIds: Set<number> } | undefined;
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({ details: { eventIds: [eventId] } });
+
+      // The wake turn starts; the daemon drops the socket mid-turn.
+      ctx.setIdle(false);
+      client.disconnect(new Error("transient disconnect"));
+      await client.connect();
+      await vi.advanceTimersByTimeAsync(0);
+      // The in-flight batch and the presentation guard survived the reconnect
+      // (the register response re-lists the still-unacknowledged event).
+      expect(extensionState?.presentedEventIds.has(eventId)).toBe(true);
+
+      // The turn completes; the settlement must ack the batch instead of
+      // re-presenting it.
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      ctx.setIdle(true);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId }],
+      ]);
+
+      // No duplicate wake was constructed on any retry timer.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(pi.hiddenMessages).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
   test("silently ignores an unwritable diagnostic log and preserves acknowledgement behavior", async () => {
     vi.useFakeTimers();
     const logHome = mkdtempSync(join(tmpdir(), "herdsman-pi-log-blocked-"));
@@ -2608,7 +2807,12 @@ async function startExtension(
   client: FakeClient,
   pi: FakePi,
   ctx: ReturnType<typeof fakeCtx>,
-  options: { onStateExposed?: (state: { presentedEventIds: Set<number> }) => void } = {},
+  options: {
+    onStateExposed?: (state: {
+      pendingEvents: AgentEventWireRecord[];
+      presentedEventIds: Set<number>;
+    }) => void;
+  } = {},
 ): Promise<() => Promise<void>> {
   const completions: Promise<void>[] = [];
   const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;

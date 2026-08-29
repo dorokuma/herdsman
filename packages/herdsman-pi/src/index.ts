@@ -302,10 +302,15 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     const pruneAcknowledgedEvents = (ackedEventId: number | undefined) => {
       if (ackedEventId === undefined) return;
+      // Acknowledged events leave the pending projection but intentionally stay
+      // in presentedEventIds. The daemon never re-lists acked events (acked
+      // rows are excluded from pending discovery), so retaining the ids cannot
+      // suppress a legitimate future delivery; it only guarantees that an event
+      // already presented in this scope session is never presented again, even
+      // if a reconnect, an ack retry, or a daemon redelivery replays it. The
+      // set is bounded by the number of events presented per session and is
+      // cleared on role loss, scope change, and shutdown.
       state.pendingEvents = state.pendingEvents.filter((event) => event.id > ackedEventId);
-      for (const presentedId of [...state.presentedEventIds]) {
-        if (presentedId <= ackedEventId) state.presentedEventIds.delete(presentedId);
-      }
     };
 
     const isWakeableEvent = (event: AgentEventWireRecord | undefined) =>
@@ -446,9 +451,10 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             state.wakeRequested = false;
             state.wakeRequestedThroughEventId = 0;
             // Record the presentation so a reclaim redelivery of the same id is
-            // not presented twice; the ids leave this set on successful acknowledgement
-            // pruning (pruneAcknowledgedEvents), on retryable acknowledgement failures,
-            // or on role loss, scope change, and shutdown.
+            // never presented twice. The set is monotonic for the lifetime of
+            // the current orchestrator scope: ids are only removed on role
+            // loss, scope change, or shutdown (pruneAcknowledgedEvents keeps
+            // acknowledged ids on purpose).
             for (const outcome of batchOutcomes) {
               state.presentedEventIds.add(outcome.eventId);
             }
@@ -461,8 +467,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }, WAKE_SETTLE_MS);
     };
 
-    const loseRole = (ctx: PiContext | undefined, options: { abort?: boolean } = {}) => {
-      if (state.deliveredBatch) {
+    const loseRole = (
+      ctx: PiContext | undefined,
+      options: { abort?: boolean; preservePresented?: boolean } = {},
+    ) => {
+      if (state.deliveredBatch && !options.preservePresented) {
         state.deliveredBatch.invalidated = true;
         const abortedBatch = state.deliveredBatch;
         if (options.abort) {
@@ -492,14 +501,20 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       clearAgentContext();
       state.isOrchestrator = false;
       state.pendingEvents = [];
-      state.presentedEventIds.clear();
+      // A transient disconnect (reconnect) keeps the presentation guard so an
+      // event already presented in this scope session is not presented again;
+      // only a genuine role/scope loss or shutdown resets it.
+      if (!options.preservePresented) state.presentedEventIds.clear();
       state.reconnectingFromOn = false;
       setHerdsmanUi(ctx);
     };
 
     const markDisconnected = (ctx: PiContext | undefined) => {
       const reconnectingFromOn = state.reconnectingFromOn || state.isOrchestrator;
-      loseRole(ctx, { abort: false });
+      // Reconnects are not scope resets: keep the presentation guard and the
+      // in-flight batch so a settled turn can still be acknowledged and no
+      // already-presented event is injected twice.
+      loseRole(ctx, { abort: false, preservePresented: true });
       state.reconnectingFromOn = reconnectingFromOn;
       setHerdsmanUi(ctx);
     };
@@ -575,12 +590,19 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }
       state.isOrchestrator = true;
       state.reconnectingFromOn = false;
-      if (state.deliveredBatch?.invalidated) {
-        // A transient disconnect invalidated the previous batch without acking
-        // it. Clear it here so still-pending events are re-woken on this fresh
-        // connection instead of being gated forever; already acked events are
-        // covered by the server cursor (pruneAcknowledgedEvents below).
-        state.deliveredBatch = undefined;
+      if (state.deliveredBatch) {
+        if (state.deliveredBatch.invalidated || ctx?.isIdle?.() !== false) {
+          // A batch invalidated by a genuine role/scope reset, or a batch whose
+          // wake turn is no longer running (it never started, or it already
+          // settled during the disconnect), can no longer be acknowledged by a
+          // future settlement. Clear it so the still-pending events can be
+          // re-woken on this fresh connection instead of being gated forever;
+          // already acked events are covered by the server cursor
+          // (pruneAcknowledgedEvents below).
+          state.deliveredBatch = undefined;
+        }
+        // Otherwise the batch's wake turn is still in flight: keep it so the
+        // settlement acknowledges it and the events are not re-presented.
       }
       applyOwnerContext(response);
       setHerdsmanUi(ctx);
@@ -961,7 +983,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           })) as { ackedEventId?: number; state?: { ackedEventId?: number } };
           pruneAcknowledgedEvents(ackResponse?.ackedEventId ?? ackResponse?.state?.ackedEventId);
           state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
-          state.presentedEventIds.delete(event.id);
+          // The id intentionally stays in presentedEventIds: the event was
+          // already presented this session and must not be injected again even
+          // if the daemon replays it (for example after a reconnect
+          // redelivery). The set is cleared only on role loss, scope change,
+          // or shutdown.
           state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
           setHerdsmanUi(ctx);
         } catch (error) {
@@ -1036,10 +1062,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
                 `[herdsman-pi] acknowledgement resync failed eventId=${event.id} attempts=${attempts} code=${ackFailureCode(resyncError)}`,
               );
             }
-            // The event stays pending with a backoff and is eligible for a
-            // later re-presentation; continue so one failed event does not
-            // block the rest of the batch.
-            state.presentedEventIds.delete(event.id);
+            // The event stays pending with a backoff so the ack cursor can
+            // sweep it later, but it was already presented this session and is
+            // not re-presented: presentedEventIds keeps the guard until scope
+            // reset. Continue so one failed event does not block the rest of
+            // the batch.
             continue;
           }
 
@@ -1053,10 +1080,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             "warning",
           );
           setHerdsmanUi(ctx);
-          // The event stays pending with a backoff and is eligible for a later
-          // re-presentation; continue so one failed event does not block the
-          // rest of the batch.
-          state.presentedEventIds.delete(event.id);
+          // The event stays pending with a backoff so the ack cursor can sweep
+          // it later, but it was already presented this session and is not
+          // re-presented: presentedEventIds keeps the guard until scope reset.
           continue;
         }
       }

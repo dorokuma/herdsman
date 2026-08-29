@@ -8,6 +8,23 @@ import type {
 } from "@/observability/contracts.js";
 import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
 
+/**
+ * A delivered event is re-listed for the same owner terminal only within this
+ * freshness window after its last delivery attempt. The window covers the
+ * crash/redelivery path (an extension that missed the first delivery re-fetches
+ * it right after reconnecting) while preventing an unacked delivered event from
+ * being re-returned indefinitely on every orchestrator.get, which would feed
+ * duplicate presentations whenever the extension's local dedup state is lost.
+ */
+export const REDELIVERY_FRESHNESS_MS = 300_000;
+
+export function hasNonEmptyAssistantMessage(
+  compactHistory: CompactAgentHistory | null | undefined,
+): boolean {
+  const text = compactHistory?.lastAssistantMessage?.text;
+  return typeof text === "string" && text.trim().length > 0;
+}
+
 /** The single delivery predicate shared by pending discovery and acknowledgement. */
 export function isDeliverableAgentEvent(
   event: AgentEventRecord,
@@ -27,6 +44,11 @@ export function isDeliverableAgentEvent(
     event.type !== "agent.status.changed" &&
     !(event.type === "agent.idle" && asRecord(event.payload).from !== "working") &&
     !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
+    !(
+      agent.agent !== "pi" &&
+      event.type === "agent.idle" &&
+      !hasNonEmptyAssistantMessage(event.compactHistory)
+    ) &&
     agent.paneId === event.paneId &&
     (event.paneGeneration === null || agent.paneGeneration === event.paneGeneration) &&
     agent.workspaceId === scope.workspaceId &&
@@ -215,13 +237,14 @@ export class AgentEventStore {
   ): AgentEventRecord[] {
     const clauses = [
       "id > ?",
-      "((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and id > ?))",
+      "((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and id > ? and last_attempt_at >= ?))",
     ];
     const params: Array<number | string | null> = [
       input.afterEventId ?? 0,
       Date.now(),
       input.ownerTerminalId ?? null,
       input.afterEventId ?? 0,
+      Date.now() - REDELIVERY_FRESHNESS_MS,
     ];
     if (input.herdrSessionName) {
       clauses.push("herdr_session_name = ?");
@@ -261,6 +284,7 @@ export class AgentEventStore {
         afterEventId,
         Date.now(),
         input.ownerTerminalId,
+        Date.now() - REDELIVERY_FRESHNESS_MS,
         input.herdrSessionName,
         input.workspaceId,
         input.ownerTerminalId,
@@ -268,7 +292,7 @@ export class AgentEventStore {
       const rows = this.#sqlite
         .prepare(
           `select * from agent_events
-           where id > ? and ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ?)) and herdr_session_name = ? and workspace_id = ?
+           where id > ? and ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and last_attempt_at >= ?)) and herdr_session_name = ? and workspace_id = ?
              and terminal_id is not null and terminal_id != ? and agent_id is not null
              ${agentFilter}
            order by id asc limit 1000`,
@@ -295,12 +319,12 @@ export class AgentEventStore {
     return this.#transaction(() => {
       const now = Date.now();
       const idClause = ids && ids.length > 0 ? `and id in (${ids.map(() => "?").join(",")})` : "";
-      const params: Array<number | string> = [now, terminalId];
+      const params: Array<number | string> = [now, terminalId, now - REDELIVERY_FRESHNESS_MS];
       if (ids && ids.length > 0) params.push(...ids);
       params.push(limit);
       const rows = this.#sqlite
         .prepare(
-          `select * from agent_events where ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ?)) ${idClause} order by id asc limit ?`,
+          `select * from agent_events where ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and last_attempt_at >= ?)) ${idClause} order by id asc limit ?`,
         )
         .all(...params) as AgentEventRow[];
       for (const row of rows) {
