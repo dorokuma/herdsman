@@ -170,6 +170,7 @@ type PiApi = {
 type ExtensionOptions = {
   clientFactory?: () => HerdsmanDaemonClient;
   onTurnCompletionSignal?: (completion: Promise<void>) => void;
+  onStateExposed?: (state: HerdsmanState) => void;
 };
 
 const DEFAULT_HOME_NAME = ".herdsman";
@@ -263,6 +264,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       wakeTimer: undefined,
       ackInFlight: false,
     };
+    options.onStateExposed?.(state);
     let activeContext: PiContext | undefined;
     let wakeGeneration = 0;
 
@@ -444,10 +446,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             state.wakeRequested = false;
             state.wakeRequestedThroughEventId = 0;
             // Record the presentation so a reclaim redelivery of the same id is
-            // not presented twice; the ids leave this set when the events leave
-            // pendingEvents (ack, terminal failure, dead-letter, role loss,
-            // scope change, shutdown) or become retryable again after a failed
-            // acknowledgement.
+            // not presented twice; the ids leave this set on successful acknowledgement
+            // pruning (pruneAcknowledgedEvents), on retryable acknowledgement failures,
+            // or on role loss, scope change, and shutdown.
             for (const outcome of batchOutcomes) {
               state.presentedEventIds.add(outcome.eventId);
             }
@@ -980,7 +981,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
           if (classification === "terminal") {
             state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
-            state.presentedEventIds.delete(event.id);
             state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
             if (/Only the current orchestrator can acknowledge notifications/i.test(failureCode)) {
               state.isOrchestrator = false;
@@ -1000,7 +1000,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
           if (attempts >= MAX_ACK_ATTEMPTS) {
             state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
-            state.presentedEventIds.delete(event.id);
             state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
             logHerdsmanPi(
               "warn",

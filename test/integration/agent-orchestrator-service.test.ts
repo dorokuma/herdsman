@@ -575,7 +575,7 @@ describe("AgentOrchestratorService ack regression", () => {
     expect(service.status(scope)).toEqual(first);
   });
 
-  test("rejects acknowledging an event invalidated with its retired worker pane", () => {
+  test("allows acknowledging an event invalidated after delivery with its retired worker pane", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
     const event = appendEvent(harness, { terminalId: "term_worker" });
@@ -584,9 +584,10 @@ describe("AgentOrchestratorService ack regression", () => {
     ]);
     harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
 
-    expect(() => service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toThrow(
-      "orchestrator event is no longer pending (invalidated)",
-    );
+    expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toMatchObject({
+      ackedEventId: event.id,
+    });
+    expect(service.status(scope)).toMatchObject({ ackedEventId: event.id });
   });
 
   test("rejects an invalidated event without blocking a later pending event", () => {
@@ -682,13 +683,10 @@ describe("AgentOrchestratorService ack regression", () => {
 });
 
 describe("AgentOrchestratorService invalidated acknowledgement wording (independent coverage)", () => {
-  test("uses invalidated wording for a known event that is no longer deliverable", () => {
+  test("uses invalidated wording for an event invalidated before delivery", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
     const known = appendEvent(harness, { terminalId: "term_worker" });
-    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
-      expect.objectContaining({ id: known.id }),
-    ]);
     harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
 
     expect(() => service.ack({ ...scope, eventId: known.id, terminalId: "term_owner" })).toThrow(
@@ -703,5 +701,120 @@ describe("AgentOrchestratorService invalidated acknowledgement wording (independ
     expect(() => service.ack({ ...scope, eventId: 99_999, terminalId: "term_owner" })).toThrow(
       "Only the next pending orchestrator event can be acknowledged",
     );
+  });
+
+  test("advances cursor when event was delivered and subsequently invalidated via invalidatePane", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const event = appendEvent(harness, { terminalId: "term_worker" });
+    // Reserve/deliver to term_owner
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.id).toBe(event.id);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "delivered",
+      deliveredToTerminalId: "term_owner",
+    });
+
+    // Pane closed / invalidated
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: scope.herdrSessionName,
+      paneId: event.paneId ?? "wB:p_worker",
+      invalidatedReason: "PANE_CLOSED",
+    });
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+      deliveredToTerminalId: "term_owner",
+    });
+
+    // ACK advances ackedEventId cursor
+    const result = service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" });
+    expect(result.ackedEventId).toBe(event.id);
+    expect(service.status(scope)?.ackedEventId).toBe(event.id);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+    });
+
+    // Repeated ACK is idempotent
+    expect(service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" })).toEqual(result);
+
+    // Subsequent pending call does not redeliver
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toHaveLength(0);
+  });
+
+  test("advances cursor when event was delivered and pane generation drifted before ACK", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const agent = harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "codex",
+          agent_status: "working",
+          name: "term_worker",
+          pane_id: "wB:p_worker",
+          pane_generation: "gen-1",
+          terminal_id: "term_worker",
+          workspace_id: "wB",
+        },
+      ],
+    })[0];
+    if (!agent) throw new Error("Expected agent");
+    const event = harness.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      paneId: "wB:p_worker",
+      paneGeneration: "gen-1",
+      payload: {},
+      terminalId: "term_worker",
+      type: "agent.done",
+      workspaceId: "wB",
+    });
+
+    // Reserve/deliver to term_owner
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    expect(pending).toHaveLength(1);
+    expect(pending[0]?.id).toBe(event.id);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "delivered",
+      deliveredToTerminalId: "term_owner",
+      paneGeneration: "gen-1",
+    });
+
+    // Invalidate event for old generation
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: scope.herdrSessionName,
+      paneId: "wB:p_worker",
+      paneGeneration: "gen-1",
+      invalidatedReason: "PANE_CLOSED",
+    });
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+      deliveredToTerminalId: "term_owner",
+    });
+
+    // Agent generation drifts to gen-2
+    harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "codex",
+          agent_status: "working",
+          name: "term_worker",
+          pane_id: "wB:p_worker",
+          pane_generation: "gen-2",
+          terminal_id: "term_worker",
+          workspace_id: "wB",
+        },
+      ],
+    });
+
+    // ACK must succeed and advance cursor directly without throwing OUT_OF_ORDER
+    const result = service.ack({ ...scope, eventId: event.id, terminalId: "term_owner" });
+    expect(result.ackedEventId).toBe(event.id);
+    expect(service.status(scope)?.ackedEventId).toBe(event.id);
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "invalidated",
+    });
   });
 });

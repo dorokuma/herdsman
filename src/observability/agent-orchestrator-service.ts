@@ -3,6 +3,7 @@ import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes
 import type { AgentStore } from "@/db/agents.js";
 import type {
   AgentEventRecord,
+  AgentIndexRecord,
   AgentOrchestratorChangeReason,
   AgentOrchestratorState,
   AgentScope,
@@ -106,7 +107,7 @@ export class AgentOrchestratorService {
               ...input,
               afterEventId: state.ackedEventId,
               ownerTerminalId: input.terminalId,
-              getAgent: (agentId) => this.#agents.get(agentId),
+              getAgent: (agentId) => this.#safeGetAgent(agentId),
             })?.id ?? null;
         }
         console.warn("Herdsman orchestrator ack rejected", {
@@ -119,6 +120,15 @@ export class AgentOrchestratorService {
         });
       }
       throw error;
+    }
+  }
+
+  #safeGetAgent(agentId: string): AgentIndexRecord | undefined {
+    try {
+      return this.#agents.get(agentId);
+    } catch {
+      console.warn("Herdsman orchestrator skipped missing agent", { agentId });
+      return undefined;
     }
   }
 
@@ -155,32 +165,39 @@ export class AgentOrchestratorService {
         message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
       });
     }
-    if (event.status !== "pending" && event.status !== "delivered") {
+    const isDeliveredToCurrentTerminal =
+      event.status === "delivered" && event.deliveredToTerminalId === input.terminalId;
+    const isInvalidatedDelivered =
+      event.status === "invalidated" && event.deliveredToTerminalId === input.terminalId;
+
+    if (event.status !== "pending" && event.status !== "delivered" && !isInvalidatedDelivered) {
       throw new OrchestratorAckError({
         code: "ORCHESTRATOR_EVENT_INVALIDATED",
         message: ORCHESTRATOR_ACK_MESSAGES.invalidated,
       });
     }
-    const eventAgent = event.agentId ? this.#agents.get(event.agentId) : undefined;
-    if (
-      eventAgent &&
-      !isDeliverableAgentEvent(
-        event.status === "delivered" ? { ...event, status: "pending" } : event,
-        eventAgent,
-        input,
-        input.terminalId,
-      )
-    ) {
-      throw new OrchestratorAckError({
-        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
-        message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
-      });
+    if (!isInvalidatedDelivered) {
+      const eventAgent = event.agentId ? this.#safeGetAgent(event.agentId) : undefined;
+      if (
+        eventAgent &&
+        !isDeliverableAgentEvent(
+          isDeliveredToCurrentTerminal ? { ...event, status: "pending" } : event,
+          eventAgent,
+          input,
+          input.terminalId,
+        )
+      ) {
+        throw new OrchestratorAckError({
+          code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+          message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
+        });
+      }
     }
     const next = this.#agentEvents.nextDeliverableAfter({
       ...input,
       afterEventId: state.ackedEventId,
       ownerTerminalId: input.terminalId,
-      getAgent: (agentId) => this.#agents.get(agentId),
+      getAgent: (agentId) => this.#safeGetAgent(agentId),
     });
     // Only an undelivered (pending) later event blocks an out-of-order ack. If the
     // next candidate is already delivered to this owner, or there is no candidate

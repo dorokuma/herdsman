@@ -21,6 +21,7 @@ type Module = {
   createHerdsmanPiExtension: (options?: {
     clientFactory?: () => FakeClient;
     onTurnCompletionSignal?: (completion: Promise<void>) => void;
+    onStateExposed?: (state: { presentedEventIds: Set<number> }) => void;
   }) => (pi: FakePi) => void;
   defaultSocketPath: () => string;
   formatHiddenAgentContext: (input: { agents: unknown[]; workspaceId: string }) => string;
@@ -2447,6 +2448,69 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
     }
   });
 
+  test("terminal ACK failure preserves presentedEventIds and does not re-present the event on duplicate delivery", async () => {
+    vi.useFakeTimers();
+    const terminalFailedId = 301;
+    const client = createWakeClient([event(terminalFailedId, "term_agent")]);
+    const baseResponse = client.response;
+    client.response = (method, params) => {
+      if (
+        method === "agent.notifications.ack" &&
+        (params as { eventId: number }).eventId === terminalFailedId
+      ) {
+        throw new Error("orchestrator event is no longer pending (invalidated)");
+      }
+      return baseResponse(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState: { presentedEventIds: Set<number> } | undefined;
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({
+        details: { eventIds: [terminalFailedId] },
+      });
+      const hiddenMessageCountBefore = pi.hiddenMessages.length;
+
+      // Finish the turn and settle
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+
+      // Verify ACK was attempted and encountered terminal failure
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: terminalFailedId }],
+      ]);
+
+      // Direct discriminating assertion: presentedEventIds must still retain the terminal failed event id
+      expect(extensionState?.presentedEventIds.has(terminalFailedId)).toBe(true);
+
+      // When subsequent events arrive (including the old terminalFailedId and a new event 302)
+      client.emitStream({
+        method: "agent.event",
+        params: { event: event(terminalFailedId, "term_agent") },
+      });
+      client.emitStream({
+        method: "agent.event",
+        params: { event: event(302, "term_agent") },
+      });
+      await vi.advanceTimersByTimeAsync(500);
+
+      // Only the new event 302 is presented; terminalFailedId must NOT be duplicated
+      expect(pi.hiddenMessages.length).toBe(hiddenMessageCountBefore + 1);
+      expect(pi.hiddenMessages.at(-1)?.[0]).toMatchObject({ details: { eventIds: [302] } });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
   test("silently ignores an unwritable diagnostic log and preserves acknowledgement behavior", async () => {
     vi.useFakeTimers();
     const logHome = mkdtempSync(join(tmpdir(), "herdsman-pi-log-blocked-"));
@@ -2544,12 +2608,14 @@ async function startExtension(
   client: FakeClient,
   pi: FakePi,
   ctx: ReturnType<typeof fakeCtx>,
+  options: { onStateExposed?: (state: { presentedEventIds: Set<number> }) => void } = {},
 ): Promise<() => Promise<void>> {
   const completions: Promise<void>[] = [];
   const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
   createHerdsmanPiExtension({
     clientFactory: () => client,
     onTurnCompletionSignal: (completion) => completions.push(completion),
+    ...options,
   })(pi);
   await pi.emit("session_start", {}, ctx);
   await client.connect();
