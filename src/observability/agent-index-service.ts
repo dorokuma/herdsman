@@ -1,6 +1,6 @@
 import { safeAllowedSessionPath } from "@/agent-history/discovery.js";
 import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
-import type { AgentEventStore } from "@/db/agent-events.js";
+import { type AgentEventStore, hasNonEmptyAssistantMessage } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { AgentStore, HerdrAgentLike } from "@/db/agents.js";
@@ -592,6 +592,23 @@ export class AgentIndexService {
     });
     const statusType = statusEventType(input.to);
     if (statusType) {
+      if (
+        statusType === "agent.idle" &&
+        input.agent.agent !== "pi" &&
+        !hasNonEmptyAssistantMessage(compactHistory)
+      ) {
+        console.debug(
+          "Herdsman skipping agent.idle event generation for non-pi agent without assistant message",
+          {
+            agent: input.agent.agent,
+            agentId: input.agent.id,
+            from: input.from,
+            herdrSessionName: input.agent.herdrSessionName,
+            paneId: input.agent.paneId,
+          },
+        );
+        return undefined;
+      }
       return this.#appendAndAckSelfEvent({
         agentId: input.agent.id,
         compactHistory,

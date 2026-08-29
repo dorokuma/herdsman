@@ -558,3 +558,145 @@ describe("AgentIndexService identity regressions (independent coverage)", () => 
     harness.sqlite.close();
   });
 });
+
+describe("AgentIndexService non-pi completed event generation", () => {
+  test("agy working -> idle with empty assistant message suppresses agent.idle event generation", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: null,
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+
+    const result = await index.handleHerdrEvent({
+      event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+
+    // agent.idle event is suppressed in returned events
+    expect(result.events).toEqual([]);
+
+    // agent.status.changed is still recorded in DB for history
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((e) => e.type === "agent.idle")).toHaveLength(0);
+    expect(allEvents.filter((e) => e.type === "agent.status.changed")).toHaveLength(1);
+
+    harness.sqlite.close();
+  });
+
+  test("agy working -> idle with non-empty assistant message generates agent.idle event", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: { ref: "history", text: "agy finished task", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+
+    const result = await index.handleHerdrEvent({
+      event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+
+    expect(result.events).toEqual([
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: expect.objectContaining({ text: "agy finished task" }),
+        }),
+        type: "agent.idle",
+      }),
+    ]);
+
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((e) => e.type === "agent.idle")).toHaveLength(1);
+
+    harness.sqlite.close();
+  });
+
+  test("agy working -> done with empty assistant message generates agent.done event", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: null,
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+
+    const result = await index.handleHerdrEvent({
+      event: { agent_status: "done", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+
+    expect(result.events).toEqual([
+      expect.objectContaining({
+        type: "agent.done",
+      }),
+    ]);
+
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((e) => e.type === "agent.done")).toHaveLength(1);
+
+    harness.sqlite.close();
+  });
+});
