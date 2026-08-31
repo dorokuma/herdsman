@@ -1698,7 +1698,7 @@ describe("herdsman-pi orchestrator bridge", () => {
         // (it stays pending/delivered in the scope until acked). The extension
         // must not count it as a new event (which would cancel the in-flight
         // wake and stall the stream forever), and must not re-present it.
-        return connectionResponse({ events: [k0] });
+        return connectionResponse({ events: [k0, k1] });
       }
       return base(method, params);
     };
@@ -2785,18 +2785,107 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
       restoreEnv(previous);
     }
   });
+
+  test("prunes orphan pending events when orchestrator.get returns empty and skips wake", async () => {
+    vi.useFakeTimers();
+    let extensionState: { pendingEvents: AgentEventWireRecord[] } | undefined;
+    const client = createFakeClient();
+    client.response = (method) => {
+      if (method === "agent.orchestrator.register") return connectionResponse({ events: [] });
+      if (method === "agent.orchestrator.get") return connectionResponse({ events: [] });
+      if (method === "agent.list") return agentListResponse();
+      return { acknowledged: true };
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      client.emitStream({ method: "agent.event", params: { event: event(501, "term_agent") } });
+      expect(extensionState?.pendingEvents).toHaveLength(1);
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(extensionState?.pendingEvents).toHaveLength(0);
+      expect(pi.hiddenMessages).toHaveLength(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("retains local pending events beyond 100-event window when server response is truncated", async () => {
+    vi.useFakeTimers();
+    let extensionState: { pendingEvents: AgentEventWireRecord[] } | undefined;
+    const client = createFakeClient();
+
+    const server100Events: AgentEventWireRecord[] = Array.from({ length: 100 }, (_, i) =>
+      event(i + 1, "term_agent"),
+    );
+
+    client.response = (method) => {
+      if (method === "agent.orchestrator.register") {
+        return connectionResponse({ events: server100Events });
+      }
+      if (method === "agent.orchestrator.get") {
+        return connectionResponse({ events: server100Events });
+      }
+      if (method === "agent.list") return agentListResponse();
+      return { acknowledged: true };
+    };
+
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+
+      expect(extensionState?.pendingEvents).toHaveLength(100);
+
+      client.emitStream({ method: "agent.event", params: { event: event(105, "term_agent") } });
+      expect(extensionState?.pendingEvents).toHaveLength(101);
+
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(extensionState?.pendingEvents.some((e) => e.id === 105)).toBe(true);
+      expect(extensionState?.pendingEvents).toHaveLength(101);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
 });
 
 function createWakeClient(replayedEvents: AgentEventWireRecord[] = [], ackedEventId?: number) {
   const client = createFakeClient();
-  client.response = (method) => {
+  for (const ev of replayedEvents) {
+    if (ackedEventId === undefined || ev.id > ackedEventId) {
+      client.currentEvents.set(ev.id, ev);
+    }
+  }
+  client.response = (method, _params) => {
     if (method === "agent.orchestrator.register") {
       return connectionResponse({
         ...(ackedEventId === undefined ? {} : { ackedEventId }),
         events: replayedEvents,
       });
     }
-    if (method === "agent.orchestrator.get") return connectionResponse();
+    if (method === "agent.orchestrator.get") {
+      return connectionResponse({
+        ...(ackedEventId === undefined ? {} : { ackedEventId }),
+        events: [...client.currentEvents.values()],
+      });
+    }
     if (method === "agent.list") return agentListResponse();
     return { acknowledged: true };
   };
@@ -2828,13 +2917,18 @@ async function startExtension(
   };
 }
 
+let activeFakeClient: { currentEvents: Map<number, AgentEventWireRecord> } | undefined;
+
 function createFakeClient() {
   let connected: (() => Promise<void> | void) | undefined;
   let disconnected: ((error: Error) => void) | undefined;
   let stream: ((message: DaemonStreamMessage) => void) | undefined;
+  const currentEvents = new Map<number, AgentEventWireRecord>();
+  let currentAckedEventId = 0;
   const client = {
     calls: [] as Array<[string, unknown]>,
     closed: false,
+    currentEvents,
     response: (_method: string, _params: unknown): unknown => connectionResponse(),
     close() {
       client.closed = true;
@@ -2850,6 +2944,18 @@ function createFakeClient() {
       disconnected?.(error);
     },
     emitStream(message: DaemonStreamMessage) {
+      if (
+        message.method === "agent.event" &&
+        message.params &&
+        typeof message.params === "object" &&
+        "event" in message.params &&
+        (message.params as { event: AgentEventWireRecord }).event
+      ) {
+        const ev = (message.params as { event: AgentEventWireRecord }).event;
+        if (ev.terminalId && ev.terminalId !== "term_pi" && ev.id > currentAckedEventId) {
+          currentEvents.set(ev.id, ev);
+        }
+      }
       stream?.(message);
     },
     get onConnected() {
@@ -2872,9 +2978,46 @@ function createFakeClient() {
     },
     async request(method: string, params: unknown) {
       client.calls.push([method, params]);
-      return client.response(method, params);
+      const res = await client.response(method, params);
+      if (
+        method === "agent.notifications.ack" &&
+        params &&
+        typeof params === "object" &&
+        "eventId" in params
+      ) {
+        const ackId = (params as { eventId: number }).eventId;
+        currentEvents.delete(ackId);
+        if (ackId > currentAckedEventId) currentAckedEventId = ackId;
+      }
+      const acked =
+        typeof res === "object" && res !== null
+          ? ((res as { ackedEventId?: number }).ackedEventId ??
+            (res as { state?: { ackedEventId?: number } }).state?.ackedEventId)
+          : undefined;
+      if (acked !== undefined && acked > currentAckedEventId) {
+        currentAckedEventId = acked;
+        for (const id of currentEvents.keys()) {
+          if (id <= currentAckedEventId) currentEvents.delete(id);
+        }
+      }
+      if (
+        method === "agent.orchestrator.register" &&
+        res &&
+        typeof res === "object" &&
+        "events" in res &&
+        Array.isArray((res as { events: unknown }).events)
+      ) {
+        currentEvents.clear();
+        for (const ev of (res as { events: AgentEventWireRecord[] }).events) {
+          if (ev.terminalId && ev.terminalId !== "term_pi" && ev.id > currentAckedEventId) {
+            currentEvents.set(ev.id, ev);
+          }
+        }
+      }
+      return res;
     },
   };
+  activeFakeClient = client;
   return client;
 }
 
@@ -2989,11 +3132,17 @@ function connectionResponse(
   const workspaceId = options.workspaceId ?? "wB";
   const ownerTerminalId =
     options.ownerTerminalId === undefined ? "term_pi" : options.ownerTerminalId;
+  const events =
+    options.events !== undefined
+      ? options.events
+      : activeFakeClient
+        ? [...activeFakeClient.currentEvents.values()]
+        : [];
   return {
     ...(options.changed === undefined ? {} : { changed: options.changed }),
     ...(options.context === undefined ? {} : { context: options.context }),
     ...(options.ackedEventId === undefined ? {} : { ackedEventId: options.ackedEventId }),
-    events: options.events ?? [],
+    events,
     presence: {
       connectedAt: 1,
       herdrSessionName: "default",

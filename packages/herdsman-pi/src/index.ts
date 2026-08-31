@@ -558,6 +558,58 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       scheduleWake(ctx);
     };
 
+    const syncPendingEventsFromServer = (
+      serverEvents: AgentEventWireRecord[],
+      ctx: PiContext | undefined,
+    ) => {
+      const serverEventById = new Map(serverEvents.map((event) => [event.id, event]));
+      const inFlightIds = new Set(state.deliveredBatch?.events.map((event) => event.id) ?? []);
+      const previousById = new Map(state.pendingEvents.map((event) => [event.id, event]));
+      const isTruncated = serverEvents.length >= 100;
+      const maxServerEventId = serverEvents.reduce((max, event) => Math.max(max, event.id), 0);
+
+      let addedNewEvent = false;
+      const nextPending: AgentEventWireRecord[] = [];
+
+      for (const serverEvent of serverEvents) {
+        const previous = previousById.get(serverEvent.id);
+        if (!previous && serverEvent.id > state.failedWakeThroughEventId) addedNewEvent = true;
+        nextPending.push(previous ? { ...serverEvent, ...previous } : serverEvent);
+      }
+
+      for (const [previousId, previousEvent] of previousById) {
+        if (serverEventById.has(previousId)) continue;
+        if (inFlightIds.has(previousId)) {
+          nextPending.push(previousEvent);
+        } else if (isTruncated && previousId > maxServerEventId) {
+          nextPending.push(previousEvent);
+        }
+      }
+
+      for (const inFlightId of inFlightIds) {
+        if (!serverEventById.has(inFlightId) && !previousById.has(inFlightId)) {
+          const inFlightEvent = state.deliveredBatch?.events.find(
+            (event) => event.id === inFlightId,
+          );
+          if (inFlightEvent) {
+            nextPending.push(inFlightEvent);
+          }
+        }
+      }
+
+      state.pendingEvents = nextPending
+        .filter((event) => event.id > state.failedWakeThroughEventId)
+        .sort((left, right) => left.id - right.id);
+
+      setHerdsmanUi(ctx);
+      if (state.pendingEvents.length === 0 && state.wakeTimer) {
+        cancelWakeTimer();
+      } else if (addedNewEvent && state.wakeTimer) {
+        cancelWakeTimer();
+      }
+      scheduleWake(ctx);
+    };
+
     const applyConnectionStateResponse = (
       response: ConnectionStateResponse,
       ctx: PiContext | undefined,
@@ -606,8 +658,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }
       applyOwnerContext(response);
       setHerdsmanUi(ctx);
-      addPendingEvents(response.events ?? [], ctx);
+      syncPendingEventsFromServer(response.events ?? [], ctx);
       pruneAcknowledgedEvents(response.state?.ackedEventId ?? response.ackedEventId);
+      if (state.pendingEvents.length === 0 && state.wakeTimer) cancelWakeTimer();
       setHerdsmanUi(ctx);
       scheduleWake(ctx);
     };

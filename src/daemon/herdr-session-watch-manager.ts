@@ -3,6 +3,7 @@ import type { HerdrSessionStore } from "@/db/herdr-sessions.js";
 import type { HerdrSessionListEntry, HerdrSessionListRunner } from "@/herdr/session-list.js";
 import { HerdrSocketClient } from "@/herdr/socket-client.js";
 import type {
+  AgentIndexRefreshFastResult,
   AgentIndexRefreshResult,
   AgentIndexService,
 } from "@/observability/agent-index-service.js";
@@ -37,7 +38,7 @@ export class HerdrSessionWatchManager {
   }) => void;
   readonly #reconnectDelayMs: number;
   readonly #refreshPublications = new WeakMap<
-    Promise<AgentIndexRefreshResult>,
+    Promise<AgentIndexRefreshFastResult | AgentIndexRefreshResult>,
     Promise<AgentIndexRecord[]>
   >();
   readonly #retiringWatcherLoops = new Set<Promise<void>>();
@@ -137,7 +138,7 @@ export class HerdrSessionWatchManager {
     const workingSessions = [...this.#watchers.values()].filter(({ entry }) =>
       this.#agents.listForHerdrSession(entry.name).some((agent) => agent.agentStatus === "working"),
     );
-    await Promise.all(workingSessions.map(({ entry }) => this.#refresh(entry)));
+    await mapConcurrent(workingSessions, 4, ({ entry }) => this.#refresh(entry));
   }
 
   async #startWatcher(entry: HerdrSessionListEntry, generation: number): Promise<void> {
@@ -201,25 +202,53 @@ export class HerdrSessionWatchManager {
           reconnectCount = 0;
           lastEvent = eventRecord;
           if (eventRecord.type === "pane.agent_status_changed") {
-            const result = await this.#index.handleHerdrEvent({
-              event,
-              herdrSessionName: entry.name,
-              sessionDir: entry.sessionDir,
-              socketPath: entry.socketPath,
-            });
+            const result = this.#index.handleHerdrEventFast
+              ? await this.#index.handleHerdrEventFast({
+                  event,
+                  herdrSessionName: entry.name,
+                  sessionDir: entry.sessionDir,
+                  socketPath: entry.socketPath,
+                })
+              : await this.#index.handleHerdrEvent({
+                  event,
+                  herdrSessionName: entry.name,
+                  sessionDir: entry.sessionDir,
+                  socketPath: entry.socketPath,
+                });
             this.#publishResult({
               agents: this.#agents.listForHerdrSession(entry.name),
               herdrSessionName: entry.name,
               ...result,
             });
+            if ("statusEventPlans" in result && Array.isArray(result.statusEventPlans)) {
+              for (const plan of result.statusEventPlans) {
+                void this.#index.executeStatusEventPlan?.(plan)?.then((planEvent) => {
+                  if (planEvent) {
+                    this.#onAgentEvent(planEvent);
+                  }
+                });
+              }
+            }
             continue;
           }
           if (eventRecord.type === "pane.closed") {
-            await this.#index.handleHerdrEvent({
-              event,
+            const result = this.#index.handleHerdrEventFast
+              ? await this.#index.handleHerdrEventFast({
+                  event,
+                  herdrSessionName: entry.name,
+                  sessionDir: entry.sessionDir,
+                  socketPath: entry.socketPath,
+                })
+              : await this.#index.handleHerdrEvent({
+                  event,
+                  herdrSessionName: entry.name,
+                  sessionDir: entry.sessionDir,
+                  socketPath: entry.socketPath,
+                });
+            this.#publishResult({
+              agents: this.#agents.listForHerdrSession(entry.name),
               herdrSessionName: entry.name,
-              sessionDir: entry.sessionDir,
-              socketPath: entry.socketPath,
+              ...result,
             });
           }
           if (shouldRestartSubscription(eventRecord.type)) {
@@ -263,15 +292,32 @@ export class HerdrSessionWatchManager {
   }
 
   #refresh(entry: HerdrSessionListEntry): Promise<AgentIndexRecord[]> {
-    const source = this.#index.refreshHerdrSession({
-      herdrSessionName: entry.name,
-      sessionDir: entry.sessionDir,
-      socketPath: entry.socketPath,
-    });
+    const source = (
+      this.#index.refreshHerdrSessionFast
+        ? this.#index.refreshHerdrSessionFast({
+            herdrSessionName: entry.name,
+            sessionDir: entry.sessionDir,
+            socketPath: entry.socketPath,
+          })
+        : this.#index.refreshHerdrSession({
+            herdrSessionName: entry.name,
+            sessionDir: entry.sessionDir,
+            socketPath: entry.socketPath,
+          })
+    ) as Promise<AgentIndexRefreshFastResult | AgentIndexRefreshResult>;
     const existing = this.#refreshPublications.get(source);
     if (existing) return existing;
     const publication = source.then((result) => {
       this.#publishResult({ herdrSessionName: entry.name, ...result });
+      if ("statusEventPlans" in result && Array.isArray(result.statusEventPlans)) {
+        for (const plan of result.statusEventPlans) {
+          void this.#index.executeStatusEventPlan?.(plan)?.then((planEvent) => {
+            if (planEvent) {
+              this.#onAgentEvent(planEvent);
+            }
+          });
+        }
+      }
       return result.agents;
     });
     this.#refreshPublications.set(source, publication);
@@ -317,4 +363,18 @@ function shouldRestartSubscription(type: unknown): boolean {
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
+}
+
+async function mapConcurrent<T, R>(
+  items: T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = [];
+  for (let i = 0; i < items.length; i += limit) {
+    const chunk = items.slice(i, i + limit);
+    const chunkResults = await Promise.all(chunk.map(fn));
+    results.push(...chunkResults);
+  }
+  return results;
 }

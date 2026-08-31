@@ -26,8 +26,8 @@ afterEach(async () => {
 
 describe("ObservabilityRpcServer", () => {
   test("serves agent methods over JSONL", async () => {
-    const { client, harness } = await openServer();
-    seedAgent(harness);
+    const { client, dir, harness } = await openServer();
+    seedAgent(harness, dir);
 
     await expect(client.request("agent.list", { workspaceId: "wB" })).resolves.toMatchObject({
       agents: [expect.objectContaining({ agent: "pi", paneId: "wB:p1" })],
@@ -92,8 +92,8 @@ describe("ObservabilityRpcServer", () => {
 
   test("records pi turn completion signals and validates their params", async () => {
     const registry = new TurnCompletionRegistry({ timeoutMs: 1_000 });
-    const { client, harness } = await openServer({ turnCompletions: registry });
-    seedAgent(harness);
+    const { client, dir, harness } = await openServer({ turnCompletions: registry });
+    seedAgent(harness, dir);
     await client.request("agent.orchestrator.register", {
       herdrSocketPath: "/tmp/herdr/herdr.sock",
       paneId: "wB:p1",
@@ -147,8 +147,8 @@ describe("ObservabilityRpcServer", () => {
   });
 
   test("serializes structured acknowledgement errors through the real RPC server and client", async () => {
-    const { client, harness } = await openServer();
-    seedAgent(harness);
+    const { client, dir, harness } = await openServer();
+    seedAgent(harness, dir);
     await client.request("agent.orchestrator.register", {
       herdrSocketPath: "/tmp/herdr/herdr.sock",
       paneId: "wB:p1",
@@ -251,8 +251,8 @@ describe("ObservabilityRpcServer", () => {
   });
 
   test("hides retained agents after their Herdr session stops", async () => {
-    const { client, harness } = await openServer();
-    seedAgent(harness);
+    const { client, dir, harness } = await openServer();
+    seedAgent(harness, dir);
 
     harness.herdrSessions.markStoppedMissingFrom([]);
 
@@ -456,8 +456,8 @@ describe("ObservabilityRpcServer", () => {
         };
       },
     } as unknown as AgentHistoryService;
-    const { client, harness } = await openServer({ history: liveHistory });
-    seedAgent(harness);
+    const { client, dir, harness } = await openServer({ history: liveHistory });
+    seedAgent(harness, dir);
     const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wB:p1" });
     if (!agent) throw new Error("missing seeded agent");
     harness.agentContextSnapshots.put({
@@ -832,7 +832,13 @@ function seedTargetAgents(
   });
 }
 
-function seedAgent(harness: ReturnType<typeof openObservabilityDbHarness>) {
+function seedAgent(harness: ReturnType<typeof openObservabilityDbHarness>, dir?: string) {
+  const baseDir = dir ?? mkdtempSync(join(tmpdir(), "herdsman-seed-agent-"));
+  if (!dir) tempDirs.push(baseDir);
+  const sessionDir = join(baseDir, ".pi/agent/sessions");
+  mkdirSync(sessionDir, { mode: 0o700, recursive: true });
+  const sessionPath = join(sessionDir, "agent-session.jsonl");
+  writeFileSync(sessionPath, "", { mode: 0o600 });
   harness.herdrSessions.upsertRunning({
     name: "default",
     sessionDir: "/tmp/herdr",
@@ -842,6 +848,7 @@ function seedAgent(harness: ReturnType<typeof openObservabilityDbHarness>) {
     agents: [
       {
         agent: "pi",
+        agent_session: { kind: "path", source: "pi-jsonl", value: sessionPath },
         agent_status: "idle",
         cwd: "/repo",
         pane_id: "wB:p1",

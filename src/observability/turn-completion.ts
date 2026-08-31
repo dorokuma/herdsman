@@ -66,6 +66,7 @@ export class TurnCompletionRegistry {
     herdrSessionName: string;
     terminalId: string;
     recordedAfterMs: number;
+    signal?: AbortSignal;
   }): Promise<TurnCompletionWaitResult> {
     const key = terminalTurnKey(input);
     const isNewSignal = (
@@ -77,12 +78,17 @@ export class TurnCompletionRegistry {
       this.#latestByTerminal.delete(key);
       return { confirmed: existing.confirmed, received: true };
     }
+    if (input.signal?.aborted) {
+      return { confirmed: false, received: false };
+    }
     return new Promise((resolve) => {
       let timer: TimerHandle | undefined;
+      const onAbort = () => finish(true);
       const finish = (timedOut = false) => {
         const latest = this.#latestByTerminal.get(key);
         if (!timedOut && !isNewSignal(latest)) return;
         if (timer !== undefined) this.#clearTimeout(timer);
+        if (input.signal) input.signal.removeEventListener("abort", onAbort);
         this.#waitersByTerminal.get(key)?.delete(finish);
         const received = latest && isNewSignal(latest);
         if (received) this.#latestByTerminal.delete(key);
@@ -98,6 +104,9 @@ export class TurnCompletionRegistry {
         this.#waitersByTerminal.set(key, waiters);
       }
       waiters.add(finish);
+      if (input.signal) {
+        input.signal.addEventListener("abort", onAbort, { once: true });
+      }
       timer = this.#setTimeout(() => finish(true), this.#timeoutMs);
     });
   }

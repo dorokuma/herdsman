@@ -54,7 +54,34 @@ type RefreshInput = {
   socketPath: string;
 };
 
+export type StatusEventPlan = {
+  agent: AgentIndexRecord;
+  compactHistory:
+    | NonNullable<ReturnType<AgentContextService["getAgentSnapshot"]>>["compactHistory"]
+    | undefined;
+  from: AgentStatus;
+  herdrEventKey?: string;
+  to: AgentStatus;
+};
+
+export type AgentIndexRefreshFastResult = {
+  agents: AgentIndexRecord[];
+  contextChangedScopes: AgentScope[];
+  events: AgentEventRecord[];
+  statusEventPlans: StatusEventPlan[];
+};
+
+export type AgentEventHandlingFastResult = {
+  contextChangedScopes: AgentScope[];
+  events: AgentEventRecord[];
+  statusEventPlans: StatusEventPlan[];
+};
+
+type RefreshInternalResult = AgentIndexRefreshFastResult;
+type EventHandlingInternalResult = AgentEventHandlingFastResult;
+
 export class AgentIndexService {
+  readonly #activeWaiters = new Map<string, Set<AbortController>>();
   readonly #clientFactory: (input: {
     socketPath: string;
   }) => Pick<HerdrSocketClient, "close" | "sessionSnapshot">;
@@ -102,13 +129,32 @@ export class AgentIndexService {
     }
   }
 
+  refreshHerdrSessionFast(input: RefreshInput): Promise<AgentIndexRefreshFastResult> {
+    this.#incrementMutationEpoch(input.herdrSessionName);
+    return this.#enqueueSessionOperation(input.herdrSessionName, () =>
+      this.#refreshHerdrSessionNow(input),
+    );
+  }
+
   refreshHerdrSession(input: RefreshInput): Promise<AgentIndexRefreshResult> {
     const epoch = this.#mutationEpochBySession.get(input.herdrSessionName) ?? 0;
     const existing = this.#refreshInFlightBySession.get(input.herdrSessionName);
     if (existing?.epoch === epoch) return existing.promise;
     const promise = this.#enqueueSessionOperation(input.herdrSessionName, () =>
       this.#refreshHerdrSessionNow(input),
-    );
+    ).then(async (intermediate) => {
+      const statusEvents = await Promise.all(
+        intermediate.statusEventPlans.map((plan) => this.executeStatusEventPlan(plan)),
+      );
+      return {
+        agents: intermediate.agents,
+        contextChangedScopes: intermediate.contextChangedScopes,
+        events: [
+          ...intermediate.events,
+          ...statusEvents.filter((event): event is AgentEventRecord => event !== undefined),
+        ],
+      };
+    });
     this.#refreshInFlightBySession.set(input.herdrSessionName, { epoch, promise });
     const clear = () => {
       if (this.#refreshInFlightBySession.get(input.herdrSessionName)?.promise === promise) {
@@ -119,16 +165,39 @@ export class AgentIndexService {
     return promise;
   }
 
-  handleHerdrEvent(input: {
+  handleHerdrEventFast(input: {
+    event: unknown;
+    herdrSessionName: string;
+    sessionDir: string;
+    socketPath: string;
+  }): Promise<AgentEventHandlingFastResult> {
+    this.#incrementMutationEpoch(input.herdrSessionName);
+    return this.#enqueueSessionOperation(input.herdrSessionName, () =>
+      this.#handleHerdrEventNow(input),
+    );
+  }
+
+  async handleHerdrEvent(input: {
     event: unknown;
     herdrSessionName: string;
     sessionDir: string;
     socketPath: string;
   }): Promise<AgentEventHandlingResult> {
-    this.#incrementMutationEpoch(input.herdrSessionName);
-    return this.#enqueueSessionOperation(input.herdrSessionName, () =>
-      this.#handleHerdrEventNow(input),
+    const intermediate = await this.handleHerdrEventFast(input);
+    const statusEvents = await Promise.all(
+      intermediate.statusEventPlans.map((plan) => this.executeStatusEventPlan(plan)),
     );
+    return {
+      contextChangedScopes: intermediate.contextChangedScopes,
+      events: [
+        ...intermediate.events,
+        ...statusEvents.filter((event): event is AgentEventRecord => event !== undefined),
+      ],
+    };
+  }
+
+  executeStatusEventPlan(plan: StatusEventPlan): Promise<AgentEventRecord | undefined> {
+    return this.#appendStatusEvents(plan);
   }
 
   registerPiSessionRef(input: {
@@ -142,7 +211,7 @@ export class AgentIndexService {
     );
   }
 
-  async #refreshHerdrSessionNow(input: RefreshInput): Promise<AgentIndexRefreshResult> {
+  async #refreshHerdrSessionNow(input: RefreshInput): Promise<RefreshInternalResult> {
     const client = this.#clientFactory({ socketPath: input.socketPath });
     try {
       const previous = this.#stores.agents.listForHerdrSession(input.herdrSessionName);
@@ -163,15 +232,7 @@ export class AgentIndexService {
           refreshEpoch,
           mutationEpoch,
         });
-        return { agents: previous, contextChangedScopes: [], events: [] };
-      }
-      if (mutationEpoch !== refreshEpoch) {
-        console.warn("Herdsman discarding stale Herdr session refresh", {
-          sessionName: input.herdrSessionName,
-          refreshEpoch,
-          mutationEpoch,
-        });
-        return { agents: previous, contextChangedScopes: [], events: [] };
+        return { agents: previous, contextChangedScopes: [], events: [], statusEventPlans: [] };
       }
       const revisionByPane = new Map(
         snapshot.panes.flatMap((pane) => {
@@ -229,6 +290,7 @@ export class AgentIndexService {
       });
       const scopes = new Map<string, AgentScope>();
       const events: AgentEventRecord[] = [];
+      const statusEventPlans: StatusEventPlan[] = [];
       const currentIds = new Set(agents.map((agent) => agent.id));
       for (const prior of previous) {
         if (!currentIds.has(prior.id)) addScope(scopes, scopeOf(prior));
@@ -266,14 +328,13 @@ export class AgentIndexService {
           addScope(scopes, scopeOf(agent));
         }
         if (prior && prior.agentStatus !== agent.agentStatus) {
-          const event = await this.#appendStatusEvents({
+          statusEventPlans.push({
             agent,
             compactHistory:
               refreshed?.compactHistory ?? this.#context.getAgentSnapshot(agent.id)?.compactHistory,
             from: prior.agentStatus,
             to: agent.agentStatus,
           });
-          if (event) events.push(event);
           addScope(scopes, scopeOf(agent));
         }
       }
@@ -281,6 +342,7 @@ export class AgentIndexService {
         agents,
         contextChangedScopes: sortedScopes(scopes),
         events,
+        statusEventPlans,
       };
     } finally {
       client.close();
@@ -292,12 +354,17 @@ export class AgentIndexService {
     herdrSessionName: string;
     sessionDir: string;
     socketPath: string;
-  }): Promise<AgentEventHandlingResult> {
+  }): Promise<EventHandlingInternalResult> {
     const event = record(input.event);
     const paneId = stringValue(event.pane_id) ?? stringValue(event.paneId);
-    if (!paneId) return { contextChangedScopes: [], events: [] };
+    if (!paneId) return { contextChangedScopes: [], events: [], statusEventPlans: [] };
     if (event.type === "pane.closed") {
       const closedGeneration = paneGenerationFromEvent(event);
+      this.#abortPendingWaiters({
+        herdrSessionName: input.herdrSessionName,
+        paneId,
+        paneGeneration: closedGeneration,
+      });
       this.#stores.agentEvents.invalidatePane({
         herdrSessionName: input.herdrSessionName,
         paneId,
@@ -335,16 +402,19 @@ export class AgentIndexService {
       return {
         contextChangedScopes: sortedScopes(scopes),
         events: [],
+        statusEventPlans: [],
       };
     }
-    if (event.type !== "pane.agent_status_changed") return { contextChangedScopes: [], events: [] };
+    if (event.type !== "pane.agent_status_changed") {
+      return { contextChangedScopes: [], events: [], statusEventPlans: [] };
+    }
     const eventGeneration = paneGenerationFromEvent(event);
     let agent = this.#stores.agents.findByPane({
       herdrSessionName: input.herdrSessionName,
       paneId,
       paneGeneration: eventGeneration,
     });
-    let recovered: AgentIndexRefreshResult | undefined;
+    let recovered: RefreshInternalResult | undefined;
     if (!agent) {
       if (eventGeneration) {
         // A generation-scoped tombstone still closes its own generation.
@@ -355,7 +425,7 @@ export class AgentIndexService {
             paneGeneration: eventGeneration,
           })
         ) {
-          return { contextChangedScopes: [], events: [] };
+          return { contextChangedScopes: [], events: [], statusEventPlans: [] };
         }
         // No generation-scoped close: a live generation-carrying status
         // overrides a generation-less close, so recover the pane (the refresh
@@ -368,7 +438,7 @@ export class AgentIndexService {
           paneGeneration: null,
         })
       ) {
-        return { contextChangedScopes: [], events: [] };
+        return { contextChangedScopes: [], events: [], statusEventPlans: [] };
       }
       recovered = await this.#refreshHerdrSessionNow(input);
       agent = this.#stores.agents.findByPane({
@@ -379,8 +449,12 @@ export class AgentIndexService {
     }
     if (!agent) {
       return recovered
-        ? { contextChangedScopes: recovered.contextChangedScopes, events: recovered.events }
-        : { contextChangedScopes: [], events: [] };
+        ? {
+            contextChangedScopes: recovered.contextChangedScopes,
+            events: recovered.events,
+            statusEventPlans: recovered.statusEventPlans,
+          }
+        : { contextChangedScopes: [], events: [], statusEventPlans: [] };
     }
     const from = recovered ? "unknown" : agent.agentStatus;
     const to = parseAgentStatus(event.agent_status);
@@ -397,6 +471,7 @@ export class AgentIndexService {
     for (const scope of recovered?.contextChangedScopes ?? []) addScope(scopes, scope);
     if (refreshed.changed || from !== to) addScope(scopes, scopeOf(current));
     const events = [...(recovered?.events ?? [])];
+    const statusEventPlans = [...(recovered?.statusEventPlans ?? [])];
     const equivalent = events.some(
       (candidate) =>
         candidate.agentId === current.id &&
@@ -404,17 +479,15 @@ export class AgentIndexService {
         (candidate.payload as { to?: AgentStatus }).to === to,
     );
     if (!equivalent) {
-      const statusEvent = await this.#appendStatusEvents({
+      statusEventPlans.push({
         agent: current,
         compactHistory: refreshed.snapshot.compactHistory,
         from,
         herdrEventKey,
         to,
       });
-
-      if (statusEvent) events.push(statusEvent);
     }
-    return { contextChangedScopes: sortedScopes(scopes), events };
+    return { contextChangedScopes: sortedScopes(scopes), events, statusEventPlans };
   }
 
   async #registerPiSessionRefNow(input: {
@@ -480,15 +553,42 @@ export class AgentIndexService {
     });
   }
 
-  async #appendStatusEvents(input: {
-    agent: AgentIndexRecord;
-    compactHistory:
-      | NonNullable<ReturnType<AgentContextService["getAgentSnapshot"]>>["compactHistory"]
-      | undefined;
-    from: AgentStatus;
-    herdrEventKey?: string;
-    to: AgentStatus;
-  }): Promise<AgentEventRecord | undefined> {
+  #registerActiveWaiter(agent: AgentIndexRecord, controller: AbortController): () => void {
+    const key = `${agent.herdrSessionName}\0${agent.paneId}\0${agent.paneGeneration ?? ""}`;
+    let set = this.#activeWaiters.get(key);
+    if (!set) {
+      set = new Set();
+      this.#activeWaiters.set(key, set);
+    }
+    set.add(controller);
+    return () => {
+      set.delete(controller);
+      if (set.size === 0 && this.#activeWaiters.get(key) === set) {
+        this.#activeWaiters.delete(key);
+      }
+    };
+  }
+
+  #abortPendingWaiters(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+  }): void {
+    for (const [key, controllers] of this.#activeWaiters) {
+      const [sessionName, paneId, paneGen] = key.split("\0");
+      if (sessionName === input.herdrSessionName && paneId === input.paneId) {
+        if (!input.paneGeneration || !paneGen || input.paneGeneration === paneGen) {
+          for (const controller of controllers) {
+            controller.abort();
+          }
+          controllers.clear();
+          this.#activeWaiters.delete(key);
+        }
+      }
+    }
+  }
+
+  async #appendStatusEvents(input: StatusEventPlan): Promise<AgentEventRecord | undefined> {
     if (input.from === input.to || !input.compactHistory) return undefined;
     if (
       this.#stores.agents.isPaneClosed({
@@ -497,138 +597,257 @@ export class AgentIndexService {
         paneGeneration: input.agent.paneGeneration ?? null,
       })
     ) {
+      console.debug("Herdsman skipping status event generation because pane is closed", {
+        agentId: input.agent.id,
+        herdrSessionName: input.agent.herdrSessionName,
+        paneId: input.agent.paneId,
+      });
       return undefined;
     }
     const latest = this.#stores.agentEvents.latestStatusTransition(
       input.agent.id,
       input.agent.herdrSessionName,
     );
-    if (latest && statusTransitionMatches(latest, input.from, input.to)) return undefined;
+    if (latest && statusTransitionMatches(latest, input.from, input.to)) {
+      console.debug("Herdsman skipping duplicate status transition event", {
+        agentId: input.agent.id,
+        from: input.from,
+        to: input.to,
+      });
+      return undefined;
+    }
     const observationId = `transition:${latest?.id ?? 0}`;
 
-    let compactHistory = input.compactHistory;
-    if (
-      this.#turnCompletions !== undefined &&
-      (input.to === "done" || input.to === "blocked") &&
-      input.agent.terminalId !== null
-    ) {
-      const turn =
-        input.agent.agent === "pi"
-          ? await this.#turnCompletions.waitForSignal({
-              herdrSessionName: input.agent.herdrSessionName,
-              recordedAfterMs: Date.now() - TURN_SIGNAL_WAIT_MS,
-              terminalId: input.agent.terminalId,
-            })
-          : undefined;
-      if (turn?.received) {
-        let refreshed = await this.#context.refreshAgent({
-          agent: input.agent,
-          identityChanged: false,
-          forceRefresh: true,
-        });
-        for (
-          let attempt = 0;
-          attempt < 8 && refreshed.snapshot.compactHistory.lastAssistantMessage === null;
-          attempt += 1
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          refreshed = await this.#context.refreshAgent({
-            agent: input.agent,
-            identityChanged: false,
-            forceRefresh: true,
-          });
-        }
-        compactHistory = refreshed.snapshot.compactHistory;
-        console.log(
-          `Herdsman emitted pi agent.${input.to} after turn completion signal (confirmed=${turn.confirmed})`,
-          {
-            agentId: input.agent.id,
-            herdrSessionName: input.agent.herdrSessionName,
-            terminalId: input.agent.terminalId,
-          },
-        );
-      } else {
-        for (
-          let attempt = 0;
-          attempt < 8 && compactHistory.lastAssistantMessage === null;
-          attempt += 1
-        ) {
-          await new Promise((resolve) => setTimeout(resolve, 500));
-          const refreshed = await this.#context.refreshAgent({
-            agent: input.agent,
-            identityChanged: false,
-            forceRefresh: true,
-          });
-          compactHistory = refreshed.snapshot.compactHistory;
-        }
-        console.warn(
-          `Herdsman emitted pi agent.${input.to} without a turn completion signal after ${TURN_SIGNAL_WAIT_MS}ms`,
-          {
-            agentId: input.agent.id,
-            herdrSessionName: input.agent.herdrSessionName,
-            terminalId: input.agent.terminalId,
-          },
-        );
-      }
-    }
+    const controller = new AbortController();
+    const unregister = this.#registerActiveWaiter(input.agent, controller);
 
-    const lastEvent = this.#appendAndAckSelfEvent({
-      agentId: input.agent.id,
-      compactHistory,
-      herdrSessionName: input.agent.herdrSessionName,
-      idempotencyKey: idempotencyKey(
-        "agent.status.changed",
-        input.agent,
-        input.from,
-        input.to,
-        `${observationId}:${input.herdrEventKey ?? "legacy"}:agent.status.changed`,
-      ),
-      paneId: input.agent.paneId,
-      paneGeneration: input.agent.paneGeneration ?? null,
-      payload: payload(input.agent, input.from, input.to),
-      terminalId: input.agent.terminalId,
-      type: "agent.status.changed",
-      workspaceId: input.agent.workspaceId,
-    });
-    const statusType = statusEventType(input.to);
-    if (statusType) {
+    try {
+      let compactHistory = input.compactHistory;
       if (
-        statusType === "agent.idle" &&
-        input.agent.agent !== "pi" &&
-        !hasNonEmptyAssistantMessage(compactHistory)
+        this.#turnCompletions !== undefined &&
+        (input.to === "done" || input.to === "blocked") &&
+        input.agent.terminalId !== null
+      ) {
+        const turn =
+          input.agent.agent === "pi"
+            ? await this.#turnCompletions.waitForSignal({
+                herdrSessionName: input.agent.herdrSessionName,
+                recordedAfterMs: Date.now() - TURN_SIGNAL_WAIT_MS,
+                signal: controller.signal,
+                terminalId: input.agent.terminalId,
+              })
+            : undefined;
+
+        if (
+          controller.signal.aborted ||
+          this.#stores.agents.isPaneClosed({
+            herdrSessionName: input.agent.herdrSessionName,
+            paneId: input.agent.paneId,
+            paneGeneration: input.agent.paneGeneration ?? null,
+          })
+        ) {
+          console.debug(
+            "Herdsman skipping status event generation because turn wait was aborted or pane closed",
+            {
+              aborted: controller.signal.aborted,
+              agentId: input.agent.id,
+              herdrSessionName: input.agent.herdrSessionName,
+              paneId: input.agent.paneId,
+            },
+          );
+          return undefined;
+        }
+
+        if (turn?.received) {
+          let refreshed = await this.#context.refreshAgent({
+            agent: input.agent,
+            identityChanged: false,
+            forceRefresh: true,
+          });
+          for (
+            let attempt = 0;
+            attempt < 8 &&
+            refreshed.snapshot.compactHistory.lastAssistantMessage === null &&
+            !controller.signal.aborted;
+            attempt += 1
+          ) {
+            await sleep(500, controller.signal);
+            if (
+              controller.signal.aborted ||
+              this.#stores.agents.isPaneClosed({
+                herdrSessionName: input.agent.herdrSessionName,
+                paneId: input.agent.paneId,
+                paneGeneration: input.agent.paneGeneration ?? null,
+              })
+            ) {
+              console.debug(
+                "Herdsman skipping status event generation because wait was aborted during history refresh",
+                {
+                  aborted: controller.signal.aborted,
+                  agentId: input.agent.id,
+                  herdrSessionName: input.agent.herdrSessionName,
+                  paneId: input.agent.paneId,
+                },
+              );
+              return undefined;
+            }
+            refreshed = await this.#context.refreshAgent({
+              agent: input.agent,
+              identityChanged: false,
+              forceRefresh: true,
+            });
+          }
+          compactHistory = refreshed.snapshot.compactHistory;
+          console.log(
+            `Herdsman emitted pi agent.${input.to} after turn completion signal (confirmed=${turn.confirmed})`,
+            {
+              agentId: input.agent.id,
+              herdrSessionName: input.agent.herdrSessionName,
+              terminalId: input.agent.terminalId,
+            },
+          );
+        } else if (!controller.signal.aborted) {
+          for (
+            let attempt = 0;
+            attempt < 8 &&
+            compactHistory.lastAssistantMessage === null &&
+            !controller.signal.aborted;
+            attempt += 1
+          ) {
+            await sleep(500, controller.signal);
+            if (
+              controller.signal.aborted ||
+              this.#stores.agents.isPaneClosed({
+                herdrSessionName: input.agent.herdrSessionName,
+                paneId: input.agent.paneId,
+                paneGeneration: input.agent.paneGeneration ?? null,
+              })
+            ) {
+              console.debug(
+                "Herdsman skipping status event generation because wait was aborted without turn signal",
+                {
+                  aborted: controller.signal.aborted,
+                  agentId: input.agent.id,
+                  herdrSessionName: input.agent.herdrSessionName,
+                  paneId: input.agent.paneId,
+                },
+              );
+              return undefined;
+            }
+            const refreshed = await this.#context.refreshAgent({
+              agent: input.agent,
+              identityChanged: false,
+              forceRefresh: true,
+            });
+            compactHistory = refreshed.snapshot.compactHistory;
+          }
+          console.warn(
+            `Herdsman emitted pi agent.${input.to} without a turn completion signal after ${TURN_SIGNAL_WAIT_MS}ms`,
+            {
+              agentId: input.agent.id,
+              herdrSessionName: input.agent.herdrSessionName,
+              terminalId: input.agent.terminalId,
+            },
+          );
+        }
+      }
+
+      if (
+        controller.signal.aborted ||
+        this.#stores.agents.isPaneClosed({
+          herdrSessionName: input.agent.herdrSessionName,
+          paneId: input.agent.paneId,
+          paneGeneration: input.agent.paneGeneration ?? null,
+        })
       ) {
         console.debug(
-          "Herdsman skipping agent.idle event generation for non-pi agent without assistant message",
+          "Herdsman skipping status event generation because turn wait was aborted or pane closed before append",
           {
-            agent: input.agent.agent,
+            aborted: controller.signal.aborted,
             agentId: input.agent.id,
-            from: input.from,
             herdrSessionName: input.agent.herdrSessionName,
             paneId: input.agent.paneId,
           },
         );
         return undefined;
       }
-      return this.#appendAndAckSelfEvent({
-        agentId: input.agent.id,
-        compactHistory,
+
+      const currentAgent = this.#stores.agents.findByPane({
         herdrSessionName: input.agent.herdrSessionName,
-        idempotencyKey: idempotencyKey(
-          statusType,
-          input.agent,
-          input.from,
-          input.to,
-          `${observationId}:${input.herdrEventKey ?? "legacy"}:${statusType}`,
-        ),
         paneId: input.agent.paneId,
         paneGeneration: input.agent.paneGeneration ?? null,
-        payload: payload(input.agent, input.from, input.to),
-        terminalId: input.agent.terminalId,
-        type: statusType,
-        workspaceId: input.agent.workspaceId,
       });
+      if (!currentAgent || currentAgent.agentStatus !== input.to) {
+        console.debug("Herdsman skipping status event generation due to status mismatch", {
+          agentId: input.agent.id,
+          current: currentAgent?.agentStatus,
+          expected: input.to,
+          herdrSessionName: input.agent.herdrSessionName,
+          paneId: input.agent.paneId,
+        });
+        return undefined;
+      }
+
+      const lastEvent = this.#appendAndAckSelfEvent({
+        agentId: currentAgent.id,
+        compactHistory,
+        herdrSessionName: currentAgent.herdrSessionName,
+        idempotencyKey: idempotencyKey(
+          "agent.status.changed",
+          currentAgent,
+          input.from,
+          input.to,
+          `${observationId}:${input.herdrEventKey ?? "legacy"}:agent.status.changed`,
+        ),
+        paneId: currentAgent.paneId,
+        paneGeneration: currentAgent.paneGeneration ?? null,
+        payload: payload(currentAgent, input.from, input.to),
+        terminalId: currentAgent.terminalId,
+        type: "agent.status.changed",
+        workspaceId: currentAgent.workspaceId,
+      });
+      const statusType = statusEventType(input.to);
+      if (statusType) {
+        if (
+          statusType === "agent.idle" &&
+          currentAgent.agent !== "pi" &&
+          !hasNonEmptyAssistantMessage(compactHistory)
+        ) {
+          console.debug(
+            "Herdsman skipping agent.idle event generation for non-pi agent without assistant message",
+            {
+              agent: currentAgent.agent,
+              agentId: currentAgent.id,
+              from: input.from,
+              herdrSessionName: currentAgent.herdrSessionName,
+              paneId: currentAgent.paneId,
+            },
+          );
+          return undefined;
+        }
+        return this.#appendAndAckSelfEvent({
+          agentId: currentAgent.id,
+          compactHistory,
+          herdrSessionName: currentAgent.herdrSessionName,
+          idempotencyKey: idempotencyKey(
+            statusType,
+            currentAgent,
+            input.from,
+            input.to,
+            `${observationId}:${input.herdrEventKey ?? "legacy"}:${statusType}`,
+          ),
+          paneId: currentAgent.paneId,
+          paneGeneration: currentAgent.paneGeneration ?? null,
+          payload: payload(currentAgent, input.from, input.to),
+          terminalId: currentAgent.terminalId,
+          type: statusType,
+          workspaceId: currentAgent.workspaceId,
+        });
+      }
+      return lastEvent;
+    } finally {
+      unregister();
     }
-    return lastEvent;
   }
 
   #appendAndAckSelfEvent(input: Parameters<AgentEventStore["append"]>[0]): AgentEventRecord {
@@ -805,4 +1024,20 @@ function stringValue(value: unknown): string | null {
 
 function integerValue(value: unknown): number | undefined {
   return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  if (signal?.aborted) return Promise.resolve();
+  return new Promise((resolve) => {
+    let timer: NodeJS.Timeout | undefined;
+    const onAbort = () => {
+      if (timer !== undefined) clearTimeout(timer);
+      resolve();
+    };
+    timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
 }
