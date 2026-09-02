@@ -434,7 +434,7 @@ A missed lifecycle event or disconnected stream could therefore leave the agent 
 
 **Skill evidence:** Pi explicitly loaded the project Herdsman skill, checked daemon status first, started it after observing a stopped state, listed the current Herdr workspace, selected exact target `wJ:p2`, and used both metadata/history queries. Its final answer correctly reported `idle`, all five available normalized messages, and the latest non-error compact tool result with the known `toolName: unknown` limitation.
 
-**Daemon lifecycle observation:** repeated starts overwrote the PID file while older daemon processes remained attached to the same configured socket path. After PID `87875` exited, `daemon status` reported it stale while `agent list` still succeeded through older daemon PID `67945`; `lsof` also found older PID `4507`. The server had unlinked a reachable Unix socket during startup, allowing duplicate daemons rather than rejecting the new start. The fix classifies a reachable socket with missing/stale PID ownership as `orphaned` and refuses start/stop until the operator cleans up the unknown owner.
+**Daemon lifecycle observation:** repeated starts overwrote the PID file while older daemon processes remained attached to the same configured socket path. After PID `87875` exited, `daemon status` reported it stale while `agent list` still succeeded through older daemon PID `67945`; `lsof` also found older PID `4507`. The server had unlinked a reachable Unix socket during startup, allowing duplicate daemons rather than rejecting the new start. The fix classifies a reachable socket with missing/stale PID ownership as `orphaned` and refuses start/stop until the operator cleans up the unknown owner. (注：orphaned 信号已按 2026-09-02 改动移除，现状以 CHANGELOG 为准。)
 
 **Cleanup evidence:** with explicit approval, old PID `67945` stopped from the coding environment; sandbox policy blocked signaling PID `4507`, so the user stopped it from the ordinary shell. The stale PID/socket were removed. No pre-fix daemon remains.
 
@@ -458,7 +458,7 @@ A missed lifecycle event or disconnected stream could therefore leave the agent 
 - official `{event,data}` envelopes now flatten to internal `{type,...}` records;
 - dot-form status names and snake_case lifecycle names are both normalized;
 - periodic snapshot refresh compares terminal/pane-stable previous agents and appends one terminal event for missed status transitions;
-- stale/missing PID plus reachable socket is reported as `orphaned`, and start/stop refuse to create or signal an ambiguously owned daemon;
+- stale/missing PID plus reachable socket is reported as `orphaned`, and start/stop refuse to create or signal an ambiguously owned daemon (注：orphaned 信号已按 2026-09-02 改动移除，现状以 CHANGELOG 为准。);
 - focused tests, `pnpm check` (31 files, 139 tests), and `pnpm build` pass.
 
 **Second live-run finding:** the official envelope fix alone still produced no notification. A direct real-Herdr subscription showed that broad lifecycle subscriptions replay retained events from sequence `0`. Herdsman reacted to the first historical lifecycle event by refreshing and reconnecting, then received the same historical event again, so it never kept a status subscription open. The final fix subscribes only to pane-specific `pane.agent_status_changed`; topology changes use the existing 60-second snapshot rescan. After restart as PID `33996`, `lsof` showed two stable outbound Herdr Unix socket connections instead of zero.

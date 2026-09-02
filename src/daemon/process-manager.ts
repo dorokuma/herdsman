@@ -34,11 +34,14 @@ export type DaemonStatus =
       state: "running";
     }
   | {
+      // Socket is reachable, so a daemon is running, but the pid file points to a
+      // dead or foreign PID. The daemon is managed outside this pid file (e.g.
+      // by systemd); stalePid is metadata only, not an orphan signal.
       pidPath: string;
       socketPath: string;
       socketReachable: true;
       stalePid: number;
-      state: "orphaned";
+      state: "running";
     }
   | { pidPath: string; socketPath: string; state: "stopped"; stalePid?: number }
   | {
@@ -100,6 +103,24 @@ export function readDaemonRuntimeRecord(path: string): DaemonRuntimeRecord | und
   }
 }
 
+export function writeDaemonPidFile(pidPath: string, pid: number): void {
+  mkdirSync(dirname(pidPath), { mode: 0o700, recursive: true });
+  writeFileSync(pidPath, `${pid}\n`, { mode: 0o600 });
+}
+
+export function removeDaemonPidFile(pidPath: string, expectedPid: number): boolean {
+  try {
+    if (!existsSync(pidPath)) return false;
+    const content = readFileSync(pidPath, "utf8").trim();
+    if (Number(content) !== expectedPid) return false;
+    rmSync(pidPath, { force: true });
+    return true;
+  } catch {
+    // Never let pid clean-up failure abort shutdown
+    return false;
+  }
+}
+
 export function writeDaemonRuntimeRecord(path: string, record: DaemonRuntimeRecord): void {
   mkdirSync(dirname(path), { mode: 0o700, recursive: true });
   writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
@@ -152,7 +173,7 @@ export async function getDaemonStatus(input: {
         socketPath: input.socketPath,
         socketReachable: true,
         stalePid: pid,
-        state: "orphaned",
+        state: "running",
       };
     }
     return {
@@ -171,7 +192,7 @@ export async function getDaemonStatus(input: {
         socketPath: input.socketPath,
         socketReachable: true,
         stalePid: pid,
-        state: "orphaned",
+        state: "running",
       };
     }
     return {
@@ -214,12 +235,20 @@ export async function startDaemonProcess(input: {
     pidPath: input.pidPath,
     socketPath: input.socketPath,
   });
-  if (existing.state === "running")
-    throw new Error(`Herdsman daemon is already running with pid ${existing.pid}`);
-  if (existing.state === "orphaned")
+  if (existing.state === "running") {
+    if (existing.socketReachable) {
+      const pid = "pid" in existing ? existing.pid : undefined;
+      throw new Error(
+        pid !== undefined
+          ? `Herdsman daemon is already running with pid ${pid}: ${existing.socketPath}`
+          : `Herdsman daemon is already running: ${existing.socketPath}`,
+      );
+    }
+    const pid = "pid" in existing ? existing.pid : undefined;
     throw new Error(
-      `Herdsman daemon socket is reachable but its PID is stale: ${existing.socketPath}. Remove the stale socket or stop the listening process before restarting.`,
+      `Herdsman daemon process is already running${pid !== undefined ? ` with pid ${pid}` : ""} but its socket is not reachable: ${existing.socketPath}`,
     );
+  }
   if (existing.stalePid !== undefined) rmSync(input.pidPath, { force: true });
   let pidFd: number;
   try {
@@ -256,7 +285,7 @@ export async function startDaemonProcess(input: {
     if (!child.pid) throw new Error("Failed to start Herdsman daemon: child pid was not assigned");
     childPid = child.pid;
     child.unref();
-    writeFileSync(input.pidPath, `${child.pid}\n`, { mode: 0o600 });
+    writeDaemonPidFile(input.pidPath, child.pid);
     try {
       const waitMs =
         input.deps?.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
@@ -315,17 +344,20 @@ export async function stopDaemonProcess(input: {
     rmSync(input.pidPath, { force: true });
     return { alreadyStopped: true };
   }
-  if (status.state === "orphaned") {
-    throw new Error(
-      `Herdsman daemon socket is reachable but its PID is stale: ${status.socketPath}. Remove the stale socket or stop the listening process before stopping.`,
-    );
-  }
 
   const killProcess = deps.killProcess ?? ((pid, signal) => process.kill(pid, signal));
   const processIsRunning = deps.isProcessRunning ?? isProcessRunning;
   const waitMs = deps.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const pid = status.pid;
-  if (pid === undefined) throw new Error("Herdsman daemon status is missing a PID");
+  const pid = "pid" in status ? status.pid : undefined;
+  if (pid === undefined) {
+    const stalePid = "stalePid" in status ? status.stalePid : undefined;
+    if (status.state === "running" && stalePid !== undefined) {
+      throw new Error(
+        `Herdsman daemon socket is reachable at ${status.socketPath} but pid file ${status.pidPath} refers to stale PID ${stalePid}; the daemon is managed outside this pid file and cannot be stopped via CLI`,
+      );
+    }
+    throw new Error("Herdsman daemon status is missing a PID");
+  }
 
   killProcess(pid, "SIGTERM");
   const deadline = Date.now() + input.timeoutMs;
@@ -344,7 +376,7 @@ export async function stopDaemonProcess(input: {
     rmSync(input.pidPath, { force: true });
     return { alreadyStopped: false, pid };
   }
-  throw new Error(`Timed out waiting for Herdsman daemon pid ${status.pid} to stop after SIGKILL`);
+  throw new Error(`Timed out waiting for Herdsman daemon pid ${pid} to stop after SIGKILL`);
 }
 
 function openRotatedLog(path: string): number {
@@ -551,7 +583,7 @@ export async function withDaemonLock<T>(
   }
 }
 
-function defaultConnectSocket(socketPath: string): Promise<boolean> {
+export function defaultConnectSocket(socketPath: string): Promise<boolean> {
   return new Promise((resolve) => {
     const socket = createConnection(socketPath);
     const done = (value: boolean) => {

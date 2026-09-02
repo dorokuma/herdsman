@@ -1,5 +1,7 @@
 ## 0.8.6
 
+- 修复 daemon 启动入口守卫与 PID 生命周期管理：PID 文件改由 daemon service 自身在 `server.start()` 成功后写入，`stop()` 时使用 try/finally 兜底校验当前 PID 匹配后清理；正常退出 `exit(0)`，异常捕获后显式 `exit(1)`。
+- 修复 socket 冲突处理并移除 `orphaned` 语义：`ObservabilityRpcServer.start()` 启动前探测 socket 可达性，可达即拒绝启动并报错，仅残留不可达 socket 允许 unlink；daemon 状态统一将 socket 可达判定为 `running`（stalePid 降级为元数据，移除歧义的 `orphaned` 状态信号），彻底避免双 daemon 并存与 PID 覆写。
 - 修复事件查询 SQL 括号与 legacy close 全量失效；持久化隔离 Grok HOME，并加强 runtime record、session 路径所有权校验。
 - 修复 wake 请求发送空窗与 turn 信号重复消费；启动 reconcile 不释放 owner，补齐 runtime record 与 session 校验回归测试。
 

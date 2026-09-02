@@ -2,6 +2,7 @@ import { chmodSync, existsSync, unlinkSync } from "node:fs";
 import { createServer, type Server, type Socket } from "node:net";
 import { Value } from "@sinclair/typebox/value";
 import type { AgentHistoryService } from "@/agent-history/service.js";
+import { defaultConnectSocket } from "@/daemon/process-manager.js";
 import type { AgentEventStore } from "@/db/agent-events.js";
 import type { AgentStore } from "@/db/agents.js";
 import type { HerdrSessionStore } from "@/db/herdr-sessions.js";
@@ -82,6 +83,7 @@ export class ObservabilityRpcServer {
   readonly #clearInterval: (handle: IntervalHandle) => void;
   readonly #setInterval: (callback: () => void, delay: number) => IntervalHandle;
   readonly #clearTimeout: (handle: TimerHandle) => void;
+  readonly #connectSocket: (socketPath: string) => Promise<boolean>;
   readonly #context: AgentContextService;
   readonly #connectionOrderBySocket = new Map<Socket, number>();
   readonly #publishedContextFingerprintByScope = new Map<string, string>();
@@ -120,6 +122,7 @@ export class ObservabilityRpcServer {
     clearInterval?: (handle: IntervalHandle) => void;
     setInterval?: (callback: () => void, delay: number) => IntervalHandle;
     clearTimeout?: (handle: TimerHandle) => void;
+    connectSocket?: (socketPath: string) => Promise<boolean>;
     context: AgentContextService;
     disconnectGraceMs?: number;
     heartbeatScanIntervalMs?: number;
@@ -146,6 +149,7 @@ export class ObservabilityRpcServer {
     this.#clearInterval = options.clearInterval ?? clearInterval;
     this.#setInterval = options.setInterval ?? setInterval;
     this.#clearTimeout = options.clearTimeout ?? clearTimeout;
+    this.#connectSocket = options.connectSocket ?? defaultConnectSocket;
     this.#context = options.context;
     this.#disconnectGraceMs = options.disconnectGraceMs ?? DISCONNECT_GRACE_MS;
     this.#heartbeatScanIntervalMs =
@@ -167,7 +171,12 @@ export class ObservabilityRpcServer {
 
   async start(): Promise<void> {
     this.#stopping = false;
-    if (existsSync(this.#socketPath)) unlinkSync(this.#socketPath);
+    if (existsSync(this.#socketPath)) {
+      if (await this.#connectSocket(this.#socketPath)) {
+        throw new Error(`Herdsman daemon socket is already reachable: ${this.#socketPath}`);
+      }
+      unlinkSync(this.#socketPath);
+    }
     process.umask(0o077);
     await new Promise<void>((resolve, reject) => {
       this.#server.once("error", reject);
@@ -197,14 +206,15 @@ export class ObservabilityRpcServer {
     this.#piPresenceBySocket.clear();
     this.#socketsByTerminal.clear();
     this.#connectionOrderBySocket.clear();
+    const wasListening = this.#server.listening;
     await new Promise<void>((resolve, reject) => {
-      if (!this.#server.listening) {
+      if (!wasListening) {
         resolve();
         return;
       }
       this.#server.close((error) => (error ? reject(error) : resolve()));
     });
-    if (existsSync(this.#socketPath)) unlinkSync(this.#socketPath);
+    if (wasListening && existsSync(this.#socketPath)) unlinkSync(this.#socketPath);
   }
 
   publishAgentContext(scope: AgentScope): void {

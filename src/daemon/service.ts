@@ -1,9 +1,10 @@
-import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { env, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createAgentHistoryService } from "@/agent-history/service.js";
 import { resolveRuntime } from "@/config/runtime.js";
+import { removeDaemonPidFile, writeDaemonPidFile } from "@/daemon/process-manager.js";
 import { AgentContextSnapshotStore } from "@/db/agent-context-snapshots.js";
 import { AgentEventStore } from "@/db/agent-events.js";
 import { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
@@ -13,7 +14,7 @@ import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
 import { HerdrSessionStore } from "@/db/herdr-sessions.js";
 import { HerdrWorkspaceStore } from "@/db/herdr-workspaces.js";
-import { createHerdrSessionListRunner } from "@/herdr/session-list.js";
+import { createHerdrSessionListRunner, type HerdrSessionListRunner } from "@/herdr/session-list.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
@@ -92,10 +93,18 @@ export class PeriodicReconcileScheduler {
 
 export async function runObservabilityDaemonService(
   input: {
+    connectSocket?: (socketPath: string) => Promise<boolean>;
     environment?: NodeJS.ProcessEnv | undefined;
+    exit?: (code?: number) => void;
+    pid?: number;
     reconcileClearInterval?: (handle: ReturnType<typeof setInterval>) => void;
     reconcileIntervalMs?: number;
     reconcileSetInterval?: (callback: () => void, delay: number) => ReturnType<typeof setInterval>;
+    sessionList?: HerdrSessionListRunner;
+    signalTarget?: {
+      off?: (event: "SIGINT" | "SIGTERM", listener: () => void | Promise<void>) => void;
+      once: (event: "SIGINT" | "SIGTERM", listener: () => void | Promise<void>) => void;
+    };
   } = {},
 ): Promise<void> {
   const runtime = resolveRuntime({ environment: input.environment });
@@ -151,15 +160,19 @@ export async function runObservabilityDaemonService(
     turnCompletions,
   });
 
+  const sessionList =
+    input.sessionList ?? createHerdrSessionListRunner({ env: runtime.environment });
+
   let connectedTerminal = (_input: { herdrSessionName: string; terminalId: string }) => false;
   const reconciler = new AgentEventReconciler({
     connectedTerminal: (input) => connectedTerminal(input),
     events: agentEvents,
     scopes: agentOrchestratorScopes,
-    sessionList: createHerdrSessionListRunner({ env: runtime.environment }),
+    sessionList,
   });
 
   const server = new ObservabilityRpcServer({
+    ...(input.connectSocket !== undefined ? { connectSocket: input.connectSocket } : {}),
     context: daemonServices.context,
     history: daemonServices.history,
     orchestrator,
@@ -176,14 +189,50 @@ export async function runObservabilityDaemonService(
     onAgentContextChanged: (scope) => server.publishAgentContext(scope),
     onAgentEvent: (event) => server.publishAgentEvent(event),
     onAgentIndexRefreshed: (refreshed) => server.reconcileAgentLocations(refreshed),
-    sessionList: createHerdrSessionListRunner({ env: runtime.environment }),
+    sessionList,
   });
 
-  await server.start();
+  const currentPid = input.pid ?? process.pid;
+  const signalTarget = input.signalTarget ?? process;
+  const doExit = input.exit ?? exit;
+
+  // Register signal handlers before the first await that can block (server
+  // start, reconcile): once the pid file is written the daemon must always
+  // clean it up on a graceful shutdown, even if startup is still in progress.
+  let reconcileScheduler: PeriodicReconcileScheduler | undefined;
+  const stop = async () => {
+    let exitCode = 0;
+    try {
+      await reconcileScheduler?.stop();
+      await watchManager.stop();
+      await server.stop();
+      sqlite.close();
+    } catch (error) {
+      console.error("Herdsman daemon shutdown failed", error);
+      exitCode = 1;
+    } finally {
+      removeDaemonPidFile(runtime.paths.pidPath, currentPid);
+      doExit(exitCode);
+    }
+  };
+  signalTarget.once("SIGINT", stop);
+  signalTarget.once("SIGTERM", stop);
+
+  try {
+    await server.start();
+  } catch (error) {
+    if (typeof signalTarget.off === "function") {
+      signalTarget.off("SIGINT", stop);
+      signalTarget.off("SIGTERM", stop);
+    }
+    sqlite.close();
+    throw error;
+  }
+  writeDaemonPidFile(runtime.paths.pidPath, currentPid);
   await reconciler.reconcile({ releaseStaleOwners: false });
   // Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
   // daemons; the in-flight guard inside the scheduler prevents overlapping runs.
-  const reconcileScheduler = new PeriodicReconcileScheduler({
+  reconcileScheduler = new PeriodicReconcileScheduler({
     ...(input.reconcileClearInterval === undefined
       ? {}
       : { clearInterval: input.reconcileClearInterval }),
@@ -196,26 +245,6 @@ export async function runObservabilityDaemonService(
   reconcileScheduler.start();
   await watchManager.start();
   console.log(`Herdsman daemon listening on ${runtime.paths.socketPath}`);
-
-  const stop = async () => {
-    await reconcileScheduler.stop();
-    await watchManager.stop();
-    await server.stop();
-    sqlite.close();
-    try {
-      if (existsSync(runtime.paths.pidPath)) {
-        const content = readFileSync(runtime.paths.pidPath, "utf8").trim();
-        if (Number(content) === process.pid) {
-          rmSync(runtime.paths.pidPath, { force: true });
-        }
-      }
-    } catch {
-      // Ignore clean-up error on shutdown
-    }
-    exit(0);
-  };
-  process.once("SIGINT", stop);
-  process.once("SIGTERM", stop);
 }
 
 export function resolveMigrationsFolder(startDir: string): string {

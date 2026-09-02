@@ -19,9 +19,11 @@ import {
   readDaemonProcessIdentity,
   readDaemonRuntimeRecord,
   releaseDaemonLock,
+  removeDaemonPidFile,
   startDaemonProcess,
   stopDaemonProcess,
   withDaemonLock,
+  writeDaemonPidFile,
   writeDaemonRuntimeRecord,
 } from "@/daemon/process-manager.js";
 
@@ -110,7 +112,7 @@ describe("daemon process manager", () => {
     });
   });
 
-  test("reports orphaned when the pid is stale but the daemon socket is reachable", async () => {
+  test("reports running with stalePid metadata when the pid is stale but the daemon socket is reachable", async () => {
     const dir = tempDir();
     const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
@@ -129,8 +131,37 @@ describe("daemon process manager", () => {
       socketPath: "/tmp/herdsman.sock",
       socketReachable: true,
       stalePid: 1234,
-      state: "orphaned",
+      state: "running",
     });
+  });
+
+  test("writes the daemon pid file with 0o600 mode and creates parent directories", () => {
+    const dir = tempDir();
+    const nested = join(dir, "nested");
+    const pidPath = join(nested, "herdsman.pid");
+
+    writeDaemonPidFile(pidPath, 4242);
+
+    expect(readFileSync(pidPath, "utf8")).toBe("4242\n");
+    expect(statSync(pidPath).mode & 0o777).toBe(0o600);
+  });
+
+  test("removes the daemon pid file only when its content matches the expected pid", () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+
+    // Missing file: no-op
+    expect(removeDaemonPidFile(pidPath, 4242)).toBe(false);
+    expect(existsSync(pidPath)).toBe(false);
+
+    // Foreign pid: file must be left untouched
+    writeFileSync(pidPath, "9999\n");
+    expect(removeDaemonPidFile(pidPath, 4242)).toBe(false);
+    expect(readFileSync(pidPath, "utf8")).toBe("9999\n");
+
+    // Matching pid: removed
+    expect(removeDaemonPidFile(pidPath, 9999)).toBe(true);
+    expect(existsSync(pidPath)).toBe(false);
   });
 
   test("writes and reads a daemon runtime record", () => {
@@ -205,7 +236,7 @@ describe("daemon process manager", () => {
     ).rejects.toThrow("Herdsman daemon is already running with pid 1234");
   });
 
-  test("refuses to start when an orphaned daemon socket is reachable", async () => {
+  test("refuses to start when a daemon socket is reachable even if the pid file is stale", async () => {
     const dir = tempDir();
     const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
@@ -230,8 +261,68 @@ describe("daemon process manager", () => {
         runtimeRecordPath: join(dir, "runtime.json"),
         socketPath: "/tmp/herdsman.sock",
       }),
-    ).rejects.toThrow("Herdsman daemon socket is reachable but its PID is stale");
+    ).rejects.toThrow("Herdsman daemon is already running");
     expect(spawned).toBe(false);
+    // The stale pid file must be preserved: it is metadata for the running daemon
+    expect(readFileSync(pidPath, "utf8")).toBe("1234\n");
+  });
+
+  test("refuses to start when the daemon process is alive but its socket is unreachable", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+    let spawned = false;
+
+    await expect(
+      startDaemonProcess({
+        deps: {
+          connectSocket: async () => false,
+          identityProbe: () => true,
+          isProcessRunning: () => true,
+          spawnProcess: () => {
+            spawned = true;
+            return { pid: 5678, unref() {} };
+          },
+        },
+        entrypointPath: "/repo/dist/src/cli/herdsman-daemon.js",
+        env: {},
+        logPath: join(dir, "herdsman.log"),
+        nodePath: "/usr/bin/node",
+        pidPath,
+        runtimeRecord: runtimeRecord(dir),
+        runtimeRecordPath: join(dir, "runtime.json"),
+        socketPath: "/tmp/herdsman.sock",
+      }),
+    ).rejects.toThrow(
+      "Herdsman daemon process is already running with pid 1234 but its socket is not reachable",
+    );
+    expect(spawned).toBe(false);
+  });
+
+  test("starts normally when the pid file is stale and the socket is unreachable", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+
+    const result = await startDaemonProcess({
+      deps: {
+        connectSocket: async () => false,
+        isProcessRunning: () => false,
+        readinessProbe: async () => true,
+        spawnProcess: () => ({ pid: 5678, unref() {} }),
+      },
+      entrypointPath: "/repo/dist/src/cli/herdsman-daemon.js",
+      env: {},
+      logPath: join(dir, "herdsman.log"),
+      nodePath: "/usr/bin/node",
+      pidPath,
+      runtimeRecord: runtimeRecord(dir),
+      runtimeRecordPath: join(dir, "runtime.json"),
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(result).toEqual({ pid: 5678 });
+    expect(readFileSync(pidPath, "utf8")).toBe("5678\n");
   });
 
   test("starts a detached daemon process and writes its pid and runtime record", async () => {
@@ -413,7 +504,7 @@ describe("daemon process manager", () => {
     expect(readFileSync(pidPath, "utf8")).toBe("5678\n");
   });
 
-  test("reports orphaned when PID is reused but socket is reachable, and stop/start throw without killing", async () => {
+  test("reports running with stalePid when PID is reused but socket is reachable, and stop/start refuse without killing", async () => {
     const dir = tempDir();
     const pidPath = join(dir, "herdsman.pid");
     writeFileSync(pidPath, "1234\n");
@@ -435,7 +526,7 @@ describe("daemon process manager", () => {
       socketPath: "/tmp/herdsman.sock",
       socketReachable: true,
       stalePid: 1234,
-      state: "orphaned",
+      state: "running",
     });
 
     await expect(
@@ -450,8 +541,9 @@ describe("daemon process manager", () => {
         socketPath: "/tmp/herdsman.sock",
         timeoutMs: 100,
       }),
-    ).rejects.toThrow("Herdsman daemon socket is reachable but its PID is stale");
+    ).rejects.toThrow("daemon is managed outside this pid file");
     expect(signals).toHaveLength(0);
+    expect(existsSync(pidPath)).toBe(true);
 
     await expect(
       startDaemonProcess({
@@ -473,7 +565,7 @@ describe("daemon process manager", () => {
         runtimeRecordPath: join(dir, "runtime.json"),
         socketPath: "/tmp/herdsman.sock",
       }),
-    ).rejects.toThrow("Herdsman daemon socket is reachable but its PID is stale");
+    ).rejects.toThrow("Herdsman daemon is already running");
     expect(spawned).toBe(false);
   });
 
