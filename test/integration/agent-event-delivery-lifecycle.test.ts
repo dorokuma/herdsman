@@ -446,11 +446,14 @@ describe("agent event delivery lifecycle", () => {
             workspaceId: "wA",
           }),
         ).toHaveLength(1);
-        expect(
-          restarted.sqlite
-            .prepare("select value from daemon_meta where key = 'logical_now_ms'")
-            .get(),
-        ).toMatchObject({ value: String(realNow) });
+        // The logical clock is monotonic and may have ticked one more
+        // millisecond between realNow and the last persist, so only a lower
+        // bound is asserted: a restart must never roll the clock back below
+        // the wall-clock moment the test started at.
+        const persistedLogicalNow = restarted.sqlite
+          .prepare("select value from daemon_meta where key = 'logical_now_ms'")
+          .get() as { value: string };
+        expect(Number(persistedLogicalNow.value)).toBeGreaterThanOrEqual(realNow);
       } finally {
         restarted.sqlite.close();
       }
