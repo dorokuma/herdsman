@@ -64,6 +64,13 @@
       "when": 1787736960078,
       "tag": "0008_pane_tombstones",
       "breakpoints": true
+    },
+    {
+      "idx": 9,
+      "version": "6",
+      "when": 1788403075026,
+      "tag": "0009_high_lake",
+      "breakpoints": true
     }
   ]
 }

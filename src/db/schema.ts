@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm";
 import {
   index,
   integer,
@@ -134,6 +135,32 @@ export const agentEvents = sqliteTable(
       table.id,
     ),
     index("agent_events_delivery_retry_idx").on(table.status, table.nextAttemptAt),
+  ],
+);
+
+export const statusEventPlans = sqliteTable(
+  "status_event_plans",
+  {
+    agentId: text("agent_id").notNull(),
+    attempts: integer("attempts").notNull().default(0),
+    compactHistoryJson: text("compact_history_json"),
+    createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+    fromStatus: text("from_status").notNull(),
+    herdrEventKey: text("herdr_event_key"),
+    herdrSessionName: text("herdr_session_name").notNull(),
+    id: integer("id").primaryKey({ autoIncrement: true }),
+    lastError: text("last_error"),
+    paneGeneration: text("pane_generation"),
+    paneId: text("pane_id").notNull(),
+    status: text("status").notNull().default("pending"),
+    toStatus: text("to_status").notNull(),
+    updatedAt: integer("updated_at", { mode: "timestamp_ms" }).notNull(),
+  },
+  (table) => [
+    uniqueIndex("status_event_plans_session_key_idx")
+      .on(table.herdrSessionName, table.herdrEventKey)
+      .where(sql`herdr_event_key IS NOT NULL`),
+    index("status_event_plans_status_id_idx").on(table.status, table.id),
   ],
 );
 

@@ -6,11 +6,13 @@ import type {
   AgentIndexRefreshFastResult,
   AgentIndexRefreshResult,
   AgentIndexService,
+  StatusEventPlan,
 } from "@/observability/agent-index-service.js";
 import type { AgentEventRecord, AgentIndexRecord, AgentScope } from "@/observability/contracts.js";
 
 export const ACTIVE_REVISION_POLL_MS = 10_000;
 export const FULL_RESCAN_MS = 60_000;
+export const PLAN_DRAIN_GRACE_MS = 12_000;
 
 type Client = Pick<HerdrSocketClient, "close" | "subscribeEvents">;
 
@@ -42,6 +44,7 @@ export class HerdrSessionWatchManager {
     Promise<AgentIndexRecord[]>
   >();
   readonly #retiringWatcherLoops = new Set<Promise<void>>();
+  readonly #inFlightPlans = new Set<Promise<void>>();
   readonly #sessionList: HerdrSessionListRunner;
   readonly #watchers = new Map<string, Watcher>();
   #lastFullRescanAt = 0;
@@ -101,6 +104,13 @@ export class HerdrSessionWatchManager {
     await this.#abortWatchers();
     await this.#tickInFlight?.catch(() => undefined);
     await Promise.all([...this.#retiringWatcherLoops]);
+    if (this.#inFlightPlans.size > 0) {
+      const controller = new AbortController();
+      const timeout = delay(PLAN_DRAIN_GRACE_MS, controller.signal);
+      await Promise.race([Promise.all([...this.#inFlightPlans]), timeout]).finally(() => {
+        controller.abort();
+      });
+    }
     await this.#abortWatchers();
   }
 
@@ -222,11 +232,7 @@ export class HerdrSessionWatchManager {
             });
             if ("statusEventPlans" in result && Array.isArray(result.statusEventPlans)) {
               for (const plan of result.statusEventPlans) {
-                void this.#index.executeStatusEventPlan?.(plan)?.then((planEvent) => {
-                  if (planEvent) {
-                    this.#onAgentEvent(planEvent);
-                  }
-                });
+                this.#submitPlan(plan);
               }
             }
             continue;
@@ -311,17 +317,36 @@ export class HerdrSessionWatchManager {
       this.#publishResult({ herdrSessionName: entry.name, ...result });
       if ("statusEventPlans" in result && Array.isArray(result.statusEventPlans)) {
         for (const plan of result.statusEventPlans) {
-          void this.#index.executeStatusEventPlan?.(plan)?.then((planEvent) => {
-            if (planEvent) {
-              this.#onAgentEvent(planEvent);
-            }
-          });
+          this.#submitPlan(plan);
         }
       }
       return result.agents;
     });
     this.#refreshPublications.set(source, publication);
     return publication;
+  }
+
+  #submitPlan(plan: StatusEventPlan): void {
+    const execute = this.#index.executeStatusEventPlan?.(plan);
+    if (!execute) return;
+    const task: Promise<void> = Promise.resolve(execute)
+      .then((planEvent) => {
+        if (planEvent) {
+          this.#onAgentEvent(planEvent);
+        }
+      })
+      .catch((error) => {
+        console.warn("Herdsman status event plan failed", {
+          agentId: plan.agent.id,
+          error,
+          from: plan.from,
+          to: plan.to,
+        });
+      })
+      .finally(() => {
+        this.#inFlightPlans.delete(task);
+      });
+    this.#inFlightPlans.add(task);
   }
 
   #publishResult(input: {

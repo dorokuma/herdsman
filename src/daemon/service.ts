@@ -14,6 +14,7 @@ import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
 import { HerdrSessionStore } from "@/db/herdr-sessions.js";
 import { HerdrWorkspaceStore } from "@/db/herdr-workspaces.js";
+import { StatusEventPlanStore } from "@/db/status-event-plans.js";
 import { createHerdrSessionListRunner, type HerdrSessionListRunner } from "@/herdr/session-list.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
@@ -135,6 +136,7 @@ export async function runObservabilityDaemonService(
   const agentHistoryCache = new AgentHistoryCacheStore(sqlite);
   const agentContextSnapshots = new AgentContextSnapshotStore(sqlite);
   const agentOrchestratorScopes = new AgentOrchestratorScopeStore(sqlite);
+  const statusEventPlans = new StatusEventPlanStore(sqlite);
   const history = createAgentHistoryService({ cache: agentHistoryCache });
   const context = new AgentContextService({
     history,
@@ -156,6 +158,7 @@ export async function runObservabilityDaemonService(
       agents,
       herdrSessions,
       herdrWorkspaces,
+      statusEventPlans,
     },
     turnCompletions,
   });
@@ -169,6 +172,7 @@ export async function runObservabilityDaemonService(
     events: agentEvents,
     scopes: agentOrchestratorScopes,
     sessionList,
+    statusEventPlans,
   });
 
   const server = new ObservabilityRpcServer({
@@ -237,7 +241,15 @@ export async function runObservabilityDaemonService(
       ? {}
       : { clearInterval: input.reconcileClearInterval }),
     intervalMs: input.reconcileIntervalMs ?? RECONCILE_INTERVAL_MS,
-    run: () => reconciler.reconcile({ releaseStaleOwners: false }),
+    // Long-lived daemons must also keep retrying runtime-failed status event
+    // plans: drainPendingPlans is idempotent (pending/running rows only,
+    // per-agent serial, attempts capped) and the periodic cadence prevents a
+    // hot loop, so piggybacking it on the reconcile cycle completes the retry
+    // path that the startup-only drain leaves open.
+    run: async () => {
+      await reconciler.reconcile({ releaseStaleOwners: false });
+      await index.drainPendingPlans();
+    },
     ...(input.reconcileSetInterval === undefined
       ? {}
       : { setInterval: input.reconcileSetInterval }),

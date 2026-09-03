@@ -311,7 +311,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     await index.refreshHerdrSession(sessionInput());
     calls = 0;
     const result = await index.handleHerdrEvent(doneEvent);
-    expect(calls).toBe(9);
+    expect(calls).toBe(10);
     expect(result.events).toContainEqual(
       expect.objectContaining({
         compactHistory: expect.objectContaining({ lastAssistantMessage: null }),
@@ -477,7 +477,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   });
 
-  test("suppresses outdated status plan when agent status flips during wait (done -> working)", async () => {
+  test("emits terminal event when status flips during wait (done -> working)", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 5_000 });
     const index = new AgentIndexService({
@@ -525,14 +525,150 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
 
     const planResult = await planPromise;
-    expect(planResult).toBeUndefined();
+    expect(planResult).toEqual(expect.objectContaining({ type: "agent.done" }));
 
     const events = harness.agentEvents.listAfter({
       herdrSessionName: "default",
       workspaceId: "wJ",
     });
-    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(1);
+    expect(events.find((e) => e.type === "agent.done")?.payload).toEqual(
+      expect.objectContaining({ from: "working", to: "done" }),
+    );
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
 
+    harness.sqlite.close();
+  });
+
+  test("emits agent.done even when an idle event flips the status during the turn wait", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 5_000 });
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const fast = await index.handleHerdrEventFast(doneEvent);
+    expect(fast.statusEventPlans).toHaveLength(1);
+    const plan = fast.statusEventPlans[0];
+    if (!plan) throw new Error("expected statusEventPlan");
+
+    // The done plan starts its turn wait; an idle event immediately flips the
+    // stored status. The done plan must still emit its terminal event (the
+    // idle flip may be skipped by the plan's terminal-emission logic).
+    const planPromise = index.executeStatusEventPlan(plan);
+    await index.handleHerdrEventFast({
+      event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+
+    registry.record({
+      confirmed: true,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    const planResult = await planPromise;
+    expect(planResult).toEqual(expect.objectContaining({ type: "agent.done" }));
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(1);
+    harness.sqlite.close();
+  });
+
+  test("drains persisted pending plans after a crash without new events", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+
+    // Simulate a crash mid-plan: a pending plan row survives in the DB and the
+    // agent is already at the terminal state; no new Herdr event will arrive.
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected indexed agent");
+    harness.statusEventPlans.insertPending({
+      agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+      },
+      fromStatus: "working",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      toStatus: "done",
+    });
+    harness.agents.updateStatus({
+      agentStatus: "done",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+    });
+
+    // A fresh index service instance (daemon restart) drains the plan.
+    const restarted = new AgentIndexService({
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+    await restarted.drainPendingPlans();
+
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(1);
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
     harness.sqlite.close();
   });
 

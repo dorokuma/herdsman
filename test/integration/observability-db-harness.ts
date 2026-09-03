@@ -10,6 +10,7 @@ import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
 import { HerdrSessionStore } from "@/db/herdr-sessions.js";
 import { HerdrWorkspaceStore } from "@/db/herdr-workspaces.js";
+import { StatusEventPlanStore } from "@/db/status-event-plans.js";
 
 export const tempDirs: string[] = [];
 
@@ -27,6 +28,7 @@ export function openObservabilityDbHarness() {
     agents: new AgentStore(sqlite, agentEvents),
     herdrSessions: new HerdrSessionStore(sqlite),
     herdrWorkspaces: new HerdrWorkspaceStore(sqlite),
+    statusEventPlans: new StatusEventPlanStore(sqlite),
     sqlite,
     dbPath: join(dir, "test.sqlite"),
     cleanup: () => {
@@ -47,6 +49,7 @@ export function openObservabilityDbHarnessAt(dbPath: string) {
     agents: new AgentStore(sqlite, agentEvents),
     herdrSessions: new HerdrSessionStore(sqlite),
     herdrWorkspaces: new HerdrWorkspaceStore(sqlite),
+    statusEventPlans: new StatusEventPlanStore(sqlite),
     sqlite,
   };
 }

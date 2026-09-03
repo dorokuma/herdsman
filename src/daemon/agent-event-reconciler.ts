@@ -1,5 +1,6 @@
 import type { AgentEventStore } from "@/db/agent-events.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
+import type { StatusEventPlanStore } from "@/db/status-event-plans.js";
 import type { HerdrSessionListEntry, HerdrSessionListRunner } from "@/herdr/session-list.js";
 import { normalizeHerdrSessionSnapshot } from "@/herdr/session-snapshot.js";
 import { HerdrSocketClient } from "@/herdr/socket-client.js";
@@ -21,6 +22,7 @@ export class AgentEventReconciler {
   readonly #sessionList: HerdrSessionListRunner;
   readonly #connectedTerminal: (input: { herdrSessionName: string; terminalId: string }) => boolean;
   readonly #clientFactory: (entry: HerdrSessionListEntry) => HerdrSocketClient;
+  readonly #statusEventPlans: StatusEventPlanStore | undefined;
 
   constructor(options: {
     events: AgentEventStore;
@@ -28,6 +30,7 @@ export class AgentEventReconciler {
     sessionList: HerdrSessionListRunner;
     clientFactory?: (entry: HerdrSessionListEntry) => HerdrSocketClient;
     connectedTerminal?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
+    statusEventPlans?: StatusEventPlanStore;
   }) {
     this.#events = options.events;
     this.#scopes = options.scopes;
@@ -35,6 +38,7 @@ export class AgentEventReconciler {
     this.#clientFactory =
       options.clientFactory ?? ((entry) => new HerdrSocketClient({ socketPath: entry.socketPath }));
     this.#connectedTerminal = options.connectedTerminal ?? (() => true);
+    this.#statusEventPlans = options.statusEventPlans;
   }
 
   async reconcile(
@@ -98,6 +102,9 @@ export class AgentEventReconciler {
     }
     invalidated += this.#events.deleteInvalidated();
     this.#events.deleteSettledOlderThan(RECONCILE_SETTLED_TTL_MS);
+    // Settled status event plans share the same 7-day TTL as settled agent
+    // events: a drained/completed/cancelled/failed plan is pure bookkeeping.
+    this.#statusEventPlans?.deleteSettledOlderThan(RECONCILE_SETTLED_TTL_MS);
     let released = 0;
     if (options.releaseStaleOwners !== false) {
       for (const scope of this.#scopes.listOwnedScopes()) {

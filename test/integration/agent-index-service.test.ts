@@ -1,10 +1,18 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
-import { AgentIndexService } from "@/observability/agent-index-service.js";
+import { AgentIndexService, type StatusEventPlan } from "@/observability/agent-index-service.js";
+import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
+
+const doneEvent = {
+  event: { agent_status: "done", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+  herdrSessionName: "default",
+  sessionDir: "/tmp/herdr",
+  socketPath: "/tmp/herdr.sock",
+};
 
 afterEach(cleanupTempDirs);
 
@@ -198,6 +206,112 @@ describe("AgentIndexService", () => {
     ).toHaveLength(2);
     harness.sqlite.close();
     unknownHarness.sqlite.close();
+  });
+
+  test("S3: waits for a new history ref instead of advancing on a repeated old ref", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 50 });
+    const oldHistory = {
+      ...emptyCompactHistory("pi-jsonl"),
+      lastAssistantMessage: { ref: "x#entry=1", text: "old", timestamp: null },
+      messageCount: 2,
+    };
+    let calls = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          calls += 1;
+          // The first two resolutions return the baseline value again: the
+          // same ref must NOT count as history advancing. Only the third
+          // resolution reports a new ref (text may stay identical).
+          if (calls <= 2) {
+            return { compactHistory: oldHistory, historyRef: null, sourceFingerprint: null };
+          }
+          return {
+            compactHistory: {
+              ...oldHistory,
+              lastAssistantMessage: { ref: "x#entry=2", text: "old", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    calls = 0;
+    const result = await index.handleHerdrEvent(doneEvent);
+    expect(calls).toBeGreaterThanOrEqual(3);
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: expect.objectContaining({ ref: "x#entry=2" }),
+        }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  });
+
+  test("recovered path emits exactly one agent.done when refresh and event plans overlap", async () => {
+    const harness = openObservabilityDbHarness();
+    let current = oneAgent("working", 10);
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return current;
+        },
+      }),
+      history: history(() => undefined, "final result"),
+      stores: harness,
+    });
+    // Index the agent without a generation first.
+    await index.refreshHerdrSession(sessionInput());
+
+    // The pane is re-created with generation g1 and already terminal (done);
+    // the event arrives with the generation, so the DB row (generation-less,
+    // working) does not match and the daemon recovers via an internal refresh.
+    // The refresh-side plan (working -> done) and the event-side plan
+    // (unknown -> done) overlap; the equivalent guard must keep exactly one.
+    current = snapshot(
+      [
+        agent({
+          agent_status: "done",
+          pane_generation: "g1",
+          pane_id: "wJ:p2",
+          revision: 11,
+          terminal_id: "term_claude",
+          workspace_id: "wJ",
+        }),
+      ],
+      [{ pane_id: "wJ:p2", revision: 11 }],
+    );
+    const result = await index.handleHerdrEvent({
+      event: {
+        agent_status: "done",
+        pane_generation: "g1",
+        pane_id: "wJ:p2",
+        type: "pane.agent_status_changed",
+      },
+      ...sessionInput(),
+    });
+    expect(result.events.filter((event) => event.type === "agent.done")).toHaveLength(1);
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((event) => event.type === "agent.done")).toHaveLength(1);
+    harness.sqlite.close();
   });
 
   test("deduplicates a refresh transition repeated by a realtime event in the same session", async () => {
@@ -697,6 +811,168 @@ describe("AgentIndexService non-pi completed event generation", () => {
     });
     expect(allEvents.filter((e) => e.type === "agent.done")).toHaveLength(1);
 
+    harness.sqlite.close();
+  });
+});
+
+describe("AgentIndexService status event plan drain resilience", () => {
+  function openIndex(harness: ReturnType<typeof openObservabilityDbHarness>) {
+    return new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+  }
+
+  test("drain cancels a plan whose agent row is missing and still executes healthy rows", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = openIndex(harness);
+    await index.refreshHerdrSession(sessionInput());
+
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected indexed agent");
+
+    // Healthy row: the agent row exists, the plan drains to completion.
+    const healthy = harness.statusEventPlans.insertPending({
+      agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+      },
+      fromStatus: "working",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      toStatus: "done",
+    });
+    // Ghost row: neither findByPane nor agents.get can resolve it (get throws).
+    const ghost = harness.statusEventPlans.insertPending({
+      agentId: "ag_ghost",
+      fromStatus: "working",
+      herdrSessionName: "default",
+      paneId: "ghost:p1",
+      toStatus: "done",
+    });
+
+    // drainPendingPlans must never reject: a missing-agent row is cancelled
+    // without poisoning the healthy rows.
+    await expect(index.drainPendingPlans()).resolves.toBeUndefined();
+
+    expect(harness.statusEventPlans.get(ghost.id).status).toBe("cancelled");
+    expect(harness.statusEventPlans.get(healthy.id).status).toBe("completed");
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(1);
+    harness.sqlite.close();
+  });
+
+  test("a runtime-failed plan is retried by the next drain and completes", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = openIndex(harness);
+    await index.refreshHerdrSession(sessionInput());
+
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected indexed agent");
+    const row = harness.statusEventPlans.insertPending({
+      agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+      },
+      fromStatus: "working",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      toStatus: "done",
+    });
+
+    // First drain: the append blows up once; the row goes back to pending with
+    // attempts=1 (markRetry path) and the drain still resolves.
+    const append = vi.spyOn(harness.agentEvents, "append").mockImplementationOnce(() => {
+      throw new Error("append boom");
+    });
+    await expect(index.drainPendingPlans()).resolves.toBeUndefined();
+    expect(append).toHaveBeenCalledTimes(1);
+    expect(harness.statusEventPlans.get(row.id)).toMatchObject({
+      attempts: 1,
+      lastError: "append boom",
+      status: "pending",
+    });
+
+    // Second drain retries the same row and completes it: the retry pathway.
+    await expect(index.drainPendingPlans()).resolves.toBeUndefined();
+    expect(harness.statusEventPlans.get(row.id).status).toBe("completed");
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(1);
+    harness.sqlite.close();
+  });
+
+  test("executeStatusEventPlan skips inserting a plan when from equals to", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = openIndex(harness);
+    await index.refreshHerdrSession(sessionInput());
+
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected indexed agent");
+    const plan: StatusEventPlan = {
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+      },
+      from: "working",
+      to: "working",
+    };
+
+    await expect(index.executeStatusEventPlan(plan)).resolves.toBeUndefined();
+    const count = harness.sqlite
+      .prepare("select count(*) as count from status_event_plans")
+      .get() as { count: number };
+    expect(count.count).toBe(0);
+    harness.sqlite.close();
+  });
+
+  test("appending a terminal plan whose agent row is gone cancels the plan and appends nothing", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = openIndex(harness);
+    await index.refreshHerdrSession(sessionInput());
+
+    const fast = await index.handleHerdrEventFast({
+      event: { agent_status: "done", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+    expect(fast.statusEventPlans).toHaveLength(1);
+    const plan = fast.statusEventPlans[0];
+    if (!plan) throw new Error("expected status event plan");
+
+    // The agent row disappears before the plan executes: the append-time
+    // mismatch guard must cancel (not append a dangling event, not mark
+    // completed).
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected indexed agent");
+    harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+
+    await expect(index.executeStatusEventPlan(plan)).resolves.toBeUndefined();
+
+    const rows = harness.sqlite
+      .prepare("select id, status from status_event_plans order by id")
+      .all() as Array<{ id: number; status: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("cancelled");
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(0);
     harness.sqlite.close();
   });
 });

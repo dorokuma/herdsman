@@ -1,10 +1,16 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { emptyCompactHistory } from "@/agent-history/service.js";
 import {
   ACTIVE_REVISION_POLL_MS,
   FULL_RESCAN_MS,
   HerdrSessionWatchManager,
+  PLAN_DRAIN_GRACE_MS,
 } from "@/daemon/herdr-session-watch-manager.js";
-import type { AgentIndexRefreshResult } from "@/observability/agent-index-service.js";
+import type {
+  AgentIndexRefreshResult,
+  StatusEventPlan,
+} from "@/observability/agent-index-service.js";
+import { AgentIndexService } from "@/observability/agent-index-service.js";
 import type { AgentIndexRecord } from "@/observability/contracts.js";
 import {
   cleanupTempDirs,
@@ -260,6 +266,195 @@ describe("HerdrSessionWatchManager", () => {
     expect(received).toContainEqual(expect.objectContaining({ type: "agent.idle" }));
   });
 
+  test("rejects a status plan without escaping the watch loop (warn + stop completes)", async () => {
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const received: unknown[] = [];
+    let handled = 0;
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents() {
+          yield { agent_status: "done", pane_id: "wB:p2", type: "pane.agent_status_changed" };
+          await new Promise<void>((resolve) =>
+            // keep the stream open until the watcher aborts
+            setTimeout(resolve, 200),
+          );
+        },
+      }),
+      index: {
+        async handleHerdrEventFast() {
+          handled += 1;
+          return {
+            agents: [],
+            contextChangedScopes: [],
+            events: [],
+            statusEventPlans: [testPlan()],
+          };
+        },
+        async refreshHerdrSessionFast() {
+          return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+        },
+        executeStatusEventPlan: () => Promise.reject(new Error("plan boom")),
+      },
+      onAgentEvent: (event) => received.push(event),
+    });
+    await manager.start();
+    await waitFor(() => handled > 0);
+    // The rejection must be contained inside the watch loop: stop() completes
+    // and no event escapes to the publisher.
+    await manager.stop();
+    expect(received).toEqual([]);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Herdsman status event plan failed",
+      expect.objectContaining({
+        agentId: "ag_1",
+        error: expect.any(Error),
+        from: "working",
+        to: "done",
+      }),
+    );
+    warnSpy.mockRestore();
+    harness.sqlite.close();
+  });
+
+  test("stop() waits for an in-flight plan and settles once it completes", async () => {
+    vi.useFakeTimers();
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    let releasePlan!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      releasePlan = resolve;
+    });
+    let planStarted = false;
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(_params, options) {
+          yield { agent_status: "done", pane_id: "wB:p2", type: "pane.agent_status_changed" };
+          await new Promise<void>((resolve) =>
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        },
+      }),
+      index: {
+        async handleHerdrEventFast() {
+          return {
+            agents: [],
+            contextChangedScopes: [],
+            events: [],
+            statusEventPlans: [testPlan()],
+          };
+        },
+        async refreshHerdrSessionFast() {
+          return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+        },
+        executeStatusEventPlan: () => {
+          planStarted = true;
+          return gate.then(() => undefined);
+        },
+      },
+    });
+    await manager.start();
+    for (let index = 0; index < 50 && !planStarted; index += 1) await Promise.resolve();
+    expect(planStarted).toBe(true);
+
+    let settled = false;
+    const stopping = manager.stop().then(() => {
+      settled = true;
+    });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    releasePlan();
+    await stopping;
+    expect(settled).toBe(true);
+    harness.sqlite.close();
+  });
+
+  test("stop() settles after PLAN_DRAIN_GRACE_MS even when a plan never finishes", async () => {
+    vi.useFakeTimers();
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(_params, options) {
+          yield { agent_status: "done", pane_id: "wB:p2", type: "pane.agent_status_changed" };
+          await new Promise<void>((resolve) =>
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        },
+      }),
+      index: {
+        async handleHerdrEventFast() {
+          return {
+            agents: [],
+            contextChangedScopes: [],
+            events: [],
+            statusEventPlans: [testPlan()],
+          };
+        },
+        async refreshHerdrSessionFast() {
+          return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+        },
+        executeStatusEventPlan: () => new Promise<undefined>(() => {}),
+      },
+    });
+    await manager.start();
+    const stopping = manager.stop();
+    await vi.advanceTimersByTimeAsync(PLAN_DRAIN_GRACE_MS + 1_000);
+    await stopping;
+    harness.sqlite.close();
+  });
+
+  test("serializes status plans per agent so a repeated transition appends a single done event", async () => {
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    const index = new AgentIndexService({
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("claude-jsonl"),
+              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as never,
+      stores: harness,
+    });
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("expected indexed agent");
+    const plan = testPlan(agent, {
+      ...emptyCompactHistory("claude-jsonl"),
+      lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+    });
+    // Two plans for the same agent (event + refresh paths can both produce
+    // one). The per-agent queue must serialize them: the second execution sees
+    // the first one's appended transition and deduplicates instead of
+    // appending a second done.
+    await Promise.all([
+      index.executeStatusEventPlan(plan),
+      index.executeStatusEventPlan({ ...plan }),
+    ]);
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wB",
+    });
+    expect(events.filter((event) => event.type === "agent.done")).toHaveLength(1);
+    expect(events.filter((event) => event.type === "agent.status.changed")).toHaveLength(1);
+    const rows = harness.sqlite
+      .prepare("select id, status from status_event_plans order by id")
+      .all();
+    expect(rows).toHaveLength(2);
+    expect(rows.every((row) => (row as { status: string }).status === "completed")).toBe(true);
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
+    harness.sqlite.close();
+  });
+
   test("reconciles before publishing changed context and events after a pane move", async () => {
     const harness = openObservabilityDbHarness();
     const operations: string[] = [];
@@ -321,8 +516,11 @@ function managerFor(
   harness: ReturnType<typeof openObservabilityDbHarness>,
   overrides: Partial<Omit<ConstructorParameters<typeof HerdrSessionWatchManager>[0], "index">> & {
     index: {
-      handleHerdrEvent: () => Promise<unknown>;
-      refreshHerdrSession: () => Promise<unknown>;
+      executeStatusEventPlan?: () => Promise<unknown>;
+      handleHerdrEvent?: () => Promise<unknown>;
+      handleHerdrEventFast?: () => Promise<unknown>;
+      refreshHerdrSession?: () => Promise<unknown>;
+      refreshHerdrSessionFast?: () => Promise<unknown>;
     };
   },
 ) {
@@ -421,6 +619,18 @@ function agentRecord(
     tabId: null,
     terminalId: "term_1",
     workspaceId,
+  };
+}
+
+function testPlan(
+  agent: AgentIndexRecord = agentRecord("wB:p2", "wB", "working"),
+  compactHistory: StatusEventPlan["compactHistory"] = undefined,
+): StatusEventPlan {
+  return {
+    agent,
+    compactHistory,
+    from: "working",
+    to: "done",
   };
 }
 

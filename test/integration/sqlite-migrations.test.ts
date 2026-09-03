@@ -29,8 +29,10 @@ describe("SQLite migrations", () => {
       "agent_orchestrator_scopes",
       "agent_pane_tombstones",
       "agents",
+      "daemon_meta",
       "herdr_sessions",
       "herdr_workspaces",
+      "status_event_plans",
     ]);
     expect(tables).not.toContain("observed_workspaces");
     const scopeColumns = sqlite
