@@ -631,16 +631,23 @@ describe("agent event pagination regressions (independent coverage)", () => {
       ],
     })[0];
     if (!agent) throw new Error("Expected agent");
-    for (let i = 0; i < 1_001; i += 1)
-      h.agentEvents.append({
-        agentId: agent.id,
-        herdrSessionName: "default",
-        workspaceId: "wB",
-        paneId: "wB:noise",
-        payload: {},
-        terminalId: "term-agent",
-        type: "agent.done",
-      });
+    h.sqlite.exec("begin immediate");
+    try {
+      for (let i = 0; i < 1_001; i += 1)
+        h.agentEvents.append({
+          agentId: agent.id,
+          herdrSessionName: "default",
+          workspaceId: "wB",
+          paneId: "wB:noise",
+          payload: {},
+          terminalId: "term-agent",
+          type: "agent.done",
+        });
+      h.sqlite.exec("commit");
+    } catch (error) {
+      h.sqlite.exec("rollback");
+      throw error;
+    }
     const pending = h.agentEvents.append({
       agentId: agent.id,
       herdrSessionName: "default",
@@ -685,16 +692,23 @@ describe("agent event pagination regressions (independent coverage)", () => {
       ],
     })[0];
     if (!agent) throw new Error("Expected agent");
-    for (let i = 0; i < 50_001; i += 1)
-      h.agentEvents.append({
-        agentId: agent.id,
-        herdrSessionName: "default",
-        workspaceId: "wB",
-        paneId: "wB:noise",
-        payload: {},
-        terminalId: "term-agent",
-        type: "agent.done",
-      });
+    h.sqlite.exec("begin immediate");
+    try {
+      for (let i = 0; i < 50_001; i += 1)
+        h.agentEvents.append({
+          agentId: agent.id,
+          herdrSessionName: "default",
+          workspaceId: "wB",
+          paneId: "wB:noise",
+          payload: {},
+          terminalId: "term-agent",
+          type: "agent.done",
+        });
+      h.sqlite.exec("commit");
+    } catch (error) {
+      h.sqlite.exec("rollback");
+      throw error;
+    }
     const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(
       h.agentEvents.nextDeliverableAfter({

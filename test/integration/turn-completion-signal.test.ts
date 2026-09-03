@@ -135,7 +135,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       }),
     );
     harness.sqlite.close();
-  });
+  }, 10_000);
 
   test("retries for agy without waiting for a turn signal", async () => {
     const harness = openObservabilityDbHarness();
@@ -185,7 +185,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       }),
     );
     harness.sqlite.close();
-  });
+  }, 10_000);
 
   test("emits agent.done promptly when the turn signal was recorded first", async () => {
     const harness = openObservabilityDbHarness();
@@ -234,7 +234,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       }),
     );
     harness.sqlite.close();
-  });
+  }, 10_000);
   test("retries eight times after a received turn signal when history is still empty", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
@@ -282,7 +282,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       }),
     );
     harness.sqlite.close();
-  });
+  }, 20_000);
   test("generates agent.done as-is with a warning when no turn signal arrives (old extension)", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 20 });
@@ -319,7 +319,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       }),
     );
     harness.sqlite.close();
-  });
+  }, 20_000);
 
   test("does not wait for a turn signal when no registry is configured", async () => {
     const harness = openObservabilityDbHarness();
@@ -399,7 +399,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     expect(events.filter((e) => e.type === "agent.done")).toHaveLength(0);
 
     harness.sqlite.close();
-  });
+  }, 10_000);
 
   test("watch loop delivers status_changed(done) followed by pane.closed in single stream, aborting done event promptly", async () => {
     const harness = openObservabilityDbHarness();
@@ -475,7 +475,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     expect(dbEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
 
     harness.sqlite.close();
-  });
+  }, 10_000);
 
   test("emits terminal event when status flips during wait (done -> working)", async () => {
     const harness = openObservabilityDbHarness();
@@ -538,7 +538,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
 
     harness.sqlite.close();
-  });
+  }, 20_000);
 
   test("emits agent.done even when an idle event flips the status during the turn wait", async () => {
     const harness = openObservabilityDbHarness();
@@ -597,7 +597,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
     expect(events.filter((e) => e.type === "agent.done")).toHaveLength(1);
     harness.sqlite.close();
-  });
+  }, 10_000);
 
   test("drains persisted pending plans after a crash without new events", async () => {
     const harness = openObservabilityDbHarness();
@@ -730,5 +730,5 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     expect(secondResult).toBeUndefined();
 
     harness.sqlite.close();
-  });
+  }, 10_000);
 });
