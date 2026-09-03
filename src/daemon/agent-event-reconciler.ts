@@ -4,6 +4,7 @@ import type { StatusEventPlanStore } from "@/db/status-event-plans.js";
 import type { HerdrSessionListEntry, HerdrSessionListRunner } from "@/herdr/session-list.js";
 import { normalizeHerdrSessionSnapshot } from "@/herdr/session-snapshot.js";
 import { HerdrSocketClient } from "@/herdr/socket-client.js";
+import type { AgentEventRecord } from "@/observability/contracts.js";
 
 export const RECONCILE_BATCH_LIMIT = 100;
 export const RECONCILE_REASON = "PANE_NOT_PRESENT_RECONCILE";
@@ -92,11 +93,7 @@ export class AgentEventReconciler {
         cursor = event.id;
         const panes = live.get(event.herdrSessionName);
         if (!panes) continue;
-        const present = panes.some(
-          (pane) =>
-            pane.paneId === event.paneId &&
-            (event.paneGeneration === null || pane.generation === event.paneGeneration),
-        );
+        const present = panes.some((pane) => paneMatchesEvent(pane, event));
         if (!present && this.#events.deleteReconcileCandidate(event.id)) invalidated += 1;
       }
     }
@@ -148,4 +145,27 @@ export class AgentEventReconciler {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * A live pane matches an event when the pane ids are equal and the
+ * generations do not contradict each other. A generation-less live pane is
+ * treated as alive (the pane is present in the snapshot, so its events must
+ * not be swept even though the pane reports no generation); only two
+ * different non-null generations mean the pane was re-created and the old
+ * generation's events are stale.
+ */
+function paneMatchesEvent(pane: LivePane, event: AgentEventRecord): boolean {
+  if (pane.paneId !== event.paneId) return false;
+  if (event.paneGeneration === null) return true;
+  if (pane.generation === null) {
+    console.warn("Herdsman reconcile treating generation-less live pane as alive", {
+      eventId: event.id,
+      eventPaneGeneration: event.paneGeneration,
+      herdrSessionName: event.herdrSessionName,
+      paneId: event.paneId,
+    });
+    return true;
+  }
+  return pane.generation === event.paneGeneration;
 }

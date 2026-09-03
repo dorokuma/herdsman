@@ -1,10 +1,11 @@
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
+import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import {
   cleanupTempDirs,
   openObservabilityDbHarness,
@@ -322,6 +323,142 @@ describe("agent event delivery lifecycle", () => {
     });
   });
 
+  test("reclaims a delivered event immediately when the delivery terminal has no active connection", () => {
+    const harness = prepareHarness();
+    harness.agentOrchestratorScopes.claim({
+      herdrSessionName: "default",
+      workspaceId: "wA",
+      ackedEventId: 0,
+      paneId: "wA:owner",
+      terminalId: "term-owner",
+    });
+    const event = appendEvent(harness);
+    harness.agentEvents.reservePending("term-owner");
+    // last_attempt_at is very recent: without the connection check the event
+    // would linger as delivered until the timeout.
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now(), event.id);
+    expect(harness.agentEvents.reclaimDelivered(60_000, { isTerminalConnected: () => false })).toBe(
+      1,
+    );
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "pending",
+      deliverable: 1,
+      deliveryAttempts: 1,
+      deliveredToTerminalId: null,
+      nextAttemptAt: null,
+    });
+    // Control: with the terminal connected and a fresh last_attempt_at, the
+    // delivered event is kept even when the timeout has not elapsed.
+    harness.agentEvents.reservePending("term-owner");
+    expect(harness.agentEvents.reclaimDelivered(60_000, { isTerminalConnected: () => true })).toBe(
+      0,
+    );
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "delivered",
+      deliveredToTerminalId: "term-owner",
+    });
+  });
+
+  test("isTerminalConnected is judged against the delivered event's own session, not the caller's", () => {
+    const harness = prepareHarness();
+    const orchestrator = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    harness.agentOrchestratorScopes.claim({
+      herdrSessionName: "default",
+      workspaceId: "wA",
+      ackedEventId: 0,
+      paneId: "wA:owner",
+      terminalId: "term-owner",
+    });
+    const event = appendEvent(harness);
+    harness.agentEvents.reservePending("term-owner");
+    // last_attempt_at is fresh: only the connection-check shortcut can touch
+    // this delivered row.
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now(), event.id);
+
+    // Session B calls pending(); its isTerminalConnected only recognizes
+    // "session A (default) + term-owner" as connected. The delivered row
+    // belongs to session A, so it must NOT be reclaimed: the old closure over
+    // the caller's session misjudged it as offline and reclaimed it.
+    orchestrator.pending({
+      herdrSessionName: "other",
+      workspaceId: "wB",
+      terminalId: "term-b",
+      isTerminalConnected: (input) =>
+        input.herdrSessionName === "default" && input.terminalId === "term-owner",
+    });
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "delivered",
+      deliveredToTerminalId: "term-owner",
+    });
+
+    // Control: the terminal is offline in the event's OWN session -> the row
+    // is reclaimed immediately.
+    orchestrator.pending({
+      herdrSessionName: "other",
+      workspaceId: "wB",
+      terminalId: "term-b",
+      isTerminalConnected: () => false,
+    });
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      status: "pending",
+      deliverable: 1,
+      deliveredToTerminalId: null,
+    });
+  });
+
+  test("monotonic logical clock survives a wall-clock rollback and a store restart", () => {
+    const harness = prepareHarness();
+    const realNow = Date.now();
+    const event = appendEvent(harness);
+    harness.agentEvents.reservePending("term-owner");
+    expect(harness.agentEvents.get(event.id)).toMatchObject({ status: "delivered" });
+
+    // Roll the wall clock back by one hour: the logical clock must keep the
+    // delivered event inside its freshness window instead of aging it out.
+    vi.useFakeTimers();
+    vi.setSystemTime(realNow - 60 * 60 * 1_000);
+    try {
+      expect(
+        harness.agentEvents.listAfter({
+          afterEventId: 0,
+          herdrSessionName: "default",
+          ownerTerminalId: "term-owner",
+          workspaceId: "wA",
+        }),
+      ).toHaveLength(1);
+      // A brand-new store over the same database reads the persisted logical
+      // clock, so a daemon restart cannot roll the clock back either.
+      const restarted = openObservabilityDbHarnessAt(harness.dbPath);
+      try {
+        expect(
+          restarted.agentEvents.listAfter({
+            afterEventId: 0,
+            herdrSessionName: "default",
+            ownerTerminalId: "term-owner",
+            workspaceId: "wA",
+          }),
+        ).toHaveLength(1);
+        expect(
+          restarted.sqlite
+            .prepare("select value from daemon_meta where key = 'logical_now_ms'")
+            .get(),
+        ).toMatchObject({ value: String(realNow) });
+      } finally {
+        restarted.sqlite.close();
+      }
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   test("keeps deliverable and status equivalent after every transition", () => {
     const harness = prepareHarness();
     const event = appendEvent(harness);
@@ -404,7 +541,7 @@ describe("empty database migration chain", () => {
       ]),
     );
     expect(sqlite.prepare("select count(*) as count from __drizzle_migrations").get()).toEqual({
-      count: 9,
+      count: 10,
     });
     const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
       version: string;
@@ -412,7 +549,7 @@ describe("empty database migration chain", () => {
     };
     expect(
       journal.entries.every(
-        (entry, index) => entry.version === (index < 6 || index === 8 ? "6" : "7"),
+        (entry, index) => entry.version === (index < 6 || index === 8 || index === 9 ? "6" : "7"),
       ),
     ).toBe(true);
     expect(journal.entries.find((entry) => entry.tag === "0007_moaning_guardian")?.version).toBe(
@@ -421,6 +558,7 @@ describe("empty database migration chain", () => {
     expect(journal.entries.find((entry) => entry.tag === "0008_pane_tombstones")?.version).toBe(
       "6",
     );
+    expect(journal.entries.find((entry) => entry.tag === "0009_high_lake")?.version).toBe("6");
     sqlite.close();
   });
 });

@@ -53,8 +53,17 @@ export class AgentOrchestratorService {
     return { current: change.current, previous: change.previous, reason: input.reason };
   }
 
-  pending(input: AgentScope & { limit?: number; terminalId: string }): AgentEventRecord[] {
-    this.#agentEvents.reclaimDelivered(60_000);
+  pending(
+    input: AgentScope & {
+      isTerminalConnected?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
+      limit?: number;
+      terminalId: string;
+    },
+  ): AgentEventRecord[] {
+    this.#agentEvents.reclaimDelivered(
+      60_000,
+      input.isTerminalConnected ? { isTerminalConnected: input.isTerminalConnected } : undefined,
+    );
     const state = this.#scopes.get(input);
     if (!state?.owner || state.owner.terminalId !== input.terminalId) return [];
 

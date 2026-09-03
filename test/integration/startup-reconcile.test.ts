@@ -274,6 +274,55 @@ describe("startup reconcile dedicated coverage", () => {
     expect(await instance.reconcile()).toEqual({ invalidated: 0, purged: 0, released: 0 });
   });
 
+  test("keeps a generation-tagged pending event when the live pane has no generation", async () => {
+    const { harness, append } = setup();
+    const generationTagged = append({ paneId: "wA:g1", terminalId: "term-g1", generation: "g1" });
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    await reconciler(harness, [{ pane_id: "wA:g1", terminal_id: "term-g1" }]).reconcile();
+    // The generation-less live pane is treated as alive: its events must not
+    // be swept even though the event carries a generation.
+    expect(harness.agentEvents.get(generationTagged.id)).toMatchObject({
+      status: "pending",
+      deliverable: 1,
+    });
+    expect(warning).toHaveBeenCalledWith(
+      "Herdsman reconcile treating generation-less live pane as alive",
+      expect.objectContaining({
+        eventId: generationTagged.id,
+        eventPaneGeneration: "g1",
+        herdrSessionName: "default",
+        paneId: "wA:g1",
+      }),
+    );
+    warning.mockRestore();
+  });
+
+  test("still deletes a generation-tagged event whose pane is absent from the snapshot", async () => {
+    const { harness, append } = setup();
+    const orphan = append({ paneId: "wA:gone", terminalId: "term-gone", generation: "g1" });
+    await reconciler(harness, [{ pane_id: "wA:other", terminal_id: "term-other" }]).reconcile();
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id = ?")
+        .get(orphan.id),
+    ).toEqual({ count: 0 });
+  });
+
+  test("still deletes a generation-tagged event when the live pane has a different generation", async () => {
+    const { harness, append } = setup();
+    const stale = append({ paneId: "wA:g1", terminalId: "term-g1", generation: "g1" });
+    await reconciler(harness, [
+      { pane_generation: "g2", pane_id: "wA:g1", terminal_id: "term-g1" },
+    ]).reconcile();
+    // Both sides carry a generation and they differ: the pane was re-created,
+    // so the old generation's events are stale and must be deleted.
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id = ?")
+        .get(stale.id),
+    ).toEqual({ count: 0 });
+  });
+
   test("g: purges released scopes older than the 30-day TTL but keeps recent and active ones", async () => {
     const { harness } = setup();
     harness.agentOrchestratorScopes.claim({

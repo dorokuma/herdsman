@@ -17,7 +17,7 @@ export type DaemonRuntimeRecord = {
   dbPath: string;
   homeDir: string;
   logPath: string;
-  pid: number;
+  pid?: number;
   pidPath: string;
   socketPath: string;
   startedAt: string;
@@ -65,6 +65,16 @@ type DaemonSpawnProcess = (
 export const DAEMON_ENTRYPOINT_NAMES = ["herdsman-daemon.js"] as const;
 export const CLI_ENTRYPOINT_NAMES = ["herdsman-daemon.js", "herdsman.js", "herdsman"] as const;
 
+/**
+ * Instance lock path for the daemon's bare entrypoint (herdsman-daemon.js).
+ * Deliberately distinct from the CLI operation lock (`${pidPath}.lock`) so a
+ * daemon started outside the CLI does not collide with CLI start/stop/restart
+ * operations, and vice versa.
+ */
+export function daemonInstanceLockPath(pidPath: string): string {
+  return `${pidPath}.instance.lock`;
+}
+
 const warnedUnknownIdentityPids = new Set<number>();
 
 export type DaemonProcessDependencies = {
@@ -89,7 +99,6 @@ export function readDaemonRuntimeRecord(path: string): DaemonRuntimeRecord | und
       typeof value.dbPath !== "string" ||
       typeof value.homeDir !== "string" ||
       typeof value.logPath !== "string" ||
-      typeof value.pid !== "number" ||
       typeof value.pidPath !== "string" ||
       typeof value.socketPath !== "string" ||
       typeof value.startedAt !== "string"
@@ -313,12 +322,15 @@ export async function startDaemonProcess(input: {
       }
       throw error;
     }
-    writeDaemonRuntimeRecord(input.runtimeRecordPath, {
+    const record: DaemonRuntimeRecord = {
       ...input.runtimeRecord,
-      pid: child.pid,
       startedAt: new Date().toISOString(),
       version: 1,
-    });
+    };
+    // The runtime record no longer carries a pid: the pid file is the pid
+    // source of truth, and a stale pid here misleads liveness checks.
+    delete record.pid;
+    writeDaemonRuntimeRecord(input.runtimeRecordPath, record);
     return { pid: child.pid };
   } catch (error) {
     if (childPid !== undefined && childConfirmedDead) rmSync(input.pidPath, { force: true });

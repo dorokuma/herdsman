@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,8 +12,18 @@ import {
 } from "@/daemon/service.js";
 
 const tempDirs: string[] = [];
+const children: Array<import("node:child_process").ChildProcess> = [];
+
+const repoRoot = process.cwd();
+
+function killChildProcesses(): void {
+  for (const child of children.splice(0)) {
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+  }
+}
 
 afterEach(() => {
+  killChildProcesses();
   for (const dir of tempDirs.splice(0)) rmSync(dir, { force: true, recursive: true });
 });
 
@@ -305,6 +316,95 @@ describe("daemon service lifecycle and socket guard", () => {
     expect(exitCodes).toEqual([1]);
     expect(consoleError).toHaveBeenCalledWith("Herdsman daemon shutdown failed", expect.any(Error));
     consoleError.mockRestore();
+  });
+
+  test("a second daemon on the same HERDSMAN_HOME fails on the instance lock; SIGTERM releases it and allows restart", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdsman-instance-lock-"));
+    tempDirs.push(root);
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: root } });
+    mkdirSync(root, { recursive: true });
+
+    // A real daemon process whose entrypoint basename is herdsman-daemon.js
+    // (so the instance lock's identity probe recognizes it) holds the lock for
+    // this HERDSMAN_HOME. The wrapper runs the actual service via tsx.
+    const wrapperPath = join(root, "herdsman-daemon.js");
+    writeFileSync(
+      wrapperPath,
+      [
+        `import { runObservabilityDaemonService } from ${JSON.stringify(join(repoRoot, "src/daemon/service.ts"))};`,
+        "runObservabilityDaemonService({ environment: process.env, sessionList: async () => [] });",
+      ].join("\n"),
+    );
+    const child = spawn(process.execPath, ["--import", "tsx", wrapperPath], {
+      cwd: repoRoot,
+      env: { ...process.env, HERDSMAN_HOME: root },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    children.push(child);
+    let childOutput = "";
+    child.stdout.on("data", (chunk) => (childOutput += String(chunk)));
+    child.stderr.on("data", (chunk) => (childOutput += String(chunk)));
+    const childExit = new Promise<number | null>((resolve) => {
+      child.once("exit", (code) => resolve(code));
+    });
+
+    try {
+      // The pid file is written only after the instance lock is acquired and
+      // the server is listening, so its presence proves the lock is held.
+      await vi.waitFor(
+        () => {
+          if (!existsSync(runtime.paths.pidPath)) {
+            throw new Error(`child daemon not ready; output: ${childOutput}`);
+          }
+          const pid = Number(readFileSync(runtime.paths.pidPath, "utf8").trim());
+          if (pid !== child.pid) throw new Error("pid file belongs to another daemon");
+        },
+        { timeout: 20_000, interval: 100 },
+      );
+      expect(existsSync(`${runtime.paths.pidPath}.instance.lock`)).toBe(true);
+
+      const exitCodes: number[] = [];
+      const signals = createSignalTarget();
+      await expect(
+        runObservabilityDaemonService({
+          environment: { HERDSMAN_HOME: root },
+          exit: (code) => {
+            exitCodes.push(code ?? 0);
+          },
+          pid: 2222,
+          sessionList: async () => [],
+          signalTarget: signals.target,
+        }),
+      ).rejects.toThrow(/Herdsman daemon operation lock is held/);
+      expect(exitCodes).toHaveLength(0);
+
+      // Stopping the child daemon releases the instance lock.
+      child.kill("SIGTERM");
+      const exitCode = await Promise.race([
+        childExit,
+        new Promise<null>((resolve) => setTimeout(() => resolve(null), 20_000)),
+      ]);
+      expect(exitCode).toBe(0);
+      expect(childOutput).not.toContain("shutdown failed");
+      expect(existsSync(`${runtime.paths.pidPath}.instance.lock`)).toBe(false);
+      expect(existsSync(runtime.paths.pidPath)).toBe(false);
+
+      // With the lock released, the same HERDSMAN_HOME can be started again.
+      await runObservabilityDaemonService({
+        environment: { HERDSMAN_HOME: root },
+        exit: (code) => {
+          exitCodes.push(code ?? 0);
+        },
+        pid: 3333,
+        sessionList: async () => [],
+        signalTarget: signals.target,
+      });
+      expect(readFileSync(runtime.paths.pidPath, "utf8")).toBe("3333\n");
+      await signals.emit("SIGTERM");
+      expect(exitCodes).toEqual([0]);
+    } finally {
+      killChildProcesses();
+    }
   });
 
   test("simulates double-start race between two daemons sharing socket path", async () => {

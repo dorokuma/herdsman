@@ -18,6 +18,17 @@ import { isInteractivePiAgent } from "@/observability/interactive-pi.js";
  */
 export const REDELIVERY_FRESHNESS_MS = 300_000;
 
+/**
+ * Persist interval for the monotonic logical clock. The clock is written to
+ * daemon_meta only when it advances by at least this much since the last
+ * persist, so read-only queries do not trigger a write+fsync on every call.
+ * The freshness window is 300s, so a 60s persist granularity does not weaken
+ * the anti-rollback semantics.
+ */
+export const LOGICAL_CLOCK_PERSIST_INTERVAL_MS = 60_000;
+
+export const LOGICAL_CLOCK_META_KEY = "logical_now_ms";
+
 export function hasNonEmptyAssistantMessage(
   compactHistory: CompactAgentHistory | null | undefined,
 ): boolean {
@@ -90,9 +101,42 @@ type AgentEventRow = {
 
 export class AgentEventStore {
   readonly #sqlite: DatabaseSync;
+  #lastPersistedLogicalNowMs: number;
+  #logicalNowMs: number;
 
   constructor(sqlite: DatabaseSync) {
     this.#sqlite = sqlite;
+    const row = this.#sqlite
+      .prepare("select value from daemon_meta where key = ?")
+      .get(LOGICAL_CLOCK_META_KEY) as { value: string } | undefined;
+    const persisted = row ? Number(row.value) : 0;
+    this.#logicalNowMs = Number.isFinite(persisted) && persisted > 0 ? persisted : 0;
+    this.#lastPersistedLogicalNowMs = this.#logicalNowMs;
+  }
+
+  /**
+   * Monotonic logical clock: never goes backwards, even when the wall clock
+   * is rolled back. The in-memory value is seeded from daemon_meta on
+   * construction and advanced to the wall clock when the wall clock is ahead.
+   * Persistence is throttled so read-only queries do not write+fsync every
+   * call; on crash the persisted value is only ever stale (never ahead of the
+   * last persisted value), so the anti-rollback invariant holds across
+   * restarts.
+   */
+  #now(): number {
+    const wallClock = Date.now();
+    if (wallClock <= this.#logicalNowMs) return this.#logicalNowMs;
+    this.#logicalNowMs = wallClock;
+    if (this.#logicalNowMs - this.#lastPersistedLogicalNowMs >= LOGICAL_CLOCK_PERSIST_INTERVAL_MS) {
+      this.#lastPersistedLogicalNowMs = this.#logicalNowMs;
+      this.#sqlite
+        .prepare(
+          `insert into daemon_meta (key, value) values (?, ?)
+           on conflict(key) do update set value = excluded.value`,
+        )
+        .run(LOGICAL_CLOCK_META_KEY, String(this.#logicalNowMs));
+    }
+    return this.#logicalNowMs;
   }
 
   append(input: {
@@ -133,7 +177,7 @@ export class AgentEventStore {
         JSON.stringify(input.payload),
         input.compactHistory ? JSON.stringify(input.compactHistory) : null,
         input.idempotencyKey ?? null,
-        Date.now(),
+        this.#now(),
       );
     return this.get(Number(result.lastInsertRowid));
   }
@@ -241,10 +285,10 @@ export class AgentEventStore {
     ];
     const params: Array<number | string | null> = [
       input.afterEventId ?? 0,
-      Date.now(),
+      this.#now(),
       input.ownerTerminalId ?? null,
       input.afterEventId ?? 0,
-      Date.now() - REDELIVERY_FRESHNESS_MS,
+      this.#now() - REDELIVERY_FRESHNESS_MS,
     ];
     if (input.herdrSessionName) {
       clauses.push("herdr_session_name = ?");
@@ -282,9 +326,9 @@ export class AgentEventStore {
     for (let page = 0; page < 50; page += 1) {
       const params = [
         afterEventId,
-        Date.now(),
+        this.#now(),
         input.ownerTerminalId,
-        Date.now() - REDELIVERY_FRESHNESS_MS,
+        this.#now() - REDELIVERY_FRESHNESS_MS,
         input.herdrSessionName,
         input.workspaceId,
         input.ownerTerminalId,
@@ -317,7 +361,7 @@ export class AgentEventStore {
 
   reservePending(terminalId: string, limit = 100, ids?: number[]): AgentEventRecord[] {
     return this.#transaction(() => {
-      const now = Date.now();
+      const now = this.#now();
       const idClause = ids && ids.length > 0 ? `and id in (${ids.map(() => "?").join(",")})` : "";
       const params: Array<number | string> = [now, terminalId, now - REDELIVERY_FRESHNESS_MS];
       if (ids && ids.length > 0) params.push(...ids);
@@ -346,9 +390,14 @@ export class AgentEventStore {
     });
   }
 
-  reclaimDelivered(timeoutMs: number): number {
+  reclaimDelivered(
+    timeoutMs: number,
+    options?: {
+      isTerminalConnected?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
+    },
+  ): number {
     return this.#transaction(() => {
-      const cutoff = Date.now() - timeoutMs;
+      const cutoff = this.#now() - timeoutMs;
       // The delivered event's own agent row (matched by pane) is the pane-open
       // guard: it decides whether branch (a) and branch (b) apply.
       const agentPaneOpen = `exists (
@@ -390,7 +439,55 @@ export class AgentEventStore {
              )`,
         )
         .run(cutoff).changes;
-      return Number(invalidated) + Number(reclaimed);
+      let count = Number(invalidated) + Number(reclaimed);
+      const isTerminalConnected = options?.isTerminalConnected;
+      if (isTerminalConnected) {
+        // Branch (a) shortcut: the pane is open and the scope is still held by
+        // the delivery terminal, so the event would linger until the timeout.
+        // If that terminal has no active daemon connection the delivery is
+        // already dead on arrival: reclaim it immediately with the same policy
+        // as branch (c) (pending, failed at the attempt limit) instead of
+        // waiting for last_attempt_at to age out.
+        // The callback is evaluated against the delivered row's OWN session:
+        // a requester from another session must not be able to judge (and
+        // reclaim) an in-flight delivery it cannot see.
+        const deliveredRows = this.#sqlite
+          .prepare(
+            `select herdr_session_name, id, delivered_to_terminal_id from agent_events
+             where status = 'delivered' and delivered_to_terminal_id is not null`,
+          )
+          .all() as Array<{
+          delivered_to_terminal_id: string;
+          herdr_session_name: string;
+          id: number;
+        }>;
+        const disconnectedIds = deliveredRows
+          .filter(
+            (row) =>
+              !isTerminalConnected({
+                herdrSessionName: row.herdr_session_name,
+                terminalId: row.delivered_to_terminal_id,
+              }),
+          )
+          .map((row) => row.id);
+        if (disconnectedIds.length > 0) {
+          const placeholders = disconnectedIds.map(() => "?").join(",");
+          const reclaimedImmediately = this.#sqlite
+            .prepare(
+              `update agent_events
+               set status = case when delivery_attempts >= 10 then 'failed' else 'pending' end,
+                   deliverable = case when delivery_attempts >= 10 then 0 else 1 end,
+                   last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end,
+                   delivered_to_terminal_id = null,
+                   next_attempt_at = null
+               where status = 'delivered' and id in (${placeholders})
+                 and ${agentPaneOpen}`,
+            )
+            .run(...disconnectedIds).changes;
+          count += Number(reclaimedImmediately);
+        }
+      }
+      return count;
     });
   }
 

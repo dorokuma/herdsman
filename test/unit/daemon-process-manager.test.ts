@@ -13,6 +13,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   acquireDaemonLock,
   type DaemonRuntimeRecord,
+  daemonInstanceLockPath,
   getDaemonStatus,
   isProcessRunning,
   prepareDaemonSocketPath,
@@ -352,15 +353,18 @@ describe("daemon process manager", () => {
 
     expect(result).toEqual({ pid: 5678 });
     expect(readFileSync(pidPath, "utf8")).toBe("5678\n");
-    expect(readDaemonRuntimeRecord(runtimeRecordPath)).toMatchObject({
+    const record = readDaemonRuntimeRecord(runtimeRecordPath);
+    expect(record).toMatchObject({
       dbPath: join(dir, "state.db"),
       homeDir: dir,
       logPath,
-      pid: 5678,
       pidPath,
       socketPath: "/tmp/herdsman.sock",
       version: 1,
     });
+    // The runtime record deliberately carries no pid: the pid file is the pid
+    // source of truth, and a stale pid would mislead liveness checks.
+    expect(record?.pid).toBeUndefined();
     expect(spawned).toMatchObject([
       {
         args: ["/repo/dist/src/cli/herdsman-daemon.js"],
@@ -670,6 +674,29 @@ describe("daemon process manager", () => {
     expect(stopResult).toEqual({ alreadyStopped: true });
     expect(signals).toHaveLength(0);
     expect(existsSync(pidPath)).toBe(false);
+  });
+
+  test("daemonInstanceLockPath is distinct from the CLI operation lock", () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    expect(daemonInstanceLockPath(pidPath)).toBe(`${pidPath}.instance.lock`);
+    expect(daemonInstanceLockPath(pidPath)).not.toBe(`${pidPath}.lock`);
+  });
+
+  test("reads a runtime record without a pid and keeps an optional legacy pid", () => {
+    const dir = tempDir();
+    const recordPath = join(dir, "runtime.json");
+    const withoutPid: DaemonRuntimeRecord = { ...runtimeRecord(dir) };
+    delete withoutPid.pid;
+    writeDaemonRuntimeRecord(recordPath, withoutPid);
+    const parsed = readDaemonRuntimeRecord(recordPath);
+    expect(parsed).toEqual(withoutPid);
+    expect(parsed?.pid).toBeUndefined();
+
+    // A legacy record that still carries a pid remains readable (pid is
+    // optional metadata, never a required validation field).
+    writeDaemonRuntimeRecord(recordPath, runtimeRecord(dir));
+    expect(readDaemonRuntimeRecord(recordPath)?.pid).toBe(1234);
   });
 
   test("daemon lock enforces mutual exclusion and owner tracking with manual disposal guidance", () => {

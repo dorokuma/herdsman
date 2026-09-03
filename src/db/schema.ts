@@ -164,6 +164,11 @@ export const statusEventPlans = sqliteTable(
   ],
 );
 
+export const daemonMeta = sqliteTable("daemon_meta", {
+  key: text("key").primaryKey(),
+  value: text("value").notNull(),
+});
+
 export const agentOrchestratorScopes = sqliteTable(
   "agent_orchestrator_scopes",
   {

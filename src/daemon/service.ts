@@ -4,7 +4,12 @@ import { env, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createAgentHistoryService } from "@/agent-history/service.js";
 import { resolveRuntime } from "@/config/runtime.js";
-import { removeDaemonPidFile, writeDaemonPidFile } from "@/daemon/process-manager.js";
+import {
+  acquireDaemonLock,
+  daemonInstanceLockPath,
+  removeDaemonPidFile,
+  writeDaemonPidFile,
+} from "@/daemon/process-manager.js";
 import { AgentContextSnapshotStore } from "@/db/agent-context-snapshots.js";
 import { AgentEventStore } from "@/db/agent-events.js";
 import { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
@@ -196,6 +201,15 @@ export async function runObservabilityDaemonService(
     sessionList,
   });
 
+  const onUnhandledRejection = (reason: unknown) => {
+    console.error("Herdsman daemon unhandled rejection", reason);
+  };
+  const onUncaughtException = (error: Error) => {
+    console.error("Herdsman daemon uncaught exception", error);
+  };
+  process.on("unhandledRejection", onUnhandledRejection);
+  process.on("uncaughtException", onUncaughtException);
+
   const currentPid = input.pid ?? process.pid;
   const signalTarget = input.signalTarget ?? process;
   const doExit = input.exit ?? exit;
@@ -204,9 +218,18 @@ export async function runObservabilityDaemonService(
   // start, reconcile): once the pid file is written the daemon must always
   // clean it up on a graceful shutdown, even if startup is still in progress.
   let reconcileScheduler: PeriodicReconcileScheduler | undefined;
+  let releaseInstanceLock: (() => void) | undefined;
+  const releaseInstanceLockIfHeld = () => {
+    if (releaseInstanceLock) {
+      releaseInstanceLock();
+      releaseInstanceLock = undefined;
+    }
+  };
   const stop = async () => {
     let exitCode = 0;
     try {
+      process.off("unhandledRejection", onUnhandledRejection);
+      process.off("uncaughtException", onUncaughtException);
       await reconcileScheduler?.stop();
       await watchManager.stop();
       await server.stop();
@@ -216,6 +239,7 @@ export async function runObservabilityDaemonService(
       exitCode = 1;
     } finally {
       removeDaemonPidFile(runtime.paths.pidPath, currentPid);
+      releaseInstanceLockIfHeld();
       doExit(exitCode);
     }
   };
@@ -223,17 +247,26 @@ export async function runObservabilityDaemonService(
   signalTarget.once("SIGTERM", stop);
 
   try {
+    // The bare daemon entrypoint (herdsman-daemon.js) takes an instance lock
+    // distinct from the CLI operation lock so two daemon processes cannot
+    // share one HERDSMAN_HOME even when neither goes through the CLI. The lock
+    // is released on graceful stop and on every startup failure path.
+    releaseInstanceLock = acquireDaemonLock(daemonInstanceLockPath(runtime.paths.pidPath));
     await server.start();
   } catch (error) {
+    process.off("unhandledRejection", onUnhandledRejection);
+    process.off("uncaughtException", onUncaughtException);
     if (typeof signalTarget.off === "function") {
       signalTarget.off("SIGINT", stop);
       signalTarget.off("SIGTERM", stop);
     }
+    releaseInstanceLockIfHeld();
     sqlite.close();
     throw error;
   }
   writeDaemonPidFile(runtime.paths.pidPath, currentPid);
   await reconciler.reconcile({ releaseStaleOwners: false });
+  await index.drainPendingPlans();
   // Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
   // daemons; the in-flight guard inside the scheduler prevents overlapping runs.
   reconcileScheduler = new PeriodicReconcileScheduler({
