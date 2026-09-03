@@ -1,6 +1,6 @@
 {
   "name": "@dorokuma/herdsman",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "Agent history daemon and runtime bridges for Herdr-managed coding agents. Forked from @ryonakae/herdsman.",
   "type": "module",
   "files": [

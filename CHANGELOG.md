@@ -1,3 +1,14 @@
+## 0.10.2
+
+- 终态事件持久化补偿：新增 `status_event_plans` 表（0009 migration），状态迁移事件落库为计划行，daemon 启动与周期 reconcile 时 drain 重试（幂等、per-agent 串行队列、attempts 封顶、watch manager 12s drain grace），彻底修复终态事件在运行时丢失的问题。
+- mismatch 场景（herdr 事件状态与本地记录不一致）下 done/blocked 终态仍生成，仅 pane 关闭才取消计划；equivalent 守卫改查 status_event_plans 修复双计划。
+- 历史推进判据改为 `lastAssistantMessage.ref` / `messageCount`（`historyHasAdvanced`），不再依赖 message 文本比较。
+- 事件投递加固：`reclaimDelivered` 对无活跃连接的投递终态立即回收（回调按事件行自身 session 判定，防跨会话误判）。
+- 单调逻辑时钟防回拨：`daemon_meta` 持久化 `logical_now_ms`，墙钟回拨与 daemon 重启均不回退事件时间戳。
+- daemon instance lock：裸入口 `herdsman-daemon.js` 独占 `HERDSMAN_HOME`，避免 CLI 操作锁之外的双 daemon 并存。
+- reconciler 将 generation-less 存活 pane 视为存活，避免误删在跑事件。
+- 去重脚本 lib 化（拒活 daemon / wal 备份 / cursor 修理），runtime.json pid 可选化（pid 文件为唯一事实源）。
+
 ## 0.10.1
 
 - 修复 daemon 启动入口守卫与 PID 生命周期管理：PID 文件改由 daemon service 自身在 `server.start()` 成功后写入，`stop()` 时使用 try/finally 兜底校验当前 PID 匹配后清理；正常退出 `exit(0)`，异常捕获后显式 `exit(1)`。
