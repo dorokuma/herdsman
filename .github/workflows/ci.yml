@@ -9,13 +9,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/action-setup@v6
+      - uses: pnpm/setup@v2
         with:
           version: 11.9.0
-      - uses: actions/setup-node@v7
-        with:
-          node-version: 22.x
-          cache: pnpm
+          runtime: node@22
+          cache: true
+          # pnpm/setup's install input is a plain boolean with no extra-arg
+          # passthrough, so keep the explicit step to preserve --ignore-scripts
+          install: false
       - run: pnpm install --ignore-scripts
       - run: pnpm typecheck
       - run: pnpm test
