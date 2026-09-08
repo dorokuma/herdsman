@@ -6,6 +6,7 @@
 - plan failed 可见性：新增 wire 事件类型 `agent.failed`（幂等键 `agent.failed:plan:id`），status plan 耗尽 attempts 后落库并可投递；wake / agent-update-ui 渲染失败原因。
 - daemon 实例锁：以内核 `flock` + READY 握手替代 PID 探测，消除裂脑、假锁与 PID 复用；启动链事务性回滚（reconcile 失败释放锁、清理 pid、关闭 server）。
 - 事件 reclaim 加固：`reclaimDelivered` 以 `agent_orchestrator_scopes` 租约为唯一事实源，孤儿 delivered 立即回收，不再依赖连接回调。
+- 插件平台声明收窄为 Linux（flock 实例锁为内核依赖）
 
 ## 0.10.2
 
