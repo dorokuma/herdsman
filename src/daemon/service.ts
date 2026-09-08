@@ -253,8 +253,36 @@ export async function runObservabilityDaemonService(
     // distinct from the CLI operation lock so two daemon processes cannot
     // share one HERDSMAN_HOME even when neither goes through the CLI. The lock
     // is released on graceful stop and on every startup failure path.
-    releaseInstanceLock = acquireDaemonLock(daemonInstanceLockPath(runtime.paths.pidPath));
+    releaseInstanceLock = acquireDaemonLock(daemonInstanceLockPath(runtime.paths.pidPath), {
+      pid: currentPid,
+    });
     await server.start();
+    writeDaemonPidFile(runtime.paths.pidPath, currentPid);
+    await reconciler.reconcile({ releaseStaleOwners: false });
+    await index.drainPendingPlans();
+    // Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
+    // daemons; the in-flight guard inside the scheduler prevents overlapping runs.
+    reconcileScheduler = new PeriodicReconcileScheduler({
+      ...(input.reconcileClearInterval === undefined
+        ? {}
+        : { clearInterval: input.reconcileClearInterval }),
+      intervalMs: input.reconcileIntervalMs ?? RECONCILE_INTERVAL_MS,
+      // Long-lived daemons must also keep retrying runtime-failed status event
+      // plans: drainPendingPlans is idempotent (pending/running rows only,
+      // per-agent serial, attempts capped) and the periodic cadence prevents a
+      // hot loop, so piggybacking it on the reconcile cycle completes the retry
+      // path that the startup-only drain leaves open.
+      run: async () => {
+        await reconciler.reconcile({ releaseStaleOwners: false });
+        await index.drainPendingPlans();
+      },
+      ...(input.reconcileSetInterval === undefined
+        ? {}
+        : { setInterval: input.reconcileSetInterval }),
+    });
+    reconcileScheduler.start();
+    await watchManager.start();
+    console.log(`Herdsman daemon listening on ${runtime.paths.socketPath}`);
   } catch (error) {
     process.off("unhandledRejection", onUnhandledRejection);
     process.off("uncaughtException", onUncaughtException);
@@ -262,36 +290,20 @@ export async function runObservabilityDaemonService(
       signalTarget.off("SIGINT", stop);
       signalTarget.off("SIGTERM", stop);
     }
+    try {
+      await reconcileScheduler?.stop();
+    } catch {}
+    try {
+      await watchManager.stop();
+    } catch {}
+    try {
+      await server.stop();
+    } catch {}
+    removeDaemonPidFile(runtime.paths.pidPath, currentPid);
     releaseInstanceLockIfHeld();
     sqlite.close();
     throw error;
   }
-  writeDaemonPidFile(runtime.paths.pidPath, currentPid);
-  await reconciler.reconcile({ releaseStaleOwners: false });
-  await index.drainPendingPlans();
-  // Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
-  // daemons; the in-flight guard inside the scheduler prevents overlapping runs.
-  reconcileScheduler = new PeriodicReconcileScheduler({
-    ...(input.reconcileClearInterval === undefined
-      ? {}
-      : { clearInterval: input.reconcileClearInterval }),
-    intervalMs: input.reconcileIntervalMs ?? RECONCILE_INTERVAL_MS,
-    // Long-lived daemons must also keep retrying runtime-failed status event
-    // plans: drainPendingPlans is idempotent (pending/running rows only,
-    // per-agent serial, attempts capped) and the periodic cadence prevents a
-    // hot loop, so piggybacking it on the reconcile cycle completes the retry
-    // path that the startup-only drain leaves open.
-    run: async () => {
-      await reconciler.reconcile({ releaseStaleOwners: false });
-      await index.drainPendingPlans();
-    },
-    ...(input.reconcileSetInterval === undefined
-      ? {}
-      : { setInterval: input.reconcileSetInterval }),
-  });
-  reconcileScheduler.start();
-  await watchManager.start();
-  console.log(`Herdsman daemon listening on ${runtime.paths.socketPath}`);
 }
 
 export function resolveMigrationsFolder(startDir: string): string {

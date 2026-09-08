@@ -415,12 +415,7 @@ export class AgentEventStore {
     });
   }
 
-  reclaimDelivered(
-    timeoutMs: number,
-    options?: {
-      isTerminalConnected?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
-    },
-  ): number {
+  reclaimDelivered(timeoutMs: number): number {
     return this.#transaction(() => {
       const cutoff = this.#now() - timeoutMs;
       // The delivered event's own agent row (matched by pane) is the pane-open
@@ -442,10 +437,10 @@ export class AgentEventStore {
         )
         .run(cutoff).changes;
       // Branch (c): the pane is still open but the delivery terminal no longer
-      // holds the orchestrator scope, so reclaim (failed at the attempt limit,
-      // pending otherwise). Branch (a) — pane open and the scope still owned by
-      // the delivery terminal — is a valid in-flight delivery left untouched by
-      // this WHERE guard.
+      // holds the orchestrator scope (owner_terminal_id != delivered_to_terminal_id
+      // or no owner), so reclaim immediately without waiting for last_attempt_at
+      // timeout. If the scope is still owned by the delivery terminal (branch a),
+      // the event remains in-flight with the owner.
       const reclaimed = this.#sqlite
         .prepare(
           `update agent_events
@@ -454,7 +449,7 @@ export class AgentEventStore {
                last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end,
                delivered_to_terminal_id = null,
                next_attempt_at = null
-           where status = 'delivered' and last_attempt_at < ?
+           where status = 'delivered'
              and ${agentPaneOpen}
              and not exists (
                select 1 from agent_orchestrator_scopes
@@ -463,56 +458,8 @@ export class AgentEventStore {
                  and agent_orchestrator_scopes.owner_terminal_id = agent_events.delivered_to_terminal_id
              )`,
         )
-        .run(cutoff).changes;
-      let count = Number(invalidated) + Number(reclaimed);
-      const isTerminalConnected = options?.isTerminalConnected;
-      if (isTerminalConnected) {
-        // Branch (a) shortcut: the pane is open and the scope is still held by
-        // the delivery terminal, so the event would linger until the timeout.
-        // If that terminal has no active daemon connection the delivery is
-        // already dead on arrival: reclaim it immediately with the same policy
-        // as branch (c) (pending, failed at the attempt limit) instead of
-        // waiting for last_attempt_at to age out.
-        // The callback is evaluated against the delivered row's OWN session:
-        // a requester from another session must not be able to judge (and
-        // reclaim) an in-flight delivery it cannot see.
-        const deliveredRows = this.#sqlite
-          .prepare(
-            `select herdr_session_name, id, delivered_to_terminal_id from agent_events
-             where status = 'delivered' and delivered_to_terminal_id is not null`,
-          )
-          .all() as Array<{
-          delivered_to_terminal_id: string;
-          herdr_session_name: string;
-          id: number;
-        }>;
-        const disconnectedIds = deliveredRows
-          .filter(
-            (row) =>
-              !isTerminalConnected({
-                herdrSessionName: row.herdr_session_name,
-                terminalId: row.delivered_to_terminal_id,
-              }),
-          )
-          .map((row) => row.id);
-        if (disconnectedIds.length > 0) {
-          const placeholders = disconnectedIds.map(() => "?").join(",");
-          const reclaimedImmediately = this.#sqlite
-            .prepare(
-              `update agent_events
-               set status = case when delivery_attempts >= 10 then 'failed' else 'pending' end,
-                   deliverable = case when delivery_attempts >= 10 then 0 else 1 end,
-                   last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end,
-                   delivered_to_terminal_id = null,
-                   next_attempt_at = null
-               where status = 'delivered' and id in (${placeholders})
-                 and ${agentPaneOpen}`,
-            )
-            .run(...disconnectedIds).changes;
-          count += Number(reclaimedImmediately);
-        }
-      }
-      return count;
+        .run().changes;
+      return Number(invalidated) + Number(reclaimed);
     });
   }
 

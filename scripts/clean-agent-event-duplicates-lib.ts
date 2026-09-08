@@ -6,7 +6,7 @@
 import { copyFileSync, existsSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
-import { isProcessRunning } from "@/daemon/process-manager.js";
+import { isFlockHeld } from "@/daemon/process-manager.js";
 
 export type DaemonLiveness = {
   /** PID of the live daemon process, or undefined when no daemon is running. */
@@ -20,7 +20,7 @@ export type DaemonLiveness = {
  * has no valid owner.json.
  */
 export function readLockOwnerPid(lockPath: string): number | undefined {
-  const ownerPath = join(lockPath, "owner.json");
+  const ownerPath = `${lockPath}.owner.json`;
   if (!existsSync(ownerPath)) return undefined;
   try {
     const data = JSON.parse(readFileSync(ownerPath, "utf8")) as { pid?: unknown };
@@ -32,24 +32,14 @@ export function readLockOwnerPid(lockPath: string): number | undefined {
 }
 
 /**
- * Detects a live daemon for a HERDSMAN_HOME: the pid file's pid is alive, or a
- * lock directory's owner pid is alive. Returns the live pid with the source
- * that proved it, or undefined when nothing points at a running process.
+ * Detects a live daemon for a HERDSMAN_HOME: probes non-blocking kernel flock on
+ * lock paths (${pidPath}.instance.lock / ${pidPath}.lock). Returns the live pid
+ * from owner metadata with the source that proved it, or undefined when no live daemon holds flock.
  */
 export function liveDaemonOwnerPid(input: { pidPath: string }): DaemonLiveness {
-  if (existsSync(input.pidPath)) {
-    try {
-      const pid = Number(readFileSync(input.pidPath, "utf8").trim());
-      if (Number.isInteger(pid) && pid > 0 && isProcessRunning(pid)) {
-        return { pid, source: "pid-file" };
-      }
-    } catch {
-      // Unreadable pid file is treated as no pid-file evidence
-    }
-  }
-  for (const lockPath of [`${input.pidPath}.lock`, `${input.pidPath}.instance.lock`]) {
-    const ownerPid = readLockOwnerPid(lockPath);
-    if (ownerPid !== undefined && isProcessRunning(ownerPid)) {
+  for (const lockPath of [`${input.pidPath}.instance.lock`, `${input.pidPath}.lock`]) {
+    if (isFlockHeld(lockPath)) {
+      const ownerPid = readLockOwnerPid(lockPath);
       return { pid: ownerPid, source: "lock" };
     }
   }
@@ -63,15 +53,16 @@ export function liveDaemonOwnerPid(input: { pidPath: string }): DaemonLiveness {
  */
 export function ensureDaemonNotRunning(input: { dryRun: boolean; pidPath: string }): void {
   const live = liveDaemonOwnerPid({ pidPath: input.pidPath });
-  if (live.pid === undefined) return;
+  if (live.source === undefined && live.pid === undefined) return;
+  const pidDesc = live.pid !== undefined ? `pid ${live.pid}` : "unknown pid";
   if (input.dryRun) {
     console.warn(
-      `Herdsman daemon is running (pid ${live.pid}, ${live.source ?? "unknown"}); dry-run proceeds read-only`,
+      `Herdsman daemon is running (${pidDesc}, ${live.source ?? "unknown"}); dry-run proceeds read-only`,
     );
     return;
   }
   throw new Error(
-    `Herdsman daemon is running (pid ${live.pid}, ${live.source ?? "unknown"}); refusing to clean agent event duplicates`,
+    `Herdsman daemon is running (${pidDesc}, ${live.source ?? "unknown"}); refusing to clean agent event duplicates`,
   );
 }
 

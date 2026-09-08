@@ -4,6 +4,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { resolveRuntime } from "@/config/runtime.js";
+import { AgentEventReconciler } from "@/daemon/agent-event-reconciler.js";
+import { acquireDaemonLock } from "@/daemon/process-manager.js";
 import {
   PeriodicReconcileScheduler,
   RECONCILE_INTERVAL_MS,
@@ -386,7 +388,7 @@ describe("daemon service lifecycle and socket guard", () => {
       ]);
       expect(exitCode).toBe(0);
       expect(childOutput).not.toContain("shutdown failed");
-      expect(existsSync(`${runtime.paths.pidPath}.instance.lock`)).toBe(false);
+      expect(existsSync(`${runtime.paths.pidPath}.instance.lock`)).toBe(true);
       expect(existsSync(runtime.paths.pidPath)).toBe(false);
 
       // With the lock released, the same HERDSMAN_HOME can be started again.
@@ -404,6 +406,37 @@ describe("daemon service lifecycle and socket guard", () => {
       expect(exitCodes).toEqual([0]);
     } finally {
       killChildProcesses();
+    }
+  });
+
+  test("releases instance lock, cleans up pid file and closes server if reconcile fails during startup", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdsman-reconcile-fail-"));
+    tempDirs.push(root);
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: root } });
+    mkdirSync(root, { recursive: true });
+
+    const lockPath = `${runtime.paths.pidPath}.instance.lock`;
+
+    const reconcileSpy = vi
+      .spyOn(AgentEventReconciler.prototype, "reconcile")
+      .mockRejectedValueOnce(new Error("simulated reconcile startup explosion"));
+
+    try {
+      await expect(
+        runObservabilityDaemonService({
+          environment: { HERDSMAN_HOME: root },
+          pid: 7777,
+          sessionList: async () => [],
+        }),
+      ).rejects.toThrow("simulated reconcile startup explosion");
+
+      // Assert that pid file was removed and not left over
+      expect(existsSync(runtime.paths.pidPath)).toBe(false);
+      // Instance lock was released and can immediately be acquired by another daemon
+      const release = acquireDaemonLock(lockPath);
+      release();
+    } finally {
+      reconcileSpy.mockRestore();
     }
   });
 
@@ -443,7 +476,7 @@ describe("daemon service lifecycle and socket guard", () => {
         sessionList: async () => [],
         signalTarget: signals2.target,
       }),
-    ).rejects.toThrow("Herdsman daemon socket is already reachable");
+    ).rejects.toThrow(/Herdsman daemon (operation lock is held|socket is already reachable)/);
 
     // Daemon 1's PID file is untouched
     expect(readFileSync(runtime.paths.pidPath, "utf8")).toBe("1001\n");

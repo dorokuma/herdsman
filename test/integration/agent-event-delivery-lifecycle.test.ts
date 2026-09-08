@@ -6,7 +6,6 @@ import { emptyCompactHistory } from "@/agent-history/service.js";
 import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
-import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import {
   cleanupTempDirs,
   openObservabilityDbHarness,
@@ -328,25 +327,16 @@ describe("agent event delivery lifecycle", () => {
     });
   });
 
-  test("reclaims a delivered event immediately when the delivery terminal has no active connection", () => {
+  test("reclaims a delivered event immediately when the delivery terminal does not hold scope", () => {
     const harness = prepareHarness();
-    harness.agentOrchestratorScopes.claim({
-      herdrSessionName: "default",
-      workspaceId: "wA",
-      ackedEventId: 0,
-      paneId: "wA:owner",
-      terminalId: "term-owner",
-    });
     const event = appendEvent(harness);
     harness.agentEvents.reservePending("term-owner");
-    // last_attempt_at is very recent: without the connection check the event
-    // would linger as delivered until the timeout.
+    // last_attempt_at is very recent: without scope ownership, the event
+    // is reclaimed immediately without waiting for 60s timeout.
     harness.sqlite
       .prepare("update agent_events set last_attempt_at = ? where id = ?")
       .run(Date.now(), event.id);
-    expect(harness.agentEvents.reclaimDelivered(60_000, { isTerminalConnected: () => false })).toBe(
-      1,
-    );
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(1);
     expect(harness.agentEvents.get(event.id)).toMatchObject({
       status: "pending",
       deliverable: 1,
@@ -354,25 +344,10 @@ describe("agent event delivery lifecycle", () => {
       deliveredToTerminalId: null,
       nextAttemptAt: null,
     });
-    // Control: with the terminal connected and a fresh last_attempt_at, the
-    // delivered event is kept even when the timeout has not elapsed.
-    harness.agentEvents.reservePending("term-owner");
-    expect(harness.agentEvents.reclaimDelivered(60_000, { isTerminalConnected: () => true })).toBe(
-      0,
-    );
-    expect(harness.agentEvents.get(event.id)).toMatchObject({
-      status: "delivered",
-      deliveredToTerminalId: "term-owner",
-    });
   });
 
-  test("isTerminalConnected is judged against the delivered event's own session, not the caller's", () => {
+  test("retains delivered event when scope is held and reclaims immediately upon scope release", () => {
     const harness = prepareHarness();
-    const orchestrator = new AgentOrchestratorService({
-      agentEvents: harness.agentEvents,
-      agents: harness.agents,
-      scopes: harness.agentOrchestratorScopes,
-    });
     harness.agentOrchestratorScopes.claim({
       herdrSessionName: "default",
       workspaceId: "wA",
@@ -382,36 +357,24 @@ describe("agent event delivery lifecycle", () => {
     });
     const event = appendEvent(harness);
     harness.agentEvents.reservePending("term-owner");
-    // last_attempt_at is fresh: only the connection-check shortcut can touch
-    // this delivered row.
+    // last_attempt_at is fresh: scope owner holds the lease, so it is kept
     harness.sqlite
       .prepare("update agent_events set last_attempt_at = ? where id = ?")
       .run(Date.now(), event.id);
 
-    // Session B calls pending(); its isTerminalConnected only recognizes
-    // "session A (default) + term-owner" as connected. The delivered row
-    // belongs to session A, so it must NOT be reclaimed: the old closure over
-    // the caller's session misjudged it as offline and reclaimed it.
-    orchestrator.pending({
-      herdrSessionName: "other",
-      workspaceId: "wB",
-      terminalId: "term-b",
-      isTerminalConnected: (input) =>
-        input.herdrSessionName === "default" && input.terminalId === "term-owner",
-    });
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(0);
     expect(harness.agentEvents.get(event.id)).toMatchObject({
       status: "delivered",
       deliveredToTerminalId: "term-owner",
     });
 
-    // Control: the terminal is offline in the event's OWN session -> the row
-    // is reclaimed immediately.
-    orchestrator.pending({
-      herdrSessionName: "other",
-      workspaceId: "wB",
-      terminalId: "term-b",
-      isTerminalConnected: () => false,
+    // When scope owner is released/cleared, immediate reclaim recovers the event
+    harness.agentOrchestratorScopes.releaseIfOwner({
+      herdrSessionName: "default",
+      workspaceId: "wA",
+      terminalId: "term-owner",
     });
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(1);
     expect(harness.agentEvents.get(event.id)).toMatchObject({
       status: "pending",
       deliverable: 1,
