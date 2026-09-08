@@ -1,3 +1,12 @@
+## 0.11.0
+
+- agy 终态就绪闸：终态事件（done/idle）发射前检查正文就绪，空正文不落库 `status.changed` 与终态事件；投递闸拦截非 pi 空 `done`/`idle`（`agent.failed` 豁免），`blocked` 维持中间态豁免。Protobuf 解析仅提取真实 message 字段；compact 历史读取剥离已消费/上一轮残留。
+- WAL 指纹识别：SQLite 历史指纹纳入 `-wal`/`-shm` 的 mtime 与 size，实时感知 WAL 写入。
+- `PLAN_WAITING_HISTORY` 重试链：未就绪计划写入 pending 带哨兵，由 10s timer 接续重试；`refreshAgent` 抛错时维持哨兵，Pi keyed retry 增加 assistant 变更校验避免假 advance。
+- plan failed 可见性：新增 wire 事件类型 `agent.failed`（幂等键 `agent.failed:plan:id`），status plan 耗尽 attempts 后落库并可投递；wake / agent-update-ui 渲染失败原因。
+- daemon 实例锁：以内核 `flock` + READY 握手替代 PID 探测，消除裂脑、假锁与 PID 复用；启动链事务性回滚（reconcile 失败释放锁、清理 pid、关闭 server）。
+- 事件 reclaim 加固：`reclaimDelivered` 以 `agent_orchestrator_scopes` 租约为唯一事实源，孤儿 delivered 立即回收，不再依赖连接回调。
+
 ## 0.10.2
 
 - 终态事件持久化补偿：新增 `status_event_plans` 表（0009 migration），状态迁移事件落库为计划行，daemon 启动与周期 reconcile 时 drain 重试（幂等、per-agent 串行队列、attempts 封顶、watch manager 12s drain grace），彻底修复终态事件在运行时丢失的问题。
