@@ -317,4 +317,72 @@ describe("agent history service", () => {
     expect(cacheSourcePathForRef(first)).toBe("/tmp/opencode.db#session=session-a");
     expect(cacheSourcePathForRef(second)).toBe("/tmp/opencode.db#session=session-b");
   });
+
+  test("forceRefresh bypasses getFresh cache lookup and updates cache with put", async () => {
+    const path = await sourceFile("force-refresh.jsonl");
+    const preferred = ref(path);
+    const getFresh = vi.fn(() => ({
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        historyRef: preferred,
+        lastAssistantMessage: { ref: "stale", text: "stale cache", timestamp: null },
+      },
+    }));
+    const put = vi.fn();
+    const fixture = service({
+      cache: { getFresh: getFresh as never, put },
+      discovered: null,
+    });
+
+    const result = await fixture.service.resolveCompactHistory(lookup, {
+      forceRefresh: true,
+      preferredRef: preferred,
+    });
+
+    expect(getFresh).not.toHaveBeenCalled();
+    expect(result.compactHistory.lastAssistantMessage).toEqual(
+      expect.objectContaining({ text: "done" }),
+    );
+    expect(put).toHaveBeenCalledWith(
+      expect.objectContaining({
+        formatterVersion: "agent-history-v2",
+        sourcePath: path,
+      }),
+    );
+  });
+
+  test("statSourceFingerprint includes wal and shm sidecars in fingerprint", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "herdsman-sidecars-"));
+    tempDirs.push(dir);
+    const mainPath = join(dir, "agy.sqlite");
+    const walPath = `${mainPath}-wal`;
+    const shmPath = `${mainPath}-shm`;
+
+    await writeFile(mainPath, "main file");
+    const { statSourceFingerprint } = await import("@/agent-history/source-fingerprint.js");
+
+    const withoutSidecars = await statSourceFingerprint(mainPath);
+    const mainStats = await stat(mainPath);
+    expect(withoutSidecars).toEqual({
+      mtimeMs: Math.trunc(mainStats.mtimeMs),
+      path: mainPath,
+      size: mainStats.size,
+    });
+
+    await writeFile(walPath, "wal file data");
+    await writeFile(shmPath, "shm data");
+
+    const withSidecars = await statSourceFingerprint(mainPath);
+    const walStats = await stat(walPath);
+    const shmStats = await stat(shmPath);
+
+    expect(withSidecars).toEqual({
+      mtimeMs:
+        Math.trunc(mainStats.mtimeMs) +
+        Math.trunc(walStats.mtimeMs) * 3 +
+        Math.trunc(shmStats.mtimeMs) * 7,
+      path: mainPath,
+      size: mainStats.size + walStats.size + shmStats.size,
+    });
+  });
 });

@@ -57,7 +57,7 @@ export function isDeliverableAgentEvent(
     !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
     !(
       agent.agent !== "pi" &&
-      event.type === "agent.idle" &&
+      (event.type === "agent.idle" || event.type === "agent.done") &&
       !hasNonEmptyAssistantMessage(event.compactHistory)
     ) &&
     agent.paneId === event.paneId &&
@@ -270,6 +270,30 @@ export class AgentEventStore {
       .prepare(
         `select * from agent_events
          where agent_id = ? and herdr_session_name = ? and type = 'agent.status.changed'
+         order by id desc limit 1`,
+      )
+      .get(agentId, herdrSessionName) as AgentEventRow | undefined;
+    return row ? mapAgentEvent(row) : undefined;
+  }
+
+  hasTerminalEventAfter(agentId: string, herdrSessionName: string, afterId: number): boolean {
+    const row = this.#sqlite
+      .prepare(
+        `select 1 from agent_events
+         where agent_id = ? and herdr_session_name = ? and id > ?
+           and type in ('agent.idle', 'agent.done', 'agent.blocked')
+         limit 1`,
+      )
+      .get(agentId, herdrSessionName, afterId);
+    return Boolean(row);
+  }
+
+  latestTerminalEvent(agentId: string, herdrSessionName: string): AgentEventRecord | undefined {
+    const row = this.#sqlite
+      .prepare(
+        `select * from agent_events
+         where agent_id = ? and herdr_session_name = ?
+           and type in ('agent.idle', 'agent.done', 'agent.blocked')
          order by id desc limit 1`,
       )
       .get(agentId, herdrSessionName) as AgentEventRow | undefined;

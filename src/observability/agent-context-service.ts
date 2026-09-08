@@ -1,7 +1,7 @@
-import { stat } from "node:fs/promises";
 import { historySourceFromSessionRef } from "@/agent-history/discovery.js";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
+import { statSourceFingerprint } from "@/agent-history/source-fingerprint.js";
 import type { AgentContextSnapshotStore } from "@/db/agent-context-snapshots.js";
 import type { AgentStore } from "@/db/agents.js";
 import type {
@@ -148,7 +148,7 @@ async function shouldForceDiscovery(input: {
   if (!paneRevisionIncreased(input.agent.paneRevision, input.previous.paneRevision)) return false;
   const fingerprint = input.previous.sourceFingerprint;
   if (!fingerprint) return true;
-  const current = await sourceFingerprint(fingerprint.path);
+  const current = await statSourceFingerprint(fingerprint.path);
   return !current || sameFingerprint(fingerprint, current);
 }
 
@@ -229,11 +229,6 @@ function historyLookup(
       : {}),
     occupiedSessionPaths: occupiedSessionPaths ?? occupiedForAgent(agent, agents),
   };
-}
-
-async function sourceFingerprint(path: string): Promise<AgentHistorySourceFingerprint | null> {
-  const source = await stat(path).catch(() => null);
-  return source ? { mtimeMs: Math.trunc(source.mtimeMs), path, size: source.size } : null;
 }
 
 function paneRevisionIncreased(current: number | null, previous: number | null): boolean {

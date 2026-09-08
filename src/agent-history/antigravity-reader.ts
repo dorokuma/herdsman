@@ -68,7 +68,28 @@ export class AntigravityHistoryReader implements AgentHistoryReader {
   }
 
   async readCompact(ref: AgentHistoryRef) {
-    return compactFromMessages(ref, await this.read(ref));
+    const messages = await this.read(ref);
+    const compact = compactFromMessages(ref, messages);
+    const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
+    if (lastUserIndex === -1) {
+      return {
+        ...compact,
+        lastAssistantMessage: null,
+      };
+    }
+    const assistantAfterUser = messages
+      .slice(lastUserIndex + 1)
+      .findLast((message) => message.role === "assistant");
+    return {
+      ...compact,
+      lastAssistantMessage: assistantAfterUser
+        ? {
+            ref: assistantAfterUser.ref,
+            text: assistantAfterUser.text,
+            timestamp: assistantAfterUser.timestamp,
+          }
+        : null,
+    };
   }
 }
 

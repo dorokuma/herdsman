@@ -30,7 +30,7 @@ function appendEvent(
     agent?: string;
     compactHistory?: CompactAgentHistory | null;
     terminalId: string;
-    type?: "agent.done" | "agent.idle" | "agent.status.changed";
+    type?: "agent.done" | "agent.idle" | "agent.status.changed" | "agent.blocked";
     from?: "working" | "unknown" | "blocked";
     sessionPath?: string;
     workspaceId?: string;
@@ -75,9 +75,14 @@ function appendEvent(
     })
     .find((candidate) => candidate.terminalId === input.terminalId);
   if (!agent) throw new Error("Expected indexed agent");
+  const defaultCompactHistory: CompactAgentHistory = {
+    ...emptyCompactHistory("antigravity-sqlite"),
+    lastAssistantMessage: { ref: "ref-default", text: "default message", timestamp: null },
+  };
   return harness.agentEvents.append({
     agentId: agent.id,
-    compactHistory: input.compactHistory ?? null,
+    compactHistory:
+      input.compactHistory === undefined ? defaultCompactHistory : input.compactHistory,
     herdrSessionName: "default",
     paneId,
     payload: input.type === "agent.idle" ? { from: input.from ?? "working" } : {},
@@ -374,6 +379,10 @@ describe("AgentOrchestratorService", () => {
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
     const deleted = harness.agentEvents.append({
       agentId: initial.id,
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "ref-del", text: "done", timestamp: null },
+      },
       herdrSessionName: "default",
       paneId: "wB:p1",
       payload: {},
@@ -389,6 +398,10 @@ describe("AgentOrchestratorService", () => {
     if (!visible) throw new Error("Expected indexed agent");
     const visibleEvent = harness.agentEvents.append({
       agentId: visible.id,
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "ref-vis", text: "done", timestamp: null },
+      },
       herdrSessionName: "default",
       paneId: "wB:p2",
       payload: {},
@@ -774,6 +787,10 @@ describe("AgentOrchestratorService invalidated acknowledgement wording (independ
     if (!agent) throw new Error("Expected agent");
     const event = harness.agentEvents.append({
       agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "ref-gen", text: "done", timestamp: null },
+      },
       herdrSessionName: "default",
       paneId: "wB:p_worker",
       paneGeneration: "gen-1",
@@ -865,6 +882,7 @@ describe("Non-Pi agent completed delivery conditions", () => {
     // Case 1: compactHistory is null
     const nullHistoryEvent = appendEvent(harness, {
       agent: "agy",
+      compactHistory: null,
       terminalId: "term_agy_1",
       from: "working",
       type: "agent.idle",
@@ -935,7 +953,7 @@ describe("Non-Pi agent completed delivery conditions", () => {
     });
   });
 
-  test("agy (non-pi): done (terminal state) is delivered even if lastAssistantMessage is null or empty", () => {
+  test("agy (non-pi): working -> done with empty or missing lastAssistantMessage is not delivered", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
 
@@ -949,6 +967,26 @@ describe("Non-Pi agent completed delivery conditions", () => {
       type: "agent.done",
     });
 
+    const doneWithEmptyText = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "history", text: "   ", timestamp: null },
+      },
+      terminalId: "term_agy_done_empty_txt",
+      type: "agent.done",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    const pendingIds = pending.map((e) => e.id);
+    expect(pendingIds).not.toContain(doneWithoutMessage.id);
+    expect(pendingIds).not.toContain(doneWithEmptyText.id);
+  });
+
+  test("agy (non-pi): done and idle with non-empty lastAssistantMessage are delivered", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
     const doneWithMessage = appendEvent(harness, {
       agent: "agy",
       compactHistory: {
@@ -959,10 +997,59 @@ describe("Non-Pi agent completed delivery conditions", () => {
       type: "agent.done",
     });
 
+    const idleWithMessage = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "history", text: "Intermediate result", timestamp: null },
+      },
+      terminalId: "term_agy_idle_msg",
+      from: "working",
+      type: "agent.idle",
+    });
+
     const pending = service.pending({ ...scope, terminalId: "term_owner" });
     const pendingIds = pending.map((e) => e.id);
-    expect(pendingIds).toContain(doneWithoutMessage.id);
     expect(pendingIds).toContain(doneWithMessage.id);
+    expect(pendingIds).toContain(idleWithMessage.id);
+  });
+
+  test("pi agent: empty done is not filtered by non-pi empty gate and is delivered", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
+    const piDoneNull = appendEvent(harness, {
+      agent: "pi",
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      },
+      terminalId: "term_pi_done_null",
+      type: "agent.done",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    const pendingIds = pending.map((e) => e.id);
+    expect(pendingIds).toContain(piDoneNull.id);
+  });
+
+  test("non-pi agent: blocked with empty lastAssistantMessage is delivered (exempt from empty delivery gate)", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
+    const blockedNull = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: null,
+      },
+      terminalId: "term_agy_blocked_null",
+      type: "agent.blocked",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    const pendingIds = pending.map((e) => e.id);
+    expect(pendingIds).toContain(blockedNull.id);
   });
 
   test("pi agent: delivery semantics remain unchanged for dispatched roles and interactive observers", () => {

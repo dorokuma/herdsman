@@ -14,6 +14,13 @@ export const ACTIVE_REVISION_POLL_MS = 10_000;
 export const FULL_RESCAN_MS = 60_000;
 export const PLAN_DRAIN_GRACE_MS = 12_000;
 
+const VALID_AGENT_EVENT_TYPES = new Set<string>([
+  "agent.status.changed",
+  "agent.idle",
+  "agent.done",
+  "agent.blocked",
+]);
+
 type Client = Pick<HerdrSocketClient, "close" | "subscribeEvents">;
 
 type Watcher = {
@@ -331,7 +338,7 @@ export class HerdrSessionWatchManager {
     if (!execute) return;
     const task: Promise<void> = Promise.resolve(execute)
       .then((planEvent) => {
-        if (planEvent) {
+        if (planEvent && VALID_AGENT_EVENT_TYPES.has(planEvent.type)) {
           this.#onAgentEvent(planEvent);
         }
       })

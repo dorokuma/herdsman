@@ -164,4 +164,42 @@ describe("StatusEventPlanStore", () => {
 
     harness.sqlite.close();
   });
+
+  test("listWaitingHistory returns only pending plans with PLAN_WAITING_HISTORY last_error", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    const row1 = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "done",
+    });
+    const row2 = store.insertPending({
+      agentId: "ag_2",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p2",
+      toStatus: "done",
+    });
+    store.insertPending({
+      agentId: "ag_3",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p3",
+      toStatus: "done",
+    });
+
+    store.markRetry(row1.id, new Error("PLAN_WAITING_HISTORY"));
+    store.markRetry(row2.id, new Error("OTHER_ERROR"));
+    // row3 is clean pending without error
+
+    const waiting = store.listWaitingHistory();
+    expect(waiting.map((p) => p.id)).toEqual([row1.id]);
+    expect(waiting[0]?.lastError).toBe("PLAN_WAITING_HISTORY");
+    expect(waiting[0]?.status).toBe("pending");
+
+    harness.sqlite.close();
+  });
 });

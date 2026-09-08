@@ -17,9 +17,9 @@ export function decodeAntigravityMessage(value: unknown): AntigravityDecodedMess
     [19, 2],
   ]);
   if (user) return { role: "user", text: user };
+  // Note: [20, 3] is thinking-only; do not decode it as assistant body text.
   const assistant = firstTextAtPaths(fields, [
     [20, 8],
-    [20, 3],
     [20, 1],
   ]);
   if (assistant) return { role: "assistant", text: assistant };

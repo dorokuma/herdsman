@@ -650,6 +650,10 @@ describe("agent event pagination regressions (independent coverage)", () => {
     }
     const pending = h.agentEvents.append({
       agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: { ref: "ref-done", text: "done", timestamp: null },
+      },
       herdrSessionName: "default",
       workspaceId: "wB",
       paneId: "wB:p2",

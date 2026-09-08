@@ -43,6 +43,29 @@ describe("Antigravity protobuf fixtures", () => {
       text: "List Temporary Directory Files",
     });
   });
+  test("ignores [20,3] thinking-only field and returns null", () => {
+    const thinkingOnly = Buffer.concat([nested(20, nested(3, text("thinking only...")))]);
+    expect(decodeAntigravityMessage(thinkingOnly)).toBeNull();
+  });
+  test("prefers [20,8] over [20,3] when both are present", () => {
+    const mixed = Buffer.concat([
+      nested(
+        20,
+        Buffer.concat([nested(8, text("actual response")), nested(3, text("thinking..."))]),
+      ),
+    ]);
+    expect(decodeAntigravityMessage(mixed)).toEqual({
+      role: "assistant",
+      text: "actual response",
+    });
+  });
+  test("decodes [20,1] when only [20,1] is present", () => {
+    const field1Only = Buffer.concat([nested(20, nested(1, text("response at 1")))]);
+    expect(decodeAntigravityMessage(field1Only)).toEqual({
+      role: "assistant",
+      text: "response at 1",
+    });
+  });
   test("returns null for truncated and malformed blobs", () => {
     expect(decodeAntigravityMessage(realUser.subarray(0, realUser.length - 1))).toBeNull();
     expect(decodeAntigravityMessage(hex("9a81"))).toBeNull();

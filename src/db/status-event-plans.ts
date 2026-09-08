@@ -184,6 +184,15 @@ export class StatusEventPlanStore {
     return rows.map(mapStatusEventPlan);
   }
 
+  listWaitingHistory(): StatusEventPlanRecord[] {
+    const rows = this.#sqlite
+      .prepare(
+        "select * from status_event_plans where status = 'pending' and last_error = 'PLAN_WAITING_HISTORY' order by id asc",
+      )
+      .all() as StatusEventPlanRow[];
+    return rows.map(mapStatusEventPlan);
+  }
+
   resetRunningToPending(): number {
     const now = Date.now();
     const result = this.#sqlite

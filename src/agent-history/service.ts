@@ -15,8 +15,9 @@ import { GrokHistoryReader } from "./grok-reader.js";
 import { OpenCodeHistoryReader } from "./opencode-reader.js";
 import { PiHistoryReader } from "./pi-reader.js";
 import type { AgentHistoryReader } from "./readers.js";
+import { statSourceFingerprint } from "./source-fingerprint.js";
 
-export const agentHistoryFormatterVersion = "agent-history-v1";
+export const agentHistoryFormatterVersion = "agent-history-v2";
 
 type CacheLike = Pick<AgentHistoryCacheStore, "getFresh" | "put">;
 type Discovery = (input: AgentHistoryLookupInput) => Promise<AgentHistoryRef | null>;
@@ -52,28 +53,28 @@ export function createAgentHistoryService(
         ...(options.homeDir ? { homeDir: options.homeDir } : {}),
       }));
 
-  async function readCompactRef(historyRef: AgentHistoryRef): Promise<ResolvedCompactAgentHistory> {
+  async function readCompactRef(
+    historyRef: AgentHistoryRef,
+    readCompactOptions: { forceRefresh?: boolean | undefined } = {},
+  ): Promise<ResolvedCompactAgentHistory> {
     const reader = readers.find((candidate) => candidate.canRead(historyRef));
     if (!reader) return unresolvedCompactHistory(historyRef.source);
 
     const path = historyRef.path ?? historyRef.value;
-    const stats = await stat(path).catch(() => null);
-    if (!stats) return unresolvedCompactHistory(historyRef.source);
+    const sourceFingerprint = await statSourceFingerprint(path);
+    if (!sourceFingerprint) return unresolvedCompactHistory(historyRef.source);
 
-    const sourceFingerprint = {
-      mtimeMs: Math.trunc(stats.mtimeMs),
-      path,
-      size: stats.size,
-    };
     const cacheSourcePath = cacheSourcePathForRef(historyRef);
-    const cached = options.cache?.getFresh({
-      formatterVersion: agentHistoryFormatterVersion,
-      sourceMtimeMs: sourceFingerprint.mtimeMs,
-      sourcePath: cacheSourcePath,
-      sourceSize: sourceFingerprint.size,
-    });
-    if (cached && cached.compactHistory.lastAssistantMessage !== null) {
-      return { compactHistory: cached.compactHistory, historyRef, sourceFingerprint };
+    if (!readCompactOptions.forceRefresh) {
+      const cached = options.cache?.getFresh({
+        formatterVersion: agentHistoryFormatterVersion,
+        sourceMtimeMs: sourceFingerprint.mtimeMs,
+        sourcePath: cacheSourcePath,
+        sourceSize: sourceFingerprint.size,
+      });
+      if (cached && cached.compactHistory.lastAssistantMessage !== null) {
+        return { compactHistory: cached.compactHistory, historyRef, sourceFingerprint };
+      }
     }
 
     try {
@@ -116,12 +117,13 @@ export function createAgentHistoryService(
       preferredRef?: AgentHistoryRef | null;
     } = {},
   ): Promise<ResolvedCompactAgentHistory> {
-    if (
-      !resolveOptions.forceRefresh &&
-      resolveOptions.preferredRef &&
-      !resolveOptions.forceDiscovery
-    ) {
-      const preferred = await readCompactRef(resolveOptions.preferredRef);
+    if (resolveOptions.preferredRef && !resolveOptions.forceDiscovery) {
+      const preferred = await readCompactRef(
+        resolveOptions.preferredRef,
+        resolveOptions.forceRefresh !== undefined
+          ? { forceRefresh: resolveOptions.forceRefresh }
+          : {},
+      );
       if (preferred.historyRef) return preferred;
     }
     const historyRef = await discover(input);
@@ -129,7 +131,12 @@ export function createAgentHistoryService(
       console.warn("Herdsman agent history discovery returned no reference", input);
       return unresolvedCompactHistory();
     }
-    return readCompactRef(historyRef);
+    return readCompactRef(
+      historyRef,
+      resolveOptions.forceRefresh !== undefined
+        ? { forceRefresh: resolveOptions.forceRefresh }
+        : {},
+    );
   }
 
   async function readRef(

@@ -2,6 +2,7 @@ import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:f
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { emptyCompactHistory } from "@/agent-history/service.js";
 import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
@@ -26,6 +27,10 @@ function appendEvent(
   if (!agent) throw new Error("Expected indexed agent");
   return harness.agentEvents.append({
     agentId: agent.id,
+    compactHistory: {
+      ...emptyCompactHistory("antigravity-sqlite"),
+      lastAssistantMessage: { ref: "ref-1", text: "done text", timestamp: null },
+    },
     herdrSessionName: "default",
     paneId: "wA:p1",
     payload: { ok: true },

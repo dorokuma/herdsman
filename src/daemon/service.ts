@@ -230,6 +230,8 @@ export async function runObservabilityDaemonService(
     try {
       process.off("unhandledRejection", onUnhandledRejection);
       process.off("uncaughtException", onUncaughtException);
+      index.stopWaitingHistoryRetries();
+      await index.drainInFlightPlans();
       await reconcileScheduler?.stop();
       await watchManager.stop();
       await server.stop();
