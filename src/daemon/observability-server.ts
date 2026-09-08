@@ -505,11 +505,6 @@ export class ObservabilityRpcServer {
       events: this.#orchestrator.pending({
         ...presence,
         limit: 100,
-        // A delivered event whose owner terminal has no live socket is dead on
-        // arrival: reclaim it immediately instead of waiting out the
-        // redelivery timeout. The callback receives each delivered row's own
-        // session so a cross-session requester cannot misjudge it.
-        isTerminalConnected: (input) => this.#hasTerminalPresence(input),
       }),
       presence,
       state: state ? toWireState(state) : null,

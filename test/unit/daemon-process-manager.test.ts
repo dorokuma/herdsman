@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
@@ -9,12 +10,15 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import readline from "node:readline";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   acquireDaemonLock,
+  acquireFlockHandle,
   type DaemonRuntimeRecord,
   daemonInstanceLockPath,
   getDaemonStatus,
+  isFlockHeld,
   isProcessRunning,
   prepareDaemonSocketPath,
   readDaemonProcessIdentity,
@@ -699,90 +703,72 @@ describe("daemon process manager", () => {
     expect(readDaemonRuntimeRecord(recordPath)?.pid).toBe(1234);
   });
 
-  test("daemon lock enforces mutual exclusion and owner tracking with manual disposal guidance", () => {
+  test("isFlockHeld correctly detects flock state and handles errors", () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");
 
-    const release = acquireDaemonLock(lockPath, {
-      identityProbe: () => true,
-      isProcessRunning: () => true,
-    });
-    expect(existsSync(lockPath)).toBe(true);
-    expect(existsSync(join(lockPath, "owner.json"))).toBe(true);
+    // Non-existent path reports false
+    expect(isFlockHeld(lockPath)).toBe(false);
 
-    expect(() =>
-      acquireDaemonLock(lockPath, {
-        identityProbe: () => true,
-        isProcessRunning: () => true,
-      }),
-    ).toThrow(/Herdsman daemon operation lock is held.*确认无 daemon 操作在跑后可删除/);
+    const release = acquireDaemonLock(lockPath);
+    expect(isFlockHeld(lockPath)).toBe(true);
 
     release();
-    expect(existsSync(lockPath)).toBe(false);
-
-    acquireDaemonLock(lockPath, {
-      identityProbe: () => true,
-      isProcessRunning: () => true,
-    });
-    expect(existsSync(lockPath)).toBe(true);
-    releaseDaemonLock(lockPath);
-    expect(existsSync(lockPath)).toBe(false);
+    expect(isFlockHeld(lockPath)).toBe(false);
   });
 
-  test("daemon lock breaks stale locks when owner is dead or foreign PID", () => {
+  test("daemon lock enforces mutual exclusion and owner tracking with persistent lock file", () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");
 
-    mkdirSync(lockPath, { recursive: true });
-    writeFileSync(
-      join(lockPath, "owner.json"),
-      JSON.stringify({ pid: 9999, startedAt: new Date().toISOString() }),
+    const release = acquireDaemonLock(lockPath);
+    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(`${lockPath}.owner.json`)).toBe(true);
+
+    expect(() => acquireDaemonLock(lockPath)).toThrow(
+      /Herdsman daemon operation lock is held.*确认无 daemon 操作在跑后可删除/,
     );
 
-    const release = acquireDaemonLock(lockPath, {
-      identityProbe: () => false,
-      isProcessRunning: () => false,
+    release();
+    // Lock file is persistent and NEVER removed
+    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(`${lockPath}.owner.json`)).toBe(false);
+
+    acquireDaemonLock(lockPath);
+    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(`${lockPath}.owner.json`)).toBe(true);
+    releaseDaemonLock(lockPath);
+    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(`${lockPath}.owner.json`)).toBe(false);
+  });
+
+  test("restart lock prevents concurrent stop with clear error", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    await withDaemonLock(lockPath, async () => {
+      expect(() => acquireDaemonLock(lockPath)).toThrow(/Herdsman daemon operation lock is held/);
     });
     expect(existsSync(lockPath)).toBe(true);
-    release();
-    expect(existsSync(lockPath)).toBe(false);
   });
 
-  test("daemon lock does not break fresh lock directory when owner.json is missing (< 1s)", () => {
+  test("releaseDaemonLock does not remove owner metadata if owner PID is another process", () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");
 
-    // Fresh lock dir with no owner.json yet (simulating window right after mkdir)
-    mkdirSync(lockPath, { recursive: true });
-
-    expect(() =>
-      acquireDaemonLock(lockPath, {
-        identityProbe: () => true,
-        isProcessRunning: () => true,
-      }),
-    ).toThrow(/Herdsman daemon operation lock is held/);
-
-    // Lock dir should still exist and not be removed
-    expect(existsSync(lockPath)).toBe(true);
-  });
-
-  test("releaseDaemonLock does not remove lock if owner PID is another process", () => {
-    const dir = tempDir();
-    const lockPath = join(dir, "herdsman.pid.lock");
-
-    mkdirSync(lockPath, { recursive: true });
+    writeFileSync(lockPath, "");
     writeFileSync(
-      join(lockPath, "owner.json"),
+      `${lockPath}.owner.json`,
       JSON.stringify({ pid: process.pid + 1000, startedAt: new Date().toISOString() }),
     );
 
-    // Calling releaseDaemonLock with our PID should NOT delete someone else's lock
+    // Calling releaseDaemonLock with our PID should NOT delete someone else's owner.json
     releaseDaemonLock(lockPath, process.pid);
-    expect(existsSync(lockPath)).toBe(true);
+    expect(existsSync(`${lockPath}.owner.json`)).toBe(true);
 
-    // Calling releaseDaemonLock with matching PID should delete it
+    // Calling releaseDaemonLock with matching PID should delete owner.json
     releaseDaemonLock(lockPath, process.pid + 1000);
-    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(`${lockPath}.owner.json`)).toBe(false);
   });
 
   test("withDaemonLock releases lock even when action throws", async () => {
@@ -796,28 +782,280 @@ describe("daemon process manager", () => {
       }),
     ).rejects.toThrow("action error");
 
-    expect(existsSync(lockPath)).toBe(false);
+    expect(existsSync(lockPath)).toBe(true);
+    expect(isFlockHeld(lockPath)).toBe(false);
   });
 
-  test("restart lock prevents concurrent stop with clear error", async () => {
+  test("two real concurrent processes competing for daemon lock: exactly one succeeds", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+    const tsxCli = join(process.cwd(), "node_modules/tsx/dist/cli.mjs");
+
+    const workerCode = `
+      import { acquireDaemonLock } from "./src/daemon/process-manager.ts";
+      try {
+        const release = acquireDaemonLock(process.argv[1]);
+        process.stdout.write("ACQUIRED\\n");
+        process.stdin.resume();
+        process.stdin.on("end", () => {
+          release();
+          process.exit(0);
+        });
+      } catch {
+        process.stdout.write("HELD\\n");
+        process.exit(1);
+      }
+    `;
+
+    const p1 = spawn(process.execPath, [tsxCli, "-e", workerCode, lockPath], {
+      detached: true,
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+    const p2 = spawn(process.execPath, [tsxCli, "-e", workerCode, lockPath], {
+      detached: true,
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+
+    const readLine = (p: typeof p1) =>
+      new Promise<string>((resolve) => {
+        p.stdout.once("data", (d) => resolve(d.toString().trim()));
+      });
+
+    const results = await Promise.all([readLine(p1), readLine(p2)]);
+    expect(results.filter((r) => r === "ACQUIRED")).toHaveLength(1);
+    expect(results.filter((r) => r === "HELD")).toHaveLength(1);
+
+    const killGroup = (p: typeof p1) => {
+      try {
+        if (p.pid) process.kill(-p.pid, "SIGKILL");
+      } catch {}
+    };
+
+    killGroup(p1);
+    killGroup(p2);
+    await Promise.all([
+      new Promise((res) => p1.on("exit", res)),
+      new Promise((res) => p2.on("exit", res)),
+    ]);
+  });
+
+  test("flock held by child process is released immediately upon SIGKILL", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+    const tsxCli = join(process.cwd(), "node_modules/tsx/dist/cli.mjs");
+
+    const workerCode = `
+      import { acquireDaemonLock } from "./src/daemon/process-manager.ts";
+      acquireDaemonLock(process.argv[1]);
+      process.stdout.write("READY\\n");
+      process.stdin.resume();
+    `;
+
+    const child = spawn(process.execPath, [tsxCli, "-e", workerCode, lockPath], {
+      detached: true,
+      stdio: ["pipe", "pipe", "inherit"],
+    });
+
+    await new Promise<void>((resolve) => {
+      child.stdout.once("data", () => resolve());
+    });
+
+    // Parent cannot acquire while child holds flock
+    expect(() => acquireDaemonLock(lockPath)).toThrow(/Herdsman daemon operation lock is held/);
+
+    // SIGKILL entire child process group
+    try {
+      if (child.pid) process.kill(-child.pid, "SIGKILL");
+    } catch {}
+    await new Promise((resolve) => child.on("exit", resolve));
+
+    // Brief settling delay for kernel cleanup
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    // Lock is released in kernel
+    expect(isFlockHeld(lockPath)).toBe(false);
+
+    // Parent can immediately acquire flock without delay
+    const release = acquireDaemonLock(lockPath);
+    expect(existsSync(lockPath)).toBe(true);
+    release();
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  test("stale owner.json pointing to unrelated live PID (e.g. init PID 1) does not block lock acquisition", () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");
 
-    await withDaemonLock(
-      lockPath,
-      async () => {
-        expect(() =>
-          acquireDaemonLock(lockPath, {
-            identityProbe: () => true,
-            isProcessRunning: () => true,
-          }),
-        ).toThrow("Herdsman daemon operation lock is held by PID");
-      },
-      {
-        identityProbe: () => true,
-        isProcessRunning: () => true,
-      },
+    writeFileSync(lockPath, "");
+    writeFileSync(
+      `${lockPath}.owner.json`,
+      JSON.stringify({
+        pid: 1, // Init/systemd process is definitely alive
+        startedAt: new Date(Date.now() - 3600_000).toISOString(),
+      }),
     );
+
+    // Because PID 1 does not hold kernel flock on lockPath, acquisition succeeds
+    const release = acquireDaemonLock(lockPath);
+    expect(existsSync(lockPath)).toBe(true);
+
+    const updated = JSON.parse(readFileSync(`${lockPath}.owner.json`, "utf8"));
+    expect(updated.pid).toBe(process.pid);
+
+    release();
+    expect(existsSync(lockPath)).toBe(true);
+  });
+
+  test("flock handle release does not busy wait when another process immediately holds lock", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    const handle = acquireFlockHandle(lockPath);
+    expect(handle).not.toBeNull();
+
+    // Start a background process blocked on acquiring the flock on lockPath
+    const childHoldingNext = spawn("flock", ["-x", lockPath, "sleep", "1"], {
+      detached: true,
+      stdio: "ignore",
+    });
+
+    // Wait a brief moment for child to block on flock
+    await new Promise((res) => setTimeout(res, 20));
+
+    const start = Date.now();
+    handle?.release();
+    const elapsed = Date.now() - start;
+
+    // Release should return promptly (well below 100ms) without busy waiting for isFlockHeld
+    expect(elapsed).toBeLessThan(70);
+
+    // The lock is now immediately held by the next child process
+    expect(isFlockHeld(lockPath)).toBe(true);
+
+    try {
+      if (childHoldingNext.pid) process.kill(-childHoldingNext.pid, "SIGKILL");
+    } catch {}
+    try {
+      childHoldingNext.kill("SIGKILL");
+    } catch {}
+  });
+
+  test("acquireFlockHandle returns null if child process exits immediately after writing READY", () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+    const binDir = join(dir, "bin");
+    const fakeFlock = join(binDir, "flock");
+
+    mkdirSync(binDir, { mode: 0o700, recursive: true });
+    // Write fake flock that writes READY to the ack file and immediately exits
+    const fakeFlockScript = `#!/bin/sh
+ack=$(echo "$*" | grep -o '[^ "]*\\.ack\\.[^ "]*')
+printf READY > "$ack"
+exit 0
+`;
+    writeFileSync(fakeFlock, fakeFlockScript, { mode: 0o755 });
+
+    const origPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${origPath}`;
+
+    try {
+      const handle = acquireFlockHandle(lockPath);
+      expect(handle).toBeNull();
+    } finally {
+      process.env.PATH = origPath;
+    }
+  });
+
+  test("stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+    const tsxCli = join(process.cwd(), "node_modules/tsx/dist/cli.mjs");
+
+    const workerScript = `
+      import { acquireDaemonLock } from "./src/daemon/process-manager.ts";
+      import readline from "node:readline";
+
+      let releaseFn = null;
+      const rl = readline.createInterface({ input: process.stdin });
+      rl.on("line", (line) => {
+        const [cmd, round] = line.trim().split(" ");
+        if (cmd === "RACE") {
+          try {
+            releaseFn = acquireDaemonLock(process.argv[1]);
+            process.stdout.write("WON " + round + "\\n");
+          } catch {
+            process.stdout.write("LOST " + round + "\\n");
+          }
+        } else if (cmd === "RELEASE") {
+          if (releaseFn) {
+            releaseFn();
+            releaseFn = null;
+          }
+          process.stdout.write("RELEASED " + round + "\\n");
+        }
+      });
+      process.stdout.write("READY\\n");
+    `;
+
+    function startWorker() {
+      const child = spawn(process.execPath, [tsxCli, "-e", workerScript, lockPath], {
+        stdio: ["pipe", "pipe", "inherit"],
+      });
+      const rl = readline.createInterface({ input: child.stdout });
+      const lines: string[] = [];
+      const waiters: Array<(line: string) => void> = [];
+      rl.on("line", (line) => {
+        const resolve = waiters.shift();
+        if (resolve) {
+          resolve(line);
+        } else {
+          lines.push(line);
+        }
+      });
+      const nextLine = () => {
+        const line = lines.shift();
+        if (line !== undefined) {
+          return Promise.resolve(line);
+        }
+        return new Promise<string>((resolve) => waiters.push(resolve));
+      };
+      return { child, nextLine };
+    }
+
+    const w1 = startWorker();
+    const w2 = startWorker();
+
+    await Promise.all([w1.nextLine(), w2.nextLine()]);
+
+    const totalRounds = 200;
+    let singleMasterCount = 0;
+    let doubleMasterCount = 0;
+
+    for (let r = 0; r < totalRounds; r++) {
+      w1.child.stdin.write(`RACE ${r}\n`);
+      w2.child.stdin.write(`RACE ${r}\n`);
+
+      const [res1, res2] = await Promise.all([w1.nextLine(), w2.nextLine()]);
+      const outcomes = [res1.split(" ")[0], res2.split(" ")[0]];
+      const wonCount = outcomes.filter((o) => o === "WON").length;
+      const lostCount = outcomes.filter((o) => o === "LOST").length;
+
+      if (wonCount === 1 && lostCount === 1) {
+        singleMasterCount++;
+        const winner = res1.startsWith("WON") ? w1 : w2;
+        winner.child.stdin.write(`RELEASE ${r}\n`);
+        const rel = await winner.nextLine();
+        expect(rel).toBe(`RELEASED ${r}`);
+      } else {
+        doubleMasterCount++;
+      }
+    }
+
+    w1.child.kill("SIGKILL");
+    w2.child.kill("SIGKILL");
+
+    expect(doubleMasterCount).toBe(0);
+    expect(singleMasterCount).toBe(200);
   });
 });
 

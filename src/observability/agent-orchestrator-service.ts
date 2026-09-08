@@ -55,15 +55,11 @@ export class AgentOrchestratorService {
 
   pending(
     input: AgentScope & {
-      isTerminalConnected?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
       limit?: number;
       terminalId: string;
     },
   ): AgentEventRecord[] {
-    this.#agentEvents.reclaimDelivered(
-      60_000,
-      input.isTerminalConnected ? { isTerminalConnected: input.isTerminalConnected } : undefined,
-    );
+    this.#agentEvents.reclaimDelivered(60_000);
     const state = this.#scopes.get(input);
     if (!state?.owner || state.owner.terminalId !== input.terminalId) return [];
 

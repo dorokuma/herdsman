@@ -1,7 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { acquireDaemonLock, daemonInstanceLockPath } from "@/daemon/process-manager.js";
 import {
   copyDatabaseBackup,
   ensureDaemonNotRunning,
@@ -29,41 +30,72 @@ function tempDir(): string {
 }
 
 describe("clean agent event duplicates helpers", () => {
-  test("refuses write mode when the daemon pid file points at a live process", () => {
+  test("refuses write mode when a live daemon holds the instance flock lock", () => {
     const dir = tempDir();
     const pidPath = join(dir, "herdsman.pid");
-    writeFileSync(pidPath, `${process.pid}\n`);
-    expect(liveDaemonOwnerPid({ pidPath })).toEqual({ pid: process.pid, source: "pid-file" });
-    expect(() => ensureDaemonNotRunning({ dryRun: false, pidPath })).toThrow(
-      /Herdsman daemon is running .*refusing to clean agent event duplicates/,
-    );
+    const release = acquireDaemonLock(daemonInstanceLockPath(pidPath));
+    try {
+      expect(liveDaemonOwnerPid({ pidPath })).toEqual({ pid: process.pid, source: "lock" });
+      expect(() => ensureDaemonNotRunning({ dryRun: false, pidPath })).toThrow(
+        /Herdsman daemon is running .*refusing to clean agent event duplicates/,
+      );
+    } finally {
+      release();
+    }
   });
 
   test("refuses write mode when a lock owner is alive and warns on dry-run only", () => {
     const dir = tempDir();
     const pidPath = join(dir, "herdsman.pid");
     for (const lockPath of [`${pidPath}.lock`, `${pidPath}.instance.lock`]) {
-      mkdirSync(lockPath, { recursive: true });
-      writeFileSync(join(lockPath, "owner.json"), JSON.stringify({ pid: process.pid }));
-      expect(liveDaemonOwnerPid({ pidPath })).toEqual({ pid: process.pid, source: "lock" });
-      expect(() => ensureDaemonNotRunning({ dryRun: false, pidPath })).toThrow(/refusing/);
+      const release = acquireDaemonLock(lockPath);
+      try {
+        expect(liveDaemonOwnerPid({ pidPath })).toEqual({ pid: process.pid, source: "lock" });
+        expect(() => ensureDaemonNotRunning({ dryRun: false, pidPath })).toThrow(/refusing/);
+      } finally {
+        release();
+      }
     }
-    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
-    expect(() => ensureDaemonNotRunning({ dryRun: true, pidPath })).not.toThrow();
-    expect(warning).toHaveBeenCalledWith(expect.stringContaining("dry-run proceeds read-only"));
-    warning.mockRestore();
+    // Warns on dry-run when lock is held
+    const release = acquireDaemonLock(daemonInstanceLockPath(pidPath));
+    try {
+      const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+      expect(() => ensureDaemonNotRunning({ dryRun: true, pidPath })).not.toThrow();
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining("dry-run proceeds read-only"));
+      warning.mockRestore();
+    } finally {
+      release();
+    }
   });
 
-  test("ignores dead pids and lock owners", () => {
+  test("refuses write mode even when lock is held but owner.json is missing", () => {
     const dir = tempDir();
     const pidPath = join(dir, "herdsman.pid");
-    writeFileSync(pidPath, "999999\n");
-    mkdirSync(`${pidPath}.lock`, { recursive: true });
-    writeFileSync(join(`${pidPath}.lock`, "owner.json"), JSON.stringify({ pid: 999999 }));
+    const lockPath = daemonInstanceLockPath(pidPath);
+    const release = acquireDaemonLock(lockPath);
+    try {
+      // Intentionally remove owner.json while kernel lock is still held
+      rmSync(`${lockPath}.owner.json`, { force: true });
+      expect(liveDaemonOwnerPid({ pidPath })).toEqual({ pid: undefined, source: "lock" });
+      expect(() => ensureDaemonNotRunning({ dryRun: false, pidPath })).toThrow(
+        /Herdsman daemon is running \(unknown pid, lock\); refusing to clean agent event duplicates/,
+      );
+    } finally {
+      release();
+    }
+  });
+
+  test("ignores stale pids, dead lock files, and unheld locks even with live PIDs in metadata", () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    // Even if pid file or owner.json points to current live PID, without flock held it is stale
+    writeFileSync(pidPath, `${process.pid}\n`);
+    writeFileSync(`${pidPath}.lock`, "");
+    writeFileSync(`${pidPath}.lock.owner.json`, JSON.stringify({ pid: process.pid }));
     expect(liveDaemonOwnerPid({ pidPath })).toEqual({ pid: undefined, source: undefined });
     expect(() => ensureDaemonNotRunning({ dryRun: false, pidPath })).not.toThrow();
     // A corrupted owner.json is not treated as a live daemon.
-    writeFileSync(join(`${pidPath}.lock`, "owner.json"), "not-json");
+    writeFileSync(`${pidPath}.lock.owner.json`, "not-json");
     expect(readLockOwnerPid(`${pidPath}.lock`)).toBeUndefined();
   });
 

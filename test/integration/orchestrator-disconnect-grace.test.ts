@@ -195,6 +195,101 @@ describe("orchestrator connection grace", () => {
     expect(orchestrator.status(scope)?.owner?.terminalId).toBe("term_owner");
     setup.harness.sqlite.close();
   });
+
+  test("delivered events are not shortcut-reclaimed while disconnected terminal is within grace window", async () => {
+    const scheduler = new ManualScheduler();
+    const { harness, orchestrator, socketPath } = await openServer(scheduler);
+    const owner = await RpcTestClient.connect(socketPath);
+    await register(owner, "owner");
+    await owner.request("agent.orchestrator.set", { enabled: true });
+
+    const ownerAgent = harness.agents
+      .list({ herdrSessionName: "default", workspaceId: "wB" })
+      .find((a) => a.terminalId === "term_owner");
+    if (!ownerAgent) throw new Error("owner agent not found");
+
+    const event = harness.agentEvents.append({
+      agentId: ownerAgent.id,
+      herdrSessionName: "default",
+      paneId: "wB:p-owner",
+      payload: { message: "wake" },
+      terminalId: "term_observer",
+      type: "agent.idle",
+      workspaceId: "wB",
+    });
+    const reserved = harness.agentEvents.reservePending("term_owner", 10, [event.id]);
+    expect(reserved).toHaveLength(1);
+    expect(reserved[0]?.status).toBe("delivered");
+    expect(reserved[0]?.deliveredToTerminalId).toBe("term_owner");
+
+    owner.close();
+    await socketTick();
+
+    scheduler.advance(20);
+    // Scope owner is retained during disconnect grace period
+    expect(
+      orchestrator.status({ herdrSessionName: "default", workspaceId: "wB" })?.owner?.terminalId,
+    ).toBe("term_owner");
+
+    const observer = await RpcTestClient.connect(socketPath);
+    await register(observer, "observer");
+
+    const row = harness.sqlite
+      .prepare("select status, delivered_to_terminal_id from agent_events where id = ?")
+      .get(event.id) as { status: string; delivered_to_terminal_id: string | null };
+    expect(row.status).toBe("delivered");
+    expect(row.delivered_to_terminal_id).toBe("term_owner");
+
+    observer.close();
+    harness.sqlite.close();
+  });
+
+  test("delivered events are shortcut-reclaimed once disconnect grace expires and scope owner is cleared", async () => {
+    const scheduler = new ManualScheduler();
+    const { harness, orchestrator, socketPath } = await openServer(scheduler);
+    const owner = await RpcTestClient.connect(socketPath);
+    await register(owner, "owner");
+    await owner.request("agent.orchestrator.set", { enabled: true });
+
+    const ownerAgent = harness.agents
+      .list({ herdrSessionName: "default", workspaceId: "wB" })
+      .find((a) => a.terminalId === "term_owner");
+    if (!ownerAgent) throw new Error("owner agent not found");
+
+    const event = harness.agentEvents.append({
+      agentId: ownerAgent.id,
+      herdrSessionName: "default",
+      paneId: "wB:p-owner",
+      payload: { message: "wake" },
+      terminalId: "term_observer",
+      type: "agent.idle",
+      workspaceId: "wB",
+    });
+    const reserved = harness.agentEvents.reservePending("term_owner", 10, [event.id]);
+    expect(reserved).toHaveLength(1);
+    expect(reserved[0]?.status).toBe("delivered");
+
+    owner.close();
+    await socketTick();
+
+    scheduler.advance(60);
+    // Disconnect grace expired: scope owner was cleared by observability server
+    expect(
+      orchestrator.status({ herdrSessionName: "default", workspaceId: "wB" })?.owner,
+    ).toBeNull();
+
+    const observer = await RpcTestClient.connect(socketPath);
+    await register(observer, "observer");
+
+    const row = harness.sqlite
+      .prepare("select status, delivered_to_terminal_id from agent_events where id = ?")
+      .get(event.id) as { status: string; delivered_to_terminal_id: string | null };
+    expect(row.status).toBe("pending");
+    expect(row.delivered_to_terminal_id).toBeNull();
+
+    observer.close();
+    harness.sqlite.close();
+  });
 });
 
 async function openServer(

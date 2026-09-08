@@ -1,4 +1,5 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   closeSync,
   existsSync,
@@ -11,7 +12,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { createConnection } from "node:net";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname } from "node:path";
 
 export type DaemonRuntimeRecord = {
   dbPath: string;
@@ -86,6 +87,7 @@ export type DaemonProcessDependencies = {
   spawnProcess?: DaemonSpawnProcess;
   waitMs?: (ms: number) => Promise<void>;
   readinessTimeoutMs?: number;
+  pid?: number | undefined;
 };
 export function readDaemonRuntimeRecord(path: string): DaemonRuntimeRecord | undefined {
   if (!existsSync(path)) {
@@ -450,99 +452,189 @@ export type DaemonLockOwner = {
 
 export function releaseDaemonLock(lockPath: string, expectedPid: number = process.pid): void {
   try {
-    const ownerPath = join(lockPath, "owner.json");
+    const ownerPath = `${lockPath}.owner.json`;
     if (existsSync(ownerPath)) {
       try {
         const data = JSON.parse(readFileSync(ownerPath, "utf8")) as Partial<DaemonLockOwner>;
         if (typeof data.pid === "number" && data.pid !== expectedPid) {
           return;
         }
+        rmSync(ownerPath, { force: true });
       } catch {
-        // If owner.json is corrupted, do not remove lock belonging to others
+        // If owner.json is corrupted, do not remove
+        return;
       }
     }
-    rmSync(lockPath, { force: true, recursive: true });
   } catch {
     // Ignore lock release error
   }
 }
 
-function sleepSync(ms: number): void {
-  try {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  } catch {
-    const start = Date.now();
-    while (Date.now() - start < ms) {
-      // fallback busy-wait
+export type FlockHandle = {
+  release: () => void;
+};
+
+/**
+ * Checks whether a kernel flock is currently held on lockPath by an active process.
+ * Spawns non-blocking `flock -x -n <lockPath> true`.
+ * Returns true only if flock exited with status 1 (lock held).
+ * Throws on environmental/spawn errors or unexpected status codes.
+ */
+export function isFlockHeld(lockPath: string): boolean {
+  if (!existsSync(lockPath)) {
+    return false;
+  }
+  const res = spawnSync("flock", ["-x", "-n", lockPath, "true"], {
+    stdio: "ignore",
+  });
+  if (res.error) {
+    throw new Error(`Failed to probe flock on ${lockPath}: ${res.error.message}`, {
+      cause: res.error,
+    });
+  }
+  if (res.status === 0) {
+    return false;
+  }
+  if (res.status === 1) {
+    return true;
+  }
+  throw new Error(`flock probe exited with unexpected status ${res.status} on ${lockPath}`);
+}
+
+function isChildProcessActive(pid: number): boolean {
+  if (existsSync("/proc")) {
+    try {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const lastParen = stat.lastIndexOf(")");
+      if (lastParen === -1) return false;
+      const rest = stat.slice(lastParen + 2).trim();
+      const state = rest.charAt(0);
+      return state !== "Z" && state !== "X" && state !== "T";
+    } catch {
+      return false;
     }
   }
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Acquires an exclusive non-blocking flock on lockPath using a child process.
+ * The child process runs `flock -x -n <lockPath> sh -c 'printf READY > <ackFile>; exec cat'`.
+ * The parent process waits for the READY handshake confirmation.
+ * The lock file is a persistent regular file and is NEVER removed to prevent inode reuse race conditions.
+ */
+export function acquireFlockHandle(lockPath: string): FlockHandle | null {
+  mkdirSync(dirname(lockPath), { mode: 0o700, recursive: true });
+  // Ensure persistent lock file exists and is never removed
+  const fd = openSync(lockPath, "a", 0o600);
+  closeSync(fd);
+
+  const ackFile = `${lockPath}.ack.${process.pid}.${Date.now()}.${randomUUID()}`;
+
+  const child = spawn(
+    "flock",
+    ["-x", "-n", lockPath, "sh", "-c", `printf READY > "${ackFile}"; exec cat`],
+    {
+      detached: true,
+      stdio: ["pipe", "ignore", "ignore"],
+    },
+  );
+
+  if (!child.pid) {
+    return null;
+  }
+
+  const start = Date.now();
+  let acquired = false;
+
+  while (Date.now() - start < 1000) {
+    if (existsSync(ackFile)) {
+      try {
+        const content = readFileSync(ackFile, "utf8");
+        if (content.startsWith("READY") && isChildProcessActive(child.pid)) {
+          acquired = true;
+          try {
+            rmSync(ackFile, { force: true });
+          } catch {}
+          break;
+        }
+      } catch {}
+    }
+    // Check if child exited (e.g. flock returned 1 because lock is held by another process)
+    if (!isChildProcessActive(child.pid)) {
+      break;
+    }
+    const until = Date.now() + 1;
+    while (Date.now() < until) {}
+  }
+
+  try {
+    rmSync(ackFile, { force: true });
+  } catch {}
+
+  if (!acquired || !isChildProcessActive(child.pid)) {
+    try {
+      if (child.pid) process.kill(-child.pid, "SIGKILL");
+    } catch {}
+    try {
+      child.kill("SIGKILL");
+    } catch {}
+    return null;
+  }
+
+  child.unref();
+
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    try {
+      try {
+        if (child.pid) process.kill(-child.pid, "SIGKILL");
+      } catch {}
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+      try {
+        child.stdin?.destroy();
+      } catch {}
+      if (child.pid) {
+        const deadline = Date.now() + 100;
+        while (Date.now() < deadline) {
+          if (!isChildProcessActive(child.pid)) {
+            break;
+          }
+          const until = Date.now() + 1;
+          while (Date.now() < until) {}
+        }
+      }
+    } catch {
+      // Ignore release errors to prevent blocking the release chain
+    }
+  };
+
+  return { release };
 }
 
 export function acquireDaemonLock(lockPath: string, deps?: DaemonProcessDependencies): () => void {
   mkdirSync(dirname(lockPath), { mode: 0o700, recursive: true });
-  const processIsRunning = deps?.isProcessRunning ?? isProcessRunning;
-  const identityProbe = deps?.identityProbe ?? readDaemonProcessIdentity;
+  const currentPid = deps?.pid ?? process.pid;
 
-  const writeAndVerifyOwner = (): boolean => {
-    const ownerPath = join(lockPath, "owner.json");
-    const owner: DaemonLockOwner = {
-      pid: process.pid,
-      startedAt: new Date().toISOString(),
-    };
-    try {
-      writeFileSync(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600 });
-      const content = readFileSync(ownerPath, "utf8");
-      const data = JSON.parse(content) as Partial<DaemonLockOwner>;
-      return data.pid === process.pid;
-    } catch {
-      return false;
-    }
-  };
-
-  const checkOwnerAlive = (): { alive: boolean; pid?: number } => {
-    const ownerPath = join(lockPath, "owner.json");
-    if (!existsSync(ownerPath)) {
-      try {
-        const stat = statSync(lockPath);
-        const ageMs = Date.now() - stat.mtimeMs;
-        if (ageMs < 1000) {
-          // Grace period: lock directory is fresh (< 1s), back off briefly and recheck
-          sleepSync(50);
-          if (!existsSync(ownerPath)) {
-            // Still missing, but lock directory is < 1s old; do not break!
-            return { alive: true };
-          }
-        } else {
-          // Directory is older than 1s and owner.json is missing -> stale lock
-          return { alive: false };
-        }
-      } catch {
-        return { alive: false };
-      }
-    }
-
+  const readOwnerPid = (): number | undefined => {
+    const ownerPath = `${lockPath}.owner.json`;
+    if (!existsSync(ownerPath)) return undefined;
     try {
       const data = JSON.parse(readFileSync(ownerPath, "utf8")) as Partial<DaemonLockOwner>;
-      const ownerPid = data.pid;
-      if (typeof ownerPid !== "number" || !Number.isInteger(ownerPid) || ownerPid <= 0) {
-        return { alive: false };
-      }
-      if (!processIsRunning(ownerPid)) {
-        return { alive: false, pid: ownerPid };
-      }
-      const probe = identityProbe(ownerPid, CLI_ENTRYPOINT_NAMES);
-      if (probe === false) {
-        return { alive: false, pid: ownerPid };
-      }
-      return { alive: true, pid: ownerPid };
+      return typeof data.pid === "number" && Number.isInteger(data.pid) && data.pid > 0
+        ? data.pid
+        : undefined;
     } catch {
-      try {
-        const stat = statSync(lockPath);
-        if (Date.now() - stat.mtimeMs < 1000) {
-          return { alive: true };
-        }
-      } catch {}
-      return { alive: false };
+      return undefined;
     }
   };
 
@@ -551,35 +643,42 @@ export function acquireDaemonLock(lockPath: string, deps?: DaemonProcessDependen
     return `Herdsman daemon operation lock is held${ownerInfo}: ${lockPath}. 确认无 daemon 操作在跑后可删除: ${lockPath}`;
   };
 
-  const tryAcquire = (): boolean => {
-    try {
-      mkdirSync(lockPath, { mode: 0o700 });
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-        return false;
-      }
-      throw error;
-    }
-    return writeAndVerifyOwner();
+  const flockHandle = acquireFlockHandle(lockPath);
+  if (!flockHandle) {
+    const ownerPid = readOwnerPid();
+    throw new Error(formatLockHeldError(ownerPid));
+  }
+
+  // Flock acquired successfully. Write diagnostic owner metadata.
+  const ownerPath = `${lockPath}.owner.json`;
+  const owner: DaemonLockOwner = {
+    pid: currentPid,
+    startedAt: new Date().toISOString(),
   };
-
-  if (tryAcquire()) {
-    return () => releaseDaemonLock(lockPath, process.pid);
+  try {
+    writeFileSync(ownerPath, `${JSON.stringify(owner, null, 2)}\n`, { mode: 0o600 });
+  } catch {
+    // Diagnostic write error does not invalidate the kernel lock
   }
 
-  const ownerStatus = checkOwnerAlive();
-  if (ownerStatus.alive) {
-    throw new Error(formatLockHeldError(ownerStatus.pid));
-  }
-
-  rmSync(lockPath, { force: true, recursive: true });
-
-  if (tryAcquire()) {
-    return () => releaseDaemonLock(lockPath, process.pid);
-  }
-
-  const retryOwner = checkOwnerAlive();
-  throw new Error(formatLockHeldError(retryOwner.pid));
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    try {
+      if (existsSync(ownerPath)) {
+        try {
+          const data = JSON.parse(readFileSync(ownerPath, "utf8")) as Partial<DaemonLockOwner>;
+          if (data.pid === currentPid) {
+            rmSync(ownerPath, { force: true });
+          }
+        } catch {}
+      }
+    } catch {
+      // Ignore cleanup error
+    }
+    flockHandle.release();
+  };
 }
 
 export async function withDaemonLock<T>(
