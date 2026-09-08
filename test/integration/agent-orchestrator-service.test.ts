@@ -30,7 +30,7 @@ function appendEvent(
     agent?: string;
     compactHistory?: CompactAgentHistory | null;
     terminalId: string;
-    type?: "agent.done" | "agent.idle" | "agent.status.changed" | "agent.blocked";
+    type?: "agent.done" | "agent.idle" | "agent.status.changed" | "agent.blocked" | "agent.failed";
     from?: "working" | "unknown" | "blocked";
     sessionPath?: string;
     workspaceId?: string;
@@ -1050,6 +1050,32 @@ describe("Non-Pi agent completed delivery conditions", () => {
     const pending = service.pending({ ...scope, terminalId: "term_owner" });
     const pendingIds = pending.map((e) => e.id);
     expect(pendingIds).toContain(blockedNull.id);
+  });
+
+  test("agent.failed with empty compactHistory is delivered (failure alert skips empty-body gate)", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
+
+    const failedEmpty = appendEvent(harness, {
+      agent: "agy",
+      compactHistory: null,
+      terminalId: "term_agy_failed",
+      type: "agent.failed",
+    });
+    const failedMissing = appendEvent(harness, {
+      agent: "claude",
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: null,
+      },
+      terminalId: "term_claude_failed",
+      type: "agent.failed",
+    });
+
+    const pending = service.pending({ ...scope, terminalId: "term_owner" });
+    const pendingIds = pending.map((e) => e.id);
+    expect(pendingIds).toContain(failedEmpty.id);
+    expect(pendingIds).toContain(failedMissing.id);
   });
 
   test("pi agent: delivery semantics remain unchanged for dispatched roles and interactive observers", () => {

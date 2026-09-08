@@ -266,6 +266,44 @@ describe("HerdrSessionWatchManager", () => {
     expect(received).toContainEqual(expect.objectContaining({ type: "agent.idle" }));
   });
 
+  test("publishes agent.failed returned by executeStatusEventPlan", async () => {
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    const received: unknown[] = [];
+    let handled = 0;
+    const failedEvent = { ...event(), type: "agent.failed" as const, terminalId: "term_agent" };
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents() {
+          yield { agent_status: "done", pane_id: "wB:p2", type: "pane.agent_status_changed" };
+          await new Promise<void>((resolve) => setTimeout(resolve, 200));
+        },
+      }),
+      index: {
+        async handleHerdrEventFast() {
+          handled += 1;
+          return {
+            agents: [],
+            contextChangedScopes: [],
+            events: [],
+            statusEventPlans: [testPlan()],
+          };
+        },
+        async refreshHerdrSessionFast() {
+          return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+        },
+        executeStatusEventPlan: async () => failedEvent,
+      },
+      onAgentEvent: (item) => received.push(item),
+    });
+    await manager.start();
+    await waitFor(() => handled > 0 && received.length > 0);
+    await manager.stop();
+    harness.sqlite.close();
+    expect(received).toContainEqual(expect.objectContaining({ type: "agent.failed" }));
+  });
+
   test("rejects a status plan without escaping the watch loop (warn + stop completes)", async () => {
     const harness = openObservabilityDbHarness();
     seedAgent(harness, "working");

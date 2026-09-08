@@ -112,6 +112,23 @@ describe("Herdsman Pi agent update UI", () => {
     expect(text).toContain("… 2 more");
   });
 
+  test("renders failed outcomes with payload reason when text is empty", () => {
+    const text = render(
+      [
+        outcome(90, {
+          kind: "failed",
+          reason: "PLAN_WAITING_HISTORY",
+          text: "",
+        }),
+      ],
+      true,
+    );
+
+    expect(text).toContain("! Claude failed wB:p2");
+    expect(text).toContain("Last response  PLAN_WAITING_HISTORY");
+    expect(text).not.toContain("No final response");
+  });
+
   test("expands every outcome with its complete final response", () => {
     const text = render(
       [

@@ -19,6 +19,7 @@ const VALID_AGENT_EVENT_TYPES = new Set<string>([
   "agent.idle",
   "agent.done",
   "agent.blocked",
+  "agent.failed",
 ]);
 
 type Client = Pick<HerdrSocketClient, "close" | "subscribeEvents">;

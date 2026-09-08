@@ -39,11 +39,14 @@ function isAgentOutcome(value: unknown): value is AgentOutcome {
   return (
     typeof candidate.agent === "string" &&
     typeof candidate.eventId === "number" &&
-    (candidate.kind === "blocked" || candidate.kind === "completed") &&
+    (candidate.kind === "blocked" ||
+      candidate.kind === "completed" ||
+      candidate.kind === "failed") &&
     (candidate.name === undefined ||
       candidate.name === null ||
       typeof candidate.name === "string") &&
     (candidate.paneId === null || typeof candidate.paneId === "string") &&
+    (candidate.reason === undefined || typeof candidate.reason === "string") &&
     typeof candidate.terminalId === "string" &&
     typeof candidate.text === "string"
   );
@@ -106,7 +109,14 @@ export function renderAgentUpdateMessage(
     ].join(" ");
     if (!options.expanded) return [summary];
     const cleanedResponse = cleanDisplayText(outcome.text);
-    const response = cleanedResponse.length > 0 ? cleanedResponse : "No final response";
+    const cleanedReason =
+      outcome.kind === "failed" ? cleanDisplayText(outcome.reason ?? "") : "";
+    const response =
+      cleanedResponse.length > 0
+        ? cleanedResponse
+        : cleanedReason.length > 0
+          ? cleanedReason
+          : "No final response";
     return [summary, theme.fg("muted", `  Last response  ${response}`)];
   });
   const hiddenCount = details.outcomes.length - visibleOutcomes.length;

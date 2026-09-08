@@ -333,6 +333,15 @@ export class AgentIndexService {
           to: plan.to,
           herdrSessionName: plan.agent.herdrSessionName,
         });
+        this.#appendPlanFailedEvent({
+          agent: plan.agent,
+          attempts: updated.attempts,
+          compactHistory: plan.compactHistory,
+          from: plan.from,
+          planId,
+          reason: updated.lastError,
+          to: plan.to,
+        });
       }
       return;
     }
@@ -427,20 +436,38 @@ export class AgentIndexService {
       });
       activeCompact = refreshed.snapshot.compactHistory;
     } catch (err) {
-      console.warn("Herdsman failed to refresh agent during drain plan row, keeping waiting", {
-        planId: row.id,
-        agentId: agent.id,
-        error: err,
-      });
       this.#stores.statusEventPlans.markRetry(row.id, new PlanWaitingHistoryError());
       const updated = this.#stores.statusEventPlans.get(row.id);
       if (updated.status === "pending") {
+        console.warn("Herdsman failed to refresh agent during drain plan row, keeping waiting", {
+          planId: row.id,
+          agentId: agent.id,
+          error: err,
+        });
         this.#scheduleWaitingHistoryRetry(row.id, {
           agent,
           compactHistory: row.compactHistory,
           from: row.fromStatus,
           to: row.toStatus,
           ...(row.herdrEventKey ? { herdrEventKey: row.herdrEventKey } : {}),
+        });
+      } else if (updated.status === "failed") {
+        this.#clearWaitingTimer(row.id);
+        console.warn("Herdsman plan marked failed", {
+          planId: row.id,
+          agentId: agent.id,
+          from: row.fromStatus,
+          to: row.toStatus,
+          reason: updated.lastError,
+        });
+        this.#appendPlanFailedEvent({
+          agent,
+          attempts: updated.attempts,
+          compactHistory: row.compactHistory,
+          from: row.fromStatus,
+          planId: row.id,
+          reason: updated.lastError,
+          to: row.toStatus,
         });
       }
       return;
@@ -526,6 +553,15 @@ export class AgentIndexService {
               to: row.toStatus,
               herdrSessionName: row.herdrSessionName,
             });
+            return this.#appendPlanFailedEvent({
+              agent: plan.agent,
+              attempts: updated.attempts,
+              compactHistory: plan.compactHistory,
+              from: row.fromStatus,
+              planId: row.id,
+              reason: updated.lastError,
+              to: row.toStatus,
+            });
           }
         }
         return undefined;
@@ -571,6 +607,15 @@ export class AgentIndexService {
               to: row.toStatus,
               herdrSessionName: row.herdrSessionName,
             });
+            return this.#appendPlanFailedEvent({
+              agent: plan.agent,
+              attempts: updated.attempts,
+              compactHistory: activePlan.compactHistory,
+              from: row.fromStatus,
+              planId: row.id,
+              reason: updated.lastError,
+              to: row.toStatus,
+            });
           }
         }
         return undefined;
@@ -600,6 +645,15 @@ export class AgentIndexService {
           from: row.fromStatus,
           to: row.toStatus,
           herdrSessionName: row.herdrSessionName,
+        });
+        return this.#appendPlanFailedEvent({
+          agent: plan.agent,
+          attempts: updated.attempts,
+          compactHistory: activePlan.compactHistory,
+          from: row.fromStatus,
+          planId: row.id,
+          reason: updated.lastError,
+          to: row.toStatus,
         });
       }
       throw error;
@@ -1400,6 +1454,40 @@ export class AgentIndexService {
     } finally {
       unregister();
     }
+  }
+
+  #appendPlanFailedEvent(input: {
+    agent: AgentIndexRecord;
+    attempts: number;
+    compactHistory: CompactAgentHistory | null | undefined;
+    from: AgentStatus;
+    planId: number;
+    reason: string | null;
+    to: AgentStatus;
+  }): AgentEventRecord {
+    return this.#appendAndAckSelfEvent({
+      agentId: input.agent.id,
+      compactHistory: input.compactHistory ?? null,
+      herdrSessionName: input.agent.herdrSessionName,
+      idempotencyKey: `agent.failed:plan:${input.planId}`,
+      paneId: input.agent.paneId,
+      paneGeneration: input.agent.paneGeneration ?? null,
+      payload: {
+        agent: input.agent.agent,
+        attempts: input.attempts,
+        from: input.from,
+        herdrSessionName: input.agent.herdrSessionName,
+        name: input.agent.name,
+        paneId: input.agent.paneId,
+        reason: input.reason ?? "unknown",
+        terminalId: input.agent.terminalId,
+        to: input.to,
+        workspaceId: input.agent.workspaceId,
+      },
+      terminalId: input.agent.terminalId,
+      type: "agent.failed",
+      workspaceId: input.agent.workspaceId,
+    });
   }
 
   #appendAndAckSelfEvent(input: Parameters<AgentEventStore["append"]>[0]): AgentEventRecord {

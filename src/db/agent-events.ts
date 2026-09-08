@@ -56,6 +56,7 @@ export function isDeliverableAgentEvent(
     !(event.type === "agent.idle" && asRecord(event.payload).from !== "working") &&
     !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
     !(
+      event.type !== "agent.failed" &&
       agent.agent !== "pi" &&
       (event.type === "agent.idle" || event.type === "agent.done") &&
       !hasNonEmptyAssistantMessage(event.compactHistory)

@@ -54,6 +54,33 @@ describe("Pi agent wake projection", () => {
     ).toEqual([expect.objectContaining({ eventId: 7, kind: "completed" })]);
   });
 
+  test("projects agent.failed as a failed outcome and formats a reason line", () => {
+    const projection = projectAgentOutcomes([
+      event(19, "agent.failed", {
+        agent: "claude",
+        from: "working",
+        name: "reviewer",
+        paneId: "wB:p2",
+        reason: "PLAN_WAITING_HISTORY",
+        to: "done",
+      }),
+    ]);
+    expect(projection.outcomes).toEqual([
+      expect.objectContaining({
+        eventId: 19,
+        kind: "failed",
+        reason: "PLAN_WAITING_HISTORY",
+      }),
+    ]);
+    const [outcome] = projection.outcomes;
+    if (!outcome) throw new Error("expected failed outcome");
+    const formatted = formatAgentOutcomeUpdates([outcome]);
+    expect(formatted).toContain("[HERDSMAN WAKE POLICY]");
+    expect(formatted).toContain("- failed reviewer · Claude wB:p2");
+    expect(formatted).toContain("reason: PLAN_WAITING_HISTORY");
+    expect(formatted).not.toContain("last assistant:");
+  });
+
   test.each([
     ["agent.idle", { from: "done", to: "idle" }],
     ["agent.idle", { from: "blocked", to: "idle" }],

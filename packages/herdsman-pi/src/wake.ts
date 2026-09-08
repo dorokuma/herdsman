@@ -7,9 +7,10 @@ export const WAKE_SETTLE_MS = 500;
 export type AgentOutcome = {
   agent: string;
   eventId: number;
-  kind: "blocked" | "completed";
+  kind: "blocked" | "completed" | "failed";
   name?: string | null;
   paneId: string | null;
+  reason?: string;
   terminalId: string;
   text: string;
 };
@@ -31,6 +32,7 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
   if (!event.terminalId) return undefined;
   if (event.type === "agent.done") return "completed";
   if (event.type === "agent.blocked") return "blocked";
+  if (event.type === "agent.failed") return "failed";
   const payload = asRecord(event.payload);
   if (event.type === "agent.idle" && payload.from === "working") return "completed";
   return undefined;
@@ -45,7 +47,8 @@ function project(events: AgentEventWireRecord[], seen: Set<number>): AgentOutcom
     const payload = asRecord(event.payload);
     const paneId = event.paneId ?? null;
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
-    return [{ agent: stringValue(payload.agent) ?? stringValue(event.agentId) ?? paneId ?? event.terminalId, eventId: event.id, kind, name: stringValue(payload.name) ?? null, paneId, terminalId: event.terminalId, text }];
+    const reason = kind === "failed" ? normalizeExcerpt(payload.reason) : undefined;
+    return [{ agent: stringValue(payload.agent) ?? stringValue(event.agentId) ?? paneId ?? event.terminalId, eventId: event.id, kind, name: stringValue(payload.name) ?? null, paneId, ...(reason ? { reason } : {}), terminalId: event.terminalId, text }];
   });
   for (const outcome of outcomes) seen.add(outcome.eventId);
   return { outcomes, rawEvents };
@@ -54,9 +57,14 @@ export function projectAgentOutcomes(events: AgentEventWireRecord[]): AgentOutco
 export function createAgentOutcomeProjector(): (events: AgentEventWireRecord[]) => AgentOutcomeProjection { const seen = new Set<number>(); return (events) => project(events, seen); }
 export function formatAgentOutcomeUpdates(outcomes: AgentOutcome[]): string {
   const updates = outcomes.map((outcome) => {
-    const excerpt = outcome.text.length > 0 ? outcome.text : "(no assistant message)";
     const identity = agentIdentityLabel({ agent: outcome.agent, name: outcome.name });
-    return `- ${outcome.kind} ${identity} ${outcome.paneId ?? "unknown"}\n  last assistant: ${excerpt}\n  event: ${outcome.eventId}`;
+    const pane = outcome.paneId ?? "unknown";
+    if (outcome.kind === "failed") {
+      const reason = outcome.reason && outcome.reason.length > 0 ? outcome.reason : "(unknown)";
+      return `- failed ${identity} ${pane}\n  reason: ${reason}`;
+    }
+    const excerpt = outcome.text.length > 0 ? outcome.text : "(no assistant message)";
+    return `- ${outcome.kind} ${identity} ${pane}\n  last assistant: ${excerpt}\n  event: ${outcome.eventId}`;
   }).join("\n");
   return `${WAKE_POLICY}\n\n[HERDSMAN AGENT UPDATES]\n${updates}`;
 }
