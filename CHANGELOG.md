@@ -1,3 +1,8 @@
+## 0.11.2
+
+- discovery 会话根从 `/tmp/pi-role-sessions` 迁到 `/tmp/herdr-role-sessions/<herdr-session>/`，回退扫描按 own-session 子目录隔离，根除跨 session 错配。
+- 恢复派发子代理 wake 正文；interactive-pi 派发前缀跟新根，修复 idle 误杀。
+
 ## 0.11.1
 
 - W1：状态迁移与 status_event_plans 写入同 sqlite 事务，避免状态已改、计划未落库。
