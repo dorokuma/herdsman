@@ -202,4 +202,40 @@ describe("StatusEventPlanStore", () => {
 
     harness.sqlite.close();
   });
+
+  test("listFailed returns only failed plans in order of id", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    const row1 = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "done",
+    });
+    const row2 = store.insertPending({
+      agentId: "ag_2",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p2",
+      toStatus: "done",
+    });
+    store.insertPending({
+      agentId: "ag_3",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p3",
+      toStatus: "done",
+    });
+
+    for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS; i += 1) {
+      store.markRetry(row1.id, new Error("err"));
+      store.markRetry(row2.id, new Error("err"));
+    }
+    expect(store.listFailed().map((plan) => plan.id)).toEqual([row1.id, row2.id]);
+    expect(store.listFailed().every((plan) => plan.status === "failed")).toBe(true);
+
+    harness.sqlite.close();
+  });
 });

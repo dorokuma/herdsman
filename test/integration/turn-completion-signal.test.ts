@@ -509,8 +509,10 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
 
     const planPromise = index.executeStatusEventPlan(plan);
 
-    // Status flips back to working in store
-    await index.handleHerdrEventFast({
+    // Status flips back to working in store. Fast now persists that plan in the
+    // same transaction as the status write (W1); execute it after the done plan
+    // so listUnfinished drains the way handleHerdrEvent would.
+    const flip = await index.handleHerdrEventFast({
       event: { agent_status: "working", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
       ...sessionInput(),
     });
@@ -526,6 +528,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
 
     const planResult = await planPromise;
     expect(planResult).toEqual(expect.objectContaining({ type: "agent.done" }));
+    await Promise.all(flip.statusEventPlans.map((next) => index.executeStatusEventPlan(next)));
 
     const events = harness.agentEvents.listAfter({
       herdrSessionName: "default",
@@ -731,4 +734,160 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
 
     harness.sqlite.close();
   }, 10_000);
+
+  test("W12: pi received signal re-reads disk so done body is M2 not Fast-time M1", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    let diskText = "turn-1";
+    let diskRef = "m1";
+    let releaseFirstRefreshStarted!: () => void;
+    let firstRefreshStarted = Promise.resolve();
+    const armGate = () => {
+      firstRefreshStarted = new Promise<void>((resolve) => {
+        releaseFirstRefreshStarted = resolve;
+      });
+    };
+    armGate();
+    let gateArmed = false;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          const snapshot = { ref: diskRef, text: diskText };
+          if (gateArmed) {
+            gateArmed = false;
+            releaseFirstRefreshStarted();
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: snapshot.ref,
+                text: snapshot.text,
+                timestamp: null,
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    armGate();
+    gateArmed = true;
+    const fastPromise = index.handleHerdrEventFast(doneEvent);
+    await firstRefreshStarted;
+    diskRef = "m2";
+    diskText = "turn-2";
+    const fast = await fastPromise;
+    expect(fast.statusEventPlans).toHaveLength(1);
+    const plan = fast.statusEventPlans[0];
+    if (!plan) throw new Error("expected statusEventPlan");
+    expect(plan.compactHistory?.lastAssistantMessage?.text).toBe("turn-1");
+
+    registry.record({
+      confirmed: true,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+    const event = await index.executeStatusEventPlan(plan);
+    expect(event?.type).toBe("agent.done");
+    expect(event?.compactHistory?.lastAssistantMessage?.text).toBe("turn-2");
+    expect(event?.compactHistory?.lastAssistantMessage?.text).not.toBe("turn-1");
+    expect(event?.compactHistory?.lastAssistantMessage?.ref).toBe("m2");
+    harness.sqlite.close();
+  });
+
+  test("W13: pi timeout without advance clears lastAssistantMessage and sets noAdvance", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 0 });
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "m1", text: "turn-1", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const result = await index.handleHerdrEvent(doneEvent);
+    const done = result.events.find((event) => event.type === "agent.done");
+    expect(done).toBeDefined();
+    expect(done?.compactHistory?.lastAssistantMessage).toBeNull();
+    expect(done?.payload).toEqual(
+      expect.objectContaining({ noAdvance: true, staleSnapshot: false }),
+    );
+    expect(JSON.stringify(done?.compactHistory)).not.toContain("turn-1");
+    harness.sqlite.close();
+  });
+
+  test("W13: pi timeout with disk advanced to M2 emits M2 body", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 0 });
+    let diskText = "turn-1";
+    let diskRef = "m1";
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: diskRef, text: diskText, timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const fast = await index.handleHerdrEventFast(doneEvent);
+    const plan = fast.statusEventPlans[0];
+    if (!plan) throw new Error("expected statusEventPlan");
+    diskRef = "m2";
+    diskText = "turn-2";
+    const event = await index.executeStatusEventPlan(plan);
+    expect(event?.type).toBe("agent.done");
+    expect(event?.compactHistory?.lastAssistantMessage?.text).toBe("turn-2");
+    expect(event?.payload).not.toEqual(expect.objectContaining({ noAdvance: true }));
+    harness.sqlite.close();
+  });
 });

@@ -1,9 +1,11 @@
+import type { DatabaseSync } from "node:sqlite";
 import { safeAllowedSessionPath } from "@/agent-history/discovery.js";
 import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
 import { type AgentEventStore, hasNonEmptyAssistantMessage } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { AgentStore, HerdrAgentLike } from "@/db/agents.js";
+import { runSqliteTransaction } from "@/db/client.js";
 import type { HerdrSessionStore } from "@/db/herdr-sessions.js";
 import type { HerdrWorkspaceStore } from "@/db/herdr-workspaces.js";
 import type { StatusEventPlanRecord, StatusEventPlanStore } from "@/db/status-event-plans.js";
@@ -71,6 +73,7 @@ export type AgentIndexServiceStores = {
   agents: AgentStore;
   herdrSessions: HerdrSessionStore;
   herdrWorkspaces: HerdrWorkspaceStore;
+  sqlite: DatabaseSync;
   statusEventPlans: StatusEventPlanStore;
 };
 
@@ -86,6 +89,7 @@ export type StatusEventPlan = {
   compactHistory: CompactAgentHistory | undefined;
   from: AgentStatus;
   herdrEventKey?: string;
+  planId?: number;
   to: AgentStatus;
 };
 
@@ -364,13 +368,16 @@ export class AgentIndexService {
         }
       });
     }
-    const inserted = this.#stores.statusEventPlans.insertPending({
-      agent: plan.agent,
-      from: plan.from,
-      herdrEventKey: plan.herdrEventKey ?? null,
-      to: plan.to,
-      ...(plan.compactHistory ? { compactHistory: plan.compactHistory } : {}),
-    });
+    const inserted =
+      plan.planId !== undefined
+        ? this.#stores.statusEventPlans.get(plan.planId)
+        : this.#stores.statusEventPlans.insertPending({
+            agent: plan.agent,
+            from: plan.from,
+            herdrEventKey: plan.herdrEventKey ?? null,
+            to: plan.to,
+            ...(plan.compactHistory ? { compactHistory: plan.compactHistory } : {}),
+          });
     return this.#enqueueAgentPlan(plan.agent.id, () => this.#runPlanRow(inserted, plan));
   }
 
@@ -402,6 +409,81 @@ export class AgentIndexService {
     // Individual rows may reject (after markRetry) but the drain itself never
     // rejects: every row is either drained, cancelled, or retried.
     await Promise.allSettled(tasks);
+    await this.#backfillFailedPlanEvents();
+  }
+
+  async #backfillFailedPlanEvents(): Promise<void> {
+    const store = this.#stores.statusEventPlans;
+    if (!store) return;
+    for (const row of store.listFailed()) {
+      const existing = this.#stores.sqlite
+        .prepare("select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?")
+        .get(row.herdrSessionName, `agent.failed:plan:${row.id}`);
+      if (existing) continue;
+      let agent: AgentIndexRecord | undefined;
+      try {
+        agent = this.#stores.agents.get(row.agentId);
+      } catch {
+        agent = this.#minimalAgentFromLatestEvent(row.agentId, row.herdrSessionName);
+        if (!agent) {
+          console.warn("Herdsman skipping agent.failed backfill; no agent row or events", {
+            agentId: row.agentId,
+            herdrSessionName: row.herdrSessionName,
+            planId: row.id,
+          });
+          continue;
+        }
+      }
+      this.#appendPlanFailedEvent({
+        agent,
+        attempts: row.attempts,
+        compactHistory: row.compactHistory,
+        from: row.fromStatus,
+        planId: row.id,
+        reason: row.lastError,
+        to: row.toStatus,
+      });
+    }
+  }
+
+  #minimalAgentFromLatestEvent(
+    agentId: string,
+    herdrSessionName: string,
+  ): AgentIndexRecord | undefined {
+    const latest = this.#stores.sqlite
+      .prepare(
+        `select pane_id, pane_generation, terminal_id, workspace_id, herdr_session_name
+         from agent_events where agent_id = ? order by id desc limit 1`,
+      )
+      .get(agentId) as
+      | {
+          herdr_session_name: string;
+          pane_generation: string | null;
+          pane_id: string | null;
+          terminal_id: string | null;
+          workspace_id: string | null;
+        }
+      | undefined;
+    if (!latest?.pane_id || !latest.workspace_id) return undefined;
+    return {
+      agent: null,
+      agentSession: null,
+      agentStatus: "unknown",
+      cwd: null,
+      firstSeenAt: new Date(0),
+      focused: false,
+      foregroundCwd: null,
+      herdrSessionName: latest.herdr_session_name || herdrSessionName,
+      id: agentId,
+      lastSeenAt: new Date(0),
+      name: null,
+      paneId: latest.pane_id,
+      paneRevision: null,
+      ...(latest.pane_generation === null ? {} : { paneGeneration: latest.pane_generation }),
+      tabId: null,
+      terminalId: latest.terminal_id,
+      workspaceId: latest.workspace_id,
+    };
   }
 
   async #drainPlanRow(row: StatusEventPlanRecord): Promise<void> {
@@ -973,13 +1055,7 @@ export class AgentIndexService {
     const from = recovered ? "unknown" : agent.agentStatus;
     const to = parseAgentStatus(event.agent_status);
     const herdrEventKey = herdrInputIdempotencyKey(input.herdrSessionName, paneId, event, to);
-    const updated = this.#stores.agents.updateStatus({
-      agentStatus: to,
-      herdrSessionName: input.herdrSessionName,
-      paneId,
-      paneGeneration: eventGeneration,
-    });
-    const current = updated ?? { ...agent, agentStatus: to };
+    const current = { ...agent, agentStatus: to };
     const refreshed = await this.#context.refreshAgent({ agent: current, identityChanged: false });
     const scopes = new Map<string, AgentScope>();
     for (const scope of recovered?.contextChangedScopes ?? []) addScope(scopes, scope);
@@ -989,14 +1065,38 @@ export class AgentIndexService {
     const equivalent = statusEventPlans.some(
       (candidate) => candidate.agent.id === current.id && candidate.to === to,
     );
-    if (!equivalent) {
+    const statusInput = {
+      agentStatus: to,
+      herdrSessionName: input.herdrSessionName,
+      paneId,
+      paneGeneration: eventGeneration,
+    };
+    if (from === to) {
+      this.#stores.agents.updateStatus(statusInput);
+    } else if (!equivalent) {
+      const inserted = runSqliteTransaction(this.#stores.sqlite, () => {
+        const updated = this.#stores.agents.updateStatus(statusInput) ?? current;
+        const plan = this.#stores.statusEventPlans.insertPending({
+          agent: updated,
+          from,
+          herdrEventKey: herdrEventKey ?? null,
+          to,
+          ...(refreshed.snapshot.compactHistory
+            ? { compactHistory: refreshed.snapshot.compactHistory }
+            : {}),
+        });
+        return { plan, updated };
+      });
       statusEventPlans.push({
-        agent: current,
+        agent: inserted.updated,
         compactHistory: refreshed.snapshot.compactHistory,
         from,
         ...(herdrEventKey ? { herdrEventKey } : {}),
+        planId: inserted.plan.id,
         to,
       });
+    } else {
+      this.#stores.agents.updateStatus(statusInput);
     }
     return { contextChangedScopes: sortedScopes(scopes), events, statusEventPlans };
   }
@@ -1122,6 +1222,7 @@ export class AgentIndexService {
       input.agent.id,
       input.agent.herdrSessionName,
     );
+    let skipStatusChanged = false;
     if (latest && statusTransitionMatches(latest, input.from, input.to)) {
       const hasTerminalAfter = this.#stores.agentEvents.hasTerminalEventAfter(
         input.agent.id,
@@ -1129,14 +1230,17 @@ export class AgentIndexService {
         latest.id,
       );
       if (!hasTerminalAfter) {
-        console.debug("Herdsman skipping duplicate status transition event", {
-          agentId: input.agent.id,
-          from: input.from,
-          to: input.to,
-        });
-        return undefined;
+        if (statusEventType(input.to) === undefined) {
+          console.debug("Herdsman skipping duplicate status transition event", {
+            agentId: input.agent.id,
+            from: input.from,
+            to: input.to,
+          });
+          return undefined;
+        }
+        skipStatusChanged = true;
       }
-      if (!input.herdrEventKey) {
+      if (hasTerminalAfter && !input.herdrEventKey) {
         const lastTerminal = this.#stores.agentEvents.latestTerminalEvent(
           input.agent.id,
           input.agent.herdrSessionName,
@@ -1170,6 +1274,7 @@ export class AgentIndexService {
 
     try {
       let compactHistory = input.compactHistory;
+      let payloadExtra: Record<string, unknown> = {};
       if (
         this.#turnCompletions !== undefined &&
         (input.to === "done" || input.to === "blocked") &&
@@ -1219,13 +1324,21 @@ export class AgentIndexService {
         }
 
         if (turn?.received) {
-          if (!isAlreadyEmittedInRetry && hasNonEmptyAssistantMessage(input.compactHistory)) {
-            compactHistory = input.compactHistory;
+          const fresh = (
+            await this.#context.refreshAgent({
+              agent: input.agent,
+              forceRefresh: true,
+              identityChanged: false,
+            })
+          ).snapshot.compactHistory;
+          if (!isAlreadyEmittedInRetry && hasNonEmptyAssistantMessage(fresh)) {
+            compactHistory = fresh;
           } else {
             const advanced = await this.#waitForHistoryAdvance({
               agent: input.agent,
               baseline,
               controller,
+              initial: fresh,
               maxAttempts: 8,
               requireAssistantChange: isRetry,
             });
@@ -1261,7 +1374,15 @@ export class AgentIndexService {
           ) {
             throw new PlanWaitingHistoryError();
           }
-          compactHistory = advanced;
+          if (
+            !isRetry &&
+            !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
+          ) {
+            compactHistory = { ...advanced, lastAssistantMessage: null };
+            payloadExtra = { noAdvance: true, staleSnapshot: false };
+          } else {
+            compactHistory = advanced;
+          }
           console.warn(
             `Herdsman emitted pi agent.${input.to} without a turn completion signal after ${TURN_SIGNAL_WAIT_MS}ms`,
             {
@@ -1284,21 +1405,43 @@ export class AgentIndexService {
             const currentRef = compact.lastAssistantMessage?.ref ?? null;
             return currentRef !== null && currentRef !== prevRef;
           }
-          // Non-agy non-pi in retry (attempts > 0):
-          if ((input.attempts ?? 0) > 0 && latestTerminal) {
-            if (
-              sameTerminalAssistantContent(
-                compact,
-                latestTerminal.compactHistory,
-                input.agent.agent,
-              )
-            ) {
-              return false;
-            }
-          }
-          // Non-agy non-pi: non-empty assistant message is ready immediately.
-          return true;
+          if (!latestTerminal) return true;
+          const currentMsg = compact.lastAssistantMessage;
+          const prevMsg = latestTerminal.compactHistory?.lastAssistantMessage;
+          const refChanged = (currentMsg?.ref ?? null) !== (prevMsg?.ref ?? null);
+          const textChanged = (currentMsg?.text ?? "") !== (prevMsg?.text ?? "");
+          const same = sameTerminalAssistantContent(
+            compact,
+            latestTerminal.compactHistory,
+            input.agent.agent,
+          );
+          return !same || refChanged || textChanged;
         };
+
+        const latestTerminalForSkip = this.#stores.agentEvents.latestTerminalEvent(
+          input.agent.id,
+          input.agent.herdrSessionName,
+        );
+        if (
+          input.agent.agent !== "agy" &&
+          compactHistory?.source !== "antigravity-sqlite" &&
+          input.herdrEventKey &&
+          latestTerminalForSkip &&
+          hasNonEmptyAssistantMessage(compactHistory)
+        ) {
+          const currentMsg = compactHistory.lastAssistantMessage;
+          const prevMsg = latestTerminalForSkip.compactHistory?.lastAssistantMessage;
+          const refChanged = (currentMsg?.ref ?? null) !== (prevMsg?.ref ?? null);
+          const textChanged = (currentMsg?.text ?? "") !== (prevMsg?.text ?? "");
+          const same = sameTerminalAssistantContent(
+            compactHistory,
+            latestTerminalForSkip.compactHistory,
+            input.agent.agent,
+          );
+          if (same && !refChanged && !textChanged) {
+            return undefined;
+          }
+        }
 
         if (!isReadyNonPi(compactHistory)) {
           for (let attempt = 0; attempt < 8; attempt += 1) {
@@ -1411,24 +1554,27 @@ export class AgentIndexService {
         targetAgent = currentAgent;
       }
 
-      const lastEvent = this.#appendAndAckSelfEvent({
-        agentId: targetAgent.id,
-        compactHistory,
-        herdrSessionName: targetAgent.herdrSessionName,
-        idempotencyKey: idempotencyKey(
-          "agent.status.changed",
-          targetAgent,
-          input.from,
-          input.to,
-          `${observationId}:${input.herdrEventKey ?? "legacy"}:agent.status.changed`,
-        ),
-        paneId: targetAgent.paneId,
-        paneGeneration: targetAgent.paneGeneration ?? null,
-        payload: payload(targetAgent, input.from, input.to),
-        terminalId: targetAgent.terminalId,
-        type: "agent.status.changed",
-        workspaceId: targetAgent.workspaceId,
-      });
+      const eventPayload = { ...payload(targetAgent, input.from, input.to), ...payloadExtra };
+      const lastEvent = skipStatusChanged
+        ? undefined
+        : this.#appendAndAckSelfEvent({
+            agentId: targetAgent.id,
+            compactHistory,
+            herdrSessionName: targetAgent.herdrSessionName,
+            idempotencyKey: idempotencyKey(
+              "agent.status.changed",
+              targetAgent,
+              input.from,
+              input.to,
+              `${observationId}:${input.herdrEventKey ?? "legacy"}:agent.status.changed`,
+            ),
+            paneId: targetAgent.paneId,
+            paneGeneration: targetAgent.paneGeneration ?? null,
+            payload: eventPayload,
+            terminalId: targetAgent.terminalId,
+            type: "agent.status.changed",
+            workspaceId: targetAgent.workspaceId,
+          });
       const statusType = statusEventType(input.to);
       if (statusType) {
         return this.#appendAndAckSelfEvent({
@@ -1444,7 +1590,7 @@ export class AgentIndexService {
           ),
           paneId: targetAgent.paneId,
           paneGeneration: targetAgent.paneGeneration ?? null,
-          payload: payload(targetAgent, input.from, input.to),
+          payload: eventPayload,
           terminalId: targetAgent.terminalId,
           type: statusType,
           workspaceId: targetAgent.workspaceId,
@@ -1465,28 +1611,38 @@ export class AgentIndexService {
     reason: string | null;
     to: AgentStatus;
   }): AgentEventRecord {
+    let agent = input.agent;
+    try {
+      agent = this.#stores.agents.get(input.agent.id);
+    } catch {
+      const stitched = this.#minimalAgentFromLatestEvent(
+        input.agent.id,
+        input.agent.herdrSessionName,
+      );
+      if (stitched) agent = stitched;
+    }
     return this.#appendAndAckSelfEvent({
-      agentId: input.agent.id,
+      agentId: agent.id,
       compactHistory: input.compactHistory ?? null,
-      herdrSessionName: input.agent.herdrSessionName,
+      herdrSessionName: agent.herdrSessionName,
       idempotencyKey: `agent.failed:plan:${input.planId}`,
-      paneId: input.agent.paneId,
-      paneGeneration: input.agent.paneGeneration ?? null,
+      paneId: agent.paneId,
+      paneGeneration: agent.paneGeneration ?? null,
       payload: {
-        agent: input.agent.agent,
+        agent: agent.agent,
         attempts: input.attempts,
         from: input.from,
-        herdrSessionName: input.agent.herdrSessionName,
-        name: input.agent.name,
-        paneId: input.agent.paneId,
+        herdrSessionName: agent.herdrSessionName,
+        name: agent.name,
+        paneId: agent.paneId,
         reason: input.reason ?? "unknown",
-        terminalId: input.agent.terminalId,
+        terminalId: agent.terminalId,
         to: input.to,
-        workspaceId: input.agent.workspaceId,
+        workspaceId: agent.workspaceId,
       },
-      terminalId: input.agent.terminalId,
+      terminalId: agent.terminalId,
       type: "agent.failed",
-      workspaceId: input.agent.workspaceId,
+      workspaceId: agent.workspaceId,
     });
   }
 

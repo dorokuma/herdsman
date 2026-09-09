@@ -4,6 +4,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { AgentIndexService, type StatusEventPlan } from "@/observability/agent-index-service.js";
+import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
@@ -1692,7 +1693,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     harness.sqlite.close();
   });
 
-  test("keyed retry: same assistant content in retry -> stays in waiting; different assistant content -> emits paired events", async () => {
+  test("keyed retry: same assistant content in retry -> explicit skip (completed, zero extra events); different assistant content -> emits paired events", async () => {
     const harness = openObservabilityDbHarness();
     let historyText = "Codex turn 1";
     let historyRef: string | null = "ref-1";
@@ -1738,7 +1739,8 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const res1 = await index.executeStatusEventPlan(p1);
     expect(res1?.type).toBe("agent.done");
 
-    // 2. Keyed retry row with new key "key-2", but SAME text/ref -> stays in waiting
+    // 2. Keyed retry row with new key "key-2", but SAME text/ref -> explicit skip
+    // (oracle b: completed, zero extra events; do not spin into waiting/failed).
     const p2Row = harness.statusEventPlans.insertPending({
       agent,
       compactHistory: {
@@ -1759,12 +1761,25 @@ describe("AgentIndexService non-pi completed event generation", () => {
     });
     let doneEvents = allEvents.filter((e) => e.type === "agent.done");
     expect(doneEvents).toHaveLength(1);
-    expect(harness.statusEventPlans.get(p2Row.id).status).toBe("pending");
+    expect(harness.statusEventPlans.get(p2Row.id).status).toBe("completed");
+    expect(harness.statusEventPlans.get(p2Row.id).status).not.toBe("pending");
+    expect(harness.statusEventPlans.get(p2Row.id).status).not.toBe("failed");
 
-    // 3. Disk updates with new text -> retry row now drains successfully and emits second done!
+    // 3. Disk updates with new text; a new keyed plan emits the second done.
     historyText = "Codex turn 2 new output";
     historyRef = "ref-2";
-    await index.drainPendingPlans();
+    const p3: StatusEventPlan = {
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("codex-jsonl"),
+        lastAssistantMessage: { ref: "ref-2", text: "Codex turn 2 new output", timestamp: null },
+      },
+      from: "working",
+      herdrEventKey: "key-3",
+      to: "done",
+    };
+    const res3 = await index.executeStatusEventPlan(p3);
+    expect(res3?.type).toBe("agent.done");
 
     allEvents = harness.agentEvents.listAfter({
       herdrSessionName: "default",
@@ -1775,7 +1790,6 @@ describe("AgentIndexService non-pi completed event generation", () => {
     expect(doneEvents[1]?.compactHistory?.lastAssistantMessage?.text).toBe(
       "Codex turn 2 new output",
     );
-    expect(harness.statusEventPlans.get(p2Row.id).status).toBe("completed");
 
     index.stopWaitingHistoryRetries();
     harness.sqlite.close();
@@ -2364,6 +2378,403 @@ describe("AgentIndexService status event plan drain resilience", () => {
       workspaceId: "wJ",
     });
     expect(events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    harness.sqlite.close();
+  });
+});
+
+describe("batch2 window regressions", () => {
+  test("W1: insertPending throw rolls back status update; agent stays working and listUnfinished is empty", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const before = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    expect(before?.agentStatus).toBe("working");
+
+    vi.spyOn(harness.statusEventPlans, "insertPending").mockImplementation(() => {
+      throw new Error("insertPending boom");
+    });
+
+    await expect(
+      index.handleHerdrEventFast({
+        event: { agent_status: "done", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInput(),
+      }),
+    ).rejects.toThrow("insertPending boom");
+
+    const after = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    expect(after?.agentStatus).toBe("working");
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
+    harness.sqlite.close();
+  });
+
+  test("W2: matching status.changed without done still emits agent.done and does not duplicate status.changed", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "claude");
+        },
+      }),
+      history: history(() => undefined),
+      sleep: async () => {},
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    harness.agentEvents.append({
+      agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "history", text: "result", timestamp: null },
+      },
+      herdrSessionName: "default",
+      paneId: agent.paneId,
+      payload: { from: "working", to: "done" },
+      terminalId: agent.terminalId,
+      type: "agent.status.changed",
+      workspaceId: agent.workspaceId,
+    });
+
+    const plan: StatusEventPlan = {
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "history", text: "result", timestamp: null },
+      },
+      from: "working",
+      to: "done",
+    };
+    const event = await index.executeStatusEventPlan(plan);
+    expect(event?.type).toBe("agent.done");
+
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((row) => row.type === "agent.done")).toHaveLength(1);
+    expect(allEvents.filter((row) => row.type === "agent.status.changed")).toHaveLength(1);
+    harness.sqlite.close();
+  });
+
+  test("W3: drainPendingPlans backfills agent.failed for failed rows without events", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < 8; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+    expect(harness.statusEventPlans.get(row.id).status).toBe("failed");
+
+    await index.drainPendingPlans();
+
+    const failed = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.payload).toMatchObject({
+      from: "working",
+      reason: "PLAN_WAITING_HISTORY",
+      to: "done",
+    });
+    harness.sqlite.close();
+  });
+
+  test("W3: drainPendingPlans does not duplicate agent.failed when event already exists", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < 8; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+    harness.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      idempotencyKey: `agent.failed:plan:${row.id}`,
+      paneId: agent.paneId,
+      payload: { from: "working", reason: "PLAN_WAITING_HISTORY", to: "done" },
+      terminalId: agent.terminalId,
+      type: "agent.failed",
+      workspaceId: agent.workspaceId,
+    });
+
+    await index.drainPendingPlans();
+
+    const failed = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.failed");
+    expect(failed).toHaveLength(1);
+    harness.sqlite.close();
+  });
+
+  test("W6: plan failed after pane generation change emits with current generation and is deliverable", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return snapshot(
+            [
+              agent({
+                pane_id: "wJ:p2",
+                pane_generation: "gen-1",
+                revision: 10,
+                terminal_id: "term_claude",
+                workspace_id: "wJ",
+              }),
+            ],
+            [{ pane_id: "wJ:p2", revision: 10 }],
+          );
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const original = harness.agents.findByPane({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      paneGeneration: "gen-1",
+    });
+    if (!original) throw new Error("expected agent");
+
+    harness.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [
+        {
+          agent: "claude",
+          agent_status: "working",
+          pane_id: "wJ:p2",
+          pane_generation: "gen-2",
+          terminal_id: "term_claude",
+          workspace_id: "wJ",
+        },
+      ],
+    });
+    const current = harness.agents.findByPane({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      paneGeneration: "gen-2",
+    });
+    expect(current?.id).toBe(original.id);
+    expect(current?.paneGeneration).toBe("gen-2");
+
+    const orchestrator = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    orchestrator.claim({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+      paneId: "wJ:owner",
+      terminalId: "term_owner",
+    });
+
+    const row = harness.statusEventPlans.insertPending({
+      agent: original,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < 8; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+    await index.drainPendingPlans();
+
+    const failed = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.failed");
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.paneGeneration).toBe("gen-2");
+    expect(failed[0]?.payload).toMatchObject({ paneId: "wJ:p2" });
+
+    const pending = orchestrator.pending({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+      terminalId: "term_owner",
+    });
+    expect(pending.map((event) => event.id)).toContain(failed[0]?.id);
+    harness.sqlite.close();
+  });
+
+  test("W6: agent.failed is still delivered to owner after agent row is deleted", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const orchestrator = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    orchestrator.claim({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+      paneId: "wJ:owner",
+      terminalId: "term_owner",
+    });
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < 8; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+    await index.drainPendingPlans();
+    const failed = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.failed");
+    expect(failed).toHaveLength(1);
+
+    harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+
+    const pending = orchestrator.pending({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+      terminalId: "term_owner",
+    });
+    expect(pending.map((event) => event.id)).toContain(failed[0]?.id);
+    harness.sqlite.close();
+  });
+
+  test("W14: claude first done succeeds; keyed same content skips; keyed new ref emits", async () => {
+    const harness = openObservabilityDbHarness();
+    let historyRef: string | null = "ref-1";
+    let historyText = "turn-1";
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "claude");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("claude-jsonl"),
+              lastAssistantMessage: { ref: historyRef, text: historyText, timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const first = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
+      },
+      from: "working",
+      to: "done",
+    });
+    expect(first?.type).toBe("agent.done");
+    expect(first?.compactHistory?.lastAssistantMessage?.ref).toBe("ref-1");
+
+    const k2 = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
+      },
+      from: "working",
+      herdrEventKey: "k2",
+      to: "done",
+    });
+    expect(k2).toBeUndefined();
+    const afterK2 = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.done");
+    expect(afterK2).toHaveLength(1);
+    const k2Plans = harness.sqlite
+      .prepare("select status from status_event_plans where herdr_event_key = ?")
+      .all("k2") as Array<{ status: string }>;
+    expect(k2Plans).toEqual([{ status: "completed" }]);
+
+    historyRef = "ref-2";
+    historyText = "turn-2";
+    const k3 = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-2", text: "turn-2", timestamp: null },
+      },
+      from: "working",
+      herdrEventKey: "k3",
+      to: "done",
+    });
+    expect(k3?.type).toBe("agent.done");
+    expect(k3?.compactHistory?.lastAssistantMessage?.ref).toBe("ref-2");
+    const doneEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.done");
+    expect(doneEvents).toHaveLength(2);
     harness.sqlite.close();
   });
 });

@@ -43,6 +43,7 @@ export function isDeliverableAgentEvent(
   scope: { herdrSessionName: string; workspaceId: string },
   ownerTerminalId: string,
 ): boolean {
+  const failed = event.type === "agent.failed";
   return (
     (event.status === "pending" || event.status === "delivered") &&
     (event.status === "delivered" ||
@@ -50,24 +51,24 @@ export function isDeliverableAgentEvent(
       event.nextAttemptAt === undefined ||
       event.nextAttemptAt <= new Date()) &&
     (event.status === "pending" || event.deliveredToTerminalId === ownerTerminalId) &&
-    event.agentId !== null &&
-    agent !== undefined &&
+    (failed || event.agentId !== null) &&
     event.type !== "agent.status.changed" &&
     !(event.type === "agent.idle" && asRecord(event.payload).from !== "working") &&
-    !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
-    !(
-      event.type !== "agent.failed" &&
-      agent.agent !== "pi" &&
-      (event.type === "agent.idle" || event.type === "agent.done") &&
-      !hasNonEmptyAssistantMessage(event.compactHistory)
-    ) &&
-    agent.paneId === event.paneId &&
-    (event.paneGeneration === null || agent.paneGeneration === event.paneGeneration) &&
-    agent.workspaceId === scope.workspaceId &&
     event.workspaceId === scope.workspaceId &&
     event.herdrSessionName === scope.herdrSessionName &&
     event.terminalId !== null &&
-    event.terminalId !== ownerTerminalId
+    event.terminalId !== ownerTerminalId &&
+    (failed ||
+      (agent !== undefined &&
+        !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
+        !(
+          agent.agent !== "pi" &&
+          (event.type === "agent.idle" || event.type === "agent.done") &&
+          !hasNonEmptyAssistantMessage(event.compactHistory)
+        ) &&
+        agent.paneId === event.paneId &&
+        (event.paneGeneration === null || agent.paneGeneration === event.paneGeneration) &&
+        agent.workspaceId === scope.workspaceId))
   );
 }
 
@@ -441,6 +442,27 @@ export class AgentEventStore {
       // or no owner), so reclaim immediately without waiting for last_attempt_at
       // timeout. If the scope is still owned by the delivery terminal (branch a),
       // the event remains in-flight with the owner.
+      const reclaimWhere = `status = 'delivered'
+             and ${agentPaneOpen}
+             and not exists (
+               select 1 from agent_orchestrator_scopes
+               where agent_orchestrator_scopes.herdr_session_name = agent_events.herdr_session_name
+                 and agent_orchestrator_scopes.workspace_id = agent_events.workspace_id
+                 and agent_orchestrator_scopes.owner_terminal_id = agent_events.delivered_to_terminal_id
+             )`;
+      const exceeded = this.#sqlite
+        .prepare(
+          `select id, agent_id, herdr_session_name, workspace_id, delivery_attempts
+           from agent_events
+           where ${reclaimWhere} and delivery_attempts >= 10`,
+        )
+        .all() as Array<{
+        agent_id: string | null;
+        delivery_attempts: number;
+        herdr_session_name: string;
+        id: number;
+        workspace_id: string | null;
+      }>;
       const reclaimed = this.#sqlite
         .prepare(
           `update agent_events
@@ -449,16 +471,19 @@ export class AgentEventStore {
                last_failure_code = case when delivery_attempts >= 10 then 'DELIVERY_ATTEMPTS_EXCEEDED' else last_failure_code end,
                delivered_to_terminal_id = null,
                next_attempt_at = null
-           where status = 'delivered'
-             and ${agentPaneOpen}
-             and not exists (
-               select 1 from agent_orchestrator_scopes
-               where agent_orchestrator_scopes.herdr_session_name = agent_events.herdr_session_name
-                 and agent_orchestrator_scopes.workspace_id = agent_events.workspace_id
-                 and agent_orchestrator_scopes.owner_terminal_id = agent_events.delivered_to_terminal_id
-             )`,
+           where ${reclaimWhere}`,
         )
         .run().changes;
+      for (const row of exceeded) {
+        console.error("Herdsman agent event delivery attempts exceeded", {
+          eventId: row.id,
+          agentId: row.agent_id,
+          herdrSessionName: row.herdr_session_name,
+          workspaceId: row.workspace_id,
+          deliveryAttempts: row.delivery_attempts,
+          lastFailureCode: "DELIVERY_ATTEMPTS_EXCEEDED",
+        });
+      }
       return Number(invalidated) + Number(reclaimed);
     });
   }

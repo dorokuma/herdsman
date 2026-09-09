@@ -163,6 +163,7 @@ export async function runObservabilityDaemonService(
       agents,
       herdrSessions,
       herdrWorkspaces,
+      sqlite,
       statusEventPlans,
     },
     turnCompletions,

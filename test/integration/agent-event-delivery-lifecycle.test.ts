@@ -260,6 +260,37 @@ describe("agent event delivery lifecycle", () => {
     expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(0);
   });
 
+  test("W8: reclaim logs when delivery attempts exceeded; attempts below 10 do not log", () => {
+    const harness = prepareHarness();
+    const retry = appendEvent(harness);
+    const exhausted = appendEvent(harness, "term-agent-2");
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'delivered', deliverable = 1, delivery_attempts = 1, last_attempt_at = ? where id = ?",
+      )
+      .run(Date.now() - 100_000, retry.id);
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'delivered', deliverable = 1, delivery_attempts = 10, last_attempt_at = ? where id = ?",
+      )
+      .run(Date.now() - 100_000, exhausted.id);
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    try {
+      expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(2);
+      expect(errorSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledWith("Herdsman agent event delivery attempts exceeded", {
+        eventId: exhausted.id,
+        agentId: exhausted.agentId,
+        herdrSessionName: "default",
+        workspaceId: "wA",
+        deliveryAttempts: 10,
+        lastFailureCode: "DELIVERY_ATTEMPTS_EXCEEDED",
+      });
+    } finally {
+      errorSpy.mockRestore();
+    }
+  });
+
   test("keeps a delivered event with the owner while the pane is open and the scope is still held", () => {
     const harness = prepareHarness();
     harness.agentOrchestratorScopes.claim({

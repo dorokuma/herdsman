@@ -12,3 +12,15 @@ export function openSqlite(path: string) {
 
   return { sqlite };
 }
+
+export function runSqliteTransaction<T>(sqlite: DatabaseSync, fn: () => T): T {
+  sqlite.exec("begin immediate");
+  try {
+    const result = fn();
+    sqlite.exec("commit");
+    return result;
+  } catch (error) {
+    sqlite.exec("rollback");
+    throw error;
+  }
+}

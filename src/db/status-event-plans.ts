@@ -184,6 +184,13 @@ export class StatusEventPlanStore {
     return rows.map(mapStatusEventPlan);
   }
 
+  listFailed(): StatusEventPlanRecord[] {
+    const rows = this.#sqlite
+      .prepare("select * from status_event_plans where status = 'failed' order by id asc")
+      .all() as StatusEventPlanRow[];
+    return rows.map(mapStatusEventPlan);
+  }
+
   listWaitingHistory(): StatusEventPlanRecord[] {
     const rows = this.#sqlite
       .prepare(
