@@ -1,3 +1,14 @@
+## 0.11.1
+
+- W1：状态迁移与 status_event_plans 写入同 sqlite 事务，避免状态已改、计划未落库。
+- W12：Pi turn-signal 到达后强制重读会话，防止沿用旧历史快照。
+- W13：Pi 超时且历史未推进时清空正文并打 `noAdvance` 标，避免空/陈旧终态。
+- W14：非 agy keyed 同内容显式 skip，不再误当成推进。
+- W2：终态 duplicate skip 收窄，崩溃后重放不再被旧事件吞掉。
+- W3：failed plan 启动 drain 幂等回填 `agent.failed`，重启不丢失败可见性。
+- W6：`agent.failed` 豁免 agent 行/pane 匹配，并按当前代生成。
+- W8：投递耗尽打结构化 error 日志，便于定位卡住批次。
+
 ## 0.11.0
 
 - agy 终态就绪闸：终态事件（done/idle）发射前检查正文就绪，空正文不落库 `status.changed` 与终态事件；投递闸拦截非 pi 空 `done`/`idle`（`agent.failed` 豁免），`blocked` 维持中间态豁免。Protobuf 解析仅提取真实 message 字段；compact 历史读取剥离已消费/上一轮残留。
