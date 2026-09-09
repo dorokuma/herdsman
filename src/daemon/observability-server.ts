@@ -711,6 +711,7 @@ function historyInput(agent: AgentIndexRecord) {
     cwd: agent.cwd,
     firstSeenAtMs: agent.firstSeenAt.getTime(),
     foregroundCwd: agent.foregroundCwd,
+    herdrSessionName: agent.herdrSessionName,
   };
 }
 

@@ -441,8 +441,8 @@ describe("AgentIndexService", () => {
       history: history(() => undefined),
       stores: harness,
     });
-    const allowedPath = join("/tmp/pi-role-sessions", `early-${Date.now()}.jsonl`);
-    mkdirSync("/tmp/pi-role-sessions", { recursive: true });
+    const allowedPath = join("/tmp/herdr-role-sessions", `early-${Date.now()}.jsonl`);
+    mkdirSync("/tmp/herdr-role-sessions", { recursive: true });
     writeFileSync(allowedPath, JSON.stringify({ cwd: "/tmp" }));
     const sessionRef = {
       agent: "pi" as const,
@@ -492,9 +492,9 @@ describe("AgentIndexService", () => {
       agent: "pi" as const,
       kind: "path" as const,
       source: "herdr:pi",
-      value: "/tmp/pi-role-sessions/serialized-pi-session.jsonl",
+      value: "/tmp/herdr-role-sessions/serialized-pi-session.jsonl",
     };
-    mkdirSync("/tmp/pi-role-sessions", { recursive: true });
+    mkdirSync("/tmp/herdr-role-sessions", { recursive: true });
     writeFileSync(sessionRef.value, JSON.stringify({ cwd: "/tmp" }));
 
     const first = index.refreshHerdrSession(sessionInput());

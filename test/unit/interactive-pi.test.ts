@@ -19,7 +19,14 @@ describe("interactive Pi session classification", () => {
     expect(isInteractivePiAgent(agent("/root/.pi/agent/sessions/../x.jsonl"))).toBe(false);
   });
   test("classifies a real dispatched role session as non-interactive", () => {
-    expect(isInteractivePiAgent(agent("/tmp/pi-role-sessions/role-x/session.jsonl"))).toBe(false);
+    expect(isInteractivePiAgent(agent("/tmp/herdr-role-sessions/role-x/session.jsonl"))).toBe(
+      false,
+    );
+  });
+  test("does not classify a new-root herdr session pi path as interactive", () => {
+    expect(
+      isInteractivePiAgent(agent("/tmp/herdr-role-sessions/beta/role-worker/session.jsonl")),
+    ).toBe(false);
   });
   test("classifies a real root Pi session as interactive", () => {
     const dir = mkdtempSync(join(tmpdir(), "interactive-pi-test-"));

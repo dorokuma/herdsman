@@ -12,7 +12,10 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
 // Herdr observation delay is on the second scale, so a 10-minute grace window
 // is far more generous than needed; it only discards sessions that had already
 // stopped being written well before the agent appeared.
-export const ALLOWED_SESSION_ROOTS = ["/tmp/pi-role-sessions"] as const;
+// Dispatched Pi role sessions live under /tmp/herdr-role-sessions/<herdr-session>/.
+// Exact-path registration may resolve any file under this root; fallback/id scans
+// must be scoped to the agent's own herdr session subdirectory.
+export const ALLOWED_SESSION_ROOTS = ["/tmp/herdr-role-sessions"] as const;
 
 export const DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
 export type AgentHistoryLookupInput = {
@@ -22,6 +25,7 @@ export type AgentHistoryLookupInput = {
   foregroundCwd: string | null;
   firstSeenAtMs?: number;
   grokHome?: string;
+  herdrSessionName?: string;
   homeDir?: string;
   occupiedSessionPaths?: ReadonlySet<string>;
 };
@@ -71,7 +75,7 @@ export async function discoverAgentHistory(
       if (ref) return { ...ref, kind: "agent_session" };
     }
     if (source === "pi-jsonl") {
-      const roots = new Set([join(homeDir, ".pi", "agent", "sessions"), ...ALLOWED_SESSION_ROOTS]);
+      const roots = new Set(piJsonlScanRoots(homeDir, input.herdrSessionName));
       for (const root of roots) {
         const matches = await scanRootById(root, input.agentSession.value, source);
         const candidate = matches.find((item) => !input.occupiedSessionPaths?.has(item.path));
@@ -94,7 +98,7 @@ export async function discoverAgentHistory(
   const agent = input.agent?.toLowerCase() ?? input.agentSession?.agent.toLowerCase() ?? "";
   const candidates: Candidate[] = [];
   if (agent === "pi") {
-    const roots = new Set([join(homeDir, ".pi", "agent", "sessions"), ...ALLOWED_SESSION_ROOTS]);
+    const roots = new Set(piJsonlScanRoots(homeDir, input.herdrSessionName));
     for (const root of roots) {
       candidates.push(...(await scanRoot(root, "pi-jsonl")));
     }
@@ -188,6 +192,24 @@ export function safeAllowedSessionPath(value: string, homeDir?: string): string 
   }
 }
 const CURRENT_EUID = process.geteuid?.() ?? -1;
+
+function isSafeHerdrSessionSegment(name: string): boolean {
+  return name.length > 0 && name !== "." && name !== ".." && !/[\\/\0]/.test(name);
+}
+
+function piJsonlScanRoots(homeDir: string, herdrSessionName: string | undefined): string[] {
+  const roots = [join(homeDir, ".pi", "agent", "sessions")];
+  if (herdrSessionName === undefined || !isSafeHerdrSessionSegment(herdrSessionName)) {
+    return roots;
+  }
+  for (const allowed of ALLOWED_SESSION_ROOTS) {
+    const scoped = normalize(join(allowed, herdrSessionName));
+    const rest = relative(allowed, scoped);
+    if (rest === "" || rest.startsWith("..") || isAbsolute(rest)) continue;
+    roots.push(scoped);
+  }
+  return roots;
+}
 
 async function scanRootById(
   root: string,

@@ -246,7 +246,7 @@ describe("AgentOrchestratorService", () => {
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
     const workerEvent = appendEvent(harness, {
       agent: "pi",
-      sessionPath: "/tmp/pi-role-sessions/role-worker-fd92d978/session.jsonl",
+      sessionPath: "/tmp/herdr-role-sessions/role-worker-fd92d978/session.jsonl",
       terminalId: "term_worker",
       from: "working",
       type: "agent.idle",
@@ -1085,7 +1085,7 @@ describe("Non-Pi agent completed delivery conditions", () => {
     // Dispatched role pi agent can deliver agent.idle (from working)
     const dispatchedPi = appendEvent(harness, {
       agent: "pi",
-      sessionPath: "/tmp/pi-role-sessions/role-scout-123/session.jsonl",
+      sessionPath: "/tmp/herdr-role-sessions/role-scout-123/session.jsonl",
       terminalId: "term_scout",
       from: "working",
       type: "agent.idle",

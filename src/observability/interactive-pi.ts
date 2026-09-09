@@ -2,7 +2,7 @@ import { realpathSync } from "node:fs";
 import { normalize } from "node:path";
 import type { AgentIndexRecord } from "./contracts.js";
 
-export const DISPATCHED_PI_SESSION_ROOT = "/tmp/pi-role-sessions/";
+export const DISPATCHED_PI_SESSION_ROOT = "/tmp/herdr-role-sessions/";
 
 /** Returns true only for Pi agents used as interactive observers, not dispatched roles. */
 export function isInteractivePiAgent(agent: AgentIndexRecord | undefined): boolean {

@@ -224,6 +224,7 @@ function historyLookup(
     cwd: agent.cwd,
     firstSeenAtMs: agent.firstSeenAt.getTime(),
     foregroundCwd: agent.foregroundCwd,
+    herdrSessionName: agent.herdrSessionName,
     ...(agent.agent?.toLowerCase() === "grok" && agent.grokHome
       ? { grokHome: agent.grokHome }
       : {}),
