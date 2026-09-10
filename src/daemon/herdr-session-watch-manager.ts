@@ -1,7 +1,7 @@
 import type { AgentStore } from "@/db/agents.js";
 import type { HerdrSessionStore } from "@/db/herdr-sessions.js";
 import type { HerdrSessionListEntry, HerdrSessionListRunner } from "@/herdr/session-list.js";
-import { HerdrSocketClient } from "@/herdr/socket-client.js";
+import { HERDR_TOPOLOGY_EVENT_TYPES, HerdrSocketClient } from "@/herdr/socket-client.js";
 import type {
   AgentIndexRefreshFastResult,
   AgentIndexRefreshResult,
@@ -29,6 +29,8 @@ type Watcher = {
   client: Client;
   entry: HerdrSessionListEntry;
   loop: Promise<void>;
+  restartSubscription?: () => void;
+  subscribedPaneIds: string[];
 };
 
 export class HerdrSessionWatchManager {
@@ -156,7 +158,12 @@ export class HerdrSessionWatchManager {
     const workingSessions = [...this.#watchers.values()].filter(({ entry }) =>
       this.#agents.listForHerdrSession(entry.name).some((agent) => agent.agentStatus === "working"),
     );
-    await mapConcurrent(workingSessions, 4, ({ entry }) => this.#refresh(entry));
+    await mapConcurrent(workingSessions, 4, async (watcher) => {
+      const agents = await this.#refresh(watcher.entry);
+      if (containsNewPaneId(agents, watcher.subscribedPaneIds)) {
+        watcher.restartSubscription?.();
+      }
+    });
   }
 
   async #startWatcher(entry: HerdrSessionListEntry, generation: number): Promise<void> {
@@ -168,7 +175,13 @@ export class HerdrSessionWatchManager {
     });
     const abort = new AbortController();
     const client = this.#clientFactory({ socketPath: entry.socketPath });
-    const watcher = { abort, client, entry, loop: Promise.resolve() };
+    const watcher: Watcher = {
+      abort,
+      client,
+      entry,
+      loop: Promise.resolve(),
+      subscribedPaneIds: [],
+    };
     watcher.loop = this.#watch(entry, watcher, generation, abort.signal).catch(() => undefined);
     this.#watchers.set(entry.name, watcher);
     if (this.#stopping || generation !== this.#lifecycleGeneration) {
@@ -206,102 +219,118 @@ export class HerdrSessionWatchManager {
     let lastPaneIds: string[] = [];
     let lastEvent: Record<string, unknown> | undefined;
     let lastClosedTriggered = false;
+    let restartAgents: AgentIndexRecord[] | undefined;
     while (!signal.aborted && generation === this.#lifecycleGeneration) {
       let restart = false;
+      const subscriptionAbort = new AbortController();
+      const stopSubscription = () => subscriptionAbort.abort();
+      signal.addEventListener("abort", stopSubscription, { once: true });
+      watcher.restartSubscription = () => {
+        restart = true;
+        subscriptionAbort.abort();
+      };
       try {
-        const agents = await this.#refresh(entry);
+        if (signal.aborted) return;
+        const agents = restartAgents ?? (await this.#refresh(entry));
+        restartAgents = undefined;
         reconnectCount = 0;
         if (signal.aborted) return;
         const paneIds = agents.map((agent) => agent.paneId);
         lastPaneIds = paneIds;
-        for await (const event of watcher.client.subscribeEvents({ paneIds }, { signal })) {
+        watcher.subscribedPaneIds = paneIds;
+        for await (const event of watcher.client.subscribeEvents(
+          { paneIds },
+          { signal: subscriptionAbort.signal },
+        )) {
           if (signal.aborted) return;
           const eventRecord = record(event);
           reconnectCount = 0;
           lastEvent = eventRecord;
           if (eventRecord.type === "pane.agent_status_changed") {
-            const result = this.#index.handleHerdrEventFast
-              ? await this.#index.handleHerdrEventFast({
-                  event,
-                  herdrSessionName: entry.name,
-                  sessionDir: entry.sessionDir,
-                  socketPath: entry.socketPath,
-                })
-              : await this.#index.handleHerdrEvent({
-                  event,
-                  herdrSessionName: entry.name,
-                  sessionDir: entry.sessionDir,
-                  socketPath: entry.socketPath,
-                });
-            this.#publishResult({
-              agents: this.#agents.listForHerdrSession(entry.name),
-              herdrSessionName: entry.name,
-              ...result,
-            });
-            if ("statusEventPlans" in result && Array.isArray(result.statusEventPlans)) {
-              for (const plan of result.statusEventPlans) {
-                this.#submitPlan(plan);
-              }
-            }
+            await this.#handleWatchEvent(entry, event);
             continue;
           }
-          if (eventRecord.type === "pane.closed") {
-            const result = this.#index.handleHerdrEventFast
-              ? await this.#index.handleHerdrEventFast({
-                  event,
-                  herdrSessionName: entry.name,
-                  sessionDir: entry.sessionDir,
-                  socketPath: entry.socketPath,
-                })
-              : await this.#index.handleHerdrEvent({
-                  event,
-                  herdrSessionName: entry.name,
-                  sessionDir: entry.sessionDir,
-                  socketPath: entry.socketPath,
-                });
-            this.#publishResult({
-              agents: this.#agents.listForHerdrSession(entry.name),
-              herdrSessionName: entry.name,
-              ...result,
-            });
+          if (!isTopologyEvent(eventRecord.type)) continue;
+          const refreshed = await this.#refresh(entry);
+          lastPaneIds = refreshed.map((agent) => agent.paneId);
+          if (eventRecord.type === "pane.closed" && !closedHitsLivePane(eventRecord, refreshed)) {
+            await this.#handleWatchEvent(entry, event);
           }
-          if (shouldRestartSubscription(eventRecord.type)) {
+          if (containsNewPaneId(refreshed, watcher.subscribedPaneIds)) {
             restart = true;
+            restartAgents = refreshed;
             lastClosedTriggered = eventRecord.type === "pane.closed";
-            break;
+            subscriptionAbort.abort();
           }
         }
       } catch (error) {
         if (signal.aborted) return;
-        reconnectCount += 1;
-        const reconnectDelayMs = Math.min(
-          this.#reconnectDelayMs * 2 ** (reconnectCount - 1),
-          30_000,
-        );
-        console.warn("Herdsman Herdr subscription reconnect", {
-          sessionName: entry.name,
-          socketPath: entry.socketPath,
-          paneIds: lastPaneIds,
-          subscriptionGeneration: this.#lifecycleGeneration,
-          eventId: lastEvent?.id ?? lastEvent?.event_id ?? null,
-          revision: lastEvent?.revision ?? lastEvent?.pane_revision ?? null,
-          reconnectCount,
-          paneClosedTriggered: lastClosedTriggered,
-          error: error instanceof Error ? error.message : String(error),
-        });
-        lastClosedTriggered = false;
-        watcher.client.close();
-        if (signal.aborted) return;
-        watcher.client = this.#clientFactory({ socketPath: entry.socketPath });
-        await delay(reconnectDelayMs, signal);
-        continue;
+        if (!restart) {
+          reconnectCount += 1;
+          const reconnectDelayMs = Math.min(
+            this.#reconnectDelayMs * 2 ** (reconnectCount - 1),
+            30_000,
+          );
+          console.warn("Herdsman Herdr subscription reconnect", {
+            sessionName: entry.name,
+            socketPath: entry.socketPath,
+            paneIds: lastPaneIds,
+            subscriptionGeneration: this.#lifecycleGeneration,
+            eventId: lastEvent?.id ?? lastEvent?.event_id ?? null,
+            revision: lastEvent?.revision ?? lastEvent?.pane_revision ?? null,
+            reconnectCount,
+            paneClosedTriggered: lastClosedTriggered,
+            error: error instanceof Error ? error.message : String(error),
+          });
+          lastClosedTriggered = false;
+          restartAgents = undefined;
+          if (signal.aborted) return;
+          this.#replaceClient(watcher, entry.socketPath);
+          await delay(reconnectDelayMs, signal);
+          continue;
+        }
+      } finally {
+        signal.removeEventListener("abort", stopSubscription);
       }
+      if (signal.aborted) return;
+      this.#replaceClient(watcher, entry.socketPath);
       if (restart) {
         reconnectCount = 0;
         continue;
       }
       reconnectCount = 0;
       await delay(this.#reconnectDelayMs, signal);
+    }
+  }
+
+  #replaceClient(watcher: Watcher, socketPath: string): void {
+    watcher.client.close();
+    watcher.client = this.#clientFactory({ socketPath });
+  }
+
+  async #handleWatchEvent(entry: HerdrSessionListEntry, event: unknown): Promise<void> {
+    const result = this.#index.handleHerdrEventFast
+      ? await this.#index.handleHerdrEventFast({
+          event,
+          herdrSessionName: entry.name,
+          sessionDir: entry.sessionDir,
+          socketPath: entry.socketPath,
+        })
+      : await this.#index.handleHerdrEvent({
+          event,
+          herdrSessionName: entry.name,
+          sessionDir: entry.sessionDir,
+          socketPath: entry.socketPath,
+        });
+    this.#publishResult({
+      agents: this.#agents.listForHerdrSession(entry.name),
+      herdrSessionName: entry.name,
+      ...result,
+    });
+    if ("statusEventPlans" in result && Array.isArray(result.statusEventPlans)) {
+      for (const plan of result.statusEventPlans) {
+        this.#submitPlan(plan);
+      }
     }
   }
 
@@ -384,14 +413,34 @@ async function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function shouldRestartSubscription(type: unknown): boolean {
-  return (
-    type === "pane.agent_detected" ||
-    type === "pane.closed" ||
-    type === "pane.created" ||
-    type === "pane.moved" ||
-    type === "workspace.closed"
+function isTopologyEvent(type: unknown): boolean {
+  return (HERDR_TOPOLOGY_EVENT_TYPES as readonly string[]).includes(type as string);
+}
+
+function closedHitsLivePane(
+  event: Record<string, unknown>,
+  agents: ReadonlyArray<{ paneId: string; paneGeneration?: string | null }>,
+): boolean {
+  const paneId = stringValue(event.pane_id) ?? stringValue(event.paneId);
+  if (!paneId) return false;
+  const generation = stringValue(event.pane_generation) ?? stringValue(event.paneGeneration);
+  return agents.some(
+    (agent) =>
+      agent.paneId === paneId && (generation == null || agent.paneGeneration === generation),
   );
+}
+
+function stringValue(value: unknown): string | null {
+  return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+function containsNewPaneId(
+  agents: ReadonlyArray<{ paneId: string }>,
+  subscribedPaneIds: readonly string[],
+): boolean {
+  if (agents.length === 0) return false;
+  const subscribed = new Set(subscribedPaneIds);
+  return agents.some((agent) => !subscribed.has(agent.paneId));
 }
 
 function record(value: unknown): Record<string, unknown> {

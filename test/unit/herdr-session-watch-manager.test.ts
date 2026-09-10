@@ -371,6 +371,7 @@ describe("HerdrSessionWatchManager", () => {
         close() {},
         async *subscribeEvents(_params, options) {
           yield { agent_status: "done", pane_id: "wB:p2", type: "pane.agent_status_changed" };
+          if (options?.signal?.aborted) return;
           await new Promise<void>((resolve) =>
             options?.signal?.addEventListener("abort", () => resolve(), { once: true }),
           );
@@ -419,6 +420,7 @@ describe("HerdrSessionWatchManager", () => {
         close() {},
         async *subscribeEvents(_params, options) {
           yield { agent_status: "done", pane_id: "wB:p2", type: "pane.agent_status_changed" };
+          if (options?.signal?.aborted) return;
           await new Promise<void>((resolve) =>
             options?.signal?.addEventListener("abort", () => resolve(), { once: true }),
           );
@@ -548,7 +550,425 @@ describe("HerdrSessionWatchManager", () => {
       "event:wB",
     ]);
   });
+
+  for (const topologyType of ["pane.created", "pane.agent_detected"] as const) {
+    test(`restarts subscription after ${topologyType} so the new pane is included`, async () => {
+      const harness = openObservabilityDbHarness();
+      const subscribed: string[][] = [];
+      let refreshCalls = 0;
+      const manager = managerFor(harness, {
+        clientFactory: () => ({
+          close() {},
+          async *subscribeEvents(params, options) {
+            subscribed.push([...(params?.paneIds ?? [])]);
+            if (subscribed.length === 1) {
+              yield { pane_id: "wB:p9", type: topologyType };
+            }
+            if (options?.signal?.aborted) return;
+            await new Promise<void>((resolve) => {
+              options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+            });
+          },
+        }),
+        index: {
+          async handleHerdrEvent() {
+            return { contextChangedScopes: [], events: [] };
+          },
+          async refreshHerdrSession() {
+            refreshCalls += 1;
+            if (refreshCalls === 1) return result([]);
+            return result([agentRecord("wB:p9", "wB", "working")]);
+          },
+        },
+        reconnectDelayMs: 0,
+      });
+      await manager.start();
+      await waitFor(() => subscribed.length === 2);
+      await manager.stop();
+      harness.sqlite.close();
+      expect(subscribed[0]).toEqual([]);
+      expect(subscribed[1]).toEqual(["wB:p9"]);
+    });
+  }
+
+  test("restarts the live subscription when a refresh discovers a new pane", async () => {
+    vi.useFakeTimers();
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    const subscribed: string[][] = [];
+    let refreshCalls = 0;
+    const manager = managerFor(harness, {
+      activeRevisionPollMs: 10,
+      fullRescanMs: 60_000,
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(params, options) {
+          subscribed.push([...(params?.paneIds ?? [])]);
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }),
+      index: {
+        async handleHerdrEvent() {
+          return { contextChangedScopes: [], events: [] };
+        },
+        async refreshHerdrSession() {
+          refreshCalls += 1;
+          if (refreshCalls === 1) {
+            return result([agentRecord("wB:p2", "wB", "working")]);
+          }
+          return result([
+            agentRecord("wB:p2", "wB", "working"),
+            { ...agentRecord("wB:p3", "wB", "working"), id: "ag_2", paneId: "wB:p3" },
+          ]);
+        },
+      },
+    });
+    await manager.start();
+    for (let index = 0; index < 50 && subscribed.length === 0; index += 1) await Promise.resolve();
+    expect(subscribed).toEqual([["wB:p2"]]);
+    await vi.advanceTimersByTimeAsync(10);
+    for (let index = 0; index < 50 && subscribed.length < 2; index += 1) await Promise.resolve();
+    expect(subscribed[1]).toEqual(["wB:p2", "wB:p3"]);
+    await manager.stop();
+    harness.sqlite.close();
+  });
+
+  test("second connection idle after created and working refresh delivers agent.idle", async () => {
+    const harness = openObservabilityDbHarness();
+    const subscribed: string[][] = [];
+    const handled: { event: unknown; stream: number }[] = [];
+    const received: unknown[] = [];
+    let refreshCalls = 0;
+    const idleEvent = { ...event(), type: "agent.idle" as const, paneId: "wB:p9" };
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(params, options) {
+          const paneIds = [...(params?.paneIds ?? [])];
+          subscribed.push(paneIds);
+          const stream = subscribed.length;
+          // Stream 1 (paneIds=[]) is topology-only. Even if working/idle are
+          // offered here, pane-specific filtering must drop them.
+          const offered =
+            stream === 1
+              ? [
+                  { pane_id: "wB:p9", type: "pane.created" },
+                  {
+                    agent_status: "working",
+                    pane_id: "wB:p9",
+                    type: "pane.agent_status_changed",
+                  },
+                  {
+                    agent_status: "idle",
+                    pane_id: "wB:p9",
+                    type: "pane.agent_status_changed",
+                  },
+                ]
+              : [
+                  {
+                    agent_status: "idle",
+                    pane_id: "wB:p9",
+                    type: "pane.agent_status_changed",
+                  },
+                ];
+          for (const event of herdrEventsForSubscription(paneIds, offered)) {
+            yield taggedWatchEvent(event, stream);
+          }
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }),
+      index: {
+        async handleHerdrEventFast(input?: { event: unknown }) {
+          const record = (input?.event ?? {}) as {
+            agent_status?: string;
+            stream?: number;
+          };
+          handled.push({ event: input?.event, stream: record.stream ?? 0 });
+          if (record.agent_status !== "idle") {
+            return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+          }
+          return {
+            agents: [],
+            contextChangedScopes: [],
+            events: [],
+            statusEventPlans: [testPlan(agentRecord("wB:p9", "wB", "working"), undefined)],
+          };
+        },
+        async refreshHerdrSessionFast() {
+          refreshCalls += 1;
+          if (refreshCalls === 1) {
+            return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+          }
+          return {
+            agents: [agentRecord("wB:p9", "wB", "working")],
+            contextChangedScopes: [],
+            events: [],
+            statusEventPlans: [],
+          };
+        },
+        executeStatusEventPlan: async () => idleEvent,
+      },
+      onAgentEvent: (item) => received.push(item),
+      reconnectDelayMs: 0,
+    });
+    await manager.start();
+    await waitFor(() => received.length > 0 && subscribed.length >= 2);
+    await manager.stop();
+    harness.sqlite.close();
+    expect(subscribed[0]).toEqual([]);
+    expect(subscribed[1]).toEqual(["wB:p9"]);
+    expect(
+      handled.filter(
+        (item) => (item.event as { type?: string }).type === "pane.agent_status_changed",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        stream: 2,
+        event: expect.objectContaining({ agent_status: "idle", pane_id: "wB:p9" }),
+      }),
+    ]);
+    expect(received).toContainEqual(expect.objectContaining({ type: "agent.idle" }));
+  });
+
+  test("does not invent working-to-idle when first refresh of a created pane is already idle", async () => {
+    const harness = openObservabilityDbHarness();
+    const subscribed: string[][] = [];
+    const received: unknown[] = [];
+    let planCalls = 0;
+    let refreshCalls = 0;
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(params, options) {
+          const paneIds = [...(params?.paneIds ?? [])];
+          subscribed.push(paneIds);
+          // Stream 1: topology only. Stream 2 may include the new pane_id, but
+          // herdr does not replay status for a pane that is already idle.
+          for (const event of herdrEventsForSubscription(
+            paneIds,
+            subscribed.length === 1 ? [{ pane_id: "wB:p9", type: "pane.created" }] : [],
+          )) {
+            yield event;
+          }
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }),
+      index: {
+        async handleHerdrEventFast() {
+          return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+        },
+        async refreshHerdrSessionFast() {
+          refreshCalls += 1;
+          if (refreshCalls === 1) {
+            return { agents: [], contextChangedScopes: [], events: [], statusEventPlans: [] };
+          }
+          return {
+            agents: [agentRecord("wB:p9", "wB", "idle")],
+            contextChangedScopes: [],
+            events: [],
+            statusEventPlans: [],
+          };
+        },
+        executeStatusEventPlan: async () => {
+          planCalls += 1;
+          return { ...event(), type: "agent.idle" as const };
+        },
+      },
+      onAgentEvent: (item) => received.push(item),
+      reconnectDelayMs: 0,
+    });
+    await manager.start();
+    await waitFor(() => subscribed.length >= 2);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await manager.stop();
+    harness.sqlite.close();
+    expect(subscribed[0]).toEqual([]);
+    expect(subscribed[1]).toEqual(["wB:p9"]);
+    expect(planCalls).toBe(0);
+    expect(received).toEqual([]);
+  });
+
+  test("does not resubscribe in a loop when the next connection replays historical topology", async () => {
+    const harness = openObservabilityDbHarness();
+    const subscribed: string[][] = [];
+    let refreshCalls = 0;
+    const historical = [
+      { pane_id: "wB:p9", type: "pane.created" },
+      { pane_id: "wB:p9", type: "pane.moved" },
+    ];
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(params, options) {
+          const paneIds = [...(params?.paneIds ?? [])];
+          subscribed.push(paneIds);
+          for (const event of herdrEventsForSubscription(paneIds, historical)) {
+            if (options?.signal?.aborted) return;
+            yield event;
+          }
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }),
+      index: {
+        async handleHerdrEvent() {
+          return { contextChangedScopes: [], events: [] };
+        },
+        async refreshHerdrSession() {
+          refreshCalls += 1;
+          if (refreshCalls === 1) return result([]);
+          return result([agentRecord("wB:p9", "wB", "working")]);
+        },
+      },
+      reconnectDelayMs: 0,
+    });
+    await manager.start();
+    await waitFor(() => subscribed.length >= 2);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await manager.stop();
+    harness.sqlite.close();
+    expect(subscribed[0]).toEqual([]);
+    expect(subscribed[1]).toEqual(["wB:p9"]);
+    expect(subscribed).toHaveLength(2);
+  });
+
+  test("does not restart after pane.moved when refresh has no new pane", async () => {
+    const harness = openObservabilityDbHarness();
+    const subscribed: string[][] = [];
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(params, options) {
+          subscribed.push([...(params?.paneIds ?? [])]);
+          if (subscribed.length === 1) {
+            yield { pane_id: "wB:p2", type: "pane.moved" };
+            yield { pane_id: "wB:p2", type: "pane.created" };
+          }
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }),
+      index: {
+        async handleHerdrEvent() {
+          return { contextChangedScopes: [], events: [] };
+        },
+        async refreshHerdrSession() {
+          return result([agentRecord("wB:p2", "wB", "working")]);
+        },
+      },
+      reconnectDelayMs: 0,
+    });
+    await manager.start();
+    await waitFor(() => subscribed.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await manager.stop();
+    harness.sqlite.close();
+    expect(subscribed).toEqual([["wB:p2"]]);
+  });
+
+  test("ignores a generation-less pane.closed while the pane is still live", async () => {
+    const harness = openObservabilityDbHarness();
+    const handled: unknown[] = [];
+    const subscribed: string[][] = [];
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(params, options) {
+          subscribed.push([...(params?.paneIds ?? [])]);
+          if (subscribed.length === 1) {
+            yield { pane_id: "wB:p2", type: "pane.closed" };
+          }
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }),
+      index: {
+        async handleHerdrEvent(input?: { event: unknown }) {
+          handled.push(input?.event);
+          return { contextChangedScopes: [], events: [] };
+        },
+        async refreshHerdrSession() {
+          return result([agentRecord("wB:p2", "wB", "working")]);
+        },
+      },
+      reconnectDelayMs: 0,
+    });
+    await manager.start();
+    await waitFor(() => subscribed.length === 1);
+    await new Promise((resolve) => setTimeout(resolve, 40));
+    await manager.stop();
+    harness.sqlite.close();
+    expect(handled).toEqual([]);
+    expect(subscribed).toEqual([["wB:p2"]]);
+  });
+
+  test("applies pane.closed after refresh shows the pane is gone", async () => {
+    const harness = openObservabilityDbHarness();
+    const handled: unknown[] = [];
+    let refreshCalls = 0;
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {},
+        async *subscribeEvents(_params, options) {
+          yield { pane_id: "wB:p2", type: "pane.closed" };
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) => {
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true });
+          });
+        },
+      }),
+      index: {
+        async handleHerdrEvent(input?: { event: unknown }) {
+          handled.push(input?.event);
+          return { contextChangedScopes: [], events: [] };
+        },
+        async refreshHerdrSession() {
+          refreshCalls += 1;
+          if (refreshCalls === 1) return result([agentRecord("wB:p2", "wB", "working")]);
+          return result([]);
+        },
+      },
+      reconnectDelayMs: 0,
+    });
+    await manager.start();
+    await waitFor(() => handled.length > 0);
+    await manager.stop();
+    harness.sqlite.close();
+    expect(handled).toContainEqual(
+      expect.objectContaining({ pane_id: "wB:p2", type: "pane.closed" }),
+    );
+  });
 });
+
+/** Herdr only emits pane.agent_status_changed for pane-specific subscriptions. */
+function herdrEventsForSubscription(
+  paneIds: readonly string[],
+  events: Array<Record<string, unknown>>,
+): Array<Record<string, unknown>> {
+  return events.filter((event) => {
+    if (event.type !== "pane.agent_status_changed") return true;
+    return typeof event.pane_id === "string" && paneIds.includes(event.pane_id);
+  });
+}
+
+function taggedWatchEvent(event: Record<string, unknown>, stream: number): Record<string, unknown> {
+  return { ...event, stream };
+}
 
 function managerFor(
   harness: ReturnType<typeof openObservabilityDbHarness>,

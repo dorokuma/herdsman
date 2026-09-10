@@ -195,9 +195,119 @@ describe("HerdrSocketClient", () => {
     expect(requests[0]).toMatchObject({
       method: "events.subscribe",
       params: {
-        subscriptions: [{ type: "pane.agent_status_changed", pane_id: "w1:p1" }],
+        subscriptions: [
+          { type: "pane.created" },
+          { type: "pane.closed" },
+          { type: "pane.moved" },
+          { type: "pane.agent_detected" },
+          { type: "workspace.closed" },
+          { type: "pane.agent_status_changed", pane_id: "w1:p1" },
+        ],
       },
     });
+  });
+
+  test("subscribes to topology events even when no pane ids are known yet", async () => {
+    const { requests, socketPath } = await openFakeHerdrServer((socket, request) => {
+      socket.write(encodeJsonLine({ id: request.id, result: { subscribed: true } }));
+      socket.write(
+        encodeJsonLine({
+          data: { pane_id: "w1:p2", workspace_id: "w1" },
+          event: "pane.created",
+        }),
+      );
+    });
+
+    const client = new HerdrSocketClient({ socketPath });
+    const controller = new AbortController();
+    const iterator = client
+      .subscribeEvents({}, { signal: controller.signal })
+      [Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toEqual({
+      done: false,
+      value: { pane_id: "w1:p2", type: "pane.created", workspace_id: "w1" },
+    });
+    controller.abort();
+    client.close();
+
+    expect(requests[0]).toMatchObject({
+      method: "events.subscribe",
+      params: {
+        subscriptions: [
+          { type: "pane.created" },
+          { type: "pane.closed" },
+          { type: "pane.moved" },
+          { type: "pane.agent_detected" },
+          { type: "workspace.closed" },
+        ],
+      },
+    });
+  });
+
+  test("refuses a second events.subscribe on the same connection", async () => {
+    const { requests, socketPath } = await openFakeHerdrServer((socket, request) => {
+      socket.write(encodeJsonLine({ id: request.id, result: { subscribed: true } }));
+    });
+
+    const client = new HerdrSocketClient({ socketPath });
+    const controller = new AbortController();
+    const iterator = client
+      .subscribeEvents({ paneIds: ["w1:p1"] }, { signal: controller.signal })
+      [Symbol.asyncIterator]();
+    await Promise.race([iterator.next(), new Promise<void>((resolve) => setTimeout(resolve, 50))]);
+    const second = client
+      .subscribeEvents({}, { signal: controller.signal })
+      [Symbol.asyncIterator]();
+    await expect(second.next()).rejects.toThrow("already has an events.subscribe");
+    controller.abort();
+    client.close();
+
+    expect(requests.filter((request) => request.method === "events.subscribe")).toHaveLength(1);
+  });
+
+  test("yields already-queued events after abort before ending the stream", async () => {
+    // Drain protects status already queued for panes this connection subscribed
+    // to (w1:p1). It is not a same-stream path for a newly created pane.
+    const { socketPath } = await openFakeHerdrServer((socket, request) => {
+      socket.write(encodeJsonLine({ id: request.id, result: { subscribed: true } }));
+      socket.write(
+        encodeJsonLine({
+          data: { agent_status: "working", pane_id: "w1:p1" },
+          event: "pane.agent_status_changed",
+        }),
+      );
+      socket.write(
+        encodeJsonLine({
+          data: { agent_status: "idle", pane_id: "w1:p1" },
+          event: "pane.agent_status_changed",
+        }),
+      );
+    });
+
+    const client = new HerdrSocketClient({ socketPath });
+    const controller = new AbortController();
+    const iterator = client
+      .subscribeEvents({ paneIds: ["w1:p1"] }, { signal: controller.signal })
+      [Symbol.asyncIterator]();
+    await expect(iterator.next()).resolves.toEqual({
+      done: false,
+      value: {
+        agent_status: "working",
+        pane_id: "w1:p1",
+        type: "pane.agent_status_changed",
+      },
+    });
+    controller.abort();
+    await expect(iterator.next()).resolves.toEqual({
+      done: false,
+      value: {
+        agent_status: "idle",
+        pane_id: "w1:p1",
+        type: "pane.agent_status_changed",
+      },
+    });
+    await expect(iterator.next()).resolves.toEqual({ done: true, value: undefined });
+    client.close();
   });
 
   test("rejects the event stream when the Herdr socket closes", async () => {

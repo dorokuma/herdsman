@@ -27,12 +27,22 @@ type EventSubscriber = {
   push(event: unknown): void;
 };
 
+/** Session-wide topology events that must be subscribed even when no pane ids are known yet. */
+export const HERDR_TOPOLOGY_EVENT_TYPES = [
+  "pane.created",
+  "pane.closed",
+  "pane.moved",
+  "pane.agent_detected",
+  "workspace.closed",
+] as const;
+
 export class HerdrSocketClient {
   readonly #decoder = new JsonLineDecoder();
   readonly #pending = new Map<HerdrRequestId, PendingRequest>();
   readonly #subscribers = new Set<EventSubscriber>();
   readonly #socket: Socket;
   readonly #socketPath: string;
+  #eventsSubscribed = false;
   #nextId = 1;
 
   constructor(options: HerdrSocketClientOptions) {
@@ -47,12 +57,30 @@ export class HerdrSocketClient {
     this.#socket.destroy();
   }
 
-  #request(method: string, params: unknown = {}): Promise<unknown> {
+  #request(method: string, params: unknown = {}, signal?: AbortSignal): Promise<unknown> {
+    if (signal?.aborted) {
+      return Promise.reject(new Error("Herdr request aborted"));
+    }
     const id = `herdsman-${this.#nextId}`;
     this.#nextId += 1;
 
     return new Promise((resolve, reject) => {
-      this.#pending.set(id, { reject, resolve });
+      const onAbort = () => {
+        if (!this.#pending.has(id)) return;
+        this.#pending.delete(id);
+        reject(new Error("Herdr request aborted"));
+      };
+      this.#pending.set(id, {
+        reject: (error) => {
+          signal?.removeEventListener("abort", onAbort);
+          reject(error);
+        },
+        resolve: (value) => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve(value);
+        },
+      });
+      signal?.addEventListener("abort", onAbort, { once: true });
       this.#socket.write(encodeJsonLine({ id, method, params }));
     });
   }
@@ -97,6 +125,11 @@ export class HerdrSocketClient {
     params: { paneIds?: string[] } = {},
     options: { signal?: AbortSignal } = {},
   ): AsyncIterable<unknown> {
+    // Herdr 0.9 / protocol 22 ACKs the first events.subscribe, then resets the
+    // socket if the same connection sends it again. Never re-subscribe here.
+    if (this.#eventsSubscribed) {
+      throw new Error("Herdr connection already has an events.subscribe");
+    }
     const queue: unknown[] = [];
     let failure: Error | undefined;
     let wake: (() => void) | undefined;
@@ -113,27 +146,41 @@ export class HerdrSocketClient {
       },
     };
     if (options.signal?.aborted) return;
+    this.#eventsSubscribed = true;
     this.#subscribers.add(subscriber);
     try {
-      await this.#request("events.subscribe", {
-        subscriptions: (params.paneIds ?? []).map((pane_id) => ({
-          pane_id,
-          type: "pane.agent_status_changed" as const,
-        })),
-      });
-      if (options.signal?.aborted) return;
-      while (!options.signal?.aborted) {
+      try {
+        await this.#request(
+          "events.subscribe",
+          {
+            subscriptions: [
+              ...HERDR_TOPOLOGY_EVENT_TYPES.map((type) => ({ type })),
+              ...(params.paneIds ?? []).map((pane_id) => ({
+                pane_id,
+                type: "pane.agent_status_changed" as const,
+              })),
+            ],
+          },
+          options.signal,
+        );
+      } catch (error) {
+        if (!options.signal?.aborted) throw error;
+      }
+      // Drain events already queued before honoring abort so a restart does
+      // not drop status already received for panes this connection subscribed
+      // to. New panes are not visible here: herdr only emits
+      // pane.agent_status_changed for pane-specific subscriptions.
+      while (true) {
         if (failure) throw failure;
-        if (queue.length === 0) {
-          await new Promise<void>((resolve) => {
-            wake = resolve;
-            options.signal?.addEventListener("abort", () => resolve(), { once: true });
-          });
-        }
-        if (failure) throw failure;
-        while (queue.length > 0) {
+        if (queue.length > 0) {
           yield queue.shift();
+          continue;
         }
+        if (options.signal?.aborted) return;
+        await new Promise<void>((resolve) => {
+          wake = resolve;
+          options.signal?.addEventListener("abort", () => resolve(), { once: true });
+        });
       }
     } finally {
       this.#subscribers.delete(subscriber);
