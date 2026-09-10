@@ -1,3 +1,9 @@
+## 0.11.3
+
+- 短命新 pane 通过先验 working→idle 唤醒 owner，避免错过 pane-specific 订阅窗口。
+- Herdr socket 禁止 wildcard status；同连接二次 subscribe 会 RST，订阅重启改走新连接；拓扑事件按 pane 过滤。
+- 接缝测试锁定 from=working→idle 唤醒路径。
+
 ## 0.11.2
 
 - discovery 会话根从 `/tmp/pi-role-sessions` 迁到 `/tmp/herdr-role-sessions/<herdr-session>/`，回退扫描按 own-session 子目录隔离，根除跨 session 错配。
