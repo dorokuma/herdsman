@@ -10,7 +10,7 @@ Herdsman は、Herdr で動く coding agent の状態を記録する daemon ベ�
 
 Herdr の `herdr agent read` は terminal stream や scrollback を読みます。Herdsman は agent の session data から作業状況、message の抜粋、compact tool result、未読の outcome を取得します。Herdsman は agent を操作しません。agent の start、prompt、wait、pane 操作、terminal control には公式 Herdr CLI または skill を使います。
 
-現在は Claude Code、Codex、Gemini CLI、OpenCode、Pi のセッション履歴の取得に対応しています。
+現在は Claude Code、Codex、Gemini CLI、OpenCode、Pi、Grok、Antigravity CLI のセッション履歴の取得に対応しています。
 
 ## 要件
 
@@ -108,8 +108,10 @@ agentが完了またはblockedになると、visibleなHerdsman turnを1回開�
 任意のpluginはGitHub Releaseのtagからインストールします。
 
 ```bash
-herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.6.0 --yes
+herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.11.4 --yes
 ```
+
+インストール済みの Herdsman CLI と同じバージョンの release tag を指定してください。
 
 plugin は Herdsman daemon に接続し、current Herdr workspace の compact agent row を Herdr UI に表示します。row には live name と runtime kind の column、cached history の抜粋が含まれます。Herdrはrepository subdirectoryからpluginをインストールします。npmには公開せず、CLIとPi extensionだけを使う場合は不要です。
 

@@ -17,7 +17,7 @@ Herdsman is a daemon-backed observability layer for coding agents running in Her
 
 Herdr's `herdr agent read` reads terminal streams or scrollback. Herdsman instead reads agent session data so callers can retrieve work status, structured message excerpts, compact tool results, and unread outcomes without parsing terminal output. Herdsman is read-only; use the official Herdr CLI or skill for agent start, prompts, waits, pane operations, and terminal control.
 
-Herdsman currently supports session history from Claude Code, Codex, Gemini CLI, OpenCode, and Pi.
+Herdsman currently supports session history from Claude Code, Codex, Gemini CLI, OpenCode, Pi, Grok, and Antigravity CLI.
 
 ## Requirements
 
@@ -115,8 +115,10 @@ Use `/herdsman` or `/herdsman status` to inspect the current Pi, and `/herdsman 
 Install the optional plugin from the GitHub release tag:
 
 ```bash
-herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.6.0 --yes
+herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.11.4 --yes
 ```
+
+Use the release tag that matches the installed Herdsman CLI version.
 
 The plugin connects to the Herdsman daemon and shows compact agent rows for the current Herdr workspace, including separate live-name and runtime-kind columns plus cached history excerpts. Herdr installs it from the repository subdirectory; it is not published to npm or required for the CLI and Pi extension.
 

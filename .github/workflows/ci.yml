@@ -18,5 +18,4 @@ jobs:
           # passthrough, so keep the explicit step to preserve --ignore-scripts
           install: false
       - run: pnpm install --ignore-scripts
-      - run: pnpm typecheck
-      - run: pnpm test
+      - run: pnpm check
