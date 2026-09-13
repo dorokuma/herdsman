@@ -1,4 +1,5 @@
 import { agentIdentityLabel } from "./agent-display.js";
+import { sanitizeText } from "./sanitize-text.js";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
@@ -1162,8 +1163,8 @@ export function formatHiddenAgentContext(input: {
       });
       return [
         `- ${identity} ${agent.paneId ?? "unknown"} ${agent.agentStatus ?? "unknown"}`,
-        `  last user: ${oneLine(history.lastUserMessage?.text ?? "")}`,
-        `  last assistant: ${oneLine(history.lastAssistantMessage?.text ?? "")}`,
+        `  last user: ${oneLine(sanitizeText(history.lastUserMessage?.text ?? "").text)}`,
+        `  last assistant: ${oneLine(sanitizeText(history.lastAssistantMessage?.text ?? "").text)}`,
       ].join("\n");
     }),
     "Use herdsman agent get/read if details are needed.",
@@ -1182,7 +1183,7 @@ export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string
       });
       return [
         `- ${event.type} ${identity} ${event.paneId ?? "unknown"}`,
-        `  last assistant: ${oneLine(history.lastAssistantMessage?.text ?? "")}`,
+        `  last assistant: ${oneLine(sanitizeText(history.lastAssistantMessage?.text ?? "").text)}`,
         `  event: ${event.id}`,
       ].join("\n");
     }),

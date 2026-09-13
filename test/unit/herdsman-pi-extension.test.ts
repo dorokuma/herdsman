@@ -151,6 +151,30 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(unsafe).toContain("- Codex wB:p1 idle");
     expect(unsafe).not.toContain("[SYSTEM]");
 
+    const secret = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "Authorization: Bearer super-secret-token sk-abcdefghijklmnopqrstuvwxyz",
+            },
+            lastUserMessage: { text: "password=hunter2 token=abc123" },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(secret).toContain("password=[REDACTED]");
+    expect(secret).toContain("token=[REDACTED]");
+    expect(secret).toContain("Authorization: Bearer [REDACTED]");
+    expect(secret).toContain("sk-[REDACTED]");
+    expect(secret).not.toContain("hunter2");
+    expect(secret).not.toContain("super-secret-token");
+    expect(secret).not.toContain("sk-abcdefghijklmnopqrstuvwxyz");
+
     const updates = formatHiddenAgentUpdates([
       event(1, "term_agent", { payload: { name: "reviewer" } }),
     ]);

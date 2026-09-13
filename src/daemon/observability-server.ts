@@ -43,6 +43,7 @@ import {
   JsonLineDecoder,
   JsonLineFrameTooLargeError,
 } from "@/shared/json-lines.js";
+import { linuxPeerPid, peerBoundToPaneCwd } from "@/shared/unix-peercred.js";
 
 export const DISCONNECT_GRACE_MS = 5_000;
 export const STARTUP_RECONNECT_GRACE_MS = 10_000;
@@ -96,6 +97,7 @@ export class ObservabilityRpcServer {
   #heartbeatTimer: IntervalHandle | undefined;
   readonly #now: () => number;
   readonly #orchestrator: AgentOrchestratorService;
+  readonly #peerPidOf: (socket: Socket) => number | undefined;
   readonly #piPresenceBySocket = new Map<Socket, PiPresence>();
   readonly #socketsByTerminal = new Map<string, Set<Socket>>();
   readonly #registerPiSessionRef: (input: {
@@ -130,6 +132,7 @@ export class ObservabilityRpcServer {
     history: AgentHistoryService;
     now?: () => number;
     orchestrator: AgentOrchestratorService;
+    peerPidOf?: (socket: Socket) => number | undefined;
     registerPiSessionRef?: (input: {
       herdrSessionName: string;
       sessionRef: PiPresenceRegistration["sessionRef"];
@@ -158,6 +161,7 @@ export class ObservabilityRpcServer {
     this.#history = options.history;
     this.#now = options.now ?? Date.now;
     this.#orchestrator = options.orchestrator;
+    this.#peerPidOf = options.peerPidOf ?? linuxPeerPid;
     this.#registerPiSessionRef =
       options.registerPiSessionRef ?? (async () => ({ contextChangedScopes: [] }));
     this.#resolvePaneIdentity = options.resolvePaneIdentity ?? resolveHerdrPaneIdentity;
@@ -383,7 +387,7 @@ export class ObservabilityRpcServer {
       case "agent.orchestrator.register": {
         assertSchema(agentOrchestratorRegisterInputSchema, params);
         const previous = this.#piPresenceBySocket.get(socket);
-        const presence = await this.#resolvePiPresence(params as PiPresenceRegistration);
+        const presence = await this.#resolvePiPresence(socket, params as PiPresenceRegistration);
         if (previous) this.#unregisterTerminalSocket(socket, previous);
         this.#piPresenceBySocket.set(socket, presence);
         this.#registerTerminalSocket(socket, presence);
@@ -454,7 +458,7 @@ export class ObservabilityRpcServer {
     }
   }
 
-  async #resolvePiPresence(input: PiPresenceRegistration): Promise<PiPresence> {
+  async #resolvePiPresence(socket: Socket, input: PiPresenceRegistration): Promise<PiPresence> {
     const session = this.#stores.herdrSessions.findRunningBySocketPath(input.herdrSocketPath);
     if (!session) throw new Error("Herdr socket is not registered as a running session");
     const indexed = this.#stores.agents.findByPane({
@@ -462,7 +466,7 @@ export class ObservabilityRpcServer {
       paneId: input.paneId,
     });
     if (indexed?.workspaceId === input.workspaceId && indexed.terminalId) {
-      return {
+      const presence = {
         connectedAt: this.#now(),
         herdrSessionName: session.name,
         paneId: indexed.paneId,
@@ -470,6 +474,11 @@ export class ObservabilityRpcServer {
         terminalId: indexed.terminalId,
         workspaceId: indexed.workspaceId,
       };
+      this.#assertConnectorBoundToPane(
+        socket,
+        await this.#tryPaneIdentity(session.socketPath, input.paneId),
+      );
+      return presence;
     }
 
     try {
@@ -477,7 +486,7 @@ export class ObservabilityRpcServer {
         paneId: input.paneId,
         socketPath: session.socketPath,
       });
-      return {
+      const presence = {
         connectedAt: this.#now(),
         herdrSessionName: session.name,
         paneId: live.paneId,
@@ -485,12 +494,48 @@ export class ObservabilityRpcServer {
         terminalId: live.terminalId,
         workspaceId: live.workspaceId,
       };
-    } catch {
+      this.#assertConnectorBoundToPane(socket, live);
+      return presence;
+    } catch (error) {
+      if (error instanceof ConnectorPaneMismatchError) throw error;
       if (!indexed) throw new Error("Herdr pane is not indexed yet");
       if (indexed.workspaceId !== input.workspaceId) {
         throw new Error("Pi presence workspace does not match indexed Herdr pane");
       }
       throw new Error("Herdr pane has no terminal identity");
+    }
+  }
+
+  async #tryPaneIdentity(
+    socketPath: string,
+    paneId: string,
+  ): Promise<HerdrPaneIdentity | undefined> {
+    try {
+      return await this.#resolvePaneIdentity({ paneId, socketPath });
+    } catch {
+      return undefined;
+    }
+  }
+
+  #assertConnectorBoundToPane(
+    socket: Socket,
+    pane: Pick<HerdrPaneIdentity, "cwd" | "foregroundCwd"> | undefined,
+  ): void {
+    const paneCwd = pane?.cwd ?? pane?.foregroundCwd;
+    if (!pane || !paneCwd) {
+      console.warn("Herdsman could not resolve Herdr pane cwd for connector binding");
+      return;
+    }
+    const peerPid = this.#peerPidOf(socket);
+    if (peerPid === undefined) {
+      console.warn("Herdsman could not read UDS peer pid for pane binding");
+      return;
+    }
+    const bound =
+      (pane.cwd !== undefined && peerBoundToPaneCwd(peerPid, pane.cwd)) ||
+      (pane.foregroundCwd !== undefined && peerBoundToPaneCwd(peerPid, pane.foregroundCwd));
+    if (!bound) {
+      throw new ConnectorPaneMismatchError();
     }
   }
 
@@ -701,6 +746,13 @@ export class ObservabilityRpcServer {
     throw new Error(
       "agent scope requires current Herdr workspace, --workspace, --session, or --all",
     );
+  }
+}
+
+class ConnectorPaneMismatchError extends Error {
+  constructor() {
+    super("Connector process does not match Herdr pane");
+    this.name = "ConnectorPaneMismatchError";
   }
 }
 

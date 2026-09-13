@@ -17,7 +17,7 @@ import { PiHistoryReader } from "./pi-reader.js";
 import type { AgentHistoryReader } from "./readers.js";
 import { statSourceFingerprint } from "./source-fingerprint.js";
 
-export const agentHistoryFormatterVersion = "agent-history-v2";
+export const agentHistoryFormatterVersion = "agent-history-v3";
 
 type CacheLike = Pick<AgentHistoryCacheStore, "getFresh" | "put">;
 type Discovery = (input: AgentHistoryLookupInput) => Promise<AgentHistoryRef | null>;

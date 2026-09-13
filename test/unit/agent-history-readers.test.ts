@@ -7,6 +7,7 @@ import { CodexHistoryReader } from "@/agent-history/codex-reader.js";
 import { GeminiHistoryReader } from "@/agent-history/gemini-reader.js";
 import { GrokHistoryReader } from "@/agent-history/grok-reader.js";
 import { OpenCodeHistoryReader } from "@/agent-history/opencode-reader.js";
+import { JsonlTooLargeError, readJsonl, UnstableJsonlError } from "@/agent-history/readers.js";
 import { createAgentHistoryService } from "@/agent-history/service.js";
 
 const tempDirs: string[] = [];
@@ -290,5 +291,96 @@ describe("GeminiHistoryReader", () => {
         { limit: 10 },
       ),
     ).resolves.toEqual([]);
+  });
+});
+
+describe("readJsonl", () => {
+  test("streams lines from a file within the size cap", async () => {
+    const homeDir = await tempHome("herdsman-jsonl-cap-");
+    const path = join(homeDir, "chat.jsonl");
+    await writeFile(
+      path,
+      `${JSON.stringify({ type: "user", content: "ok" })}\n${JSON.stringify({ type: "assistant", content: "done" })}\n`,
+    );
+    await expect(readJsonl(path)).resolves.toEqual([
+      { line: 1, value: { type: "user", content: "ok" } },
+      { line: 2, value: { type: "assistant", content: "done" } },
+    ]);
+  });
+
+  test("reads a tail window from an oversized file so later limit trimming still has history", async () => {
+    const homeDir = await tempHome("herdsman-jsonl-tail-");
+    const path = join(homeDir, "huge.jsonl");
+    const dropped = `${JSON.stringify({ type: "user", content: "old" })}\n`;
+    const keptUser = JSON.stringify({ type: "user", content: "recent" });
+    const keptAssistant = JSON.stringify({ type: "assistant", content: "kept" });
+    const kept = `${keptUser}\n${keptAssistant}\n`;
+    const padding = `${"x".repeat(80)}\n`;
+    await writeFile(path, `${dropped}${padding}${kept}`);
+    const maxBytes = Buffer.byteLength(kept, "utf8") + 10;
+    const entries = await readJsonl(path, { maxBytes });
+    expect(entries.map((entry) => entry.value)).toEqual([
+      { type: "user", content: "recent" },
+      { type: "assistant", content: "kept" },
+    ]);
+    const limited = entries.slice(Math.max(0, entries.length - 1));
+    expect(limited).toEqual([
+      { line: expect.any(Number), value: { type: "assistant", content: "kept" } },
+    ]);
+  });
+
+  test("still treats a malformed final record as an unstable tail", async () => {
+    const homeDir = await tempHome("herdsman-jsonl-unstable-");
+    const path = join(homeDir, "tail.jsonl");
+    await writeFile(path, `${JSON.stringify({ type: "user", content: "ok" })}\n{\n`);
+    await expect(readJsonl(path)).rejects.toBeInstanceOf(UnstableJsonlError);
+  });
+
+  test("throws JsonlTooLargeError when a single record exceeds the tail window", async () => {
+    const homeDir = await tempHome("herdsman-jsonl-one-line-");
+    const path = join(homeDir, "huge-line.jsonl");
+    const record = JSON.stringify({ type: "user", content: "x".repeat(200) });
+    await writeFile(path, `${record}\n`);
+    const maxBytes = 40;
+    await expect(readJsonl(path, { maxBytes })).rejects.toBeInstanceOf(JsonlTooLargeError);
+  });
+
+  test("rethrows stream errors after a successful stat", async () => {
+    const homeDir = await tempHome("herdsman-jsonl-stream-error-");
+    await expect(readJsonl(homeDir)).rejects.toMatchObject({ code: "EISDIR" });
+  });
+});
+
+describe("history body sanitization", () => {
+  test("redacts secrets in user and assistant JSONL bodies", async () => {
+    const homeDir = await tempHome("herdsman-jsonl-sanitize-");
+    const path = join(homeDir, "chat_history.jsonl");
+    await writeFile(
+      path,
+      `${[
+        { type: "user", content: "password=hunter2 please use sk-abcdefghijklmnopqrstuvwxyz" },
+        { type: "assistant", content: "Authorization: Bearer super-secret-token" },
+      ]
+        .map((entry) => JSON.stringify(entry))
+        .join("\n")}\n`,
+    );
+    const messages = await new GrokHistoryReader().read({
+      kind: "discovered_file",
+      path,
+      source: "grok-jsonl",
+      value: path,
+    });
+    expect(messages).toEqual([
+      expect.objectContaining({
+        role: "user",
+        text: "password=[REDACTED] please use sk-[REDACTED]",
+      }),
+      expect.objectContaining({
+        role: "assistant",
+        text: "Authorization: Bearer [REDACTED]",
+      }),
+    ]);
+    expect(messages.map((message) => message.text).join("\n")).not.toContain("hunter2");
+    expect(messages.map((message) => message.text).join("\n")).not.toContain("super-secret-token");
   });
 });

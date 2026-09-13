@@ -1,0 +1,24 @@
+{
+  "type": "pane_info",
+  "pane": {
+    "agent": "pi",
+    "agent_session": null,
+    "agent_status": "idle",
+    "cwd": "/root/herdsman",
+    "display_agent": "pi",
+    "focused": true,
+    "foreground_cwd": "/root/herdsman",
+    "label": null,
+    "pane_id": "wB:p2",
+    "revision": 3,
+    "scroll": null,
+    "state_labels": {},
+    "tab_id": "wB:t1",
+    "terminal_id": "term_2",
+    "terminal_title": null,
+    "terminal_title_stripped": null,
+    "title": null,
+    "tokens": {},
+    "workspace_id": "wB"
+  }
+}

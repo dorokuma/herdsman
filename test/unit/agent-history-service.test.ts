@@ -345,7 +345,7 @@ describe("agent history service", () => {
     );
     expect(put).toHaveBeenCalledWith(
       expect.objectContaining({
-        formatterVersion: "agent-history-v2",
+        formatterVersion: "agent-history-v3",
         sourcePath: path,
       }),
     );

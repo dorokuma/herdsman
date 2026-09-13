@@ -4,6 +4,10 @@ export type HerdrPaneIdentity = {
   paneId: string;
   terminalId: string;
   workspaceId: string;
+  agent?: string;
+  cwd?: string;
+  foregroundCwd?: string;
+  tabId?: string;
 };
 
 type PaneClient = Pick<HerdrSocketClient, "close" | "getPane">;
@@ -25,7 +29,19 @@ export async function resolveHerdrPaneIdentity(input: {
     if (!paneId || !terminalId || !workspaceId) {
       throw new Error("Herdr pane response has no terminal identity");
     }
-    return { paneId, terminalId, workspaceId };
+    const agent = stringField(pane, "agent", "agent");
+    const cwd = stringField(pane, "cwd", "cwd");
+    const foregroundCwd = stringField(pane, "foreground_cwd", "foregroundCwd");
+    const tabId = stringField(pane, "tab_id", "tabId");
+    return {
+      paneId,
+      terminalId,
+      workspaceId,
+      ...(agent ? { agent } : {}),
+      ...(cwd ? { cwd } : {}),
+      ...(foregroundCwd ? { foregroundCwd } : {}),
+      ...(tabId ? { tabId } : {}),
+    };
   } finally {
     client.close();
   }

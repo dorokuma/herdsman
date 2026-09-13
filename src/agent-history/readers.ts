@@ -1,11 +1,17 @@
-import { readFile, stat } from "node:fs/promises";
+import { createReadStream } from "node:fs";
+import { stat } from "node:fs/promises";
+import { createInterface } from "node:readline";
 import type {
   AgentHistoryMessage,
   AgentHistoryRef,
   CompactAgentHistory,
 } from "@/observability/contracts.js";
+import { sanitizeText } from "./text.js";
 
 export type JsonlEntry = { line: number; value: Record<string, unknown> };
+
+/** Cap JSONL reads; larger files are consumed from a tail window of this size. */
+export const JSONL_MAX_BYTES = 32 * 1024 * 1024;
 
 /** A writer can leave a partial final record while message_end is firing. */
 export class UnstableJsonlError extends Error {
@@ -15,42 +21,85 @@ export class UnstableJsonlError extends Error {
   }
 }
 
+export class JsonlTooLargeError extends Error {
+  constructor(readonly details: { maxBytes: number; size: number }) {
+    super(`JSONL file exceeds maximum size (${details.size} > ${details.maxBytes} bytes)`);
+    this.name = "JsonlTooLargeError";
+  }
+}
+
 export type AgentHistoryReader = {
   canRead(ref: AgentHistoryRef): boolean;
   read(ref: AgentHistoryRef, options: { limit?: number }): Promise<AgentHistoryMessage[]>;
   readCompact(ref: AgentHistoryRef): Promise<CompactAgentHistory>;
 };
 
-export async function readJsonl(path: string): Promise<JsonlEntry[]> {
-  const [content, metadata] = await Promise.all([readFile(path, "utf8"), stat(path)]);
-  const entries: JsonlEntry[] = [];
-  const lines = content.split(/\r?\n/);
-  let malformedLines = 0;
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    if (!line || line.trim().length === 0) continue;
-    try {
-      const parsed = JSON.parse(line) as unknown;
-      if (typeof parsed === "object" && parsed !== null) {
-        entries.push({ line: index + 1, value: parsed as Record<string, unknown> });
-      }
-    } catch {
-      malformedLines += 1;
-    }
+export async function readJsonl(
+  path: string,
+  options: { maxBytes?: number } = {},
+): Promise<JsonlEntry[]> {
+  const maxBytes = options.maxBytes ?? JSONL_MAX_BYTES;
+  const metadata = await stat(path);
+  const start = metadata.size > maxBytes ? metadata.size - maxBytes : 0;
+  if (start > 0) {
+    console.warn("Herdsman reading JSONL tail window to stay within size cap", {
+      maxBytes,
+      path,
+      size: metadata.size,
+    });
   }
+
+  const input = createReadStream(path, { encoding: "utf8", start });
+  let streamError: Error | undefined;
+  input.on("error", (error: Error) => {
+    streamError = error;
+  });
+  const lines = createInterface({ crlfDelay: Infinity, input });
+  const entries: JsonlEntry[] = [];
+  let malformedLines = 0;
+  let lineNumber = 0;
+  let skipPartialLead = start > 0;
+  let tailMalformed = false;
+
+  try {
+    for await (const line of lines) {
+      if (skipPartialLead) {
+        skipPartialLead = false;
+        continue;
+      }
+      lineNumber += 1;
+      if (!line || line.trim().length === 0) continue;
+      try {
+        const parsed = JSON.parse(line) as unknown;
+        if (typeof parsed === "object" && parsed !== null) {
+          entries.push({ line: lineNumber, value: parsed as Record<string, unknown> });
+        }
+        tailMalformed = false;
+      } catch {
+        malformedLines += 1;
+        tailMalformed = true;
+      }
+    }
+  } finally {
+    lines.close();
+    input.destroy();
+  }
+
+  if (streamError) throw streamError;
+
   // Only the tail can be transient: malformed historical records remain
   // observable, but a malformed final record must not be mistaken for no data.
-  const tail = lines.findLastIndex((line) => line.trim().length > 0);
-  if (malformedLines > 0 && tail >= 0) {
-    try {
-      JSON.parse(lines[tail] ?? "");
-    } catch {
-      throw new UnstableJsonlError({
-        malformedLines,
-        size: metadata.size,
-        mtimeMs: metadata.mtimeMs,
-      });
-    }
+  if (malformedLines > 0 && tailMalformed) {
+    throw new UnstableJsonlError({
+      malformedLines,
+      size: metadata.size,
+      mtimeMs: metadata.mtimeMs,
+    });
+  }
+  // A single record larger than the tail window is skipped as a partial lead,
+  // which would otherwise look like an empty history with no error.
+  if (start > 0 && entries.length === 0) {
+    throw new JsonlTooLargeError({ maxBytes, size: metadata.size });
   }
   return entries;
 }
@@ -77,8 +126,9 @@ export function limitMessages(
   messages: AgentHistoryMessage[],
   limit: number | undefined,
 ): AgentHistoryMessage[] {
-  if (!limit || messages.length <= limit) return messages;
-  return messages.slice(messages.length - limit);
+  const selected =
+    !limit || messages.length <= limit ? messages : messages.slice(messages.length - limit);
+  return selected.map(sanitizeHistoryMessage);
 }
 
 function lastByRole(
@@ -89,5 +139,10 @@ function lastByRole(
 }
 
 function excerpt(message: AgentHistoryMessage) {
-  return { ref: message.ref, text: message.text, timestamp: message.timestamp };
+  return { ref: message.ref, text: sanitizeText(message.text).text, timestamp: message.timestamp };
+}
+
+function sanitizeHistoryMessage(message: AgentHistoryMessage): AgentHistoryMessage {
+  const text = sanitizeText(message.text).text;
+  return text === message.text ? message : { ...message, text };
 }

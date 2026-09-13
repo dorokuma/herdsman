@@ -2,7 +2,7 @@ import { existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { createAgentHistoryService, emptyCompactHistory } from "@/agent-history/service.js";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
@@ -606,6 +606,98 @@ describe("ObservabilityRpcServer", () => {
     client.close();
     harness.sqlite.close();
   });
+
+  test("rejects register when the connector cwd does not match the Herdr pane cwd", async () => {
+    const { client, dir, harness } = await openServer({
+      peerPidOf: () => process.pid,
+      resolvePaneIdentity: async () => ({
+        cwd: "/tmp/herdsman-not-this-pane",
+        paneId: "wB:p1",
+        terminalId: "term_1",
+        workspaceId: "wB",
+      }),
+    });
+    seedAgent(harness, dir);
+    await expect(
+      client.request("agent.orchestrator.register", {
+        herdrSocketPath: "/tmp/herdr/herdr.sock",
+        paneId: "wB:p1",
+        sessionRef: {
+          agent: "pi",
+          kind: "path",
+          source: "herdr:pi",
+          value: "/tmp/pi-session.jsonl",
+        },
+        subscriberId: "pi-session",
+        subscriberKind: "pi",
+        workspaceId: "wB",
+      }),
+    ).rejects.toThrow("does not match Herdr pane");
+    client.close();
+    harness.sqlite.close();
+  });
+
+  test("accepts register when the connector cwd matches the Herdr pane cwd", async () => {
+    const { client, dir, harness } = await openServer({
+      peerPidOf: () => process.pid,
+      resolvePaneIdentity: async () => ({
+        cwd: process.cwd(),
+        paneId: "wB:p1",
+        terminalId: "term_1",
+        workspaceId: "wB",
+      }),
+    });
+    seedAgent(harness, dir);
+    await expect(
+      client.request("agent.orchestrator.register", {
+        herdrSocketPath: "/tmp/herdr/herdr.sock",
+        paneId: "wB:p1",
+        sessionRef: {
+          agent: "pi",
+          kind: "path",
+          source: "herdr:pi",
+          value: "/tmp/pi-session.jsonl",
+        },
+        subscriberId: "pi-session",
+        subscriberKind: "pi",
+        workspaceId: "wB",
+      }),
+    ).resolves.toMatchObject({ presence: { terminalId: "term_1" } });
+    client.close();
+    harness.sqlite.close();
+  });
+
+  test("warns instead of silently skipping when pane cwd is missing", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { client, dir, harness } = await openServer({
+      peerPidOf: () => process.pid,
+      resolvePaneIdentity: async () => ({
+        paneId: "wB:p1",
+        terminalId: "term_1",
+        workspaceId: "wB",
+      }),
+    });
+    seedAgent(harness, dir);
+    await expect(
+      client.request("agent.orchestrator.register", {
+        herdrSocketPath: "/tmp/herdr/herdr.sock",
+        paneId: "wB:p1",
+        sessionRef: {
+          agent: "pi",
+          kind: "path",
+          source: "herdr:pi",
+          value: "/tmp/pi-session.jsonl",
+        },
+        subscriberId: "pi-session",
+        subscriberKind: "pi",
+        workspaceId: "wB",
+      }),
+    ).resolves.toMatchObject({ presence: { terminalId: "term_1" } });
+    expect(warn.mock.calls.some((args) => String(args[0]).includes("pane cwd"))).toBe(true);
+    warn.mockRestore();
+    client.close();
+    harness.sqlite.close();
+  });
 });
 
 async function openServer(options: Parameters<typeof openServerWithoutClient>[0] = {}) {
@@ -617,8 +709,10 @@ async function openServer(options: Parameters<typeof openServerWithoutClient>[0]
 async function openServerWithoutClient(
   options: {
     history?: AgentHistoryService;
+    peerPidOf?: () => number | undefined;
     resolvePaneIdentity?: () => Promise<{
       paneId: string;
+      cwd?: string;
       terminalId: string;
       workspaceId: string;
     }>;
@@ -645,6 +739,7 @@ async function openServerWithoutClient(
       agents: harness.agents,
       scopes: harness.agentOrchestratorScopes,
     }),
+    ...(options.peerPidOf ? { peerPidOf: options.peerPidOf } : {}),
     ...(options.resolvePaneIdentity ? { resolvePaneIdentity: options.resolvePaneIdentity } : {}),
     ...(options.turnCompletions ? { turnCompletions: options.turnCompletions } : {}),
     socketPath,
