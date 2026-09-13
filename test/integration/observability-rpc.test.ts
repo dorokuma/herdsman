@@ -90,6 +90,16 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
+  test("answers agent.ping without side effects and rejects extra params", async () => {
+    const { client, harness } = await openServer();
+    await expect(client.request("agent.ping", {})).resolves.toEqual({ ok: true });
+    await expect(client.request("agent.ping", { unexpected: true })).rejects.toThrow(
+      "Invalid RPC params",
+    );
+    client.close();
+    harness.sqlite.close();
+  });
+
   test("records pi turn completion signals and validates their params", async () => {
     const registry = new TurnCompletionRegistry({ timeoutMs: 1_000 });
     const { client, dir, harness } = await openServer({ turnCompletions: registry });

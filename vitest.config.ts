@@ -1,3 +1,5 @@
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { defineConfig } from "vitest/config";
 
@@ -9,6 +11,10 @@ export default defineConfig({
   },
   test: {
     environment: "node",
+    env: {
+      HERDSMAN_HOME: join(tmpdir(), "herdsman-vitest-home"),
+    },
+    setupFiles: ["./test/setup-herdsman-home.ts"],
     include: ["test/unit/**/*.test.ts", "test/integration/**/*.test.ts"],
     passWithNoTests: false,
     restoreMocks: true,

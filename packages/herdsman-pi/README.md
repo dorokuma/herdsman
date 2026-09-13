@@ -12,7 +12,7 @@ pi install npm:@dorokuma/herdsman-pi
 herdsman daemon start
 ```
 
-When Pi runs inside Herdr, this extension connects to the Herdsman daemon and registers its exact Pi session path as presence identity. It does not send per-turn tool-result or final-message telemetry.
+When Pi runs inside Herdr, this extension connects to the Herdsman daemon and registers its exact Pi session path as presence identity. After register it sends `agent.ping` at least every 30 seconds so an idle owner is not dropped by the daemon heartbeat. It does not send per-turn tool-result or final-message telemetry.
 
 Enter these commands in Pi, not in a shell:
 

@@ -52,6 +52,33 @@ describe("orchestrator connection grace", () => {
     harness.sqlite.close();
   });
 
+  test("agent.ping keeps a terminal connected past heartbeat timeout", async () => {
+    const scheduler = new ManualScheduler();
+    const { harness, orchestrator, server, socketPath } = await openServer(scheduler, {
+      heartbeatScanIntervalMs: 10,
+      heartbeatTimeoutMs: 30,
+    });
+    const owner = await RpcTestClient.connect(socketPath);
+    await register(owner, "owner");
+    await owner.request("agent.orchestrator.set", { enabled: true });
+
+    await expect(owner.request("agent.ping", {})).resolves.toEqual({ ok: true });
+    scheduler.advance(20);
+    await expect(owner.request("agent.ping", {})).resolves.toEqual({ ok: true });
+    scheduler.advance(20);
+    await expect(owner.request("agent.ping", {})).resolves.toEqual({ ok: true });
+    scheduler.advance(20);
+
+    expect(
+      server.isTerminalConnected({ herdrSessionName: "default", terminalId: "term_owner" }),
+    ).toBe(true);
+    expect(orchestrator.status(scope)?.owner?.terminalId).toBe("term_owner");
+    expect(owner.socketDestroyed()).toBe(false);
+
+    owner.close();
+    harness.sqlite.close();
+  });
+
   test("heartbeat activity keeps a terminal connected", async () => {
     const scheduler = new ManualScheduler();
     const { harness, orchestrator, server, socketPath } = await openServer(scheduler, {

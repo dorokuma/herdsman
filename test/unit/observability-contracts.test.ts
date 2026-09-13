@@ -14,6 +14,7 @@ import {
   agentOrchestratorGetInputSchema,
   agentOrchestratorRegisterInputSchema,
   agentOrchestratorSetInputSchema,
+  agentPingInputSchema,
   agentReadInputSchema,
 } from "@/observability/schemas.js";
 
@@ -111,6 +112,8 @@ describe("agent observability contracts", () => {
     expect(Value.Check(agentOrchestratorSetInputSchema, { enabled: false })).toBe(true);
     expect(Value.Check(agentOrchestratorSetInputSchema, {})).toBe(false);
     expect(Value.Check(agentOrchestratorGetInputSchema, {})).toBe(true);
+    expect(Value.Check(agentPingInputSchema, {})).toBe(true);
+    expect(Value.Check(agentPingInputSchema, { unexpected: true })).toBe(false);
     expect(Value.Check(agentOrchestratorAckInputSchema, { eventId: 42 })).toBe(true);
     expect(
       Value.Check(agentOrchestratorAckInputSchema, {

@@ -34,6 +34,7 @@ import {
   agentOrchestratorGetInputSchema,
   agentOrchestratorRegisterInputSchema,
   agentOrchestratorSetInputSchema,
+  agentPingInputSchema,
   agentReadInputSchema,
   agentTurnCompletedInputSchema,
 } from "@/observability/schemas.js";
@@ -452,6 +453,10 @@ export class ObservabilityRpcServer {
           workspaceId: input.workspaceId,
         });
         return { accepted: true };
+      }
+      case "agent.ping": {
+        assertSchema(agentPingInputSchema, params);
+        return { ok: true };
       }
       default:
         throw new Error(`Unknown method: ${method}`);

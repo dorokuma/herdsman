@@ -77,6 +77,8 @@ export const agentOrchestratorSetInputSchema = Type.Object(
 
 export const agentOrchestratorGetInputSchema = Type.Object({}, { additionalProperties: false });
 
+export const agentPingInputSchema = Type.Object({}, { additionalProperties: false });
+
 export const agentOrchestratorAckInputSchema = Type.Object(
   { eventId: Type.Integer({ minimum: 1 }) },
   { additionalProperties: false },
