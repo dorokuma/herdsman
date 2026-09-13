@@ -1,3 +1,9 @@
+## 0.11.4
+
+- register 用 Linux SO_PEERCRED 绑定连接进程 cwd 到 Herdr pane，拒绝错配 connector。
+- 历史读取与 Pi 扩展脱敏补裸 Bearer 与 sk- 前缀。
+- readJsonl 改为流式读取；超限走 32MiB 尾窗，单记录超窗抛 JsonlTooLargeError。
+
 ## 0.11.3
 
 - 短命新 pane 通过先验 working→idle 唤醒 owner，避免错过 pane-specific 订阅窗口。
