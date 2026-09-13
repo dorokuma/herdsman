@@ -165,6 +165,44 @@ describe("ReconnectingDaemonClient", () => {
     );
   });
 
+  test("treats agent.ping as optional so an old daemon keeps the connection", async () => {
+    const resource = createResource();
+    let connectionCount = 0;
+    resource.server = await startServer(
+      resource.socketPath,
+      (socket, message) => {
+        if (message.method === "agent.ping") {
+          socket.write(
+            `${JSON.stringify({
+              error: { message: `Unknown method: ${message.method}` },
+              id: message.id,
+            })}\n`,
+          );
+          return;
+        }
+        socket.write(`${JSON.stringify({ id: message.id, result: { ok: true } })}\n`);
+      },
+      () => {
+        connectionCount += 1;
+      },
+    );
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [5],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+    let disconnected = 0;
+    client.onDisconnected = () => {
+      disconnected += 1;
+    };
+    await waitFor(() => connectionCount === 1);
+
+    await expect(client.request("agent.ping", {})).rejects.toThrow("Unknown method: agent.ping");
+    await expect(client.request("agent.list", {})).resolves.toEqual({ ok: true });
+    expect(disconnected).toBe(0);
+    expect(connectionCount).toBe(1);
+  });
+
   test("treats agent.turn.completed as optional so an old daemon keeps the connection", async () => {
     const resource = createResource();
     let connectionCount = 0;

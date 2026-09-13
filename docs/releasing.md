@@ -123,6 +123,7 @@ npm install --global --prefix "$RELEASE_TMP/root-prefix" \
 npm install --prefix "$RELEASE_TMP/pi-prefix" --ignore-scripts \
   "$RELEASE_TMP/dorokuma-herdsman-pi-$VERSION.tgz"
 test -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts"
+test -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/LICENSE"
 test ! -f "$RELEASE_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/tsconfig.json"
 ```
 

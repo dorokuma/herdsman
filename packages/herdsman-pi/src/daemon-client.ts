@@ -245,11 +245,12 @@ export class ReconnectingDaemonClient {
         code: message.error.code,
       });
       pending.reject(error);
-      // Optional methods (turn completion signaling) are rejected like any other
-      // failure but must not mark the daemon incompatible: an older daemon
-      // answers "Unknown method" and the connection has to stay alive.
+      // Optional methods (turn completion signaling, keepalive ping) are rejected
+      // like any other failure but must not mark the daemon incompatible: an older
+      // daemon answers "Unknown method" and the connection has to stay alive.
       if (
         pending.method !== "agent.turn.completed" &&
+        pending.method !== "agent.ping" &&
         /unknown|not found|unsupported|method/i.test(error.message)
       ) {
         const incompatible = new Error("Herdsman daemon version is incompatible; restart the session");

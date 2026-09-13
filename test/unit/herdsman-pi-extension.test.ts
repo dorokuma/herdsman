@@ -2110,7 +2110,7 @@ describe("herdsman-pi orchestrator bridge", () => {
         method: "agent.orchestrator.changed",
         params: { change: roleChange("term_other", "term_pi") },
       });
-      await vi.runAllTimersAsync();
+      await vi.advanceTimersByTimeAsync(500);
       client.emitStream({ method: "agent.event", params: { event: event(112, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       await pi.emit("agent_start", {}, ctx);
@@ -2882,6 +2882,74 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
 
       expect(extensionState?.pendingEvents.some((e) => e.id === 105)).toBe(true);
       expect(extensionState?.pendingEvents).toHaveLength(101);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+});
+
+describe("herdsman-pi daemon keepalive", () => {
+  test("pings every 30s after register and stops on disconnect", async () => {
+    vi.useFakeTimers();
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx();
+    const previous = withHerdrEnv();
+    const pings = () => client.calls.filter(([method]) => method === "agent.ping");
+    try {
+      await startExtension(client, pi, ctx);
+      expect(pings()).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(29_999);
+      expect(pings()).toEqual([]);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(pings()).toEqual([["agent.ping", {}]]);
+
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(pings()).toHaveLength(2);
+
+      client.disconnect(new Error("socket closed"));
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(pings()).toHaveLength(2);
+
+      await client.connect();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(pings()).toHaveLength(3);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("clears keepalive on session_shutdown and client.close", async () => {
+    vi.useFakeTimers();
+    const shutdownClient = createFakeClient();
+    const closeClient = createFakeClient();
+    const shutdownPi = createFakePi();
+    const closePi = createFakePi();
+    const shutdownCtx = fakeCtx();
+    const closeCtx = fakeCtx({ sessionId: "pi-session-close" });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(shutdownClient, shutdownPi, shutdownCtx);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(shutdownClient.calls.filter(([method]) => method === "agent.ping")).toHaveLength(1);
+      await shutdownPi.emit("session_shutdown");
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(shutdownClient.calls.filter(([method]) => method === "agent.ping")).toHaveLength(1);
+      expect(shutdownClient.closed).toBe(true);
+
+      await startExtension(closeClient, closePi, closeCtx);
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(closeClient.calls.filter(([method]) => method === "agent.ping")).toHaveLength(1);
+      closeClient.close();
+      await vi.advanceTimersByTimeAsync(30_000);
+      expect(closeClient.calls.filter(([method]) => method === "agent.ping")).toHaveLength(1);
+      expect(closeClient.closed).toBe(true);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();

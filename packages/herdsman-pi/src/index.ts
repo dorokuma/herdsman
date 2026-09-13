@@ -180,6 +180,7 @@ const HERDR_REQUIRED_MESSAGE = "Herdsman requires a Herdr workspace";
 const RECONNECTING_MESSAGE = "Herdsman is reconnecting · try again shortly";
 export const MAX_ACK_ATTEMPTS = 5;
 export const ACK_BACKOFF_CAP_MS = 30_000;
+const KEEPALIVE_INTERVAL_MS = 30_000;
 
 type AckFailureClass = "terminal" | "resync" | "transient";
 
@@ -267,7 +268,22 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     };
     options.onStateExposed?.(state);
     let activeContext: PiContext | undefined;
+    let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
     let wakeGeneration = 0;
+
+    const stopKeepalive = () => {
+      if (!keepaliveTimer) return;
+      clearInterval(keepaliveTimer);
+      keepaliveTimer = undefined;
+    };
+
+    const startKeepalive = (client: HerdsmanDaemonClient) => {
+      stopKeepalive();
+      keepaliveTimer = setInterval(() => {
+        void client.request("agent.ping", {}).catch(() => undefined);
+      }, KEEPALIVE_INTERVAL_MS);
+      keepaliveTimer.unref?.();
+    };
 
     const setHerdsmanUi = (ctx: PiContext | undefined) => {
       if (!ctx) return;
@@ -782,11 +798,13 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         })
         .then((response) => {
           state.connected = true;
+          startKeepalive(client);
           applyConnectionStateResponse(response as ConnectionStateResponse, ctx, {
             notifyReconnectLoss: true,
           });
         })
         .catch((error) => {
+          stopKeepalive();
           state.connected = false;
           const incompatibleMessage =
             error instanceof Error && /incompatible/i.test(error.message)
@@ -865,12 +883,19 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         loseRole(ctx);
         return;
       }
+      stopKeepalive();
       state.client?.close();
       const client = options.clientFactory?.() ?? new ReconnectingDaemonClient({ socketPath: defaultSocketPath() });
       client.resetForSession?.();
+      const closeClient = client.close.bind(client);
+      client.close = () => {
+        stopKeepalive();
+        closeClient();
+      };
       state.client = client;
       client.onConnected = () => registerPresence(ctx);
       client.onDisconnected = () => {
+        stopKeepalive();
         state.connected = false;
         markDisconnected(activeContext);
       };
@@ -878,6 +903,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     });
 
     pi.on("session_shutdown", () => {
+      stopKeepalive();
       state.connected = false;
       loseRole(activeContext);
       state.deliveredBatch = undefined;

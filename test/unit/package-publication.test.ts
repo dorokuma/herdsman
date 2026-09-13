@@ -1,4 +1,6 @@
+import { execFileSync } from "node:child_process";
 import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
 import { describe, expect, test } from "vitest";
 
 type PackageManifest = {
@@ -44,7 +46,7 @@ describe("npm publication metadata", () => {
     expect(root.scripts?.check).toContain("pnpm package:check");
 
     expect(pi.name).toBe("@dorokuma/herdsman-pi");
-    expect(pi.files).toEqual(["src", "../LICENSE"]);
+    expect(pi.files).toEqual(["src", "LICENSE"]);
     expect(pi.publishConfig?.access).toBe("public");
     expect(pi.repository).toEqual({
       type: "git",
@@ -57,5 +59,21 @@ describe("npm publication metadata", () => {
     expect(new Set([root.version, pi.version, herdr.version, pluginVersion])).toEqual(
       new Set([root.version]),
     );
+  });
+
+  test("includes LICENSE in the Pi package tarball", () => {
+    const cwd = fileURLToPath(new URL("../../packages/herdsman-pi", import.meta.url));
+    const output = execFileSync("npm", ["pack", "--dry-run", "--json"], {
+      cwd,
+      encoding: "utf8",
+    });
+    const packed = JSON.parse(output) as
+      | Array<{ files?: Array<{ path: string }> }>
+      | {
+          files?: Array<{ path: string }>;
+        };
+    const entries = Array.isArray(packed) ? packed : [packed];
+    const files = entries.flatMap((entry) => entry.files ?? []).map((file) => file.path);
+    expect(files).toContain("LICENSE");
   });
 });
