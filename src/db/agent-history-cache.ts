@@ -83,6 +83,39 @@ export class AgentHistoryCacheStore {
     if (!row) throw new Error("Agent history cache write failed");
     return mapCache(row);
   }
+
+  /** Physically removes cache rows whose updated_at is older than the given age. */
+  deleteOlderThan(ageMs: number): number {
+    return Number(
+      this.#sqlite
+        .prepare("delete from agent_history_cache where updated_at < ?")
+        .run(Date.now() - ageMs).changes,
+    );
+  }
+
+  listSourcePaths(): string[] {
+    const rows = this.#sqlite
+      .prepare("select distinct source_path from agent_history_cache order by source_path")
+      .all() as Array<{ source_path: string }>;
+    return rows.map((row) => row.source_path);
+  }
+
+  deleteBySourcePaths(sourcePaths: readonly string[]): number {
+    const unique = [...new Set(sourcePaths)];
+    if (unique.length === 0) return 0;
+    let deleted = 0;
+    const batchSize = 100;
+    for (let offset = 0; offset < unique.length; offset += batchSize) {
+      const batch = unique.slice(offset, offset + batchSize);
+      const placeholders = batch.map(() => "?").join(", ");
+      deleted += Number(
+        this.#sqlite
+          .prepare(`delete from agent_history_cache where source_path in (${placeholders})`)
+          .run(...batch).changes,
+      );
+    }
+    return deleted;
+  }
 }
 
 function mapCache(row: AgentHistoryCacheRow): AgentHistoryCacheRecord {

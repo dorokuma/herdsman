@@ -1,4 +1,6 @@
+import { existsSync } from "node:fs";
 import type { AgentEventStore } from "@/db/agent-events.js";
+import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { StatusEventPlanStore } from "@/db/status-event-plans.js";
 import type { HerdrSessionListEntry, HerdrSessionListRunner } from "@/herdr/session-list.js";
@@ -15,9 +17,39 @@ export const SCOPE_RELEASE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 /** Terminal agent events (acked/failed) are purged after 7 days in the reconcile cycle. */
 export const RECONCILE_SETTLED_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 
+/** History cache rows are purged after 30 days regardless of whether the source file still exists. */
+export const HISTORY_CACHE_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+
+/**
+ * Invalidated events are retained this long so an owner that already received
+ * the event can still ack it (`isInvalidatedDelivered`) and advance the cursor.
+ * Must be >= REDELIVERY_FRESHNESS_MS; 1 hour covers reconnect delays without
+ * letting invalidated rows accumulate.
+ */
+export const INVALIDATED_GRACE_MS = 60 * 60 * 1000;
+
 type LivePane = { paneId: string; generation: string | null; terminalId: string | null };
 
+export type AgentEventReconcileResult = {
+  historyCacheExpired: number;
+  historyCacheMissing: number;
+  invalidated: number;
+  purged: number;
+  released: number;
+};
+
+function emptyReconcileResult(): AgentEventReconcileResult {
+  return {
+    historyCacheExpired: 0,
+    historyCacheMissing: 0,
+    invalidated: 0,
+    purged: 0,
+    released: 0,
+  };
+}
+
 export class AgentEventReconciler {
+  readonly #agentHistoryCache: AgentHistoryCacheStore | undefined;
   readonly #events: AgentEventStore;
   readonly #scopes: AgentOrchestratorScopeStore;
   readonly #sessionList: HerdrSessionListRunner;
@@ -26,6 +58,7 @@ export class AgentEventReconciler {
   readonly #statusEventPlans: StatusEventPlanStore | undefined;
 
   constructor(options: {
+    agentHistoryCache?: AgentHistoryCacheStore;
     events: AgentEventStore;
     scopes: AgentOrchestratorScopeStore;
     sessionList: HerdrSessionListRunner;
@@ -33,6 +66,7 @@ export class AgentEventReconciler {
     connectedTerminal?: (input: { herdrSessionName: string; terminalId: string }) => boolean;
     statusEventPlans?: StatusEventPlanStore;
   }) {
+    this.#agentHistoryCache = options.agentHistoryCache;
     this.#events = options.events;
     this.#scopes = options.scopes;
     this.#sessionList = options.sessionList;
@@ -44,13 +78,13 @@ export class AgentEventReconciler {
 
   async reconcile(
     options: { releaseStaleOwners?: boolean } = {},
-  ): Promise<{ invalidated: number; purged: number; released: number }> {
+  ): Promise<AgentEventReconcileResult> {
     let sessions: HerdrSessionListEntry[];
     try {
       sessions = await this.#sessionList();
     } catch (error) {
       console.warn("Herdsman reconcile skipped: Herdr session list unavailable", error);
-      return { invalidated: 0, purged: 0, released: 0 };
+      return emptyReconcileResult();
     }
     const live = new Map<string, LivePane[]>();
     const clients: HerdrSocketClient[] = [];
@@ -79,7 +113,7 @@ export class AgentEventReconciler {
     } catch (error) {
       for (const client of clients) client.close();
       console.warn("Herdsman reconcile skipped: incomplete Herdr pane snapshot", error);
-      return { invalidated: 0, purged: 0, released: 0 };
+      return emptyReconcileResult();
     } finally {
       for (const client of clients) client.close();
     }
@@ -97,11 +131,12 @@ export class AgentEventReconciler {
         if (!present && this.#events.deleteReconcileCandidate(event.id)) invalidated += 1;
       }
     }
-    invalidated += this.#events.deleteInvalidated();
+    invalidated += this.#events.deleteInvalidatedOlderThan(INVALIDATED_GRACE_MS);
     this.#events.deleteSettledOlderThan(RECONCILE_SETTLED_TTL_MS);
     // Settled status event plans share the same 7-day TTL as settled agent
     // events: a drained/completed/cancelled/failed plan is pure bookkeeping.
     this.#statusEventPlans?.deleteSettledOlderThan(RECONCILE_SETTLED_TTL_MS);
+    const { historyCacheExpired, historyCacheMissing } = this.#purgeHistoryCache();
     let released = 0;
     if (options.releaseStaleOwners !== false) {
       for (const scope of this.#scopes.listOwnedScopes()) {
@@ -139,12 +174,35 @@ export class AgentEventReconciler {
         });
       }
     }
-    return { invalidated, purged, released };
+    return { historyCacheExpired, historyCacheMissing, invalidated, purged, released };
+  }
+
+  #purgeHistoryCache(): { historyCacheExpired: number; historyCacheMissing: number } {
+    if (!this.#agentHistoryCache) {
+      return { historyCacheExpired: 0, historyCacheMissing: 0 };
+    }
+    const historyCacheExpired = this.#agentHistoryCache.deleteOlderThan(HISTORY_CACHE_TTL_MS);
+    const missing = this.#agentHistoryCache
+      .listSourcePaths()
+      .filter((sourcePath) => !historyCacheSourceExists(sourcePath));
+    const historyCacheMissing = this.#agentHistoryCache.deleteBySourcePaths(missing);
+    return { historyCacheExpired, historyCacheMissing };
   }
 }
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * Cache keys for opencode-sqlite append `#session=...` onto the backing file
+ * path. Existence is checked against the real path, not the synthetic key.
+ */
+function historyCacheSourceExists(sourcePath: string): boolean {
+  if (existsSync(sourcePath)) return true;
+  const marker = "#session=";
+  const index = sourcePath.indexOf(marker);
+  return index > 0 && existsSync(sourcePath.slice(0, index));
 }
 
 /**

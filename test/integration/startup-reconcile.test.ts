@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { AgentEventReconciler } from "@/daemon/agent-event-reconciler.js";
+import { AgentEventReconciler, INVALIDATED_GRACE_MS } from "@/daemon/agent-event-reconciler.js";
+import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
@@ -48,6 +49,7 @@ function reconciler(
   connectedTerminal = false,
 ) {
   return new AgentEventReconciler({
+    agentHistoryCache: harness.agentHistoryCache,
     events: harness.agentEvents,
     scopes: harness.agentOrchestratorScopes,
     sessionList: async () => [session],
@@ -60,6 +62,22 @@ function reconciler(
       }) as never,
     connectedTerminal: () => connectedTerminal,
   });
+}
+
+function reconcileResult(counts: {
+  historyCacheExpired?: number;
+  historyCacheMissing?: number;
+  invalidated: number;
+  purged: number;
+  released: number;
+}) {
+  return {
+    historyCacheExpired: counts.historyCacheExpired ?? 0,
+    historyCacheMissing: counts.historyCacheMissing ?? 0,
+    invalidated: counts.invalidated,
+    purged: counts.purged,
+    released: counts.released,
+  };
 }
 
 describe("startup reconcile dedicated coverage", () => {
@@ -103,7 +121,7 @@ describe("startup reconcile dedicated coverage", () => {
     const result = await reconciler(harness, [
       { pane_id: "wA:live", terminal_id: "term-live" },
     ]).reconcile();
-    expect(result).toEqual({ invalidated: 2, purged: 0, released: 1 });
+    expect(result).toEqual(reconcileResult({ invalidated: 2, purged: 0, released: 1 }));
     expect(
       harness.sqlite
         .prepare("select count(*) as count from agent_events where id in (?, ?)")
@@ -128,7 +146,7 @@ describe("startup reconcile dedicated coverage", () => {
     const result = await reconciler(harness, [
       { pane_id: "wA:live", terminal_id: "term-owner" },
     ]).reconcile({ releaseStaleOwners: false });
-    expect(result).toEqual({ invalidated: 1, purged: 0, released: 0 });
+    expect(result).toEqual(reconcileResult({ invalidated: 1, purged: 0, released: 0 }));
     expect(
       harness.sqlite
         .prepare("select count(*) as count from agent_events where id = ?")
@@ -138,7 +156,7 @@ describe("startup reconcile dedicated coverage", () => {
       owner: { paneId: "wA:live", terminalId: "term-owner" },
     });
   });
-  test("reconcile physically removes existing invalidated rows but preserves acked rows", async () => {
+  test("reconcile retains invalidated rows within the grace period and preserves acked rows", async () => {
     const { harness, append } = setup();
     const invalidatedOne = append({ paneId: "wA:gone-1", terminalId: "term-1" });
     const invalidatedTwo = append({ paneId: "wA:gone-2", terminalId: "term-2" });
@@ -147,14 +165,129 @@ describe("startup reconcile dedicated coverage", () => {
       .prepare("update agent_events set status = 'invalidated' where id in (?, ?)")
       .run(invalidatedOne.id, invalidatedTwo.id);
     harness.sqlite.prepare("update agent_events set status = 'acked' where id = ?").run(acked.id);
-    await reconciler(harness, []).reconcile();
+    const result = await reconciler(harness, []).reconcile();
+    expect(result).toEqual(reconcileResult({ invalidated: 0, purged: 0, released: 0 }));
     expect(
       harness.sqlite
         .prepare("select count(*) as count from agent_events where status = 'invalidated'")
         .get(),
-    ).toEqual({ count: 0 });
+    ).toEqual({ count: 2 });
+    expect(harness.agentEvents.get(invalidatedOne.id)).toMatchObject({ status: "invalidated" });
+    expect(harness.agentEvents.get(invalidatedTwo.id)).toMatchObject({ status: "invalidated" });
     expect(harness.agentEvents.get(acked.id)).toMatchObject({ status: "acked" });
   });
+
+  test("reconcile deletes invalidated rows older than the grace period", async () => {
+    const { harness, append } = setup();
+    const staleCreated = append({ paneId: "wA:stale-created", terminalId: "term-stale-created" });
+    const staleDelivered = append({
+      paneId: "wA:stale-delivered",
+      terminalId: "term-stale-delivered",
+    });
+    const fresh = append({ paneId: "wA:fresh-invalidated", terminalId: "term-fresh" });
+    const staleCutoff = Date.now() - INVALIDATED_GRACE_MS - 1_000;
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'invalidated', last_attempt_at = null, created_at = ? where id = ?",
+      )
+      .run(staleCutoff, staleCreated.id);
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'invalidated', last_attempt_at = ?, created_at = ? where id = ?",
+      )
+      .run(staleCutoff, Date.now(), staleDelivered.id);
+    harness.sqlite
+      .prepare("update agent_events set status = 'invalidated' where id = ?")
+      .run(fresh.id);
+    const result = await reconciler(harness, []).reconcile();
+    expect(result).toEqual(reconcileResult({ invalidated: 2, purged: 0, released: 0 }));
+    expect(
+      harness.sqlite.prepare("select id from agent_events where status = 'invalidated'").all(),
+    ).toEqual([{ id: fresh.id }]);
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id in (?, ?)")
+        .get(staleCreated.id, staleDelivered.id),
+    ).toEqual({ count: 0 });
+  });
+
+  test("INVALIDATED_GRACE_MS is at least REDELIVERY_FRESHNESS_MS", () => {
+    expect(INVALIDATED_GRACE_MS).toBeGreaterThanOrEqual(REDELIVERY_FRESHNESS_MS);
+  });
+
+  test("grace-period invalidated events remain acked via isInvalidatedDelivered then drop after the window", async () => {
+    const { harness, append } = setup();
+    const service = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    service.claim({ ...scope, paneId: "wA:live", terminalId: "term-owner" });
+    const event = append({ paneId: "wA:external", terminalId: "term-external" });
+    harness.agentEvents.reservePending("term-owner");
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      deliveredToTerminalId: "term-owner",
+      status: "delivered",
+    });
+    expect(harness.agentEvents.invalidateById(event.id, "PANE_CLOSED")).toBe(true);
+    await reconciler(
+      harness,
+      [{ pane_id: "wA:live", terminal_id: "term-owner" }],
+      true,
+    ).reconcile();
+    expect(harness.agentEvents.get(event.id)).toMatchObject({
+      deliveredToTerminalId: "term-owner",
+      status: "invalidated",
+    });
+    expect(service.ack({ ...scope, eventId: event.id, terminalId: "term-owner" })).toMatchObject({
+      ackedEventId: event.id,
+    });
+    expect(service.status(scope)?.ackedEventId).toBe(event.id);
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - INVALIDATED_GRACE_MS - 1_000, event.id);
+    const result = await reconciler(
+      harness,
+      [{ pane_id: "wA:live", terminal_id: "term-owner" }],
+      true,
+    ).reconcile();
+    expect(result.invalidated).toBe(1);
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id = ?")
+        .get(event.id),
+    ).toEqual({ count: 0 });
+  });
+
+  test("an unacked invalidated event past the grace period is deleted and ack reports not found", async () => {
+    const { harness, append } = setup();
+    const service = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    service.claim({ ...scope, paneId: "wA:live", terminalId: "term-owner" });
+    const event = append({ paneId: "wA:external", terminalId: "term-external" });
+    harness.agentEvents.reservePending("term-owner");
+    expect(harness.agentEvents.invalidateById(event.id, "PANE_CLOSED")).toBe(true);
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - INVALIDATED_GRACE_MS - 1_000, event.id);
+    await reconciler(
+      harness,
+      [{ pane_id: "wA:live", terminal_id: "term-owner" }],
+      true,
+    ).reconcile();
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id = ?")
+        .get(event.id),
+    ).toEqual({ count: 0 });
+    expect(() => service.ack({ ...scope, eventId: event.id, terminalId: "term-owner" })).toThrow(
+      "Only the next pending orchestrator event can be acknowledged",
+    );
+  });
+
   test("reconcile purges acked and failed events older than the 7-day TTL", async () => {
     const { harness, append } = setup();
     const staleAcked = append({ paneId: "wA:live", terminalId: "term-a" });
@@ -201,7 +334,7 @@ describe("startup reconcile dedicated coverage", () => {
     const result = await reconciler(harness, async () => {
       throw new Error("snapshot unavailable");
     }).reconcile();
-    expect(result).toEqual({ invalidated: 0, purged: 0, released: 0 });
+    expect(result).toEqual(reconcileResult({ invalidated: 0, purged: 0, released: 0 }));
     expect(harness.agentEvents.get(event.id)).toMatchObject({ status: "pending" });
     expect(harness.agentOrchestratorScopes.get(scope)).toEqual(before);
     expect(warning).toHaveBeenCalledWith(
@@ -228,7 +361,7 @@ describe("startup reconcile dedicated coverage", () => {
           },
         }) as never,
     }).reconcile();
-    expect(result).toEqual({ invalidated: 0, purged: 0, released: 0 });
+    expect(result).toEqual(reconcileResult({ invalidated: 0, purged: 0, released: 0 }));
     expect(harness.agentEvents.get(event.id)).toMatchObject({ status: "pending" });
     expect(warning).toHaveBeenCalledWith(
       "Herdsman reconcile skipped: incomplete Herdr pane snapshot",
@@ -246,7 +379,7 @@ describe("startup reconcile dedicated coverage", () => {
         throw new Error("list unavailable");
       },
     }).reconcile();
-    expect(result).toEqual({ invalidated: 0, purged: 0, released: 0 });
+    expect(result).toEqual(reconcileResult({ invalidated: 0, purged: 0, released: 0 }));
     expect(harness.agentEvents.get(event.id)).toMatchObject({ status: "pending" });
     expect(warning).toHaveBeenCalledWith(
       "Herdsman reconcile skipped: Herdr session list unavailable",
@@ -270,8 +403,12 @@ describe("startup reconcile dedicated coverage", () => {
     const { harness, append } = setup();
     append({ paneId: "wA:gone", terminalId: "term-gone" });
     const instance = reconciler(harness, []);
-    expect(await instance.reconcile()).toEqual({ invalidated: 1, purged: 0, released: 0 });
-    expect(await instance.reconcile()).toEqual({ invalidated: 0, purged: 0, released: 0 });
+    expect(await instance.reconcile()).toEqual(
+      reconcileResult({ invalidated: 1, purged: 0, released: 0 }),
+    );
+    expect(await instance.reconcile()).toEqual(
+      reconcileResult({ invalidated: 0, purged: 0, released: 0 }),
+    );
   });
 
   test("keeps a generation-tagged pending event when the live pane has no generation", async () => {
@@ -359,7 +496,7 @@ describe("startup reconcile dedicated coverage", () => {
       [{ pane_id: "wA:live", terminal_id: "term-live" }],
       true,
     ).reconcile();
-    expect(result).toEqual({ invalidated: 0, purged: 1, released: 0 });
+    expect(result).toEqual(reconcileResult({ invalidated: 0, purged: 1, released: 0 }));
     expect(harness.agentOrchestratorScopes.get(scope)).toBeUndefined();
     expect(harness.agentOrchestratorScopes.get(recent)).toMatchObject({ owner: null });
     expect(harness.agentOrchestratorScopes.get(active)).toMatchObject({

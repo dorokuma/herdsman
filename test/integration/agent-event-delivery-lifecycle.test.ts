@@ -518,6 +518,36 @@ describe("agent event delivery lifecycle", () => {
       }),
     ).toMatchObject({ id: pending.id });
   });
+
+  test("deleteInvalidatedOlderThan keeps fresh rows and ages from last_attempt_at", () => {
+    const harness = prepareHarness();
+    const staleCreated = appendEvent(harness, "term-stale-created");
+    const staleDelivered = appendEvent(harness, "term-stale-delivered");
+    const fresh = appendEvent(harness, "term-fresh");
+    const pending = appendEvent(harness, "term-pending");
+    const graceMs = 60 * 60 * 1000;
+    const staleCutoff = Date.now() - graceMs - 1_000;
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'invalidated', last_attempt_at = null, created_at = ? where id = ?",
+      )
+      .run(staleCutoff, staleCreated.id);
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'invalidated', last_attempt_at = ?, created_at = ? where id = ?",
+      )
+      .run(staleCutoff, Date.now(), staleDelivered.id);
+    harness.sqlite
+      .prepare("update agent_events set status = 'invalidated' where id = ?")
+      .run(fresh.id);
+    expect(harness.agentEvents.deleteInvalidatedOlderThan(graceMs)).toBe(2);
+    expect(harness.sqlite.prepare("select id, status from agent_events order by id").all()).toEqual(
+      [
+        { id: fresh.id, status: "invalidated" },
+        { id: pending.id, status: "pending" },
+      ],
+    );
+  });
 });
 
 describe("empty database migration chain", () => {

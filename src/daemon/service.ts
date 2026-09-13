@@ -174,6 +174,7 @@ export async function runObservabilityDaemonService(
 
   let connectedTerminal = (_input: { herdrSessionName: string; terminalId: string }) => false;
   const reconciler = new AgentEventReconciler({
+    agentHistoryCache,
     connectedTerminal: (input) => connectedTerminal(input),
     events: agentEvents,
     scopes: agentOrchestratorScopes,
