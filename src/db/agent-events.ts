@@ -225,9 +225,20 @@ export class AgentEventStore {
     );
   }
 
-  deleteInvalidated(): number {
+  /**
+   * Physically removes invalidated events older than the given age, measured from
+   * coalesce(last_attempt_at, created_at) so a delivered-then-invalidated event is
+   * aged from its last delivery. A short grace window lets the owner that already
+   * received the event ack it and advance the cursor.
+   */
+  deleteInvalidatedOlderThan(ageMs: number): number {
     return Number(
-      this.#sqlite.prepare("delete from agent_events where status = 'invalidated'").run().changes,
+      this.#sqlite
+        .prepare(
+          `delete from agent_events
+           where status = 'invalidated' and coalesce(last_attempt_at, created_at) < ?`,
+        )
+        .run(Date.now() - ageMs).changes,
     );
   }
 
