@@ -1,8 +1,9 @@
-import { existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vitest";
+import { DISCOVERY_RECENCY_GRACE_MS } from "@/agent-history/discovery.js";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { createAgentHistoryService, emptyCompactHistory } from "@/agent-history/service.js";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
@@ -477,7 +478,7 @@ describe("ObservabilityRpcServer", () => {
         lastUserMessage: { ref: "cached", text: "cached user", timestamp: null },
       },
       historyRef: {
-        kind: "discovered_file",
+        kind: "agent_session",
         path: "/tmp/history.jsonl",
         source: "pi-jsonl",
         value: "/tmp/history.jsonl",
@@ -492,6 +493,170 @@ describe("ObservabilityRpcServer", () => {
     await client.request("agent.get", { target: "pi", workspaceId: "wB" });
     await client.request("agent.read", { target: "pi", workspaceId: "wB" });
     expect(calls).toEqual(["get:/tmp/history.jsonl", "read:/tmp/history.jsonl"]);
+    client.close();
+    harness.sqlite.close();
+  });
+
+  test("skips locking discovered_file refs and forwards terminalTitle on agent.get/read", async () => {
+    const calls: Array<{
+      method: string;
+      preferred?: string | undefined;
+      title?: string | null | undefined;
+    }> = [];
+    const liveHistory = {
+      async read(
+        input: { terminalTitle?: string | null },
+        options: { preferredRef?: { value: string } | null },
+      ) {
+        calls.push({
+          method: "read",
+          preferred: options.preferredRef?.value,
+          title: input.terminalTitle,
+        });
+        return { historyRef: null, messages: [] };
+      },
+      async resolveCompactHistory(
+        input: { terminalTitle?: string | null },
+        options: { preferredRef?: { value: string } | null } = {},
+      ) {
+        calls.push({
+          method: "get",
+          preferred: options.preferredRef?.value,
+          title: input.terminalTitle,
+        });
+        return {
+          compactHistory: emptyCompactHistory("pi-jsonl"),
+          historyRef: null,
+          sourceFingerprint: null,
+        };
+      },
+    } as unknown as AgentHistoryService;
+    const { client, dir, harness } = await openServer({ history: liveHistory });
+    seedAgent(harness, dir);
+    harness.agents.replaceForSession({
+      agents: [
+        {
+          agent: "pi",
+          agent_status: "idle",
+          cwd: "/repo",
+          pane_id: "wB:p1",
+          terminal_id: "term_1",
+          terminal_title: "π - role-worker-53c500b2 - root",
+          workspace_id: "wB",
+        },
+      ],
+      herdrSessionName: "default",
+    });
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wB:p1" });
+    if (!agent) throw new Error("missing seeded agent");
+    harness.agentContextSnapshots.put({
+      agentId: agent.id,
+      compactHistory: emptyCompactHistory("pi-jsonl"),
+      historyRef: {
+        kind: "discovered_file",
+        path: "/tmp/missing-discovered.jsonl",
+        source: "pi-jsonl",
+        value: "/tmp/missing-discovered.jsonl",
+      },
+      paneRevision: null,
+      sourceFingerprint: { mtimeMs: 1, path: "/tmp/missing-discovered.jsonl", size: 1 },
+    });
+    await client.request("agent.get", { target: "pi", workspaceId: "wB" });
+    await client.request("agent.read", { target: "pi", workspaceId: "wB" });
+    expect(calls).toEqual([
+      { method: "get", preferred: undefined, title: "π - role-worker-53c500b2 - root" },
+      { method: "read", preferred: undefined, title: "π - role-worker-53c500b2 - root" },
+    ]);
+    client.close();
+    harness.sqlite.close();
+  });
+
+  test("keeps preferred discovered_file on agent.get/read when the file is recent and occupied is unchanged", async () => {
+    const calls: string[] = [];
+    const liveHistory = {
+      async read(_input: unknown, options: { preferredRef?: { value: string } | null }) {
+        calls.push(options.preferredRef ? `read:${options.preferredRef.value}` : "read:discover");
+        return { historyRef: null, messages: [] };
+      },
+      async resolveCompactHistory(
+        _input: unknown,
+        options: { preferredRef?: { value: string } | null } = {},
+      ) {
+        calls.push(options.preferredRef ? `get:${options.preferredRef.value}` : "get:discover");
+        return {
+          compactHistory: emptyCompactHistory("pi-jsonl"),
+          historyRef: null,
+          sourceFingerprint: null,
+        };
+      },
+    } as unknown as AgentHistoryService;
+    const { client, dir, harness } = await openServer({ history: liveHistory });
+    seedAgent(harness, dir);
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wB:p1" });
+    if (!agent) throw new Error("missing seeded agent");
+    const path = join(dir, "recent-discovered.jsonl");
+    writeFileSync(path, "history\n");
+    harness.agentContextSnapshots.put({
+      agentId: agent.id,
+      compactHistory: emptyCompactHistory("pi-jsonl"),
+      historyRef: {
+        kind: "discovered_file",
+        path,
+        source: "pi-jsonl",
+        value: path,
+      },
+      paneRevision: null,
+      sourceFingerprint: { mtimeMs: Date.now(), path, size: 1 },
+    });
+    await client.request("agent.get", { target: "pi", workspaceId: "wB" });
+    await client.request("agent.read", { target: "pi", workspaceId: "wB" });
+    expect(calls).toEqual([`get:${path}`, `read:${path}`]);
+    client.close();
+    harness.sqlite.close();
+  });
+
+  test("rediscovers on agent.get/read when the discovered_file recency has expired", async () => {
+    const calls: string[] = [];
+    const liveHistory = {
+      async read(_input: unknown, options: { preferredRef?: { value: string } | null }) {
+        calls.push(options.preferredRef ? `read:${options.preferredRef.value}` : "read:discover");
+        return { historyRef: null, messages: [] };
+      },
+      async resolveCompactHistory(
+        _input: unknown,
+        options: { preferredRef?: { value: string } | null } = {},
+      ) {
+        calls.push(options.preferredRef ? `get:${options.preferredRef.value}` : "get:discover");
+        return {
+          compactHistory: emptyCompactHistory("pi-jsonl"),
+          historyRef: null,
+          sourceFingerprint: null,
+        };
+      },
+    } as unknown as AgentHistoryService;
+    const { client, dir, harness } = await openServer({ history: liveHistory });
+    seedAgent(harness, dir);
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wB:p1" });
+    if (!agent) throw new Error("missing seeded agent");
+    const path = join(dir, "expired-discovered.jsonl");
+    writeFileSync(path, "history\n");
+    const expired = agent.firstSeenAt.getTime() - DISCOVERY_RECENCY_GRACE_MS - 1_000;
+    utimesSync(path, new Date(expired), new Date(expired));
+    harness.agentContextSnapshots.put({
+      agentId: agent.id,
+      compactHistory: emptyCompactHistory("pi-jsonl"),
+      historyRef: {
+        kind: "discovered_file",
+        path,
+        source: "pi-jsonl",
+        value: path,
+      },
+      paneRevision: null,
+      sourceFingerprint: { mtimeMs: expired, path, size: 1 },
+    });
+    await client.request("agent.get", { target: "pi", workspaceId: "wB" });
+    await client.request("agent.read", { target: "pi", workspaceId: "wB" });
+    expect(calls).toEqual(["get:discover", "read:discover"]);
     client.close();
     harness.sqlite.close();
   });

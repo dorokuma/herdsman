@@ -233,6 +233,64 @@ describe("herdr role session root isolation", () => {
     ).resolves.toBeNull();
   });
 
+  test("terminalTitle role segment matches the role directory and rejects other roles", async () => {
+    const root = await roleRoot();
+    const own = await session(root, "role-worker-53c500b2", "/repo");
+    const other = await session(root, "role-scout", "/repo");
+    const now = Date.now();
+    await utimes(own, new Date(now - 5_000), new Date(now - 5_000));
+    await utimes(other, new Date(now), new Date(now));
+
+    await expect(
+      discoverAgentHistory(piLookup(root, { terminalTitle: "π - role-worker-53c500b2 - root" })),
+    ).resolves.toMatchObject({ path: own, source: "pi-jsonl" });
+    await expect(
+      discoverAgentHistory(piLookup(root, { terminalTitle: "π - role-scout - root" })),
+    ).resolves.toMatchObject({ path: other, source: "pi-jsonl" });
+    await expect(discoverAgentHistory(piLookup(root))).resolves.toMatchObject({
+      path: other,
+      source: "pi-jsonl",
+    });
+  });
+
+  test("does not extract a role hint from foo-role-x or substring matches", async () => {
+    const root = await roleRoot();
+    const own = await session(root, "role-worker", "/repo");
+    const other = await session(root, "role-scout", "/repo");
+    const now = Date.now();
+    await utimes(own, new Date(now - 5_000), new Date(now - 5_000));
+    await utimes(other, new Date(now), new Date(now));
+
+    await expect(
+      discoverAgentHistory(piLookup(root, { terminalTitle: "π - foo-role-x - root" })),
+    ).resolves.toMatchObject({ path: other, source: "pi-jsonl" });
+    await expect(
+      discoverAgentHistory(piLookup(root, { terminalTitle: "pane role-worker" })),
+    ).resolves.toMatchObject({ path: other, source: "pi-jsonl" });
+  });
+
+  test("role hint excludes ~/.pi/agent/sessions from scan roots", async () => {
+    const root = await roleRoot();
+    const own = await session(root, "role-worker", "/repo");
+    const homeDir = await mkdtemp(join("/tmp", "herdsman-role-hint-home-"));
+    roleDirs.push(homeDir);
+    const leakedDir = join(homeDir, ".pi", "agent", "sessions");
+    await mkdir(leakedDir, { recursive: true });
+    const leaked = join(leakedDir, "leaked.jsonl");
+    await writeFile(leaked, `${JSON.stringify({ cwd: "/repo" })}\n`);
+    const now = Date.now();
+    await utimes(own, new Date(now - 5_000), new Date(now - 5_000));
+    await utimes(leaked, new Date(now), new Date(now));
+
+    await expect(
+      discoverAgentHistory(piLookup(root, { homeDir, terminalTitle: "π - role-worker - root" })),
+    ).resolves.toMatchObject({ path: own, source: "pi-jsonl" });
+    await expect(discoverAgentHistory(piLookup(root, { homeDir }))).resolves.toMatchObject({
+      path: leaked,
+      source: "pi-jsonl",
+    });
+  });
+
   test("retired /tmp/pi-role-sessions is not scanned or accepted", async () => {
     await mkdir(RETIRED_ROLE_SESSIONS_ROOT, { recursive: true });
     const oldRoot = await mkdtemp(join(RETIRED_ROLE_SESSIONS_ROOT, "retired-"));

@@ -1,7 +1,8 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
+import { DISCOVERY_RECENCY_GRACE_MS } from "@/agent-history/discovery.js";
 import type { AgentHistoryService, ResolvedCompactAgentHistory } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
@@ -31,6 +32,25 @@ async function source(
   return {
     fingerprint: { mtimeMs: Math.trunc(info.mtimeMs), path, size: info.size },
     ref: { kind: "discovered_file", path, source: "pi-jsonl", value: path },
+  };
+}
+
+async function allowedSession(
+  name: string,
+): Promise<{ fingerprint: AgentHistorySourceFingerprint; ref: AgentHistoryRef }> {
+  const dir = join(
+    "/tmp/herdr-role-sessions",
+    `ctx-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  );
+  await mkdir(dir, { recursive: true });
+  sourceDirs.push(dir);
+  const path = join(dir, name);
+  await writeFile(path, "history\n");
+  await chmod(path, 0o600);
+  const info = await stat(path);
+  return {
+    fingerprint: { mtimeMs: Math.trunc(info.mtimeMs), path, size: info.size },
+    ref: { kind: "agent_session", path, source: "pi-jsonl", value: path },
   };
 }
 
@@ -99,10 +119,18 @@ function refreshAgent(
 
 function fakeHistory(result: ResolvedCompactAgentHistory) {
   const calls: Array<{ forceDiscovery?: boolean; preferredRef?: AgentHistoryRef | null }> = [];
+  const occupied: Array<ReadonlySet<string> | undefined> = [];
+  const lookups: Array<{ terminalTitle?: string | null }> = [];
   return {
     calls,
+    lookups,
+    occupied,
     service: {
-      resolveCompactHistory: async (_input, options) => {
+      resolveCompactHistory: async (input, options) => {
+        occupied.push(
+          (input as { occupiedSessionPaths?: ReadonlySet<string> }).occupiedSessionPaths,
+        );
+        lookups.push(input as { terminalTitle?: string | null });
         calls.push(options ?? {});
         return result;
       },
@@ -205,13 +233,32 @@ describe("AgentContextService refresh", () => {
         agent,
         identityChanged: item.identityChanged,
       });
-      expect(fake.calls).toEqual([{ forceDiscovery: true, preferredRef: original.ref }]);
+      expect(fake.calls[0]?.forceDiscovery).toBe(true);
+      if (item.identityChanged) {
+        expect(fake.calls[0]).not.toHaveProperty("preferredRef");
+      }
     }
+  });
+
+  test("does not prefer a path session until safeAllowedSessionPath succeeds", async () => {
+    const missing = join(
+      "/tmp/herdr-role-sessions",
+      `missing-pref-${Date.now()}-${Math.random().toString(16).slice(2)}.jsonl`,
+    );
+    const session = { agent: "pi", kind: "path" as const, source: "pi", value: missing };
+    const harness = openAgent({ agentSession: session, revision: 1 });
+    const fake = fakeHistory(resolved(null, null));
+    await context(harness, fake.service).refreshAgent({
+      agent: harness.agent,
+      identityChanged: true,
+    });
+    expect(fake.calls).toEqual([{ forceDiscovery: true }]);
+    expect(fake.calls[0]).not.toHaveProperty("preferredRef");
   });
 
   test("prefers a changed authoritative session ref and retains an unchanged authoritative ref", async () => {
     const oldSource = await source("old.jsonl");
-    const authoritative = await source("authoritative.jsonl");
+    const authoritative = await allowedSession("authoritative.jsonl");
     const authoritativePath = authoritative.ref.path;
     if (!authoritativePath) throw new Error("Expected authoritative path");
     const session = { agent: "pi", kind: "path", source: "pi", value: authoritative.ref.value };
@@ -322,6 +369,170 @@ describe("AgentContextService refresh", () => {
     expect(refreshed.snapshot.paneRevision).toBe(2);
     expect(refreshed.snapshot.updatedAt).toBeInstanceOf(Date);
     expect(refreshed.snapshot.updatedAt.getTime()).toBeGreaterThan(stored.updatedAt.getTime());
+  });
+
+  test("prefers a recent discovered_file when occupied is unchanged", async () => {
+    const speculative = await source("speculative.jsonl");
+    const harness = openAgent({ revision: 1 });
+    harness.agentContextSnapshots.put(
+      snapshotInput(harness.agent, resolved(speculative.ref, speculative.fingerprint)),
+    );
+    const fake = fakeHistory(resolved(speculative.ref, speculative.fingerprint));
+
+    await context(harness, fake.service).refreshAgent({
+      agent: harness.agent,
+      identityChanged: false,
+    });
+    expect(fake.calls).toEqual([{ forceDiscovery: false, preferredRef: speculative.ref }]);
+  });
+
+  test("rediscovers a discovered_file after recency expires", async () => {
+    const speculative = await source("stale-speculative.jsonl");
+    const harness = openAgent({ revision: 1 });
+    const expired = harness.agent.firstSeenAt.getTime() - DISCOVERY_RECENCY_GRACE_MS - 1_000;
+    const path = speculative.ref.path;
+    if (!path) throw new Error("Expected speculative path");
+    await utimes(path, new Date(expired), new Date(expired));
+    const info = await stat(path);
+    harness.agentContextSnapshots.put(
+      snapshotInput(
+        harness.agent,
+        resolved(speculative.ref, {
+          mtimeMs: Math.trunc(info.mtimeMs),
+          path,
+          size: info.size,
+        }),
+      ),
+    );
+    const fake = fakeHistory(resolved(speculative.ref, speculative.fingerprint));
+
+    await context(harness, fake.service).refreshAgent({
+      agent: harness.agent,
+      identityChanged: false,
+    });
+    expect(fake.calls).toEqual([{ forceDiscovery: false }]);
+    expect(fake.calls[0]).not.toHaveProperty("preferredRef");
+  });
+
+  test("passes terminalTitle into history lookup", async () => {
+    const harness = openAgent();
+    const titled = { ...harness.agent, terminalTitle: "π - role-worker - root" };
+    const current = await source("titled.jsonl");
+    const fake = fakeHistory(resolved(current.ref, current.fingerprint));
+    await context(harness, fake.service).refreshAgent({
+      agent: titled,
+      identityChanged: false,
+    });
+    expect(fake.lookups[0]).toMatchObject({ terminalTitle: "π - role-worker - root" });
+  });
+
+  test("rediscovers a discovered_file when occupied paths change", async () => {
+    const speculative = await source("occupied-change.jsonl");
+    const path = speculative.ref.path;
+    if (!path) throw new Error("Expected speculative path");
+    const harness = openAgent({ revision: 1 });
+    harness.agentContextSnapshots.put(
+      snapshotInput(harness.agent, resolved(speculative.ref, speculative.fingerprint)),
+    );
+    const fake = fakeHistory(resolved(speculative.ref, speculative.fingerprint));
+    const service = context(harness, fake.service);
+    await service.refreshAgent({ agent: harness.agent, identityChanged: false });
+    expect(fake.calls).toEqual([{ forceDiscovery: false, preferredRef: speculative.ref }]);
+
+    harness.agents.replaceForSession({
+      agents: [
+        {
+          agent: "pi",
+          agent_status: "working",
+          pane_id: "wB:p1",
+          terminal_id: "term_pi",
+          workspace_id: "wB",
+        },
+        {
+          agent: "pi",
+          agent_session: { agent: "pi", kind: "path", source: "pi", value: path },
+          agent_status: "working",
+          pane_id: "wB:p2",
+          terminal_id: "term_other",
+          workspace_id: "wB",
+        },
+      ],
+      herdrSessionName: "default",
+    });
+    const self = harness.agents.findByTerminal({
+      herdrSessionName: "default",
+      terminalId: "term_pi",
+    });
+    if (!self) throw new Error("Expected self agent");
+    await service.refreshAgent({ agent: self, identityChanged: false });
+    expect(fake.calls[1]?.forceDiscovery).toBe(true);
+    expect(fake.calls[1]).not.toHaveProperty("preferredRef");
+  });
+
+  test("occupies other agents' snapshot historyRef paths during discovery", async () => {
+    const harness = openAgent();
+    const agents = harness.agents.replaceForSession({
+      agents: [
+        {
+          agent: "pi",
+          agent_status: "working",
+          pane_id: "wB:p1",
+          terminal_id: "term_pi",
+          workspace_id: "wB",
+        },
+        {
+          agent: "pi",
+          agent_session: {
+            agent: "pi",
+            kind: "path",
+            source: "pi",
+            value: "/tmp/herdr-role-sessions/default/role-direct/session.jsonl",
+          },
+          agent_status: "working",
+          pane_id: "wB:p2",
+          terminal_id: "term_other",
+          workspace_id: "wB",
+        },
+        {
+          agent: "pi",
+          agent_status: "working",
+          pane_id: "wB:p3",
+          terminal_id: "term_speculative",
+          workspace_id: "wB",
+        },
+      ],
+      herdrSessionName: "default",
+    });
+    const self = agents.find((agent) => agent.terminalId === "term_pi");
+    const speculative = agents.find((agent) => agent.terminalId === "term_speculative");
+    if (!self || !speculative) throw new Error("Expected seeded agents");
+    const snapshotPath = "/tmp/herdr-role-sessions/default/role-spec/session.jsonl";
+    harness.agentContextSnapshots.put({
+      agentId: speculative.id,
+      compactHistory: history({
+        kind: "discovered_file",
+        path: snapshotPath,
+        source: "pi-jsonl",
+        value: snapshotPath,
+      }),
+      historyRef: {
+        kind: "discovered_file",
+        path: snapshotPath,
+        source: "pi-jsonl",
+        value: snapshotPath,
+      },
+      paneRevision: 1,
+      sourceFingerprint: { mtimeMs: 1, path: snapshotPath, size: 1 },
+    });
+    const current = await source("occupied.jsonl");
+    const fake = fakeHistory(resolved(current.ref, current.fingerprint));
+
+    await context(harness, fake.service).refreshAgent({ agent: self, identityChanged: false });
+    const occupied = [...(fake.occupied[0] ?? [])].sort();
+    expect(occupied).toEqual([
+      "/tmp/herdr-role-sessions/default/role-direct/session.jsonl",
+      snapshotPath,
+    ]);
   });
 });
 

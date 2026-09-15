@@ -1,4 +1,8 @@
-import { historySourceFromSessionRef } from "@/agent-history/discovery.js";
+import {
+  discoveryRecencyGraceMs,
+  historySourceFromSessionRef,
+  safeAllowedSessionPath,
+} from "@/agent-history/discovery.js";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { statSourceFingerprint } from "@/agent-history/source-fingerprint.js";
@@ -47,25 +51,65 @@ export class AgentContextService {
     this.#stores = options.stores;
   }
 
+  occupiedSessionPathsFor(agent: AgentIndexRecord): ReadonlySet<string> {
+    return occupiedForAgent(agent, this.#stores.agents, this.#stores.agentContextSnapshots);
+  }
+
+  historyLookupInput(
+    agent: AgentIndexRecord,
+    occupiedSessionPaths?: ReadonlySet<string>,
+  ): ReturnType<typeof historyLookup> {
+    return historyLookup(
+      agent,
+      this.#stores.agents,
+      this.#stores.agentContextSnapshots,
+      occupiedSessionPaths,
+    );
+  }
+
+  async preferredHistoryRef(agent: AgentIndexRecord): Promise<AgentHistoryRef | null> {
+    const previous = this.#stores.agentContextSnapshots.get(agent.id);
+    const occupiedSessionPaths = occupiedForAgent(
+      agent,
+      this.#stores.agents,
+      this.#stores.agentContextSnapshots,
+    );
+    const occupiedFingerprint = fingerprintOccupied(occupiedSessionPaths);
+    const priorOccupiedFingerprint = this.#occupiedFingerprintByAgent.get(agent.id);
+    const occupiedChanged =
+      priorOccupiedFingerprint !== undefined && priorOccupiedFingerprint !== occupiedFingerprint;
+    return selectPreferredRef({
+      agent,
+      identityChanged: occupiedChanged,
+      occupiedChanged,
+      occupiedSessionPaths,
+      previous,
+    });
+  }
+
   async refreshAgent(input: RefreshAgentContextInput): Promise<RefreshAgentContextResult> {
     const previous = this.#stores.agentContextSnapshots.get(input.agent.id);
-    const directAuthoritativeRef = pathHistoryRefFromAgent(input.agent);
-    const preferredRef =
-      directAuthoritativeRef ??
-      matchingAuthoritativeIdRef(input.agent, previous?.historyRef ?? null) ??
-      (input.agent.agentSession ? null : (previous?.historyRef ?? null));
-    const occupiedSessionPaths =
-      input.occupiedSessionPaths ?? occupiedForAgent(input.agent, this.#stores.agents);
+    const occupiedSessionPaths = new Set([
+      ...(input.occupiedSessionPaths ?? []),
+      ...occupiedForAgent(input.agent, this.#stores.agents, this.#stores.agentContextSnapshots),
+    ]);
     const occupiedFingerprint = fingerprintOccupied(occupiedSessionPaths);
     const priorOccupiedFingerprint = this.#occupiedFingerprintByAgent.get(input.agent.id);
     const occupiedChanged =
       priorOccupiedFingerprint !== undefined && priorOccupiedFingerprint !== occupiedFingerprint;
     this.#occupiedFingerprintByAgent.set(input.agent.id, occupiedFingerprint);
+    const preferredRef = await selectPreferredRef({
+      agent: input.agent,
+      identityChanged: input.identityChanged || occupiedChanged,
+      occupiedChanged,
+      occupiedSessionPaths,
+      previous,
+    });
     const forceDiscovery =
       input.forceRefresh ||
       (await shouldForceDiscovery({
         agent: input.agent,
-        directAuthoritativeRef,
+        directAuthoritativeRef: pathHistoryRefFromAgent(input.agent),
         identityChanged: input.identityChanged || occupiedChanged,
         preferredRef,
         previous,
@@ -73,7 +117,7 @@ export class AgentContextService {
     const resolved = bindAuthoritativeId(
       input.agent,
       await this.#history.resolveCompactHistory(
-        historyLookup(input.agent, this.#stores.agents, occupiedSessionPaths),
+        this.historyLookupInput(input.agent, occupiedSessionPaths),
         {
           forceDiscovery,
           ...(input.forceRefresh === undefined ? {} : { forceRefresh: input.forceRefresh }),
@@ -154,9 +198,11 @@ async function shouldForceDiscovery(input: {
 
 function pathHistoryRefFromAgent(agent: AgentIndexRecord): AgentHistoryRef | null {
   if (agent.agentSession?.kind !== "path") return null;
+  const path = safeAllowedSessionPath(agent.agentSession.value);
+  if (!path) return null;
   return {
     kind: "agent_session",
-    path: agent.agentSession.value,
+    path,
     source: historySourceFromSessionRef(agent.agentSession),
     value: agent.agentSession.value,
   };
@@ -198,15 +244,57 @@ function bindAuthoritativeId(
   };
 }
 
-function occupiedForAgent(agent: AgentIndexRecord, agents: AgentStore): ReadonlySet<string> {
-  return new Set(
-    agents
-      .listForHerdrSession(agent.herdrSessionName)
-      .filter((candidate) => candidate.id !== agent.id)
-      .flatMap((candidate) =>
-        candidate.agentSession?.kind === "path" ? [candidate.agentSession.value] : [],
-      ),
-  );
+async function selectPreferredRef(input: {
+  agent: AgentIndexRecord;
+  identityChanged: boolean;
+  occupiedChanged: boolean;
+  occupiedSessionPaths: ReadonlySet<string>;
+  previous: AgentContextSnapshotRecord | undefined;
+}): Promise<AgentHistoryRef | null> {
+  const previousRef = input.previous?.historyRef ?? null;
+  const directAuthoritativeRef = pathHistoryRefFromAgent(input.agent);
+  if (directAuthoritativeRef) return directAuthoritativeRef;
+  const matchingId = matchingAuthoritativeIdRef(input.agent, previousRef);
+  if (matchingId) return matchingId;
+  if (previousRef?.kind === "discovered_file") {
+    const path = previousRef.path ?? previousRef.value;
+    if (input.identityChanged || input.occupiedChanged || input.occupiedSessionPaths.has(path)) {
+      return null;
+    }
+    if (!(await discoveredFileStillRecent(input.agent, path))) return null;
+    return previousRef;
+  }
+  if (input.agent.agentSession) return null;
+  return previousRef;
+}
+
+async function discoveredFileStillRecent(agent: AgentIndexRecord, path: string): Promise<boolean> {
+  const fingerprint = await statSourceFingerprint(path);
+  if (!fingerprint) return false;
+  const graceMs = discoveryRecencyGraceMs({
+    agent: agent.agent,
+    agentSession: agent.agentSession,
+    ...(agent.terminalTitle ? { terminalTitle: agent.terminalTitle } : {}),
+  });
+  return fingerprint.mtimeMs >= agent.firstSeenAt.getTime() - graceMs;
+}
+
+export function occupiedForAgent(
+  agent: AgentIndexRecord,
+  agents: AgentStore,
+  snapshots: AgentContextSnapshotStore,
+): ReadonlySet<string> {
+  const others = agents
+    .listForHerdrSession(agent.herdrSessionName)
+    .filter((candidate) => candidate.id !== agent.id);
+  return new Set([
+    ...others.flatMap((candidate) =>
+      candidate.agentSession?.kind === "path" ? [candidate.agentSession.value] : [],
+    ),
+    ...snapshots
+      .listByAgentIds(others.map((candidate) => candidate.id))
+      .flatMap((snapshot) => (snapshot.historyRef?.path ? [snapshot.historyRef.path] : [])),
+  ]);
 }
 
 function fingerprintOccupied(paths: ReadonlySet<string>): string {
@@ -216,6 +304,7 @@ function fingerprintOccupied(paths: ReadonlySet<string>): string {
 function historyLookup(
   agent: AgentIndexRecord,
   agents: AgentStore,
+  snapshots: AgentContextSnapshotStore,
   occupiedSessionPaths?: ReadonlySet<string>,
 ) {
   return {
@@ -228,7 +317,8 @@ function historyLookup(
     ...(agent.agent?.toLowerCase() === "grok" && agent.grokHome
       ? { grokHome: agent.grokHome }
       : {}),
-    occupiedSessionPaths: occupiedSessionPaths ?? occupiedForAgent(agent, agents),
+    ...(agent.terminalTitle ? { terminalTitle: agent.terminalTitle } : {}),
+    occupiedSessionPaths: occupiedSessionPaths ?? occupiedForAgent(agent, agents, snapshots),
   };
 }
 

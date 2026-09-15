@@ -380,7 +380,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       });
       await pi.emit("agent_start", {}, ctx);
       expect(await pi.emitContext([], ctx)).toEqual([
-        expect.objectContaining({ content: expect.stringContaining("first") }),
+        expect.objectContaining({ content: expect.stringContaining("second") }),
       ]);
 
       await pi.emit("agent_settled", {}, ctx);
@@ -3474,6 +3474,62 @@ describe("herdsman-pi context intersection regressions (independent coverage)", 
       restoreEnv(previous);
     }
   });
+  test("overlays next agentStatus and history onto retained panes", async () => {
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx();
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    const first = {
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "working",
+          id: "same",
+          history: { lastAssistantMessage: { text: "old-history" } },
+          paneId: "wB:p-agent",
+          terminalId: "term_agent",
+        },
+      ],
+      herdrSessionName: "default",
+      updatedAt: "2026-07-16T00:00:00.000Z",
+      workspaceId: "wB",
+    };
+    const second = {
+      ...first,
+      agents: [
+        {
+          ...first.agents[0],
+          agentStatus: "done",
+          history: { lastAssistantMessage: { text: "new-history" } },
+        },
+      ],
+      updatedAt: "2026-07-16T00:00:01.000Z",
+    };
+    client.response = (method) =>
+      method === "agent.orchestrator.register" ? connectionResponse({ context: first }) : {};
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
+    const previous = withHerdrEnv();
+    try {
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+      await pi.emit("agent_start", {}, ctx);
+      const before = await pi.emitContext([], ctx);
+      expect((before[0] as { content: string }).content).toContain("working");
+      expect((before[0] as { content: string }).content).toContain("old-history");
+      client.emitStream({
+        method: "agent.context.changed",
+        params: { context: second, herdrSessionName: "default", workspaceId: "wB" },
+      });
+      const after = await pi.emitContext([], ctx);
+      expect((after[0] as { content: string }).content).toContain("done");
+      expect((after[0] as { content: string }).content).toContain("new-history");
+      expect((after[0] as { content: string }).content).not.toContain("working");
+      expect((after[0] as { content: string }).content).not.toContain("old-history");
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+
   test("新快照缺少某 pane 时注入内容移除该 pane，仍存在的 pane 保留", async () => {
     const client = createFakeClient();
     const pi = createFakePi();

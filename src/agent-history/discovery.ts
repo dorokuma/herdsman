@@ -9,15 +9,19 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
 // registration) may not have landed when the agent is first observed, so
 // discovery falls back to cwd-based guessing. A session file untouched since
 // before the agent was first seen cannot be that agent's live session.
-// Herdr observation delay is on the second scale, so a 10-minute grace window
-// is far more generous than needed; it only discards sessions that had already
-// stopped being written well before the agent appeared.
+// Herdr observation delay is on the second scale. Pi and role-hinted lookups
+// use a 30-second grace window to absorb detection lag; other executor
+// fallbacks (claude/codex/gemini/grok) keep 10 minutes so idle sessions are
+// not dropped. Antigravity already short-circuits before recency ranking.
 // Dispatched Pi role sessions live under /tmp/herdr-role-sessions/<herdr-session>/.
 // Exact-path registration may resolve any file under this root; fallback/id scans
-// must be scoped to the agent's own herdr session subdirectory.
+// must be scoped to the agent's own herdr session subdirectory, and when the pane
+// terminal title contains a complete role-<id> segment, to that role directory only
+// (no cross-role adopt, and ~/.pi/agent/sessions is excluded while the hint is set).
 export const ALLOWED_SESSION_ROOTS = ["/tmp/herdr-role-sessions"] as const;
 
-export const DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
+export const DISCOVERY_RECENCY_GRACE_MS = 30_000;
+export const FALLBACK_DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
 export type AgentHistoryLookupInput = {
   agent: string | null;
   agentSession: AgentSessionRef | null;
@@ -28,6 +32,7 @@ export type AgentHistoryLookupInput = {
   herdrSessionName?: string;
   homeDir?: string;
   occupiedSessionPaths?: ReadonlySet<string>;
+  terminalTitle?: string | null;
 };
 
 type Candidate = {
@@ -75,7 +80,9 @@ export async function discoverAgentHistory(
       if (ref) return { ...ref, kind: "agent_session" };
     }
     if (source === "pi-jsonl") {
-      const roots = new Set(piJsonlScanRoots(homeDir, input.herdrSessionName));
+      const roots = new Set(
+        piJsonlScanRoots(homeDir, input.herdrSessionName, roleDirectoryHint(input)),
+      );
       for (const root of roots) {
         const matches = await scanRootById(root, input.agentSession.value, source);
         const candidate = matches.find((item) => !input.occupiedSessionPaths?.has(item.path));
@@ -97,8 +104,9 @@ export async function discoverAgentHistory(
 
   const agent = input.agent?.toLowerCase() ?? input.agentSession?.agent.toLowerCase() ?? "";
   const candidates: Candidate[] = [];
+  const roleHint = roleDirectoryHint(input);
   if (agent === "pi") {
-    const roots = new Set(piJsonlScanRoots(homeDir, input.herdrSessionName));
+    const roots = new Set(piJsonlScanRoots(homeDir, input.herdrSessionName, roleHint));
     for (const root of roots) {
       candidates.push(...(await scanRoot(root, "pi-jsonl")));
     }
@@ -132,10 +140,11 @@ export async function discoverAgentHistory(
   const ranked = candidates
     .filter((candidate) => normalizedCwd !== null && normalizeCwd(candidate.cwd) === normalizedCwd)
     .filter((candidate) => !input.occupiedSessionPaths?.has(candidate.path))
+    .filter((candidate) => matchesRoleDirectory(candidate.path, roleHint))
     .filter(
       (candidate) =>
         input.firstSeenAtMs === undefined ||
-        candidate.mtimeMs >= input.firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS,
+        candidate.mtimeMs >= input.firstSeenAtMs - discoveryRecencyGraceMs(input),
     )
     .sort((a, b) => {
       if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
@@ -197,8 +206,64 @@ function isSafeHerdrSessionSegment(name: string): boolean {
   return name.length > 0 && name !== "." && name !== ".." && !/[\\/\0]/.test(name);
 }
 
-function piJsonlScanRoots(homeDir: string, herdrSessionName: string | undefined): string[] {
-  const roots = [join(homeDir, ".pi", "agent", "sessions")];
+const ROLE_DIRECTORY_SEGMENT = /^role-[a-z0-9][\w-]*$/i;
+
+function roleDirectoryHint(input: Pick<AgentHistoryLookupInput, "terminalTitle">): string | null {
+  if (!input.terminalTitle) return null;
+  for (const segment of input.terminalTitle.split(" - ")) {
+    const trimmed = segment.trim();
+    if (ROLE_DIRECTORY_SEGMENT.test(trimmed)) return trimmed;
+  }
+  return null;
+}
+
+export function usesShortDiscoveryRecency(
+  input: Pick<AgentHistoryLookupInput, "agent" | "agentSession" | "terminalTitle">,
+): boolean {
+  const agent = input.agent?.toLowerCase() ?? input.agentSession?.agent.toLowerCase() ?? "";
+  return agent === "pi" || roleDirectoryHint(input) !== null;
+}
+
+export function discoveryRecencyGraceMs(
+  input: Pick<AgentHistoryLookupInput, "agent" | "agentSession" | "terminalTitle">,
+): number {
+  return usesShortDiscoveryRecency(input)
+    ? DISCOVERY_RECENCY_GRACE_MS
+    : FALLBACK_DISCOVERY_RECENCY_GRACE_MS;
+}
+
+export function sessionPathAllowedByShape(value: string, homeDir?: string): boolean {
+  if (!isAbsolute(value) || value.includes("..")) return false;
+  const resolved = normalize(value);
+  const homeSessionRoot = join(homeDir ?? process.env.HOME ?? "/root", ".pi/agent/sessions");
+  const roots = [homeSessionRoot, ...ALLOWED_SESSION_ROOTS];
+  return roots.some((root) => {
+    const rest = relative(root, resolved);
+    return rest !== "" && !rest.startsWith("..") && !isAbsolute(rest);
+  });
+}
+
+function pathIsUnderAllowedSessionRoot(path: string): boolean {
+  return ALLOWED_SESSION_ROOTS.some((root) => {
+    const rest = relative(root, path);
+    return rest !== "" && !rest.startsWith("..") && !isAbsolute(rest);
+  });
+}
+
+function matchesRoleDirectory(path: string, roleHint: string | null): boolean {
+  if (!roleHint || !pathIsUnderAllowedSessionRoot(path)) return true;
+  return path.split("/").includes(roleHint);
+}
+
+function piJsonlScanRoots(
+  homeDir: string,
+  herdrSessionName: string | undefined,
+  roleDirectory?: string | null,
+): string[] {
+  const roots: string[] = [];
+  if (!roleDirectory) {
+    roots.push(join(homeDir, ".pi", "agent", "sessions"));
+  }
   if (herdrSessionName === undefined || !isSafeHerdrSessionSegment(herdrSessionName)) {
     return roots;
   }
@@ -206,7 +271,14 @@ function piJsonlScanRoots(homeDir: string, herdrSessionName: string | undefined)
     const scoped = normalize(join(allowed, herdrSessionName));
     const rest = relative(allowed, scoped);
     if (rest === "" || rest.startsWith("..") || isAbsolute(rest)) continue;
-    roots.push(scoped);
+    if (roleDirectory && isSafeHerdrSessionSegment(roleDirectory)) {
+      const roleScoped = normalize(join(scoped, roleDirectory));
+      const roleRest = relative(scoped, roleScoped);
+      if (roleRest === "" || roleRest.startsWith("..") || isAbsolute(roleRest)) continue;
+      roots.push(roleScoped);
+    } else {
+      roots.push(scoped);
+    }
   }
   return roots;
 }

@@ -38,6 +38,7 @@ export type AgentIndexRecord = {
   lastSeenAt: Date;
   name: string | null;
   paneId: string;
+  terminalTitle?: string | null;
   paneRevision: number | null;
   paneGeneration?: string | null;
   tabId: string | null;

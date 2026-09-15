@@ -1,4 +1,4 @@
-import { mkdirSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
@@ -518,19 +518,268 @@ describe("AgentIndexService", () => {
     ).toEqual(sessionRef);
     harness.sqlite.close();
   });
+
+  test("stores a session hint when the registered file is missing and promotes it after the file appears", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("idle", 10, "pi");
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const allowedPath = join("/tmp/herdr-role-sessions", `hint-missing-${Date.now()}.jsonl`);
+    const sessionRef = {
+      agent: "pi" as const,
+      kind: "path" as const,
+      source: "herdr:pi",
+      value: allowedPath,
+    };
+
+    const registered = await index.registerPiSessionRef({
+      herdrSessionName: "default",
+      sessionRef,
+      terminalId: "term_claude",
+    });
+    expect(registered.agent?.agentSession).toEqual(sessionRef);
+    expect(
+      harness.sqlite
+        .prepare("select agent_session_hint_json from agents where terminal_id = ?")
+        .get("term_claude"),
+    ).toEqual({ agent_session_hint_json: JSON.stringify(sessionRef) });
+    const registeredId = registered.agent?.id;
+    if (!registeredId) throw new Error("expected registered agent");
+    expect(harness.agentContextSnapshots.get(registeredId)?.historyRef?.path).not.toBe(allowedPath);
+
+    mkdirSync("/tmp/herdr-role-sessions", { recursive: true });
+    writeFileSync(allowedPath, JSON.stringify({ cwd: "/tmp" }));
+    chmodSync(allowedPath, 0o600);
+    const refreshed = await index.refreshHerdrSession(sessionInput());
+    expect(refreshed.agents[0]?.agentSession).toEqual(sessionRef);
+    expect(harness.agentContextSnapshots.get(registeredId)?.historyRef?.path).toBe(allowedPath);
+    harness.sqlite.close();
+  });
+
+  test("re-evaluates discovered_file and null history snapshots on every index refresh", async () => {
+    const harness = openObservabilityDbHarness();
+    const calls: string[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("idle", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory(agent: { agent: string | null }) {
+          calls.push(agent.agent ?? "unknown");
+          const path = "/tmp/herdr-role-sessions/default/role-spec/session.jsonl";
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "history", text: "result", timestamp: null },
+            },
+            historyRef: {
+              kind: "discovered_file",
+              path,
+              source: "pi-jsonl",
+              value: path,
+            },
+            sourceFingerprint: { mtimeMs: 1, path, size: 1 },
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    expect(calls).toEqual(["pi"]);
+    calls.length = 0;
+    await index.refreshHerdrSession(sessionInput());
+    expect(calls).toEqual(["pi"]);
+
+    const nullHarness = openObservabilityDbHarness();
+    const nullCalls: string[] = [];
+    const nullIndex = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("idle", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory(agent: { agent: string | null }) {
+          nullCalls.push(agent.agent ?? "unknown");
+          return {
+            compactHistory: emptyCompactHistory("pi-jsonl"),
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: nullHarness,
+    });
+    await nullIndex.refreshHerdrSession(sessionInput());
+    expect(nullCalls).toEqual(["pi"]);
+    nullCalls.length = 0;
+    await nullIndex.refreshHerdrSession(sessionInput());
+    expect(nullCalls).toEqual(["pi"]);
+    harness.sqlite.close();
+    nullHarness.sqlite.close();
+  });
+
+  test("re-discovers when another agent occupies the cached history path", async () => {
+    const harness = openObservabilityDbHarness();
+    const calls: string[] = [];
+    const sharedPath = "/tmp/herdr-role-sessions/default/role-shared/session.jsonl";
+    let includeOccupant = false;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return snapshot(
+            [
+              agent({
+                agent: "pi",
+                pane_id: "wJ:p2",
+                revision: undefined,
+                terminal_id: "term_claude",
+                workspace_id: "wJ",
+              }),
+              ...(includeOccupant
+                ? [
+                    agent({
+                      agent: "pi",
+                      agent_session: {
+                        agent: "pi",
+                        kind: "path",
+                        source: "herdr:pi",
+                        value: sharedPath,
+                      },
+                      pane_id: "wJ:p3",
+                      revision: undefined,
+                      terminal_id: "term_other",
+                      workspace_id: "wJ",
+                    }),
+                  ]
+                : []),
+            ],
+            includeOccupant
+              ? [
+                  { pane_id: "wJ:p2", revision: 10 },
+                  { pane_id: "wJ:p3", revision: 10 },
+                ]
+              : [{ pane_id: "wJ:p2", revision: 10 }],
+          );
+        },
+      }),
+      history: {
+        async resolveCompactHistory(agent: {
+          agent: string | null;
+          agentSession?: { value?: string };
+        }) {
+          calls.push(`${agent.agent}:${agent.agentSession?.value ?? "none"}`);
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "history", text: "result", timestamp: null },
+            },
+            historyRef: {
+              kind: "agent_session",
+              path: sharedPath,
+              source: "pi-jsonl",
+              value: sharedPath,
+            },
+            sourceFingerprint: { mtimeMs: 1, path: sharedPath, size: 1 },
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    expect(calls).toEqual(["pi:none"]);
+    calls.length = 0;
+    await index.refreshHerdrSession(sessionInput());
+    expect(calls).toEqual([]);
+    includeOccupant = true;
+    await index.refreshHerdrSession(sessionInput());
+    expect(calls).toContain("pi:none");
+    harness.sqlite.close();
+  });
+
+  test("forwards terminalTitle from the live snapshot into history lookup", async () => {
+    const harness = openObservabilityDbHarness();
+    const titles: Array<string | null | undefined> = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return snapshot(
+            [
+              agent({
+                agent: "pi",
+                pane_id: "wJ:p2",
+                revision: undefined,
+                terminal_id: "term_claude",
+                workspace_id: "wJ",
+              }),
+            ],
+            [
+              {
+                pane_id: "wJ:p2",
+                revision: 10,
+                terminal_title: "π - role-worker-53c500b2 - root",
+              },
+            ],
+          );
+        },
+      }),
+      history: {
+        async resolveCompactHistory(input: { terminalTitle?: string | null }) {
+          titles.push(input.terminalTitle);
+          return {
+            compactHistory: emptyCompactHistory("pi-jsonl"),
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    expect(titles).toEqual(["π - role-worker-53c500b2 - root"]);
+    harness.sqlite.close();
+  });
 });
 
 function history(onResolve: (agent: { agent: string | null }) => void, assistantText = "result") {
   return {
-    async resolveCompactHistory(agent: { agent: string | null }) {
+    async resolveCompactHistory(
+      agent: { agent: string | null },
+      options: { preferredRef?: { path?: string; value?: string } | null } = {},
+    ) {
       onResolve(agent);
+      const path =
+        options.preferredRef?.path ??
+        options.preferredRef?.value ??
+        `/tmp/herdr-role-sessions/default/${agent.agent ?? "unknown"}-history.jsonl`;
+      const historyRef = {
+        kind: "agent_session" as const,
+        path,
+        source: "claude-jsonl" as const,
+        value: path,
+      };
       return {
         compactHistory: {
           ...emptyCompactHistory("claude-jsonl"),
+          historyRef,
           lastAssistantMessage: { ref: "history", text: assistantText, timestamp: null },
         },
-        historyRef: null,
-        sourceFingerprint: null,
+        historyRef,
+        sourceFingerprint: { mtimeMs: 1, path, size: 1 },
       };
     },
   } as unknown as AgentHistoryService;

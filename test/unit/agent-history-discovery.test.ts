@@ -6,7 +6,10 @@ import { afterEach, describe, expect, test } from "vitest";
 import {
   DISCOVERY_RECENCY_GRACE_MS,
   discoverAgentHistory,
+  discoveryRecencyGraceMs,
+  FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
   historySourceFromSessionRef,
+  usesShortDiscoveryRecency,
 } from "@/agent-history/discovery.js";
 
 const tempDirs: string[] = [];
@@ -202,7 +205,38 @@ describe("agent history discovery", () => {
     });
   });
 
-  test("drops stale candidates whose mtime predates firstSeenAtMs by more than the grace window", async () => {
+  test("uses a 30s recency window for pi and role-hinted lookups, 10min otherwise", () => {
+    expect(
+      usesShortDiscoveryRecency({ agent: "pi", agentSession: null, terminalTitle: null }),
+    ).toBe(true);
+    expect(discoveryRecencyGraceMs({ agent: "pi", agentSession: null })).toBe(
+      DISCOVERY_RECENCY_GRACE_MS,
+    );
+    expect(discoveryRecencyGraceMs({ agent: "claude", agentSession: null })).toBe(
+      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
+    );
+    expect(discoveryRecencyGraceMs({ agent: "codex", agentSession: null })).toBe(
+      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
+    );
+    expect(discoveryRecencyGraceMs({ agent: "gemini", agentSession: null })).toBe(
+      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
+    );
+    expect(discoveryRecencyGraceMs({ agent: "grok", agentSession: null })).toBe(
+      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
+    );
+    expect(discoveryRecencyGraceMs({ agent: "agy", agentSession: null })).toBe(
+      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
+    );
+    expect(
+      discoveryRecencyGraceMs({
+        agent: "claude",
+        agentSession: null,
+        terminalTitle: "π - role-worker-53c500b2 - root",
+      }),
+    ).toBe(DISCOVERY_RECENCY_GRACE_MS);
+  });
+
+  test("drops stale fallback candidates whose mtime predates firstSeenAtMs by more than 10 minutes", async () => {
     const homeDir = await tempHome("herdsman-codex-stale-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
@@ -214,14 +248,16 @@ describe("agent history discovery", () => {
       path,
       `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
     );
-    await utimes(path, new Date(1000), new Date(1000));
+    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
+    const mtimeMs = firstSeenAtMs - FALLBACK_DISCOVERY_RECENCY_GRACE_MS - 1_000;
+    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
 
     await expect(
       discoverAgentHistory({
         agent: "codex",
         agentSession: null,
         cwd: "/repo",
-        firstSeenAtMs: Date.UTC(2026, 6, 9, 14, 0, 0),
+        firstSeenAtMs,
         foregroundCwd: null,
         homeDir,
       }),
@@ -261,7 +297,7 @@ describe("agent history discovery", () => {
     });
   });
 
-  test("keeps a candidate whose mtime is before firstSeenAtMs but within the grace window", async () => {
+  test("keeps a fallback candidate whose mtime is before firstSeenAtMs but within 10 minutes", async () => {
     const homeDir = await tempHome("herdsman-codex-grace-home-");
     const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
     await mkdir(dir, { recursive: true });
@@ -274,7 +310,7 @@ describe("agent history discovery", () => {
       `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
     );
     const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
-    const mtimeMs = firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS + 1_000; // 1s inside the grace window
+    const mtimeMs = firstSeenAtMs - FALLBACK_DISCOVERY_RECENCY_GRACE_MS + 1_000;
     await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
 
     await expect(
@@ -290,6 +326,55 @@ describe("agent history discovery", () => {
       kind: "discovered_file",
       path,
       source: "codex-jsonl",
+      value: path,
+    });
+  });
+
+  test("drops a pi candidate whose mtime predates firstSeenAtMs by more than 30s", async () => {
+    const homeDir = await tempHome("herdsman-pi-stale-home-");
+    const dir = join(homeDir, ".pi", "agent", "sessions");
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "stale-session.jsonl");
+    await writeFile(path, `${JSON.stringify({ cwd: "/repo" })}\n`);
+    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
+    const mtimeMs = firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS - 1_000;
+    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: null,
+        cwd: "/repo",
+        firstSeenAtMs,
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toBeNull();
+  });
+
+  test("keeps a pi candidate whose mtime is 29s before firstSeenAtMs", async () => {
+    const homeDir = await tempHome("herdsman-pi-grace-home-");
+    const dir = join(homeDir, ".pi", "agent", "sessions");
+    await mkdir(dir, { recursive: true });
+    const path = join(dir, "recent-session.jsonl");
+    await writeFile(path, `${JSON.stringify({ cwd: "/repo" })}\n`);
+    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
+    const mtimeMs = firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS + 1_000; // 29s before firstSeen
+    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
+
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: null,
+        cwd: "/repo",
+        firstSeenAtMs,
+        foregroundCwd: null,
+        homeDir,
+      }),
+    ).resolves.toMatchObject({
+      kind: "discovered_file",
+      path,
+      source: "pi-jsonl",
       value: path,
     });
   });

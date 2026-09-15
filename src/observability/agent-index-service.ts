@@ -1,5 +1,6 @@
+import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { safeAllowedSessionPath } from "@/agent-history/discovery.js";
+import { safeAllowedSessionPath, sessionPathAllowedByShape } from "@/agent-history/discovery.js";
 import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
 import { type AgentEventStore, hasNonEmptyAssistantMessage } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
@@ -830,17 +831,20 @@ export class AgentIndexService {
         });
         return { agents: previous, contextChangedScopes: [], events: [], statusEventPlans: [] };
       }
-      const revisionByPane = new Map(
-        snapshot.panes.flatMap((pane) => {
-          const value = record(pane);
-          const paneId = stringValue(value.pane_id) ?? stringValue(value.paneId);
-          const revision = integerValue(value.revision);
-          return paneId && revision !== undefined ? ([[paneId, revision]] as const) : [];
-        }),
-      );
-      const snapshotAgents = snapshot.agents.map((agent) =>
-        withPaneRevision(agent, revisionByPane),
-      );
+      const overlayByPane = new Map<string, PaneOverlay>();
+      for (const pane of snapshot.panes) {
+        const value = record(pane);
+        const paneId = stringValue(value.pane_id) ?? stringValue(value.paneId);
+        if (!paneId) continue;
+        const revision = integerValue(value.revision);
+        const terminalTitle = stringValue(value.terminal_title) ?? stringValue(value.terminalTitle);
+        if (revision === undefined && !terminalTitle) continue;
+        overlayByPane.set(paneId, {
+          ...(revision === undefined ? {} : { revision }),
+          ...(terminalTitle ? { terminalTitle } : {}),
+        });
+      }
+      const snapshotAgents = snapshot.agents.map((agent) => withPaneRevision(agent, overlayByPane));
       // A live pane that reports a pane_generation overrides any generation-less
       // (legacy) close: drop the legacy tombstone before consulting
       // isPaneClosed so the generation-carrying agent is indexed instead of
@@ -901,11 +905,26 @@ export class AgentIndexService {
         const identityChanged = !prior || !sameIdentity(prior, agent);
         const metadataChanged = !prior || !sameContextMetadata(prior, agent);
         const cached = this.#context.getAgentSnapshot(agent.id);
+        const occupiedByOthers = this.#context.occupiedSessionPathsFor(agent);
+        const occupancyConflict = Boolean(
+          cached?.historyRef?.path && occupiedByOthers.has(cached.historyRef.path),
+        );
+        const sessionReady =
+          agent.agentSession?.kind === "path" &&
+          safeAllowedSessionPath(agent.agentSession.value) !== null;
+        const sessionUnbound =
+          sessionReady &&
+          (cached?.historyRef?.kind !== "agent_session" ||
+            cached.historyRef.path !== agent.agentSession?.value);
         const dirty =
           !cached ||
           agent.paneRevision === null ||
           cached.paneRevision !== agent.paneRevision ||
-          identityChanged;
+          identityChanged ||
+          cached.historyRef == null ||
+          cached.historyRef.kind === "discovered_file" ||
+          occupancyConflict ||
+          sessionUnbound;
         let refreshed = cached;
         if (dirty) {
           const occupiedForCurrent = new Set(occupiedSessionPaths);
@@ -1108,7 +1127,12 @@ export class AgentIndexService {
   }): Promise<PiSessionRefRegistrationResult> {
     const key = terminalSessionKey(input.herdrSessionName, input.terminalId);
     if (input.sessionRef.kind === "path" && !safeAllowedSessionPath(input.sessionRef.value)) {
-      return { agent: undefined, contextChangedScopes: [] };
+      if (
+        existsSync(input.sessionRef.value) ||
+        !sessionPathAllowedByShape(input.sessionRef.value)
+      ) {
+        return { agent: undefined, contextChangedScopes: [] };
+      }
     }
     const previous = this.#stores.agents.findByTerminal(input);
     if (!previous) {
@@ -1660,12 +1684,32 @@ export class AgentIndexService {
   }
 }
 
-function withPaneRevision(agent: unknown, revisionByPane: Map<string, number>): HerdrAgentLike {
+type PaneOverlay = {
+  revision?: number;
+  terminalTitle?: string;
+};
+
+function withPaneRevision(agent: unknown, overlayByPane: Map<string, PaneOverlay>): HerdrAgentLike {
   const raw = record(agent);
-  if (integerValue(raw.revision) !== undefined) return raw;
   const paneId = stringValue(raw.pane_id) ?? stringValue(raw.paneId);
-  const revision = paneId ? revisionByPane.get(paneId) : undefined;
-  return revision === undefined ? raw : { ...raw, revision };
+  const overlay = paneId ? overlayByPane.get(paneId) : undefined;
+  const revision = integerValue(raw.revision) ?? overlay?.revision;
+  const terminalTitle =
+    stringValue(raw.terminal_title) ?? stringValue(raw.terminalTitle) ?? overlay?.terminalTitle;
+  if (revision === undefined && !terminalTitle) return raw;
+  // Collapse dual keys onto herdr-canonical snake_case `terminal_title`.
+  // Incoming snapshots may carry camelCase `terminalTitle`; spreading `raw`
+  // would otherwise leave both keys on the overlay object. Downstream
+  // HerdrAgentLike readers (AgentStore.replaceForSession) still accept
+  // camelCase as fallback, and AgentIndexRecord.terminalTitle is populated
+  // later from whichever key is present.
+  const rest = { ...raw };
+  delete rest.terminalTitle;
+  return {
+    ...rest,
+    ...(revision === undefined ? {} : { revision }),
+    ...(terminalTitle ? { terminal_title: terminalTitle } : {}),
+  };
 }
 
 function paneGenerationOf(agent: HerdrAgentLike): string | null {

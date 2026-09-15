@@ -362,10 +362,13 @@ export class ObservabilityRpcServer {
         const input = params as AgentQueryScope & { target: string };
         const scope = this.#resolveScope(input);
         const agent = this.#stores.agents.resolveTarget(scope, input.target);
-        const preferredRef = this.#context.getAgentSnapshot(agent.id)?.historyRef;
-        const history = await this.#history.resolveCompactHistory(historyInput(agent), {
-          preferredRef: preferredRef ?? null,
-        });
+        const preferredRef = await this.#context.preferredHistoryRef(agent);
+        const history = await this.#history.resolveCompactHistory(
+          this.#context.historyLookupInput(agent),
+          {
+            ...(preferredRef ? { preferredRef } : {}),
+          },
+        );
         return { agent: { ...agent, history: history.compactHistory } };
       }
       case "agent.read": {
@@ -373,10 +376,10 @@ export class ObservabilityRpcServer {
         const input = params as AgentQueryScope & { limit?: number; target: string };
         const scope = this.#resolveScope(input);
         const agent = this.#stores.agents.resolveTarget(scope, input.target);
-        const preferredRef = this.#context.getAgentSnapshot(agent.id)?.historyRef;
-        const read = await this.#history.read(historyInput(agent), {
+        const preferredRef = await this.#context.preferredHistoryRef(agent);
+        const read = await this.#history.read(this.#context.historyLookupInput(agent), {
           limit: input.limit ?? 20,
-          preferredRef: preferredRef ?? null,
+          ...(preferredRef ? { preferredRef } : {}),
         });
         return { agent: { ...agent, historyRef: read.historyRef, messages: read.messages } };
       }
@@ -759,17 +762,6 @@ class ConnectorPaneMismatchError extends Error {
     super("Connector process does not match Herdr pane");
     this.name = "ConnectorPaneMismatchError";
   }
-}
-
-function historyInput(agent: AgentIndexRecord) {
-  return {
-    agent: agent.agent,
-    agentSession: agent.agentSession,
-    cwd: agent.cwd,
-    firstSeenAtMs: agent.firstSeenAt.getTime(),
-    foregroundCwd: agent.foregroundCwd,
-    herdrSessionName: agent.herdrSessionName,
-  };
 }
 
 function assertSchema(schema: Parameters<typeof Value.Check>[0], value: unknown): void {

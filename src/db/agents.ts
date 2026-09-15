@@ -38,10 +38,17 @@ type AgentRow = {
 export class AgentStore {
   readonly #sqlite: DatabaseSync;
   readonly #agentEvents: AgentEventStore;
+  readonly #terminalTitleById = new Map<string, string>();
 
   constructor(sqlite: DatabaseSync, agentEvents: AgentEventStore) {
     this.#sqlite = sqlite;
     this.#agentEvents = agentEvents;
+  }
+
+  #record(row: AgentRow): AgentIndexRecord {
+    const mapped = mapAgent(row);
+    const terminalTitle = this.#terminalTitleById.get(row.id);
+    return terminalTitle === undefined ? mapped : { ...mapped, terminalTitle };
   }
 
   replaceForSession(input: {
@@ -107,6 +114,10 @@ export class AgentStore {
         retainedIds.push(id);
         const agent = stringValue(snapshot.agent.agent);
         const name = stringValue(snapshot.agent.name);
+        const terminalTitle =
+          stringValue(snapshot.agent.terminal_title) ?? stringValue(snapshot.agent.terminalTitle);
+        if (terminalTitle) this.#terminalTitleById.set(id, terminalTitle);
+        else this.#terminalTitleById.delete(id);
         const sessionHint = current?.agent === agent ? current.agent_session_hint_json : null;
         const grokHome =
           stringValue(snapshot.agent.agent)?.toLowerCase() === "grok"
@@ -166,6 +177,7 @@ export class AgentStore {
       const removedIds = existing
         .map((agent) => agent.id)
         .filter((id) => !retainedIds.includes(id));
+      for (const id of removedIds) this.#terminalTitleById.delete(id);
       for (const agent of existing.filter((candidate) => removedIds.includes(candidate.id))) {
         this.#agentEvents.invalidatePane({
           herdrSessionName: input.herdrSessionName,
@@ -211,6 +223,7 @@ export class AgentStore {
         .all(input.herdrSessionName, input.paneId, ...generationParams) as AgentRow[];
       if (agents.length === 0) return [];
       const ids = agents.map((agent) => agent.id);
+      for (const id of ids) this.#terminalTitleById.delete(id);
       const placeholders = ids.map(() => "?").join(", ");
       this.#sqlite
         .prepare(`delete from agent_context_snapshots where agent_id in (${placeholders})`)
@@ -220,7 +233,7 @@ export class AgentStore {
           `delete from agents where herdr_session_name = ? and pane_id = ?${generationClause}`,
         )
         .run(input.herdrSessionName, input.paneId, ...generationParams);
-      return agents.map(mapAgent);
+      return agents.map((row) => this.#record(row));
     });
   }
 
@@ -374,7 +387,7 @@ export class AgentStore {
          order by agents.herdr_session_name, agents.workspace_id, agents.pane_id`,
       )
       .all(...params) as AgentRow[];
-    return rows.map(mapAgent);
+    return rows.map((row) => this.#record(row));
   }
 
   listForHerdrSession(herdrSessionName: string): AgentIndexRecord[] {
@@ -396,7 +409,7 @@ export class AgentStore {
         input.paneId,
         ...(input.paneGeneration == null ? [] : [input.paneGeneration]),
       ) as AgentRow | undefined;
-    return row ? mapAgent(row) : undefined;
+    return row ? this.#record(row) : undefined;
   }
 
   findByTerminal(input: {
@@ -406,7 +419,7 @@ export class AgentStore {
     const row = this.#sqlite
       .prepare("select * from agents where herdr_session_name = ? and terminal_id = ?")
       .get(input.herdrSessionName, input.terminalId) as AgentRow | undefined;
-    return row ? mapAgent(row) : undefined;
+    return row ? this.#record(row) : undefined;
   }
 
   get(id: string): AgentIndexRecord {
@@ -414,7 +427,7 @@ export class AgentStore {
       | AgentRow
       | undefined;
     if (!row) throw new Error(`Agent not found: ${id}`);
-    return mapAgent(row);
+    return this.#record(row);
   }
 
   resolveTarget(scope: AgentQueryScope, target: string): AgentIndexRecord {
