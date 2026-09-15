@@ -3,6 +3,7 @@ import { sanitizeText } from "./sanitize-text.js";
 import { appendFileSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join } from "node:path";
+import { stripVTControlCharacters } from "node:util";
 
 export type HerdsmanPiLogLevel = "info" | "warn" | "error";
 
@@ -1189,11 +1190,46 @@ export function formatHiddenAgentContext(input: {
         agent: agent.agent ?? "unknown",
         name: agent.name,
       });
-      return [
-        `- ${identity} ${agent.paneId ?? "unknown"} ${agent.agentStatus ?? "unknown"}`,
-        `  last user: ${oneLine(sanitizeText(history.lastUserMessage?.text ?? "").text)}`,
-        `  last assistant: ${oneLine(sanitizeText(history.lastAssistantMessage?.text ?? "").text)}`,
-      ].join("\n");
+      const paneId = agent.paneId ?? "unknown";
+      const status = agent.agentStatus ?? "unknown";
+      const prefix = `- ${identity} ${paneId} ${status}`;
+
+      const rawAgent = record(agent);
+      const tabTitleCandidate =
+        stringValue(rawAgent.terminalTitle) ?? stringValue(rawAgent.label);
+      const tabTitleSanitized =
+        tabTitleCandidate !== null ? sanitizeText(tabTitleCandidate).text : "";
+      const tabTitleCleaned = cleanContextText(tabTitleSanitized);
+      const tabTitle =
+        tabTitleCleaned.length > 0 ? truncateSummary(tabTitleCleaned, 60) : null;
+
+      const rawHistory = record(history);
+      const lastAssistantRecord = record(history.lastAssistantMessage);
+      const timeCandidate =
+        lastAssistantRecord.timestamp ??
+        history.updatedAt ??
+        rawHistory.updatedAt ??
+        rawAgent.updatedAt ??
+        rawAgent.time;
+      const formattedTime = formatTimestamp(timeCandidate);
+
+      const assistantRaw = history.lastAssistantMessage?.text;
+      const assistantSanitized =
+        assistantRaw !== undefined && assistantRaw !== null
+          ? sanitizeText(assistantRaw).text
+          : "";
+      const assistantCleaned = cleanContextText(assistantSanitized);
+      const assistantSummary =
+        assistantCleaned.length > 0 ? truncateSummary(assistantCleaned, 100) : null;
+
+      const segments = [
+        prefix,
+        tabTitle,
+        formattedTime,
+        assistantSummary,
+      ].filter((segment): segment is string => segment !== null && segment.length > 0);
+
+      return segments.join(" · ");
     }),
     "Use herdsman agent get/read if details are needed.",
   ].join("\n");
@@ -1275,3 +1311,28 @@ function record(value: unknown): Record<string, unknown> {
 function oneLine(value: string): string {
   return value.replace(/\s+/g, " ");
 }
+
+function cleanContextText(value: string): string {
+  return stripVTControlCharacters(value)
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function truncateSummary(value: string, limit = 100): string {
+  if (value.length <= limit) return value;
+  return `${value.slice(0, limit)}…`;
+}
+
+function formatTimestamp(value: unknown): string | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (/^\d{2}:\d{2}:\d{2}$/.test(trimmed)) return trimmed;
+  }
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value as string | number);
+  if (Number.isNaN(date.getTime())) return null;
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+}
+

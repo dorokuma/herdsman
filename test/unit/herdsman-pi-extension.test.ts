@@ -167,13 +167,14 @@ describe("herdsman-pi orchestrator bridge", () => {
       ],
       workspaceId: "wB",
     });
-    expect(secret).toContain("password=[REDACTED]");
-    expect(secret).toContain("token=[REDACTED]");
     expect(secret).toContain("Authorization: Bearer [REDACTED]");
     expect(secret).toContain("sk-[REDACTED]");
+    expect(secret).not.toContain("password");
+    expect(secret).not.toContain("token");
     expect(secret).not.toContain("hunter2");
     expect(secret).not.toContain("super-secret-token");
     expect(secret).not.toContain("sk-abcdefghijklmnopqrstuvwxyz");
+    expect(secret).not.toContain("last user");
 
     const updates = formatHiddenAgentUpdates([
       event(1, "term_agent", { payload: { name: "reviewer" } }),
@@ -181,11 +182,10 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(updates).toContain("reviewer · Claude");
   });
 
-  test("passes through very long assistant messages in hidden agent context without truncation", async () => {
+  test("truncates long assistant messages to 100 characters in one-line hidden agent context", async () => {
     const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
     const longChunk = "response ".repeat(7000); // 63,000 chars with multiple whitespaces
     const rawAssistantText = `  first section \n\n  ${longChunk} \n  final section  `;
-    const collapsedExcerpt = rawAssistantText.replace(/\s+/g, " ");
 
     const output = formatHiddenAgentContext({
       agents: [
@@ -202,10 +202,182 @@ describe("herdsman-pi orchestrator bridge", () => {
       workspaceId: "wB",
     });
 
-    expect(collapsedExcerpt.length).toBeGreaterThan(50000);
-    expect(output).toContain(`  last assistant: ${collapsedExcerpt}`);
-    expect(output).not.toContain("truncated");
-    expect(output).not.toContain("240");
+    expect(output).not.toContain("user prompt");
+    expect(output).not.toContain("last user");
+    expect(output).toContain("- Claude wB:p1 idle · ");
+    expect(output).toContain("…");
+    const agentLine = output.split("\n").find((line) => line.startsWith("- Claude"));
+    expect(agentLine).toBeDefined();
+    const parts = (agentLine ?? "").split(" · ");
+    const summary = parts.slice(1).join(" · ");
+    expect(summary.length).toBe(101);
+  });
+
+  test("formats each agent as a single line with tab title, timestamp, and truncated assistant summary", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const output = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "pi",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "PASS（记录器返工与重跑取证达标）",
+              timestamp: "2026-09-15T20:23:45.000Z",
+            },
+            lastUserMessage: { text: "very long task description that should not appear" },
+          },
+          name: null,
+          paneId: "w6:p2P",
+          terminalTitle: "worker-guardian-recorder-r17",
+        },
+      ],
+      workspaceId: "w6",
+    });
+
+    const lines = output.split("\n");
+    expect(lines[0]).toBe("[HERDSMAN AGENT CONTEXT]");
+    expect(lines[1]).toBe("Current Herdr workspace: w6");
+    expect(lines[2]).toMatch(
+      /^- Pi w6:p2P idle · worker-guardian-recorder-r17 · \d{2}:\d{2}:\d{2} · PASS（记录器返工与重跑取证达标）$/,
+    );
+    expect(lines[3]).toBe("Use herdsman agent get/read if details are needed.");
+    expect(lines.length).toBe(4);
+    expect(output).not.toContain("very long task description");
+    expect(output).not.toContain("last user");
+  });
+
+  test("handles assistant message length boundaries at exactly 100 and 101 characters", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const exact100 = "x".repeat(100);
+    const exact101 = "y".repeat(101);
+
+    const output100 = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: exact100 },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(output100).toContain(`- Claude wB:p1 idle · ${exact100}`);
+    expect(output100).not.toContain("…");
+
+    const output101 = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: exact101 },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(output101).toContain(`- Claude wB:p1 idle · ${"y".repeat(100)}…`);
+    expect(output101).not.toContain(exact101);
+  });
+
+  test("cleans ANSI VT control characters and unprintable bytes from terminalTitle and lastAssistantMessage", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const output = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "\x1b[32mhello\x1b[0m \x00\x07world\x1f \x1b[1mbright\x1b[0m",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "\x1b[31mworker\x1b[0m\x08-pane\x1e",
+        },
+      ],
+      workspaceId: "wB",
+    });
+
+    expect(output).toContain("- Codex wB:p1 idle · worker-pane · hello world bright");
+    expect(output).not.toContain("\x1b");
+    expect(output).not.toContain("\x00");
+    expect(output).not.toContain("\x07");
+    expect(output).not.toContain("\x08");
+    expect(output).not.toContain("\x1e");
+    expect(output).not.toContain("\x1f");
+    expect(output).not.toContain("[31m");
+    expect(output).not.toContain("[32m");
+    expect(output).not.toContain("[0m");
+  });
+
+  test("omits assistant summary segment when assistant message is empty or pure whitespace/tabs", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const output = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "pi",
+          agentStatus: "busy",
+          history: {
+            lastAssistantMessage: {
+              text: "  \t \n \r  ",
+              timestamp: "2026-09-15T20:23:45.000Z",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "worker-build",
+        },
+      ],
+      workspaceId: "wB",
+    });
+
+    const lines = output.split("\n");
+    expect(lines[2]).toMatch(/^- Pi wB:p1 busy · worker-build · \d{2}:\d{2}:\d{2}$/);
+    expect(lines[2]).not.toContain(" · · ");
+    expect(lines[2]?.endsWith(" · ")).toBe(false);
+  });
+
+  test("truncates overlong tabTitle to 60 characters and sanitizes secrets in tabTitle", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const longTitle = "t".repeat(200);
+
+    const outputLong = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {},
+          paneId: "wB:p1",
+          terminalTitle: longTitle,
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputLong).toContain(`- Claude wB:p1 idle · ${"t".repeat(60)}…`);
+    expect(outputLong).not.toContain("t".repeat(61));
+
+    const outputSecret = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {},
+          paneId: "wB:p1",
+          terminalTitle:
+            "worker Authorization: Bearer secret-token sk-ant-api03-abcdef123456789012345678",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputSecret).toContain("Authorization: Bearer [REDACTED]");
+    expect(outputSecret).toContain("sk-[REDACTED]");
+    expect(outputSecret).not.toContain("secret-token");
+    expect(outputSecret).not.toContain("sk-ant-api03");
   });
 
   test("does not connect outside a complete Herdr environment", async () => {
