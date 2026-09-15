@@ -1,3 +1,9 @@
+## 0.11.5
+
+- 通路 B 遗留收尾：格式化时间戳支持跨年 MM-DD HH:MM:SS，truncateSummary 增加单词边界截断，隐藏上下文文本接入 sanitizeAndCleanContextText 清理脱敏管道。
+- 文本防御加固：truncateSummary 增加早空格下界保护（`limit - 20`），避免超长 URL 截断抹除有效前缀；cleanContextText 剥除 Unicode 零宽与不可见格式字符（\u200b-\u200f / \u2060-\u2064 / \ufeff），防御绕过密钥脱敏。
+- 版本与引用同步：全仓 npm 包、Herdr 插件配置及文档安装 tag 统一同步至 0.11.5。
+
 ## 0.11.4
 
 - register 用 Linux SO_PEERCRED 绑定连接进程 cwd 到 Herdr pane，拒绝错配 connector。

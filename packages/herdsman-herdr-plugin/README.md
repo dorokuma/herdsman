@@ -5,7 +5,7 @@ Herdr companion plugin for Herdsman agent history. Herdr installs this integrati
 Install the plugin from a release tag:
 
 ```bash
-herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.11.4 --yes
+herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.11.5 --yes
 ```
 
 Use the release tag that matches the installed Herdsman CLI version.
