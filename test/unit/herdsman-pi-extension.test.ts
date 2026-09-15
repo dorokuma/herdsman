@@ -426,6 +426,53 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(outputFallback).toContain("- Codex wB:p1 idle · worker-1 · 14:20:30 · done");
   });
 
+  test("formats cross-year ISO timestamps correctly distinguishing 12-31 vs 01-01 MM-DD prefixes", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const outputNewYearsEve = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "year-end wrapup",
+              timestamp: "2025-12-31T23:30:00",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "worker-1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputNewYearsEve).toContain(
+      "- Codex wB:p1 idle · worker-1 · 12-31 23:30:00 · year-end wrapup",
+    );
+    expect(outputNewYearsEve).not.toContain("01-01");
+
+    const outputNewYearsDay = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "new-year start",
+              timestamp: "2026-01-01T00:30:00",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "worker-1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputNewYearsDay).toContain(
+      "- Codex wB:p1 idle · worker-1 · 01-01 00:30:00 · new-year start",
+    );
+    expect(outputNewYearsDay).not.toContain("12-31");
+  });
+
   test("truncates assistant summary and tabTitle at word boundaries near limit with tolerance", async () => {
     const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
     const base99 = `${"word ".repeat(19)}word`; // length 99
@@ -463,6 +510,85 @@ describe("herdsman-pi orchestrator bridge", () => {
     });
     expect(outputTitle).toContain(`- Claude wB:p1 idle · ${titleBase55}…`);
     expect(outputTitle).not.toContain("extratitlepart");
+  });
+
+  test("asserts limit-20 lower boundary and limit+8 tolerance in truncateSummary for assistant summary", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+
+    // a) Space at index 79 (< 80): falls back to hard 100 truncation, retaining 20 chars of token info after space
+    const tokenInfo = "token-extra-info-24chars";
+    const textSpace79 = `${"a".repeat(79)} ${tokenInfo}${"x".repeat(30)}`;
+    const output79 = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: textSpace79 },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(output79).toContain(`- Claude wB:p1 idle · ${textSpace79.slice(0, 100)}…`);
+    expect(output79).toContain(`${"a".repeat(79)} ${tokenInfo.slice(0, 20)}…`);
+    expect(output79).not.toContain(`${"a".repeat(79)}…`);
+
+    // a) Space at index 80 (>= 80): uses word boundary at index 80
+    const textSpace80 = `${"a".repeat(80)} ${tokenInfo}${"x".repeat(30)}`;
+    const output80 = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: textSpace80 },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(output80).toContain(`- Claude wB:p1 idle · ${"a".repeat(80)}…`);
+    expect(output80).not.toContain(tokenInfo);
+
+    // b) limit+8 tolerance (108/109 boundary)
+    // Space at index 107 (within 108 limit+8 search window): cuts at word boundary index 107
+    const textSpace107 = `${"c".repeat(107)} trailingpart`;
+    const output107 = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: textSpace107 },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(output107).toContain(`- Claude wB:p1 idle · ${"c".repeat(107)}…`);
+    expect(output107).not.toContain("trailingpart");
+
+    // Space at index 108 (the 109th char, beyond 108 search window): falls back to hard limit 100
+    const textSpace108 = `${"c".repeat(108)} trailingpart`;
+    const output108 = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: textSpace108 },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(output108).toContain(`- Claude wB:p1 idle · ${"c".repeat(100)}…`);
+    expect(output108).not.toContain("c".repeat(101));
   });
 
   test("redacts secrets with embedded adversarial null and control characters in tabTitle and assistant summary", async () => {
@@ -512,7 +638,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       workspaceId: "wB",
     });
     expect(outputAssistant).toContain(`- Claude wB:p1 idle · ${longUrlAssistant.slice(0, 100)}…`);
-    expect(outputAssistant).toContain("https://example.com");
+    expect(outputAssistant).toContain("https://example.com/very/long/unbroken/path");
     expect(outputAssistant).not.toEqual(expect.stringContaining("- Claude wB:p1 idle · Check:…"));
 
     const longUrlTitle =
@@ -530,7 +656,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       workspaceId: "wB",
     });
     expect(outputTitle).toContain(`- Claude wB:p1 idle · ${longUrlTitle.slice(0, 60)}…`);
-    expect(outputTitle).toContain("https://");
+    expect(outputTitle).toContain("https://example.com/very");
   });
 
   test("redacts secrets containing zero-width and invisible Unicode characters in tabTitle and assistant summary", async () => {
@@ -560,6 +686,62 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(output).not.toContain("\u200d");
     expect(output).not.toContain("\u2060");
     expect(output).not.toContain("\ufeff");
+  });
+
+  test("redacts secrets containing bidi controls, bidi isolates, soft hyphens, and Mongolian vowel separators", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const output = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "api: sk-\u202eant-api03-abcdef123456789012345678\u202c and sk-\u180eant-api03-abcdef123456789012345678 and sk-\u00adant-api03-abcdef123456789012345678",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle:
+            "worker sk-\u2066ant-\u2067api03-\u2068hidden987654321012345678\u2069 \u202a\u202b\u202d",
+        },
+      ],
+      workspaceId: "wB",
+    });
+
+    expect(output).toContain("sk-[REDACTED]");
+    expect(output).not.toContain("abcdef123456789012345678");
+    expect(output).not.toContain("hidden987654321012345678");
+    expect(output).not.toContain("\u180e");
+    expect(output).not.toContain("\u202a");
+    expect(output).not.toContain("\u202b");
+    expect(output).not.toContain("\u202c");
+    expect(output).not.toContain("\u202d");
+    expect(output).not.toContain("\u202e");
+    expect(output).not.toContain("\u2066");
+    expect(output).not.toContain("\u2067");
+    expect(output).not.toContain("\u2068");
+    expect(output).not.toContain("\u2069");
+    expect(output).not.toContain("\u00ad");
+
+    const outputPrintable = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "日本語テキストとUnicode文字: ü, é, ñ, 🚀, \u2028line break folded",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "worker-タスク",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputPrintable).toContain(
+      "- Claude wB:p1 idle · worker-タスク · 日本語テキストとUnicode文字: ü, é, ñ, 🚀, line break folded",
+    );
   });
 
   test("does not connect outside a complete Herdr environment", async () => {
