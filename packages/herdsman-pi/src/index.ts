@@ -1197,9 +1197,8 @@ export function formatHiddenAgentContext(input: {
       const rawAgent = record(agent);
       const tabTitleCandidate =
         stringValue(rawAgent.terminalTitle) ?? stringValue(rawAgent.label);
-      const tabTitleSanitized =
-        tabTitleCandidate !== null ? sanitizeText(tabTitleCandidate).text : "";
-      const tabTitleCleaned = cleanContextText(tabTitleSanitized);
+      const tabTitleCleaned =
+        tabTitleCandidate !== null ? sanitizeAndCleanContextText(tabTitleCandidate) : "";
       const tabTitle =
         tabTitleCleaned.length > 0 ? truncateSummary(tabTitleCleaned, 60) : null;
 
@@ -1214,11 +1213,10 @@ export function formatHiddenAgentContext(input: {
       const formattedTime = formatTimestamp(timeCandidate);
 
       const assistantRaw = history.lastAssistantMessage?.text;
-      const assistantSanitized =
+      const assistantCleaned =
         assistantRaw !== undefined && assistantRaw !== null
-          ? sanitizeText(assistantRaw).text
+          ? sanitizeAndCleanContextText(assistantRaw)
           : "";
-      const assistantCleaned = cleanContextText(assistantSanitized);
       const assistantSummary =
         assistantCleaned.length > 0 ? truncateSummary(assistantCleaned, 100) : null;
 
@@ -1314,13 +1312,29 @@ function oneLine(value: string): string {
 
 function cleanContextText(value: string): string {
   return stripVTControlCharacters(value)
-    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "")
+    .replace(
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u200b-\u200f\u2060-\u2064\ufeff]/g,
+      "",
+    )
     .replace(/\s+/g, " ")
     .trim();
 }
 
+function sanitizeAndCleanContextText(value: string): string {
+  const preCleaned = cleanContextText(value);
+  if (!preCleaned) return "";
+  const sanitized = sanitizeText(preCleaned).text;
+  return cleanContextText(sanitized);
+}
+
 function truncateSummary(value: string, limit = 100): string {
   if (value.length <= limit) return value;
+  const maxSearch = Math.min(value.length, limit + 8);
+  const searchSlice = value.slice(0, maxSearch);
+  const lastSpaceIndex = searchSlice.search(/\s[^\s]*$/);
+  if (lastSpaceIndex >= limit - 20) {
+    return `${value.slice(0, lastSpaceIndex)}…`;
+  }
   return `${value.slice(0, limit)}…`;
 }
 
@@ -1328,11 +1342,17 @@ function formatTimestamp(value: unknown): string | null {
   if (typeof value === "string") {
     const trimmed = value.trim();
     if (/^\d{2}:\d{2}:\d{2}$/.test(trimmed)) return trimmed;
+    if (/^\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) return trimmed;
   }
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value as string | number);
   if (Number.isNaN(date.getTime())) return null;
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  const hours = pad(date.getHours());
+  const minutes = pad(date.getMinutes());
+  const seconds = pad(date.getSeconds());
+  return `${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 

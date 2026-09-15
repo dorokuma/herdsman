@@ -210,7 +210,8 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(agentLine).toBeDefined();
     const parts = (agentLine ?? "").split(" · ");
     const summary = parts.slice(1).join(" · ");
-    expect(summary.length).toBe(101);
+    expect(summary.endsWith("response…")).toBe(true);
+    expect(summary).not.toContain("respon…");
   });
 
   test("formats each agent as a single line with tab title, timestamp, and truncated assistant summary", async () => {
@@ -239,7 +240,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(lines[0]).toBe("[HERDSMAN AGENT CONTEXT]");
     expect(lines[1]).toBe("Current Herdr workspace: w6");
     expect(lines[2]).toMatch(
-      /^- Pi w6:p2P idle · worker-guardian-recorder-r17 · \d{2}:\d{2}:\d{2} · PASS（记录器返工与重跑取证达标）$/,
+      /^- Pi w6:p2P idle · worker-guardian-recorder-r17 · \d{2}-\d{2} \d{2}:\d{2}:\d{2} · PASS（记录器返工与重跑取证达标）$/,
     );
     expect(lines[3]).toBe("Use herdsman agent get/read if details are needed.");
     expect(lines.length).toBe(4);
@@ -337,7 +338,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     });
 
     const lines = output.split("\n");
-    expect(lines[2]).toMatch(/^- Pi wB:p1 busy · worker-build · \d{2}:\d{2}:\d{2}$/);
+    expect(lines[2]).toMatch(/^- Pi wB:p1 busy · worker-build · \d{2}-\d{2} \d{2}:\d{2}:\d{2}$/);
     expect(lines[2]).not.toContain(" · · ");
     expect(lines[2]?.endsWith(" · ")).toBe(false);
   });
@@ -378,6 +379,187 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(outputSecret).toContain("sk-[REDACTED]");
     expect(outputSecret).not.toContain("secret-token");
     expect(outputSecret).not.toContain("sk-ant-api03");
+  });
+
+  test("formats cross-day timestamp with MM-DD HH:MM:SS from ISO string and preserves time-only fallbacks", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const twoDaysAgo = new Date(Date.now() - 2 * 24 * 60 * 60 * 1000);
+    const pad = (n: number) => String(n).padStart(2, "0");
+    const expectedDatePrefix = `${pad(twoDaysAgo.getMonth() + 1)}-${pad(twoDaysAgo.getDate())}`;
+
+    const outputIso = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "done",
+              timestamp: twoDaysAgo.toISOString(),
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "worker-1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputIso).toContain(`- Codex wB:p1 idle · worker-1 · ${expectedDatePrefix} `);
+
+    const outputFallback = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "done",
+              timestamp: "14:20:30",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "worker-1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputFallback).toContain("- Codex wB:p1 idle · worker-1 · 14:20:30 · done");
+  });
+
+  test("truncates assistant summary and tabTitle at word boundaries near limit with tolerance", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const base99 = `${"word ".repeat(19)}word`; // length 99
+    const assistantText = `${base99} extralongunbrokenwordthatcrossestheboundary`;
+
+    const outputAssistant = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: assistantText },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputAssistant).toContain(`- Claude wB:p1 idle · ${base99}…`);
+    expect(outputAssistant).not.toContain("extralong");
+
+    const titleBase55 = `${"tab ".repeat(13)}tab`; // 13 * 4 + 3 = 55 chars
+    const titleText = `${titleBase55} extratitlepart`;
+    const outputTitle = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {},
+          paneId: "wB:p1",
+          terminalTitle: titleText,
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputTitle).toContain(`- Claude wB:p1 idle · ${titleBase55}…`);
+    expect(outputTitle).not.toContain("extratitlepart");
+  });
+
+  test("redacts secrets with embedded adversarial null and control characters in tabTitle and assistant summary", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const output = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "api key: sk-\u0000ant-\u0001api03-abcdef123456789012345678 secret",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle:
+            "worker Bearer\u0000 super-secret-token sk-abc\u0000defghijklmnopqrstuvwxyz",
+        },
+      ],
+      workspaceId: "wB",
+    });
+
+    expect(output).toContain("sk-[REDACTED]");
+    expect(output).toContain("Bearer [REDACTED]");
+    expect(output).not.toContain("abcdef123456789012345678");
+    expect(output).not.toContain("super-secret-token");
+    expect(output).not.toContain("defghijklmnopqrstuvwxyz");
+    expect(output).not.toContain("\u0000");
+    expect(output).not.toContain("\u0001");
+  });
+
+  test("avoids early space collapse in truncateSummary when the only space is far before the limit", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const longUrlAssistant =
+      "Check: https://example.com/very/long/unbroken/path/that/exceeds/the/summary/limit/by/a/substantial/amount/and/has/no/spaces";
+    const outputAssistant = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: { text: longUrlAssistant },
+          },
+          paneId: "wB:p1",
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputAssistant).toContain(`- Claude wB:p1 idle · ${longUrlAssistant.slice(0, 100)}…`);
+    expect(outputAssistant).toContain("https://example.com");
+    expect(outputAssistant).not.toEqual(expect.stringContaining("- Claude wB:p1 idle · Check:…"));
+
+    const longUrlTitle =
+      "Title: https://example.com/very/long/unbroken/path/that/exceeds/tab/title/limit/without/any/spaces";
+    const outputTitle = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "claude",
+          agentStatus: "idle",
+          history: {},
+          paneId: "wB:p1",
+          terminalTitle: longUrlTitle,
+        },
+      ],
+      workspaceId: "wB",
+    });
+    expect(outputTitle).toContain(`- Claude wB:p1 idle · ${longUrlTitle.slice(0, 60)}…`);
+    expect(outputTitle).toContain("https://");
+  });
+
+  test("redacts secrets containing zero-width and invisible Unicode characters in tabTitle and assistant summary", async () => {
+    const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
+    const output = formatHiddenAgentContext({
+      agents: [
+        {
+          agent: "codex",
+          agentStatus: "idle",
+          history: {
+            lastAssistantMessage: {
+              text: "secret key: sk-\u200bant-\u200capi03-\u200dabcdef123456789012345678\ufeff99",
+            },
+          },
+          paneId: "wB:p1",
+          terminalTitle: "worker sk-\u2060ant-\u2061api03-\u2062hidden987654321012345678\u200e",
+        },
+      ],
+      workspaceId: "wB",
+    });
+
+    expect(output).toContain("sk-[REDACTED]");
+    expect(output).not.toContain("abcdef123456789012345678");
+    expect(output).not.toContain("hidden987654321012345678");
+    expect(output).not.toContain("\u200b");
+    expect(output).not.toContain("\u200c");
+    expect(output).not.toContain("\u200d");
+    expect(output).not.toContain("\u2060");
+    expect(output).not.toContain("\ufeff");
   });
 
   test("does not connect outside a complete Herdr environment", async () => {
