@@ -108,7 +108,7 @@ agentが完了またはblockedになると、visibleなHerdsman turnを1回開�
 任意のpluginはGitHub Releaseのtagからインストールします。
 
 ```bash
-herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.11.5 --yes
+herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.11.6 --yes
 ```
 
 インストール済みの Herdsman CLI と同じバージョンの release tag を指定してください。

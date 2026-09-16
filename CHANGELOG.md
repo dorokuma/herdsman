@@ -1,3 +1,8 @@
+## 0.11.6
+
+- wake 展示线脱敏管道统一：`formatHiddenAgentUpdates` 接入 `sanitizeAndCleanContextText`，零宽与 bidi 控制字符剥除后统一脱敏（测试 114/114 通过）。
+- 版本与引用同步：全仓 npm 包、Herdr 插件配置及文档安装 tag 统一同步至 0.11.6。
+
 ## 0.11.5
 
 - 通路 B 遗留收尾：格式化时间戳支持跨年 MM-DD HH:MM:SS，truncateSummary 增加单词边界截断，隐藏上下文文本接入 sanitizeAndCleanContextText 清理脱敏管道。
