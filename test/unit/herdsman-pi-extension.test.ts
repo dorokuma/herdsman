@@ -182,6 +182,41 @@ describe("herdsman-pi orchestrator bridge", () => {
     expect(updates).toContain("reviewer · Claude");
   });
 
+  test("sanitizes zero-width and bidi characters and preserves wake structure in formatHiddenAgentUpdates", async () => {
+    const { formatHiddenAgentUpdates } = (await import(extensionModuleUrl)) as Module;
+    const updates = formatHiddenAgentUpdates([
+      event(1, "term_agent", {
+        compactHistory: {
+          lastAssistantMessage: {
+            text: "secret sk-\u200bant-api03-sample-key-12345678\u202e-injection",
+          },
+        },
+        paneId: "wB:p1",
+        payload: { agent: "codex", name: "worker" },
+        type: "agent.done",
+      }),
+      event(2, "term_agent2", {
+        compactHistory: {},
+        paneId: "wB:p2",
+        payload: { agent: "claude" },
+        type: "agent.blocked",
+      }),
+    ]);
+
+    const lines = updates.split("\n");
+    expect(lines[0]).toBe("[HERDSMAN AGENT UPDATES]");
+    expect(lines[1]).toBe("- agent.done worker · Codex wB:p1");
+    expect(lines[2]).toBe("  last assistant: secret sk-[REDACTED]");
+    expect(lines[3]).toBe("  event: 1");
+    expect(lines[4]).toBe("- agent.blocked Claude wB:p2");
+    expect(lines[5]).toBe("  last assistant: ");
+    expect(lines[6]).toBe("  event: 2");
+    expect(lines.length).toBe(7);
+    expect(updates).not.toContain("sk-\u200bant-api03");
+    expect(updates).not.toContain("\u202e");
+    expect(updates).not.toContain("sample-key");
+  });
+
   test("truncates long assistant messages to 100 characters in one-line hidden agent context", async () => {
     const { formatHiddenAgentContext } = (await import(extensionModuleUrl)) as Module;
     const longChunk = "response ".repeat(7000); // 63,000 chars with multiple whitespaces
@@ -3798,6 +3833,7 @@ function event(
   id: number,
   terminalId: string | null,
   options: {
+    compactHistory?: Record<string, unknown>;
     paneId?: string;
     payload?: Record<string, unknown>;
     type?: string;
@@ -3805,7 +3841,7 @@ function event(
   } = {},
 ): AgentEventWireRecord {
   return {
-    compactHistory: { lastAssistantMessage: { text: "done" } },
+    compactHistory: options.compactHistory ?? { lastAssistantMessage: { text: "done" } },
     id,
     paneId: options.paneId ?? "wB:p-agent",
     payload: { agent: "claude", ...options.payload },

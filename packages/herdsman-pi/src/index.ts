@@ -1245,7 +1245,7 @@ export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string
       });
       return [
         `- ${event.type} ${identity} ${event.paneId ?? "unknown"}`,
-        `  last assistant: ${oneLine(sanitizeText(history.lastAssistantMessage?.text ?? "").text)}`,
+        `  last assistant: ${sanitizeAndCleanContextText(history.lastAssistantMessage?.text ?? "")}`,
         `  event: ${event.id}`,
       ].join("\n");
     }),
@@ -1304,10 +1304,6 @@ function stringValue(value: unknown): string | null {
 
 function record(value: unknown): Record<string, unknown> {
   return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-}
-
-function oneLine(value: string): string {
-  return value.replace(/\s+/g, " ");
 }
 
 function cleanContextText(value: string): string {
