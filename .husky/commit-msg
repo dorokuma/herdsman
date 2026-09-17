@@ -1,0 +1,1 @@
+sh /root/.git-hooks/commit-msg "$1"
