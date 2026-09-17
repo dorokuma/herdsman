@@ -12,6 +12,14 @@ Herdr の `herdr agent read` は terminal stream や scrollback を読みます�
 
 現在は Claude Code、Codex、Gemini CLI、OpenCode、Pi、Grok、Antigravity CLI のセッション履歴の取得に対応しています。
 
+## Development conventions
+
+Detailed development and contribution guidelines are maintained across:
+
+- [AGENTS.md](./AGENTS.md): agent instructions, operational rules, and verification commands.
+- [docs/plans/](./docs/plans/): active architecture plans, progress tracking, and design specifications.
+- [.agents/notes/README.md](./.agents/notes/README.md): trigger criteria, templates, and conventions for architectural decisions and workarounds.
+
 ## 要件
 
 - Node.js >= 24.18.0

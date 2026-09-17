@@ -1,3 +1,7 @@
+## [Unreleased]
+
+- 规范与协作基础设施：补齐 agent 协作骨架与开发规范（AGENTS.md 铁律、.agents/notes/ 决策笔记系统及索引脚本）。
+
 ## 0.11.6
 
 - wake 展示线脱敏管道统一：`formatHiddenAgentUpdates` 接入 `sanitizeAndCleanContextText`，零宽与 bidi 控制字符剥除后统一脱敏（测试 114/114 通过）。

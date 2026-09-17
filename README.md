@@ -19,6 +19,14 @@ Herdr's `herdr agent read` reads terminal streams or scrollback. Herdsman instea
 
 Herdsman currently supports session history from Claude Code, Codex, Gemini CLI, OpenCode, Pi, Grok, and Antigravity CLI.
 
+## Development conventions
+
+Detailed development and contribution guidelines are maintained across:
+
+- [AGENTS.md](./AGENTS.md): agent instructions, operational rules, and verification commands.
+- [docs/plans/](./docs/plans/): active architecture plans, progress tracking, and design specifications.
+- [.agents/notes/README.md](./.agents/notes/README.md): trigger criteria, templates, and conventions for architectural decisions and workarounds.
+
 ## Requirements
 
 - Node.js >= 22.12.0

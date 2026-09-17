@@ -2,7 +2,26 @@
 
 Herdsman は Herdr 管理の coding agent から agent snapshot、`agent.*` event、orchestrator notification を作る TypeScript daemon / CLI です。まず `README.md` で使い方を確認し、仕様判断が必要なときだけ `docs/plans/` を見てください。
 
+## 鉄律 / Iron Rules
+
+1. **构建・テスト・静的検査**: 実装変更後は `pnpm check`（typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 検証）を通し、CLI/package 変更時は `pnpm build` と `pnpm package:check` も通す。
+2. **提交规范**——commit message 须过全局 commit-msg hook：Conventional Commits 类型白名单、≤72 字、冒号后一空格、禁噪声词与密钥。
+3. **决策/踩坑须记 .agents/notes/**：重大决策、架构调整、方案否决、临时降级/workaround/特判必须记入 `.agents/notes/`（满足六触发之一即写，详见 [.agents/notes/README.md](.agents/notes/README.md)）。
+4. **未コミット変更保護**: ユーザーや別プロセスの未コミット変更を戻さない。`node_modules/`、`dist/`、`*.sqlite` は commit しない。
+
+## ドキュメント・インデックス / Documentation Index
+
+- 現状ドキュメント: [README.md](README.md), [README.ja.md](README.ja.md), [docs/plans/](docs/plans/), [docs/releasing.md](docs/releasing.md)
+- 意思決定・踩坑ノート: [.agents/notes/](.agents/notes/)（規約: [.agents/notes/README.md](.agents/notes/README.md)）
+- 写完笔记刷新索引：scripts/notes-index.sh（本地生成 INDEX.md，不入 git）
+
+## 関連リポジトリ / Related Repositories
+
+- `pi-cache-guardian`: 同为 Pi 生态插件
+- `herdsman-wt`: 本仓 worktree 挂载目录
+
 ## よく使うコマンド
+
 
 - `mise install`: `mise.toml` の Node.js / pnpm を入れる。
 - `pnpm install`: 依存関係を入れる。
