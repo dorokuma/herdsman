@@ -43,7 +43,7 @@ export function isDeliverableAgentEvent(
   scope: { herdrSessionName: string; workspaceId: string },
   ownerTerminalId: string,
 ): boolean {
-  const failed = event.type === "agent.failed";
+  const failed = event.type === "agent.failed" || event.type === "agent.discarded";
   return (
     (event.status === "pending" || event.status === "delivered") &&
     (event.status === "delivered" ||

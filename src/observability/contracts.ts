@@ -138,6 +138,7 @@ export type AgentReadResult = AgentIndexRecord & {
 
 export type AgentEventType =
   | "agent.blocked"
+  | "agent.discarded"
   | "agent.done"
   | "agent.failed"
   | "agent.idle"

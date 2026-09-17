@@ -238,4 +238,165 @@ describe("StatusEventPlanStore", () => {
 
     harness.sqlite.close();
   });
+
+  test("markRetry with PLAN_WAITING_HISTORY exhausts to discarded instead of failed", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    const row = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "done",
+    });
+
+    for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS - 1; i += 1) {
+      store.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      expect(store.get(row.id).status).toBe("pending");
+    }
+
+    store.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    const finalRow = store.get(row.id);
+    expect(finalRow.status).toBe("discarded");
+    expect(finalRow.lastError).toBe("PLAN_WAITING_HISTORY");
+    expect(finalRow.attempts).toBe(STATUS_PLAN_MAX_ATTEMPTS);
+
+    // Discarded plans must not appear in listFailed
+    expect(store.listFailed()).toEqual([]);
+
+    // Discarded plans are settled, so deleteSettledOlderThan purges them
+    const weekMs = 7 * 24 * 60 * 60 * 1000;
+    const old = Date.now() - weekMs - 60_000;
+    harness.sqlite
+      .prepare("update status_event_plans set updated_at = ? where id = ?")
+      .run(old, row.id);
+    expect(store.deleteSettledOlderThan(weekMs)).toBe(1);
+    expect(() => store.get(row.id)).toThrow();
+
+    harness.sqlite.close();
+  });
+
+  test("markDiscarded updates status to discarded and preserves/updates last_error", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    const row = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "done",
+    });
+
+    store.markDiscarded(row.id, "MANUALLY_DISCARDED");
+    expect(store.get(row.id).status).toBe("discarded");
+    expect(store.get(row.id).lastError).toBe("MANUALLY_DISCARDED");
+
+    harness.sqlite.close();
+  });
+
+  test("markRetry guards against reviving rows in terminal states (completed, cancelled, failed, discarded) and returns null", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    const terminalStatuses = ["completed", "cancelled", "failed", "discarded"] as const;
+
+    for (const status of terminalStatuses) {
+      const row = store.insertPending({
+        agentId: `ag_${status}`,
+        fromStatus: "working",
+        herdrSessionName: "session_a",
+        paneId: "p1",
+        toStatus: "done",
+      });
+
+      if (status === "completed") {
+        store.markCompleted(row.id);
+      } else if (status === "cancelled") {
+        store.markCancelled(row.id);
+      } else if (status === "discarded") {
+        store.markDiscarded(row.id, "ORIGINAL_DISCARD");
+      } else if (status === "failed") {
+        for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS; i += 1) {
+          store.markRetry(row.id, new Error("ORIGINAL_FAIL"));
+        }
+      }
+
+      expect(store.get(row.id).status).toBe(status);
+      const attemptsBefore = store.get(row.id).attempts;
+
+      // Attempting to retry an already-terminal row must return null and not modify it
+      const retryResult = store.markRetry(row.id, new Error("ATTEMPT_REVIVAL"));
+      expect(retryResult).toBeNull();
+
+      const current = store.get(row.id);
+      expect(current.status).toBe(status);
+      expect(current.attempts).toBe(attemptsBefore);
+    }
+
+    harness.sqlite.close();
+  });
+
+  test("listDiscarded returns only discarded plans in order of id", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    const row1 = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "done",
+    });
+    const row2 = store.insertPending({
+      agentId: "ag_2",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p2",
+      toStatus: "done",
+    });
+    const row3 = store.insertPending({
+      agentId: "ag_3",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p3",
+      toStatus: "done",
+    });
+
+    store.markDiscarded(row1.id, "DISCARDED_1");
+    store.markDiscarded(row2.id, "DISCARDED_2");
+    store.markCompleted(row3.id);
+
+    const discarded = store.listDiscarded();
+    expect(discarded.map((plan) => plan.id)).toEqual([row1.id, row2.id]);
+    expect(discarded.every((plan) => plan.status === "discarded")).toBe(true);
+
+    harness.sqlite.close();
+  });
+
+  test("markRetry returns null when WHERE condition matches 0 rows (changes === 0)", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    const row = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "done",
+    });
+
+    // Directly alter status to 'completed' behind the scenes without going through store.get check
+    // by mocking a race condition where DB status changes right after get()
+    harness.sqlite
+      .prepare("update status_event_plans set status = 'completed' where id = ?")
+      .run(row.id);
+
+    // Call markRetry on the completed row
+    const retryResult = store.markRetry(row.id, new Error("CONCURRENT_ERROR"));
+    expect(retryResult).toBeNull();
+
+    harness.sqlite.close();
+  });
 });

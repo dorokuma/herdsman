@@ -281,7 +281,7 @@ export class AgentIndexService {
         if (!store) return;
         const current = store.get(planId);
         if (current.status !== "pending" || current.lastError !== PLAN_WAITING_HISTORY) {
-          this.#waitingHistoryTimers.delete(planId);
+          this.#clearWaitingTimer(planId);
           return;
         }
         await this.#enqueueAgentPlan(plan.agent.id, () => this.#retryWaitingPlanRow(planId, plan));
@@ -299,11 +299,11 @@ export class AgentIndexService {
     try {
       current = store.get(planId);
     } catch {
-      this.#waitingHistoryTimers.delete(planId);
+      this.#clearWaitingTimer(planId);
       return;
     }
     if (current.status !== "pending" || current.lastError !== PLAN_WAITING_HISTORY) {
-      this.#waitingHistoryTimers.delete(planId);
+      this.#clearWaitingTimer(planId);
       return;
     }
 
@@ -325,11 +325,34 @@ export class AgentIndexService {
         agentId: plan.agent.id,
         error: err,
       });
-      store.markRetry(planId, new PlanWaitingHistoryError());
-      const updated = store.get(planId);
+      const updated = store.markRetry(planId, new PlanWaitingHistoryError());
+      if (!updated) {
+        this.#clearWaitingTimer(planId);
+        return;
+      }
       if (updated.status === "pending") {
         this.#scheduleWaitingHistoryRetry(planId, plan);
+      } else if (updated.status === "discarded") {
+        this.#clearWaitingTimer(planId);
+        console.info("Herdsman status event plan discarded after max attempts", {
+          planId,
+          agentId: plan.agent.id,
+          attempts: updated.attempts,
+          from: plan.from,
+          to: plan.to,
+          herdrSessionName: plan.agent.herdrSessionName,
+        });
+        this.#appendPlanDiscardedEvent({
+          agent: plan.agent,
+          attempts: updated.attempts,
+          compactHistory: plan.compactHistory,
+          from: plan.from,
+          planId,
+          reason: updated.lastError,
+          to: plan.to,
+        });
       } else if (updated.status === "failed") {
+        this.#clearWaitingTimer(planId);
         console.warn("Herdsman status event plan failed after max attempts", {
           planId,
           agentId: plan.agent.id,
@@ -411,12 +434,14 @@ export class AgentIndexService {
     // rejects: every row is either drained, cancelled, or retried.
     await Promise.allSettled(tasks);
     await this.#backfillFailedPlanEvents();
+    await this.#backfillDiscardedPlanEvents();
   }
 
   async #backfillFailedPlanEvents(): Promise<void> {
     const store = this.#stores.statusEventPlans;
     if (!store) return;
     for (const row of store.listFailed()) {
+      if (row.lastError === PLAN_WAITING_HISTORY) continue;
       const existing = this.#stores.sqlite
         .prepare("select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?")
         .get(row.herdrSessionName, `agent.failed:plan:${row.id}`);
@@ -436,6 +461,40 @@ export class AgentIndexService {
         }
       }
       this.#appendPlanFailedEvent({
+        agent,
+        attempts: row.attempts,
+        compactHistory: row.compactHistory,
+        from: row.fromStatus,
+        planId: row.id,
+        reason: row.lastError,
+        to: row.toStatus,
+      });
+    }
+  }
+
+  async #backfillDiscardedPlanEvents(): Promise<void> {
+    const store = this.#stores.statusEventPlans;
+    if (!store) return;
+    for (const row of store.listDiscarded()) {
+      const existing = this.#stores.sqlite
+        .prepare("select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?")
+        .get(row.herdrSessionName, `agent.discarded:plan:${row.id}`);
+      if (existing) continue;
+      let agent: AgentIndexRecord | undefined;
+      try {
+        agent = this.#stores.agents.get(row.agentId);
+      } catch {
+        agent = this.#minimalAgentFromLatestEvent(row.agentId, row.herdrSessionName);
+        if (!agent) {
+          console.warn("Herdsman skipping agent.discarded backfill; no agent row or events", {
+            agentId: row.agentId,
+            herdrSessionName: row.herdrSessionName,
+            planId: row.id,
+          });
+          continue;
+        }
+      }
+      this.#appendPlanDiscardedEvent({
         agent,
         attempts: row.attempts,
         compactHistory: row.compactHistory,
@@ -488,29 +547,48 @@ export class AgentIndexService {
   }
 
   async #drainPlanRow(row: StatusEventPlanRecord): Promise<void> {
+    const store = this.#stores.statusEventPlans;
+    if (!store) return;
+    let current: StatusEventPlanRecord;
+    try {
+      current = store.get(row.id);
+    } catch {
+      this.#clearWaitingTimer(row.id);
+      return;
+    }
+    if (
+      current.status === "completed" ||
+      current.status === "cancelled" ||
+      current.status === "failed" ||
+      current.status === "discarded"
+    ) {
+      this.#clearWaitingTimer(row.id);
+      return;
+    }
+
     let agent: AgentIndexRecord | undefined;
     try {
       agent =
         this.#stores.agents.findByPane({
-          herdrSessionName: row.herdrSessionName,
-          paneId: row.paneId,
-          paneGeneration: row.paneGeneration,
-        }) ?? this.#stores.agents.get(row.agentId);
+          herdrSessionName: current.herdrSessionName,
+          paneId: current.paneId,
+          paneGeneration: current.paneGeneration,
+        }) ?? this.#stores.agents.get(current.agentId);
     } catch {
       agent = undefined;
     }
     if (!agent) {
-      this.#stores.statusEventPlans.markCancelled(row.id);
+      store.markCancelled(current.id);
       console.warn("Herdsman cancelling status event plan for missing agent", {
-        agentId: row.agentId,
-        herdrSessionName: row.herdrSessionName,
-        paneId: row.paneId,
-        from: row.fromStatus,
-        to: row.toStatus,
+        agentId: current.agentId,
+        herdrSessionName: current.herdrSessionName,
+        paneId: current.paneId,
+        from: current.fromStatus,
+        to: current.toStatus,
       });
       return;
     }
-    let activeCompact = row.compactHistory;
+    let activeCompact = current.compactHistory;
     try {
       const refreshed = await this.#context.refreshAgent({
         agent,
@@ -519,51 +597,72 @@ export class AgentIndexService {
       });
       activeCompact = refreshed.snapshot.compactHistory;
     } catch (err) {
-      this.#stores.statusEventPlans.markRetry(row.id, new PlanWaitingHistoryError());
-      const updated = this.#stores.statusEventPlans.get(row.id);
+      const updated = store.markRetry(current.id, new PlanWaitingHistoryError());
+      if (!updated) {
+        this.#clearWaitingTimer(current.id);
+        return;
+      }
       if (updated.status === "pending") {
         console.warn("Herdsman failed to refresh agent during drain plan row, keeping waiting", {
-          planId: row.id,
+          planId: current.id,
           agentId: agent.id,
           error: err,
         });
-        this.#scheduleWaitingHistoryRetry(row.id, {
+        this.#scheduleWaitingHistoryRetry(current.id, {
           agent,
-          compactHistory: row.compactHistory,
-          from: row.fromStatus,
-          to: row.toStatus,
-          ...(row.herdrEventKey ? { herdrEventKey: row.herdrEventKey } : {}),
+          compactHistory: current.compactHistory,
+          from: current.fromStatus,
+          to: current.toStatus,
+          ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
+        });
+      } else if (updated.status === "discarded") {
+        this.#clearWaitingTimer(current.id);
+        console.info("Herdsman plan marked discarded during drain", {
+          planId: current.id,
+          agentId: agent.id,
+          from: current.fromStatus,
+          to: current.toStatus,
+          reason: updated.lastError,
+        });
+        this.#appendPlanDiscardedEvent({
+          agent,
+          attempts: updated.attempts,
+          compactHistory: current.compactHistory,
+          from: current.fromStatus,
+          planId: current.id,
+          reason: updated.lastError,
+          to: current.toStatus,
         });
       } else if (updated.status === "failed") {
-        this.#clearWaitingTimer(row.id);
+        this.#clearWaitingTimer(current.id);
         console.warn("Herdsman plan marked failed", {
-          planId: row.id,
+          planId: current.id,
           agentId: agent.id,
-          from: row.fromStatus,
-          to: row.toStatus,
+          from: current.fromStatus,
+          to: current.toStatus,
           reason: updated.lastError,
         });
         this.#appendPlanFailedEvent({
           agent,
           attempts: updated.attempts,
-          compactHistory: row.compactHistory,
-          from: row.fromStatus,
-          planId: row.id,
+          compactHistory: current.compactHistory,
+          from: current.fromStatus,
+          planId: current.id,
           reason: updated.lastError,
-          to: row.toStatus,
+          to: current.toStatus,
         });
       }
       return;
     }
     const plan: StatusEventPlan = {
       agent,
-      attempts: row.attempts,
+      attempts: current.attempts,
       compactHistory: activeCompact,
-      from: row.fromStatus,
-      to: row.toStatus,
-      ...(row.herdrEventKey ? { herdrEventKey: row.herdrEventKey } : {}),
+      from: current.fromStatus,
+      to: current.toStatus,
+      ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
     };
-    await this.#runPlanRow(row, plan);
+    await this.#runPlanRow(current, plan);
   }
 
   #enqueueAgentPlan<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
@@ -592,7 +691,8 @@ export class AgentIndexService {
     if (
       current.status === "completed" ||
       current.status === "cancelled" ||
-      current.status === "failed"
+      current.status === "failed" ||
+      current.status === "discarded"
     ) {
       this.#clearWaitingTimer(row.id);
       return undefined;
@@ -621,12 +721,34 @@ export class AgentIndexService {
           agentId: plan.agent.id,
           error: err,
         });
-        store.markRetry(row.id, new PlanWaitingHistoryError());
-        const updated = store.get(row.id);
+        const updated = store.markRetry(row.id, new PlanWaitingHistoryError());
+        if (!updated) {
+          this.#clearWaitingTimer(row.id);
+          return undefined;
+        }
         if (updated.status === "pending") {
           this.#scheduleWaitingHistoryRetry(row.id, plan);
         } else {
           this.#clearWaitingTimer(row.id);
+          if (updated.status === "discarded") {
+            console.info("Herdsman status event plan discarded after max attempts", {
+              planId: row.id,
+              agentId: row.agentId,
+              attempts: updated.attempts,
+              from: row.fromStatus,
+              to: row.toStatus,
+              herdrSessionName: row.herdrSessionName,
+            });
+            return this.#appendPlanDiscardedEvent({
+              agent: plan.agent,
+              attempts: updated.attempts,
+              compactHistory: plan.compactHistory,
+              from: row.fromStatus,
+              planId: row.id,
+              reason: updated.lastError,
+              to: row.toStatus,
+            });
+          }
           if (updated.status === "failed") {
             console.warn("Herdsman status event plan failed after max attempts", {
               planId: row.id,
@@ -675,12 +797,34 @@ export class AgentIndexService {
       return event;
     } catch (error) {
       if (error instanceof PlanWaitingHistoryError) {
-        store.markRetry(row.id, error);
-        const updated = store.get(row.id);
+        const updated = store.markRetry(row.id, error);
+        if (!updated) {
+          this.#clearWaitingTimer(row.id);
+          return undefined;
+        }
         if (updated.status === "pending") {
           this.#scheduleWaitingHistoryRetry(row.id, plan);
         } else {
           this.#clearWaitingTimer(row.id);
+          if (updated.status === "discarded") {
+            console.info("Herdsman status event plan discarded after max attempts", {
+              planId: row.id,
+              agentId: row.agentId,
+              attempts: updated.attempts,
+              from: row.fromStatus,
+              to: row.toStatus,
+              herdrSessionName: row.herdrSessionName,
+            });
+            return this.#appendPlanDiscardedEvent({
+              agent: plan.agent,
+              attempts: updated.attempts,
+              compactHistory: activePlan.compactHistory,
+              from: row.fromStatus,
+              planId: row.id,
+              reason: updated.lastError,
+              to: row.toStatus,
+            });
+          }
           if (updated.status === "failed") {
             console.warn("Herdsman status event plan failed after max attempts", {
               planId: row.id,
@@ -718,8 +862,29 @@ export class AgentIndexService {
         return undefined;
       }
       this.#clearWaitingTimer(row.id);
-      store.markRetry(row.id, error);
-      const updated = store.get(row.id);
+      const updated = store.markRetry(row.id, error);
+      if (!updated) {
+        return undefined;
+      }
+      if (updated.status === "discarded") {
+        console.info("Herdsman status event plan discarded after max attempts", {
+          planId: row.id,
+          agentId: row.agentId,
+          attempts: updated.attempts,
+          from: row.fromStatus,
+          to: row.toStatus,
+          herdrSessionName: row.herdrSessionName,
+        });
+        return this.#appendPlanDiscardedEvent({
+          agent: plan.agent,
+          attempts: updated.attempts,
+          compactHistory: activePlan.compactHistory,
+          from: row.fromStatus,
+          planId: row.id,
+          reason: updated.lastError,
+          to: row.toStatus,
+        });
+      }
       if (updated.status === "failed") {
         console.warn("Herdsman status event plan failed after max attempts", {
           planId: row.id,
@@ -1666,6 +1831,52 @@ export class AgentIndexService {
       },
       terminalId: agent.terminalId,
       type: "agent.failed",
+      workspaceId: agent.workspaceId,
+    });
+  }
+
+  #appendPlanDiscardedEvent(input: {
+    agent: AgentIndexRecord;
+    attempts: number;
+    compactHistory: CompactAgentHistory | null | undefined;
+    from: AgentStatus;
+    planId: number;
+    reason: string | null;
+    to: AgentStatus;
+  }): AgentEventRecord {
+    let agent = input.agent;
+    try {
+      agent = this.#stores.agents.get(input.agent.id);
+    } catch {
+      const stitched = this.#minimalAgentFromLatestEvent(
+        input.agent.id,
+        input.agent.herdrSessionName,
+      );
+      if (stitched) agent = stitched;
+    }
+    return this.#appendAndAckSelfEvent({
+      agentId: agent.id,
+      compactHistory: input.compactHistory ?? null,
+      herdrSessionName: agent.herdrSessionName,
+      idempotencyKey: `agent.discarded:plan:${input.planId}`,
+      paneId: agent.paneId,
+      paneGeneration: agent.paneGeneration ?? null,
+      payload: {
+        agent: agent.agent,
+        agentId: agent.id,
+        attempts: input.attempts,
+        from: input.from,
+        herdrSessionName: agent.herdrSessionName,
+        name: agent.name,
+        paneId: agent.paneId,
+        planId: input.planId,
+        reason: input.reason ?? "unknown",
+        terminalId: agent.terminalId,
+        to: input.to,
+        workspaceId: agent.workspaceId,
+      },
+      terminalId: agent.terminalId,
+      type: "agent.discarded",
       workspaceId: agent.workspaceId,
     });
   }

@@ -1167,7 +1167,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     harness.sqlite.close();
   });
 
-  test("C5: fake timers 8x4s + 7x10s = 102s exhausts retry budget to failed with attempts=8, one agent.failed event, no drainPendingPlans called", async () => {
+  test("C5: fake timers 8x4s + 7x10s = 102s exhausts retry budget to discarded with attempts=8, zero agent.failed events, no drainPendingPlans called", async () => {
     vi.useFakeTimers();
     try {
       const harness = openObservabilityDbHarness();
@@ -1223,7 +1223,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
 
       const finalPlan = harness.statusEventPlans.get(planRecord.id);
       expect(finalPlan.attempts).toBe(8);
-      expect(finalPlan.status).toBe("failed");
+      expect(finalPlan.status).toBe("discarded");
       expect(finalPlan.lastError).toBe("PLAN_WAITING_HISTORY");
 
       const allEvents = harness.agentEvents.listAfter({
@@ -1231,15 +1231,16 @@ describe("AgentIndexService non-pi completed event generation", () => {
         workspaceId: "wJ",
       });
       const failedEvents = allEvents.filter((event) => event.type === "agent.failed");
-      expect(failedEvents).toHaveLength(1);
-      expect(failedEvents[0]?.payload).toMatchObject({
+      expect(failedEvents).toHaveLength(0);
+      const discardedEvents = allEvents.filter((event) => event.type === "agent.discarded");
+      expect(discardedEvents).toHaveLength(1);
+      expect(discardedEvents[0]?.payload).toMatchObject({
         attempts: 8,
         from: "working",
         paneId: "wJ:p2",
         reason: "PLAN_WAITING_HISTORY",
         to: "idle",
       });
-      expect(allEvents.filter((event) => event.type !== "agent.failed")).toEqual([]);
 
       // Proves drainPendingPlans was never called during retry loop
       expect(drainSpy).not.toHaveBeenCalled();
@@ -1647,7 +1648,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     harness.sqlite.close();
   });
 
-  test("plan reaching max attempts (8) transitions to failed and logs structured console.warn", async () => {
+  test("PLAN_WAITING_HISTORY plan reaching max attempts (8) transitions to discarded with zero agent.failed events", async () => {
     const harness = openObservabilityDbHarness();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
 
@@ -1685,7 +1686,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         to: "done",
       });
 
-      // Set attempts to 7 so the next failure becomes attempt 8 (failed)
+      // Set attempts to 7 so the next failure becomes attempt 8 (discarded)
       for (let i = 1; i <= 7; i += 1) {
         harness.statusEventPlans.markRetry(planRow.id, new Error("PLAN_WAITING_HISTORY"));
       }
@@ -1694,19 +1695,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
 
       const updated = harness.statusEventPlans.get(planRow.id);
       expect(updated.attempts).toBe(8);
-      expect(updated.status).toBe("failed");
-
-      expect(warnSpy).toHaveBeenCalledWith(
-        "Herdsman status event plan failed after max attempts",
-        expect.objectContaining({
-          agentId: agent.id,
-          attempts: 8,
-          from: "working",
-          herdrSessionName: "default",
-          planId: planRow.id,
-          to: "done",
-        }),
-      );
+      expect(updated.status).toBe("discarded");
 
       const failedEvents = harness.agentEvents
         .listAfter({
@@ -1714,8 +1703,16 @@ describe("AgentIndexService non-pi completed event generation", () => {
           workspaceId: "wJ",
         })
         .filter((event) => event.type === "agent.failed");
-      expect(failedEvents).toHaveLength(1);
-      expect(failedEvents[0]?.payload).toMatchObject({
+      expect(failedEvents).toHaveLength(0);
+
+      const discardedEvents = harness.agentEvents
+        .listAfter({
+          herdrSessionName: "default",
+          workspaceId: "wJ",
+        })
+        .filter((event) => event.type === "agent.discarded");
+      expect(discardedEvents).toHaveLength(1);
+      expect(discardedEvents[0]?.payload).toMatchObject({
         agent: "agy",
         attempts: 8,
         from: "working",
@@ -1731,28 +1728,17 @@ describe("AgentIndexService non-pi completed event generation", () => {
             herdrSessionName: "default",
             workspaceId: "wJ",
           })
-          .filter((event) => event.type === "agent.failed"),
+          .filter((event) => event.type === "agent.discarded"),
       ).toHaveLength(1);
-      const replayed = harness.agentEvents.append({
-        agentId: agent.id,
-        herdrSessionName: "default",
-        idempotencyKey: `agent.failed:plan:${planRow.id}`,
-        paneId: agent.paneId,
-        payload: { duplicate: true },
-        terminalId: agent.terminalId,
-        type: "agent.failed",
-        workspaceId: agent.workspaceId,
-      });
-      expect(replayed.id).toBe(failedEvents[0]?.id);
     } finally {
       warnSpy.mockRestore();
       harness.sqlite.close();
     }
   });
 
-  test("#drainPlanRow 8th refresh failure marks plan failed, logs plan marked failed, writes one agent.failed", async () => {
+  test("#drainPlanRow 8th refresh failure marks plan discarded, logs plan marked discarded, writes one agent.discarded", async () => {
     const harness = openObservabilityDbHarness();
-    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
 
     try {
       let failRefresh = false;
@@ -1804,11 +1790,11 @@ describe("AgentIndexService non-pi completed event generation", () => {
       await index.drainPendingPlans();
 
       const updated = harness.statusEventPlans.get(planRow.id);
-      expect(updated.status).toBe("failed");
+      expect(updated.status).toBe("discarded");
       expect(updated.attempts).toBe(8);
 
-      expect(warnSpy).toHaveBeenCalledWith(
-        "Herdsman plan marked failed",
+      expect(infoSpy).toHaveBeenCalledWith(
+        "Herdsman plan marked discarded during drain",
         expect.objectContaining({
           agentId: agent.id,
           from: "working",
@@ -1817,11 +1803,6 @@ describe("AgentIndexService non-pi completed event generation", () => {
           to: "done",
         }),
       );
-      expect(
-        warnSpy.mock.calls.some(
-          (call) => typeof call[0] === "string" && call[0].includes("keeping waiting"),
-        ),
-      ).toBe(false);
 
       const failedEvents = harness.agentEvents
         .listAfter({
@@ -1829,8 +1810,16 @@ describe("AgentIndexService non-pi completed event generation", () => {
           workspaceId: "wJ",
         })
         .filter((event) => event.type === "agent.failed");
-      expect(failedEvents).toHaveLength(1);
-      expect(failedEvents[0]?.payload).toMatchObject({
+      expect(failedEvents).toHaveLength(0);
+
+      const discardedEvents = harness.agentEvents
+        .listAfter({
+          herdrSessionName: "default",
+          workspaceId: "wJ",
+        })
+        .filter((event) => event.type === "agent.discarded");
+      expect(discardedEvents).toHaveLength(1);
+      expect(discardedEvents[0]?.payload).toMatchObject({
         attempts: 8,
         from: "working",
         paneId: "wJ:p2",
@@ -1845,12 +1834,12 @@ describe("AgentIndexService non-pi completed event generation", () => {
             herdrSessionName: "default",
             workspaceId: "wJ",
           })
-          .filter((event) => event.type === "agent.failed"),
+          .filter((event) => event.type === "agent.discarded"),
       ).toHaveLength(1);
 
       index.stopWaitingHistoryRetries();
     } finally {
-      warnSpy.mockRestore();
+      infoSpy.mockRestore();
       harness.sqlite.close();
     }
   });
@@ -2739,9 +2728,21 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     for (let i = 0; i < 8; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(row.id, new Error("RETRY_EXHAUSTED"));
     }
     expect(harness.statusEventPlans.get(row.id).status).toBe("failed");
+
+    // Also insert a legacy failed row with PLAN_WAITING_HISTORY; it must NOT be backfilled
+    const legacyRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    harness.sqlite
+      .prepare(
+        "update status_event_plans set status = 'failed', last_error = 'PLAN_WAITING_HISTORY' where id = ?",
+      )
+      .run(legacyRow.id);
 
     await index.drainPendingPlans();
 
@@ -2751,7 +2752,7 @@ describe("batch2 window regressions", () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]?.payload).toMatchObject({
       from: "working",
-      reason: "PLAN_WAITING_HISTORY",
+      reason: "RETRY_EXHAUSTED",
       to: "done",
     });
     harness.sqlite.close();
@@ -2779,14 +2780,14 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     for (let i = 0; i < 8; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(row.id, new Error("RETRY_EXHAUSTED"));
     }
     harness.agentEvents.append({
       agentId: agent.id,
       herdrSessionName: "default",
       idempotencyKey: `agent.failed:plan:${row.id}`,
       paneId: agent.paneId,
-      payload: { from: "working", reason: "PLAN_WAITING_HISTORY", to: "done" },
+      payload: { from: "working", reason: "RETRY_EXHAUSTED", to: "done" },
       terminalId: agent.terminalId,
       type: "agent.failed",
       workspaceId: agent.workspaceId,
@@ -2798,6 +2799,102 @@ describe("batch2 window regressions", () => {
       .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
       .filter((event) => event.type === "agent.failed");
     expect(failed).toHaveLength(1);
+    harness.sqlite.close();
+  });
+
+  test("drainPendingPlans backfills agent.discarded for discarded rows without events", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < 8; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+    expect(harness.statusEventPlans.get(row.id).status).toBe("discarded");
+
+    await index.drainPendingPlans();
+
+    const discarded = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.discarded");
+    expect(discarded).toHaveLength(1);
+    expect(discarded[0]?.payload).toMatchObject({
+      agentId: agent.id,
+      attempts: 8,
+      from: "working",
+      planId: row.id,
+      reason: "PLAN_WAITING_HISTORY",
+      to: "done",
+    });
+    harness.sqlite.close();
+  });
+
+  test("drainPendingPlans does not duplicate agent.discarded when event already exists", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < 8; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+    expect(harness.statusEventPlans.get(row.id).status).toBe("discarded");
+
+    harness.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      idempotencyKey: `agent.discarded:plan:${row.id}`,
+      paneId: agent.paneId,
+      payload: {
+        agentId: agent.id,
+        attempts: 8,
+        from: "working",
+        planId: row.id,
+        reason: "PLAN_WAITING_HISTORY",
+        to: "done",
+      },
+      terminalId: agent.terminalId,
+      type: "agent.discarded",
+      workspaceId: agent.workspaceId,
+    });
+
+    await index.drainPendingPlans();
+
+    const discarded = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((event) => event.type === "agent.discarded");
+    expect(discarded).toHaveLength(1);
     harness.sqlite.close();
   });
 
@@ -2871,7 +2968,7 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     for (let i = 0; i < 8; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(row.id, new Error("RETRY_EXHAUSTED"));
     }
     await index.drainPendingPlans();
 
@@ -2925,7 +3022,7 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     for (let i = 0; i < 8; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(row.id, new Error("RETRY_EXHAUSTED"));
     }
     await index.drainPendingPlans();
     const failed = harness.agentEvents
@@ -3024,6 +3121,336 @@ describe("batch2 window regressions", () => {
       .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
       .filter((event) => event.type === "agent.done");
     expect(doneEvents).toHaveLength(2);
+    harness.sqlite.close();
+  });
+
+  test("drain short-circuits when queued plan has already reached terminal status (completed/cancelled/failed/discarded) and does not revive it", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "claude");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("claude-jsonl"),
+              lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const terminalStatuses = ["completed", "cancelled", "failed", "discarded"] as const;
+    const planRows: Array<{ id: number; status: string; attempts: number }> = [];
+
+    for (const status of terminalStatuses) {
+      const row = harness.statusEventPlans.insertPending({
+        agent,
+        compactHistory: {
+          ...emptyCompactHistory("claude-jsonl"),
+          lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
+        },
+        from: "working",
+        to: "done",
+      });
+      if (status === "completed") {
+        harness.statusEventPlans.markCompleted(row.id);
+      } else if (status === "cancelled") {
+        harness.statusEventPlans.markCancelled(row.id);
+      } else if (status === "discarded") {
+        harness.statusEventPlans.markDiscarded(row.id, "TEST_DISCARD");
+      } else if (status === "failed") {
+        for (let i = 0; i < 8; i += 1) {
+          harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+        }
+        // Force status to failed for testing terminal failed row
+        harness.sqlite
+          .prepare(
+            "update status_event_plans set status = 'failed', last_error = 'PLAN_WAITING_HISTORY' where id = ?",
+          )
+          .run(row.id);
+      }
+      const record = harness.statusEventPlans.get(row.id);
+      planRows.push({ attempts: record.attempts, id: row.id, status });
+    }
+
+    await index.drainPendingPlans();
+
+    // Verify none of the terminal rows were revived or modified
+    for (const { attempts, id, status } of planRows) {
+      const current = harness.statusEventPlans.get(id);
+      expect(current.status).toBe(status);
+      expect(current.attempts).toBe(attempts);
+    }
+
+    // No agent.done events should have been created by draining terminal rows
+    const doneEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.done");
+    expect(doneEvents).toEqual([]);
+
+    harness.sqlite.close();
+  });
+
+  test("#retryWaitingPlanRow clears waiting timer on discarded and failed transitions without residue in timer map", async () => {
+    const harness = openObservabilityDbHarness();
+    const scheduledCallbacks = new Map<unknown, () => Promise<void> | void>();
+    const clearedTimers: unknown[] = [];
+
+    let timerSeq = 1;
+    const scheduleRetryMock = vi.fn((callback: () => Promise<void> | void) => {
+      const id = timerSeq++;
+      scheduledCallbacks.set(id, callback);
+      return id;
+    });
+    const clearRetryMock = vi.fn((timer: unknown) => {
+      clearedTimers.push(timer);
+      scheduledCallbacks.delete(timer);
+    });
+
+    let failRefresh = false;
+    const index = new AgentIndexService({
+      clearRetry: clearRetryMock,
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "claude");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          if (failRefresh) {
+            throw new Error("simulated disk error");
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("claude-jsonl"),
+              lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: scheduleRetryMock,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    // 1. Test discarded branch of #retryWaitingPlanRow:
+    // Create a plan with 6 attempts.
+    const discardedRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 1; i <= 6; i += 1) {
+      harness.statusEventPlans.markRetry(discardedRow.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+
+    // executeStatusEventPlan with failRefresh makes attempt 7 (pending) and schedules retry timer
+    failRefresh = true;
+    await index.executeStatusEventPlan({
+      agent,
+      compactHistory: undefined,
+      from: "working",
+      planId: discardedRow.id,
+      to: "done",
+    });
+
+    expect(harness.statusEventPlans.get(discardedRow.id).status).toBe("pending");
+    expect(harness.statusEventPlans.get(discardedRow.id).attempts).toBe(7);
+    expect(scheduleRetryMock).toHaveBeenCalledTimes(1);
+    const retryTimerId = scheduleRetryMock.mock.results[0]?.value;
+    const retryCallback = scheduledCallbacks.get(retryTimerId);
+    if (!retryCallback) throw new Error("expected scheduled retry callback");
+
+    // Clear record of clearRetry calls
+    clearRetryMock.mockClear();
+
+    // Now execute the scheduled retry callback (this runs #retryWaitingPlanRow for 8th attempt -> discarded)
+    await retryCallback();
+
+    expect(harness.statusEventPlans.get(discardedRow.id).status).toBe("discarded");
+    expect(harness.statusEventPlans.get(discardedRow.id).attempts).toBe(8);
+
+    // clearRetry must have been called during #retryWaitingPlanRow
+    expect(clearRetryMock).toHaveBeenCalledWith(retryTimerId);
+
+    // Calling stopWaitingHistoryRetries() must find no residue in the timer map
+    clearRetryMock.mockClear();
+    index.stopWaitingHistoryRetries();
+    expect(clearRetryMock).not.toHaveBeenCalled();
+
+    // Verify agent.discarded event was emitted
+    const discardedEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(discardedEvents).toHaveLength(1);
+    expect(discardedEvents[0]?.payload).toMatchObject({
+      attempts: 8,
+      from: "working",
+      planId: discardedRow.id,
+      reason: "PLAN_WAITING_HISTORY",
+      to: "done",
+    });
+
+    harness.sqlite.close();
+  });
+
+  test("#runPlanRow general error catch path emits agent.discarded when retry exhausted to discarded", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => ({
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
+      })),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
+      },
+      from: "working",
+      to: "done",
+    });
+    // Set attempts to 7 so the next retry exhausts attempts to 8
+    for (let i = 0; i < 7; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    }
+    expect(harness.statusEventPlans.get(row.id).attempts).toBe(7);
+
+    // Mock agentEvents.append so the first append inside #appendStatusEvents throws Error("PLAN_WAITING_HISTORY")
+    let appendCallCount = 0;
+    const originalAppend = harness.agentEvents.append.bind(harness.agentEvents);
+    harness.agentEvents.append = (input: Parameters<typeof originalAppend>[0]) => {
+      appendCallCount += 1;
+      if (appendCallCount === 1) {
+        throw new Error("PLAN_WAITING_HISTORY");
+      }
+      return originalAppend(input);
+    };
+
+    // executeStatusEventPlan with planId will invoke #runPlanRow on the existing row
+    const result = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
+      },
+      from: "working",
+      planId: row.id,
+      to: "done",
+    });
+
+    expect(result).toBeDefined();
+    expect(result?.type).toBe("agent.discarded");
+    expect(harness.statusEventPlans.get(row.id).status).toBe("discarded");
+    expect(harness.statusEventPlans.get(row.id).attempts).toBe(8);
+
+    const discardedEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(discardedEvents).toHaveLength(1);
+    expect(discardedEvents[0]?.payload).toMatchObject({
+      attempts: 8,
+      from: "working",
+      planId: row.id,
+      reason: "PLAN_WAITING_HISTORY",
+      to: "done",
+    });
+
+    harness.sqlite.close();
+  });
+
+  test("#runPlanRow gracefully handles markRetry returning null when changes === 0", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => ({
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
+      })),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
+      },
+      from: "working",
+      to: "done",
+    });
+
+    // Mock agentEvents.append so it concurrently marks row completed in DB and throws
+    let appendCallCount = 0;
+    const originalAppend = harness.agentEvents.append.bind(harness.agentEvents);
+    harness.agentEvents.append = (input: Parameters<typeof originalAppend>[0]) => {
+      appendCallCount += 1;
+      if (appendCallCount === 1) {
+        harness.sqlite
+          .prepare("update status_event_plans set status = 'completed' where id = ?")
+          .run(row.id);
+        throw new Error("UNEXPECTED_ERROR");
+      }
+      return originalAppend(input);
+    };
+
+    // executeStatusEventPlan enters #runPlanRow, which catches the error, calls markRetry.
+    // Since row was modified to 'completed', markRetry returns null (changes === 0).
+    // #runPlanRow should return undefined gracefully without crashing.
+    const result = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("claude-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
+      },
+      from: "working",
+      planId: row.id,
+      to: "done",
+    });
+
+    expect(result).toBeUndefined();
+    expect(harness.statusEventPlans.get(row.id).status).toBe("completed");
+
     harness.sqlite.close();
   });
 });

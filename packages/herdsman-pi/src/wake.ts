@@ -32,7 +32,19 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
   if (!event.terminalId) return undefined;
   if (event.type === "agent.done") return "completed";
   if (event.type === "agent.blocked") return "blocked";
-  if (event.type === "agent.failed") return "failed";
+  if (event.type === "agent.failed") {
+    const payload = asRecord(event.payload);
+    const reason = stringValue(payload.reason);
+    // Backward compatibility filter for legacy pre-upgrade failed rows with PLAN_WAITING_HISTORY
+    if (reason === "PLAN_WAITING_HISTORY") {
+      return undefined;
+    }
+    return "failed";
+  }
+  if (event.type === "agent.discarded") {
+    // 观察者放弃等待不唤醒编排者；真实故障由 agent.failed 负责唤醒，正常结束由 agent.done/idle 保底
+    return undefined;
+  }
   const payload = asRecord(event.payload);
   if (event.type === "agent.idle" && payload.from === "working") return "completed";
   return undefined;

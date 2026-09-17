@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- 修复 status plan 等待超时误报并新增 discarded 生命周期。
 - 规范与协作基础设施：补齐 agent 协作骨架与开发规范（AGENTS.md 铁律、.agents/notes/ 决策笔记系统及索引脚本）。
 
 ## 0.11.6

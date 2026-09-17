@@ -3,7 +3,13 @@ import type { AgentStatus, CompactAgentHistory } from "@/observability/contracts
 
 export const STATUS_PLAN_MAX_ATTEMPTS = 8;
 
-export type StatusEventPlanStatus = "pending" | "running" | "completed" | "cancelled" | "failed";
+export type StatusEventPlanStatus =
+  | "pending"
+  | "running"
+  | "completed"
+  | "cancelled"
+  | "failed"
+  | "discarded";
 
 export type StatusEventPlanRecord = {
   agentId: string;
@@ -191,6 +197,13 @@ export class StatusEventPlanStore {
     return rows.map(mapStatusEventPlan);
   }
 
+  listDiscarded(): StatusEventPlanRecord[] {
+    const rows = this.#sqlite
+      .prepare("select * from status_event_plans where status = 'discarded' order by id asc")
+      .all() as StatusEventPlanRow[];
+    return rows.map(mapStatusEventPlan);
+  }
+
   listWaitingHistory(): StatusEventPlanRecord[] {
     const rows = this.#sqlite
       .prepare(
@@ -231,23 +244,48 @@ export class StatusEventPlanStore {
       .run(now, id);
   }
 
-  markRetry(id: number, error: unknown): void {
+  markDiscarded(id: number, reason?: string): void {
     const now = Date.now();
-    const errorMessage = error instanceof Error ? error.message : String(error);
     const current = this.get(id);
-    const attempts = current.attempts + 1;
-    const newStatus: StatusEventPlanStatus =
-      attempts >= STATUS_PLAN_MAX_ATTEMPTS ? "failed" : "pending";
-
+    const lastError = reason ?? current.lastError;
     this.#sqlite
       .prepare(
-        "update status_event_plans set attempts = ?, status = ?, last_error = ?, updated_at = ? where id = ?",
+        "update status_event_plans set status = 'discarded', last_error = ?, updated_at = ? where id = ?",
+      )
+      .run(lastError, now, id);
+  }
+
+  markRetry(id: number, error: unknown): StatusEventPlanRecord | null {
+    const current = this.get(id);
+    if (
+      current.status === "completed" ||
+      current.status === "cancelled" ||
+      current.status === "failed" ||
+      current.status === "discarded"
+    ) {
+      return null;
+    }
+    const now = Date.now();
+    const errorMessage = error instanceof Error ? error.message : String(error);
+    const attempts = current.attempts + 1;
+    let newStatus: StatusEventPlanStatus = "pending";
+    if (attempts >= STATUS_PLAN_MAX_ATTEMPTS) {
+      newStatus = errorMessage === "PLAN_WAITING_HISTORY" ? "discarded" : "failed";
+    }
+
+    const result = this.#sqlite
+      .prepare(
+        "update status_event_plans set attempts = ?, status = ?, last_error = ?, updated_at = ? where id = ? and status in ('pending', 'running')",
       )
       .run(attempts, newStatus, errorMessage, now, id);
+    if (Number(result.changes) === 0) {
+      return null;
+    }
+    return this.get(id);
   }
 
   /**
-   * Purges settled plans (completed/cancelled/failed) whose updated_at is
+   * Purges settled plans (completed/cancelled/failed/discarded) whose updated_at is
    * older than ageMs. Pending and running rows are never touched: they are
    * still owned by the drain/retry cycle.
    */
@@ -256,7 +294,7 @@ export class StatusEventPlanStore {
     const result = this.#sqlite
       .prepare(
         `delete from status_event_plans
-         where status in ('completed', 'cancelled', 'failed') and updated_at < ?`,
+         where status in ('completed', 'cancelled', 'failed', 'discarded') and updated_at < ?`,
       )
       .run(cutoff);
     return Number(result.changes);

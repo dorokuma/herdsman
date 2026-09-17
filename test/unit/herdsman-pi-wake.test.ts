@@ -54,7 +54,7 @@ describe("Pi agent wake projection", () => {
     ).toEqual([expect.objectContaining({ eventId: 7, kind: "completed" })]);
   });
 
-  test("projects agent.failed as a failed outcome and formats a reason line", () => {
+  test("filters out agent.failed with PLAN_WAITING_HISTORY reason", () => {
     const projection = projectAgentOutcomes([
       event(19, "agent.failed", {
         agent: "claude",
@@ -65,11 +65,26 @@ describe("Pi agent wake projection", () => {
         to: "done",
       }),
     ]);
+    expect(projection.outcomes).toEqual([]);
+    expect(projection.rawEvents).toHaveLength(1);
+  });
+
+  test("projects agent.failed with real error as a failed outcome and formats a reason line", () => {
+    const projection = projectAgentOutcomes([
+      event(20, "agent.failed", {
+        agent: "claude",
+        from: "working",
+        name: "reviewer",
+        paneId: "wB:p2",
+        reason: "PROCESS_CRASH",
+        to: "done",
+      }),
+    ]);
     expect(projection.outcomes).toEqual([
       expect.objectContaining({
-        eventId: 19,
+        eventId: 20,
         kind: "failed",
-        reason: "PLAN_WAITING_HISTORY",
+        reason: "PROCESS_CRASH",
       }),
     ]);
     const [outcome] = projection.outcomes;
@@ -77,8 +92,38 @@ describe("Pi agent wake projection", () => {
     const formatted = formatAgentOutcomeUpdates([outcome]);
     expect(formatted).toContain("[HERDSMAN WAKE POLICY]");
     expect(formatted).toContain("- failed reviewer · Claude wB:p2");
-    expect(formatted).toContain("reason: PLAN_WAITING_HISTORY");
+    expect(formatted).toContain("reason: PROCESS_CRASH");
     expect(formatted).not.toContain("last assistant:");
+  });
+
+  test("filters out agent.discarded without triggering wake even with PLAN_WAITING_HISTORY reason", () => {
+    const projection = projectAgentOutcomes([
+      event(21, "agent.discarded", {
+        agent: "claude",
+        from: "working",
+        name: "reviewer",
+        paneId: "wB:p2",
+        reason: "PLAN_WAITING_HISTORY",
+        to: "done",
+      }),
+    ]);
+    expect(projection.outcomes).toEqual([]);
+    expect(projection.rawEvents).toHaveLength(1);
+  });
+
+  test("filters out agent.discarded with custom discard reason without triggering wake", () => {
+    const projection = projectAgentOutcomes([
+      event(22, "agent.discarded", {
+        agent: "claude",
+        from: "working",
+        name: "worker",
+        paneId: "wB:p3",
+        reason: "TIMEOUT_DISCARD",
+        to: "idle",
+      }),
+    ]);
+    expect(projection.outcomes).toEqual([]);
+    expect(projection.rawEvents).toHaveLength(1);
   });
 
   test.each([
