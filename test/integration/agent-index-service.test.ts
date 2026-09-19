@@ -3454,3 +3454,283 @@ describe("batch2 window regressions", () => {
     harness.sqlite.close();
   });
 });
+
+describe("agy late startup idle supersession (p76 regression)", () => {
+  test("P76: the late unknown->idle plan is superseded and the following working->done still emits agent.done", async () => {
+    const harness = openObservabilityDbHarness();
+    let agentStatus = "idle";
+    let assistantRef: string | null = null;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent(agentStatus, 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: assistantRef
+                ? { ref: assistantRef, text: `output ${assistantRef}`, timestamp: null }
+                : null,
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: () => 1,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    // 1. The pane announces idle before it is indexed: an unknown -> idle plan is
+    //    created while history is still empty, so it stays pending in WAITING.
+    const startup = await index.handleHerdrEvent({
+      event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+    expect(startup.events).toEqual([]);
+    const staleRow = harness.statusEventPlans.listUnfinished()[0];
+    if (!staleRow) throw new Error("expected pending startup idle plan");
+    expect(staleRow).toMatchObject({
+      attempts: 1,
+      fromStatus: "unknown",
+      lastError: "PLAN_WAITING_HISTORY",
+      status: "pending",
+      toStatus: "idle",
+    });
+
+    // 2. The pane starts working: the newer transition invalidates the stale
+    //    startup idle plan before it can complete late.
+    agentStatus = "working";
+    const working = await index.handleHerdrEvent({
+      event: {
+        agent_status: "working",
+        event_id: "ev-work",
+        pane_id: "wJ:p2",
+        type: "pane.agent_status_changed",
+      },
+      ...sessionInput(),
+    });
+    expect(working.events.map((event) => event.type)).toEqual(["agent.status.changed"]);
+    expect(harness.statusEventPlans.get(staleRow.id)).toMatchObject({
+      lastError: "PLAN_SUPERSEDED",
+      status: "cancelled",
+    });
+
+    // 3. The final assistant ref appears. Draining plans must not resurrect the
+    //    cancelled startup idle plan and must not let it register that ref.
+    assistantRef = "#entry=23";
+    await index.drainPendingPlans();
+    const afterDrain = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(afterDrain.map((event) => event.type)).toEqual(["agent.status.changed"]);
+
+    // 4. The round finishes with the same ref the stale plan captured: the
+    //    working -> done plan must still emit agent.done (and never discarded).
+    agentStatus = "done";
+    const done = await index.handleHerdrEvent({
+      event: {
+        agent_status: "done",
+        event_id: "ev-done",
+        pane_id: "wJ:p2",
+        type: "pane.agent_status_changed",
+      },
+      ...sessionInput(),
+    });
+    expect(done.events.map((event) => event.type)).toEqual(["agent.done"]);
+    expect(done.events[0]?.payload).toMatchObject({ from: "working", to: "done" });
+    expect(done.events[0]?.compactHistory?.lastAssistantMessage?.ref).toBe("#entry=23");
+
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((event) => event.type === "agent.done")).toHaveLength(1);
+    expect(allEvents.filter((event) => event.type === "agent.idle")).toHaveLength(0);
+    expect(allEvents.filter((event) => event.type === "agent.discarded")).toHaveLength(0);
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("agy idle delivered from unknown does not consume the final ref; a repeated working->done with the same ref skips instead of discarding", async () => {
+    const harness = openObservabilityDbHarness();
+    let agentStatus = "idle";
+    const assistantRef = "#entry=23";
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent(agentStatus, 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: {
+                ref: assistantRef,
+                text: `output ${assistantRef}`,
+                timestamp: null,
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: () => 1,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    // 1. Recovered pane idle from unknown: the idle event is emitted (it is not
+    //    deliverable, but it is recorded).
+    const startup = await index.handleHerdrEvent({
+      event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+    expect(startup.events.map((event) => event.type)).toEqual(["agent.idle"]);
+    expect(startup.events[0]?.payload).toMatchObject({ from: "unknown", to: "idle" });
+
+    // 2. The pane works and then finishes with the same assistant ref: the
+    //    unknown -> idle row must not make this round look like a duplicate.
+    agentStatus = "working";
+    await index.handleHerdrEvent({
+      event: {
+        agent_status: "working",
+        event_id: "ev-work",
+        pane_id: "wJ:p2",
+        type: "pane.agent_status_changed",
+      },
+      ...sessionInput(),
+    });
+    agentStatus = "done";
+    const done = await index.handleHerdrEvent({
+      event: {
+        agent_status: "done",
+        event_id: "ev-done",
+        pane_id: "wJ:p2",
+        type: "pane.agent_status_changed",
+      },
+      ...sessionInput(),
+    });
+    expect(done.events.map((event) => event.type)).toEqual(["agent.done"]);
+    expect(done.events[0]?.compactHistory?.lastAssistantMessage?.ref).toBe(assistantRef);
+
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected indexed agent");
+
+    // 3. A repeated working -> done legacy plan with the already delivered ref is
+    //    a genuine skip: completed, no extra event, never discarded.
+    const duplicate = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: {
+          ref: assistantRef,
+          text: `output ${assistantRef}`,
+          timestamp: null,
+        },
+      },
+      from: "working",
+      to: "done",
+    });
+    expect(duplicate).toBeUndefined();
+    const duplicateRow = harness.statusEventPlans.listUnfinished();
+    expect(duplicateRow).toEqual([]);
+
+    // 4. The same already delivered ref on a retry row skips as well instead of
+    //    exhausting the budget into discarded.
+    const retryRow = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: {
+          ref: assistantRef,
+          text: `output ${assistantRef}`,
+          timestamp: null,
+        },
+      },
+      from: "working",
+      to: "done",
+    });
+    harness.statusEventPlans.markRetry(retryRow.id, new Error("PLAN_WAITING_HISTORY"));
+    await index.drainPendingPlans();
+    expect(harness.statusEventPlans.get(retryRow.id).status).toBe("completed");
+
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((event) => event.type === "agent.done")).toHaveLength(1);
+    expect(allEvents.filter((event) => event.type === "agent.discarded")).toHaveLength(0);
+    expect(allEvents.filter((event) => event.type === "agent.idle")).toHaveLength(1);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("agy with history that never becomes non-empty still ends in PLAN_WAITING_HISTORY (pending, then discarded budget)", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: null,
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: () => 1,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const result = await index.handleHerdrEvent({
+      event: {
+        agent_status: "done",
+        event_id: "ev-done",
+        pane_id: "wJ:p2",
+        type: "pane.agent_status_changed",
+      },
+      ...sessionInput(),
+    });
+    expect(result.events).toEqual([]);
+    const pending = harness.statusEventPlans.listUnfinished();
+    expect(pending).toHaveLength(1);
+    expect(pending[0]).toMatchObject({
+      attempts: 1,
+      lastError: "PLAN_WAITING_HISTORY",
+      status: "pending",
+      toStatus: "done",
+    });
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((event) => event.type === "agent.discarded")).toHaveLength(0);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+});

@@ -1430,10 +1430,21 @@ export class AgentIndexService {
         skipStatusChanged = true;
       }
       if (hasTerminalAfter && !input.herdrEventKey) {
-        const lastTerminal = this.#stores.agentEvents.latestTerminalEvent(
-          input.agent.id,
-          input.agent.herdrSessionName,
-        );
+        const isAgyHistory =
+          input.agent.agent === "agy" || input.compactHistory.source === "antigravity-sqlite";
+        // For an agy/antigravity pane only a terminal event that already
+        // represented a completed turn may count as the delivered baseline: an
+        // `unknown -> idle` startup row would otherwise make the `working -> done`
+        // row of the same round look like a duplicate.
+        const lastTerminal = isAgyHistory
+          ? this.#stores.agentEvents.latestCompletedTurnEvent(
+              input.agent.id,
+              input.agent.herdrSessionName,
+            )
+          : this.#stores.agentEvents.latestTerminalEvent(
+              input.agent.id,
+              input.agent.herdrSessionName,
+            );
         if (
           sameTerminalAssistantContent(
             input.compactHistory,
@@ -1441,7 +1452,9 @@ export class AgentIndexService {
             input.agent.agent,
           )
         ) {
-          if ((input.attempts ?? 0) > 0) {
+          // An agy round whose ref already reached a completed turn is settled: a
+          // retry must skip it instead of exhausting the budget into `discarded`.
+          if ((input.attempts ?? 0) > 0 && !isAgyHistory) {
             throw new PlanWaitingHistoryError();
           }
           console.debug(
@@ -1583,17 +1596,28 @@ export class AgentIndexService {
         }
       } else if (input.agent.agent !== "pi" && (input.to === "idle" || input.to === "done")) {
         // Note: blocked is an interactive intermediate state, exempt from ready gate and empty delivery gate.
+        const isAgyHistory = (compact: CompactAgentHistory | undefined): boolean =>
+          compact?.source === "antigravity-sqlite" || input.agent.agent === "agy";
+        // Only a terminal event that already represented a completed turn may
+        // consume the assistant ref: a late startup idle (`unknown -> idle`),
+        // an `agent.status.changed` row or a discarded plan must not make the
+        // following `working -> done` plan look like a duplicate round.
+        const latestCompletedTurnRef = (): string | null =>
+          this.#stores.agentEvents.latestCompletedTurnEvent(
+            input.agent.id,
+            input.agent.herdrSessionName,
+          )?.compactHistory?.lastAssistantMessage?.ref ?? null;
         const isReadyNonPi = (compact: CompactAgentHistory | undefined): boolean => {
           if (!compact || !hasNonEmptyAssistantMessage(compact)) return false;
+          if (isAgyHistory(compact)) {
+            const prevRef = latestCompletedTurnRef();
+            const currentRef = compact.lastAssistantMessage?.ref ?? null;
+            return currentRef !== null && currentRef !== prevRef;
+          }
           const latestTerminal = this.#stores.agentEvents.latestTerminalEvent(
             input.agent.id,
             input.agent.herdrSessionName,
           );
-          if (compact.source === "antigravity-sqlite" || input.agent.agent === "agy") {
-            const prevRef = latestTerminal?.compactHistory?.lastAssistantMessage?.ref ?? null;
-            const currentRef = compact.lastAssistantMessage?.ref ?? null;
-            return currentRef !== null && currentRef !== prevRef;
-          }
           if (!latestTerminal) return true;
           const currentMsg = compact.lastAssistantMessage;
           const prevMsg = latestTerminal.compactHistory?.lastAssistantMessage;
@@ -1605,6 +1629,18 @@ export class AgentIndexService {
             input.agent.agent,
           );
           return !same || refChanged || textChanged;
+        };
+        // A non-empty assistant ref that was already delivered by a completed
+        // turn is a genuine skip (the round was announced), never a reason to
+        // exhaust the retry budget into `discarded`.
+        const isAlreadyDeliveredCompletedTurn = (
+          compact: CompactAgentHistory | undefined,
+        ): boolean => {
+          if (!compact || !isAgyHistory(compact) || !hasNonEmptyAssistantMessage(compact)) {
+            return false;
+          }
+          const currentRef = compact.lastAssistantMessage?.ref ?? null;
+          return currentRef !== null && currentRef === latestCompletedTurnRef();
         };
 
         const latestTerminalForSkip = this.#stores.agentEvents.latestTerminalEvent(
@@ -1671,6 +1707,19 @@ export class AgentIndexService {
         }
 
         if (!isReadyNonPi(compactHistory)) {
+          if (isAlreadyDeliveredCompletedTurn(compactHistory)) {
+            console.debug(
+              "Herdsman skipping non-pi terminal status event because the assistant ref was already delivered by a completed turn",
+              {
+                agent: input.agent.agent,
+                agentId: input.agent.id,
+                from: input.from,
+                ref: compactHistory?.lastAssistantMessage?.ref ?? null,
+                to: input.to,
+              },
+            );
+            return undefined;
+          }
           throw new PlanWaitingHistoryError();
         }
       }

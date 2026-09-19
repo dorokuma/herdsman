@@ -140,6 +140,7 @@ export class StatusEventPlanStore {
     const now = Date.now();
     const compactHistoryJson = plan.compactHistory ? JSON.stringify(plan.compactHistory) : null;
 
+    let insertedId: number;
     try {
       const result = this.#sqlite
         .prepare(
@@ -159,7 +160,7 @@ export class StatusEventPlanStore {
           toStatus,
           now,
         );
-      return this.get(Number(result.lastInsertRowid));
+      insertedId = Number(result.lastInsertRowid);
     } catch (error) {
       if (herdrEventKey) {
         const existing = this.#sqlite
@@ -171,6 +172,71 @@ export class StatusEventPlanStore {
       }
       throw error;
     }
+
+    const row = this.get(insertedId);
+    const superseded = this.cancelSupersededPendingPlans({
+      agentId,
+      herdrSessionName,
+      keepId: row.id,
+      toStatus,
+    });
+    if (superseded > 0) {
+      console.debug("Herdsman cancelled superseded status event plans", {
+        agentId,
+        cancelled: superseded,
+        from: fromStatus,
+        herdrSessionName,
+        to: toStatus,
+      });
+    }
+    return row;
+  }
+
+  /**
+   * Cancels pending/running plans for the same agent that a newly observed plan
+   * supersedes, so an obsolete plan can no longer execute late and register a
+   * stale transition (or the assistant ref of a round that was never announced
+   * through that transition).
+   *
+   * An unfinished plan P is superseded by the newer plan N (same agent +
+   * session) when the newer transition has a different target
+   * (P.to_status <> N.to_status) and P can never wake an orchestrator anyway:
+   * an `idle` target whose origin is not `working` (an `unknown -> idle`
+   * startup plan, a `done -> idle` / `blocked -> idle` plan) delivers an
+   * `agent.idle` row with payload `from` not `working`, which the delivery and
+   * wake predicates both discard. Cancelling such a plan can therefore only
+   * remove a stale, useless emission.
+   *
+   * Plans that can still deliver a wake (a `done`/`blocked` target, or an `idle`
+   * target reached from `working`) are deliberately left in place: a pane that
+   * reports `done` and then flips to `idle`/`working` while the completion plan
+   * is still waiting for history must not lose its wake.
+   *
+   * The freshly inserted row itself is never touched, and settled rows
+   * (completed/cancelled/failed/discarded) stay as they are. Cancelled rows are
+   * swept by the same settled-row cleanup as other cancelled plans.
+   */
+  cancelSupersededPendingPlans(input: {
+    agentId: string;
+    herdrSessionName: string;
+    keepId: number;
+    toStatus: AgentStatus;
+  }): number {
+    const now = Date.now();
+    const result = this.#sqlite
+      .prepare(
+        `update status_event_plans
+         set status = 'cancelled', last_error = 'PLAN_SUPERSEDED', updated_at = ?
+         where id <> ?
+           and agent_id = ?
+           and herdr_session_name = ?
+           and status in ('pending', 'running')
+           and to_status = 'idle'
+           and from_status <> 'working'
+           and to_status <> ?`,
+      )
+      .run(now, input.keepId, input.agentId, input.herdrSessionName, input.toStatus);
+    return Number(result.changes);
   }
 
   get(id: number): StatusEventPlanRecord {

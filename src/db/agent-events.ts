@@ -313,6 +313,38 @@ export class AgentEventStore {
     return row ? mapAgentEvent(row) : undefined;
   }
 
+  /**
+   * Latest event that represents a *completed turn* whose assistant ref may be
+   * treated as "already delivered": every `agent.done`, plus `agent.idle` rows
+   * that were emitted from `working`. Rows that must never consume the
+   * assistant ref of a round are excluded:
+   *
+   * - `agent.status.changed` (never a delivery), `agent.discarded`,
+   * - `agent.idle` rows whose payload `from` is not `working` (startup/unknown
+   *   idles restored before indexing),
+   * - rows whose assistant message is empty.
+   *
+   * A late `unknown -> idle` plan that finishes after the round already ended
+   * would otherwise register the final ref as an `agent.idle` terminal event and
+   * make the following `working -> done` plan look like a duplicate.
+   */
+  latestCompletedTurnEvent(
+    agentId: string,
+    herdrSessionName: string,
+  ): AgentEventRecord | undefined {
+    const row = this.#sqlite
+      .prepare(
+        `select * from agent_events
+         where agent_id = ? and herdr_session_name = ?
+           and (type = 'agent.done'
+                or (type = 'agent.idle' and json_extract(payload_json, '$.from') = 'working'))
+           and length(trim(coalesce(json_extract(compact_history_json, '$.lastAssistantMessage.text'), ''))) > 0
+         order by id desc limit 1`,
+      )
+      .get(agentId, herdrSessionName) as AgentEventRow | undefined;
+    return row ? mapAgentEvent(row) : undefined;
+  }
+
   listAfter(
     input: AgentQueryScope & { afterEventId?: number; limit?: number; ownerTerminalId?: string },
   ): AgentEventRecord[] {

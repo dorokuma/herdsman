@@ -239,6 +239,173 @@ describe("StatusEventPlanStore", () => {
     harness.sqlite.close();
   });
 
+  test("insertPending cancels a superseded un-wakeable idle plan for the same agent", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    // A startup/recovered idle plan whose event can never wake an orchestrator
+    // (agent.idle with payload from != working) is stuck waiting for history.
+    const stale = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "unknown",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "idle",
+    });
+    store.markRetry(stale.id, new Error("PLAN_WAITING_HISTORY"));
+    expect(store.get(stale.id)).toMatchObject({
+      lastError: "PLAN_WAITING_HISTORY",
+      status: "pending",
+    });
+
+    // A newer transition for the same agent arrives: the stale plan must not
+    // execute late and register its transition (or ref).
+    const fresh = store.insertPending({
+      agentId: "ag_1",
+      fromStatus: "idle",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "working",
+    });
+
+    expect(store.get(stale.id)).toMatchObject({
+      lastError: "PLAN_SUPERSEDED",
+      status: "cancelled",
+    });
+    expect(store.get(fresh.id)).toMatchObject({ status: "pending", toStatus: "working" });
+    expect(store.listUnfinished().map((plan) => plan.id)).toEqual([fresh.id]);
+
+    harness.sqlite.close();
+  });
+
+  test("insertPending keeps unfinished plans that can still deliver a wake", () => {
+    const harness = openObservabilityDbHarness();
+    const store = harness.statusEventPlans;
+
+    // Case A: a pending working -> done completion plan survives a pane flip to
+    // idle, otherwise the round would lose its wake.
+    const done = store.insertPending({
+      agentId: "ag_done",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "done",
+    });
+    store.markRetry(done.id, new Error("PLAN_WAITING_HISTORY"));
+    const flipToIdle = store.insertPending({
+      agentId: "ag_done",
+      fromStatus: "done",
+      herdrSessionName: "session_a",
+      paneId: "p1",
+      toStatus: "idle",
+    });
+    expect(store.get(done.id).status).toBe("pending");
+
+    // Case B: a working -> idle plan is wake-worthy (agent.idle from working), so
+    // it survives the next transition too.
+    const workingIdle = store.insertPending({
+      agentId: "ag_working_idle",
+      fromStatus: "working",
+      herdrSessionName: "session_a",
+      paneId: "p2",
+      toStatus: "idle",
+    });
+    store.markRetry(workingIdle.id, new Error("PLAN_WAITING_HISTORY"));
+    const resume = store.insertPending({
+      agentId: "ag_working_idle",
+      fromStatus: "idle",
+      herdrSessionName: "session_a",
+      paneId: "p2",
+      toStatus: "working",
+    });
+    expect(store.get(workingIdle.id).status).toBe("pending");
+
+    // Case C: a recovered unknown -> done plan is wake-worthy and survives.
+    const unknownDone = store.insertPending({
+      agentId: "ag_unknown_done",
+      fromStatus: "unknown",
+      herdrSessionName: "session_a",
+      paneId: "p3",
+      toStatus: "done",
+    });
+    store.markRetry(unknownDone.id, new Error("PLAN_WAITING_HISTORY"));
+    const afterDone = store.insertPending({
+      agentId: "ag_unknown_done",
+      fromStatus: "done",
+      herdrSessionName: "session_a",
+      paneId: "p3",
+      toStatus: "idle",
+    });
+    expect(store.get(unknownDone.id).status).toBe("pending");
+
+    // Case D: same agent id in another session is out of scope; another agent in
+    // the same session stays untouched; every superseded idle plan of the
+    // targeted agent is cancelled together.
+    const otherAgent = store.insertPending({
+      agentId: "ag_other",
+      fromStatus: "unknown",
+      herdrSessionName: "session_a",
+      paneId: "p4",
+      toStatus: "idle",
+    });
+    const otherSession = store.insertPending({
+      agentId: "ag_other",
+      fromStatus: "unknown",
+      herdrSessionName: "session_b",
+      paneId: "p5",
+      toStatus: "idle",
+    });
+    const supersededIdle = store.insertPending({
+      agentId: "ag_other",
+      fromStatus: "unknown",
+      herdrSessionName: "session_a",
+      paneId: "p6",
+      toStatus: "idle",
+    });
+    const newer = store.insertPending({
+      agentId: "ag_other",
+      fromStatus: "idle",
+      herdrSessionName: "session_a",
+      paneId: "p6",
+      toStatus: "working",
+    });
+    expect(store.get(otherAgent.id).status).toBe("cancelled");
+    expect(store.get(supersededIdle.id).status).toBe("cancelled");
+    expect(store.get(otherSession.id).status).toBe("pending");
+
+    // Case E: settled rows and the freshly inserted row are never touched.
+    const settled = store.insertPending({
+      agentId: "ag_settled",
+      fromStatus: "unknown",
+      herdrSessionName: "session_a",
+      paneId: "p8",
+      toStatus: "idle",
+    });
+    store.markCompleted(settled.id);
+    const settledFollowUp = store.insertPending({
+      agentId: "ag_settled",
+      fromStatus: "idle",
+      herdrSessionName: "session_a",
+      paneId: "p8",
+      toStatus: "working",
+    });
+    expect(store.get(settled.id).status).toBe("completed");
+
+    expect(store.listUnfinished().map((plan) => plan.id)).toEqual([
+      done.id,
+      flipToIdle.id,
+      workingIdle.id,
+      resume.id,
+      unknownDone.id,
+      afterDone.id,
+      otherSession.id,
+      newer.id,
+      settledFollowUp.id,
+    ]);
+
+    harness.sqlite.close();
+  });
+
   test("markRetry with PLAN_WAITING_HISTORY exhausts to discarded instead of failed", () => {
     const harness = openObservabilityDbHarness();
     const store = harness.statusEventPlans;
