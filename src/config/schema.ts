@@ -25,10 +25,21 @@ const observabilitySchema = Type.Object(
   { additionalProperties: false },
 );
 
+const wakeSchema = Type.Object(
+  {
+    extra_upstream_error_patterns: Type.Optional(
+      Type.Array(Type.String({ minLength: 1 }), { default: [] }),
+    ),
+    filter_upstream_errors: Type.Optional(Type.Boolean({ default: true })),
+  },
+  { additionalProperties: false },
+);
+
 export const herdsmanConfigSchema = Type.Object(
   {
     observability: Type.Optional(observabilitySchema),
     runtime: Type.Optional(runtimePathsSchema),
+    wake: Type.Optional(wakeSchema),
   },
   { additionalProperties: false },
 );

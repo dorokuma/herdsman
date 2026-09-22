@@ -24,6 +24,38 @@ describe("Herdsman config schema", () => {
     });
   });
 
+  test("defaults the wake filter switch to enabled with no extra patterns", () => {
+    const result = parseHerdsmanConfig({ wake: {} });
+    expect(result).toMatchObject({
+      ok: true,
+      value: { wake: { extra_upstream_error_patterns: [], filter_upstream_errors: true } },
+    });
+  });
+
+  test("accepts an explicit wake filter switch and extra patterns", () => {
+    const result = parseHerdsmanConfig({
+      wake: {
+        extra_upstream_error_patterns: ["checkpoint-stall", "/foo\\s+bar/i"],
+        filter_upstream_errors: false,
+      },
+    });
+    expect(result).toMatchObject({
+      ok: true,
+      value: {
+        wake: {
+          extra_upstream_error_patterns: ["checkpoint-stall", "/foo\\s+bar/i"],
+          filter_upstream_errors: false,
+        },
+      },
+    });
+  });
+
+  test("rejects unknown wake keys and empty extra patterns", () => {
+    expect(parseHerdsmanConfig({ wake: { extra: 1 } }).ok).toBe(false);
+    expect(parseHerdsmanConfig({ wake: { extra_upstream_error_patterns: [""] } }).ok).toBe(false);
+    expect(parseHerdsmanConfig({ wake: { filter_upstream_errors: "yes" } }).ok).toBe(false);
+  });
+
   test("rejects unknown top-level config surfaces", () => {
     for (const config of [
       { old_agents: { enabled: true } },

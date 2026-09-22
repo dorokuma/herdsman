@@ -118,6 +118,18 @@ Completed or blocked agent outcomes start one visible Herdsman turn. If a normal
 
 Use `/herdsman` or `/herdsman status` to inspect the current Pi, and `/herdsman off` to release owner behavior for that Pi. Turning one Pi off does not affect another owner. An off or non-owner Pi remains connected for a later claim, but receives no hidden agent context, pending counts, updates, or wake. The active Pi shows `◆ Herdsman`; pending outcomes add `· N agent updates` until a turn containing them produces a final assistant response, settles, and acknowledges every underlying event. A previously active Pi shows `◇ Herdsman · reconnecting` during transport recovery. With no owner, outcomes are not delivered, and outcomes created during the ownerless period are not replayed by a later claim. Reloads, reconnects, and direct replacement by another Pi preserve unacknowledged outcomes. Ownership follows the Herdr terminal across Pi session replacement and pane movement, and clears when that terminal remains disconnected beyond the grace period.
 
+Upstream model errors are filtered out of the wake path: when the final assistant message (or a `failed` reason) is error-shaped text such as `API Error: 429`, `rate_limit_error`, `overloaded_error`, or a transport failure like `ECONNRESET` / `fetch failed`, the outcome is dropped silently. No wake turn starts, no context is injected, and nothing is notified; the event is still acknowledged so the daemon's delivery queue converges. Long substantive reports that merely mention status codes, retries, or timeouts are not affected. Filtering is on by default and adds no timeout or retry fallback while the upstream stays down. Configure it in `$HERDSMAN_HOME/config.yaml`:
+
+```yaml
+wake:
+  filter_upstream_errors: true
+  extra_upstream_error_patterns:
+    - "your-provider-error-token"
+    - /quota\s+exceeded/i
+```
+
+Set `filter_upstream_errors: false` to restore waking on every outcome. `HERDSMAN_WAKE_FILTER_UPSTREAM_ERRORS` and `HERDSMAN_WAKE_EXTRA_UPSTREAM_ERROR_PATTERNS` override the file, and config changes need a Pi restart.
+
 ## Herdr plugin
 
 Install the optional plugin from the GitHub release tag:

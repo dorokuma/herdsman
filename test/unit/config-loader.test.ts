@@ -36,6 +36,37 @@ observability:
     }
   });
 
+  test("loads a wake filter section alongside the runtime config", () => {
+    const path = writeTempConfig(`
+runtime:
+  socket_path: herdsman.sock
+wake:
+  filter_upstream_errors: false
+  extra_upstream_error_patterns:
+    - checkpoint-stall
+`);
+
+    const result = loadHerdsmanConfig(path);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.wake?.filter_upstream_errors).toBe(false);
+      expect(result.value.wake?.extra_upstream_error_patterns).toEqual(["checkpoint-stall"]);
+    }
+  });
+
+  test("defaults the wake filter when the section is empty", () => {
+    const path = writeTempConfig("wake: {}\n");
+
+    const result = loadHerdsmanConfig(path);
+
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.value.wake?.filter_upstream_errors).toBe(true);
+      expect(result.value.wake?.extra_upstream_error_patterns).toEqual([]);
+    }
+  });
+
   test("rejects unknown config fields", () => {
     const result = parseHerdsmanConfig({
       old_agents: { enabled: true },

@@ -25,6 +25,7 @@ type Module = {
       pendingEvents: AgentEventWireRecord[];
       presentedEventIds: Set<number>;
     }) => void;
+    wakeFilter?: { enabled: boolean; extraPatterns: readonly string[] };
   }) => (pi: FakePi) => void;
   defaultSocketPath: () => string;
   formatHiddenAgentContext: (input: { agents: unknown[]; workspaceId: string }) => string;
@@ -2773,6 +2774,236 @@ describe("herdsman-pi orchestrator bridge", () => {
 
 const USAGE = "Usage: /herdsman [on|off|status]";
 
+describe("herdsman-pi upstream error wake filter", () => {
+  test("silently acknowledges a pure upstream error without waking or notifying", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState:
+      | { pendingEvents: AgentEventWireRecord[]; presentedEventIds: Set<number> }
+      | undefined;
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(43, "term_agent", {
+            compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+          }),
+        },
+      });
+
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
+      expect(ctx.statuses.get("herdsman")).not.toContain("agent updates");
+      const notifications = ctx.notifications.length;
+      await vi.advanceTimersByTimeAsync(499);
+      expect(pi.hiddenMessages).toEqual([]);
+      expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      expect(pi.hiddenMessages).toEqual([]);
+      expect(ctx.notifications).toHaveLength(notifications);
+      expect(client.calls).toContainEqual(["agent.notifications.ack", { eventId: 43 }]);
+      expect(extensionState?.presentedEventIds.has(43)).toBe(false);
+      expect(extensionState?.pendingEvents.some((item) => item.id === 43)).toBe(false);
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("wakes normally when the wake filter is disabled", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx, {
+        wakeFilter: { enabled: false, extraPatterns: [] },
+      });
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(43, "term_agent", {
+            compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+          }),
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({
+        content: expect.stringContaining("API Error: 429"),
+        details: { eventIds: [43] },
+      });
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("coalesces a normal outcome while dropping a suppressed error id", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState:
+      | { pendingEvents: AgentEventWireRecord[]; presentedEventIds: Set<number> }
+      | undefined;
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      // The daemon returns the swept cursor after an ack; the normal outcome's
+      // acknowledgement therefore covers the suppressed error id as well.
+      const baseResponse = client.response;
+      client.response = (method, params) => {
+        if (method === "agent.notifications.ack") {
+          const eventId = (params as { eventId: number }).eventId;
+          return { acknowledged: true, ackedEventId: eventId, state: { ackedEventId: eventId } };
+        }
+        return baseResponse(method, params);
+      };
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(43, "term_agent", {
+            compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+          }),
+        },
+      });
+      client.emitStream({ method: "agent.event", params: { event: event(44, "term_agent") } });
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[0]).toMatchObject({ details: { eventIds: [44] } });
+      expect(pi.hiddenMessages[0]?.[0]?.content).not.toContain("429");
+
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      // Only the normal outcome is acknowledged; the suppressed error id is
+      // covered by the returned cursor and swept out of the pending set.
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: 44 }],
+      ]);
+      expect(extensionState?.pendingEvents).toEqual([]);
+      expect(extensionState?.presentedEventIds.has(43)).toBe(false);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("acknowledges a pure upstream error even while the user is not idle", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: false });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(43, "term_agent", {
+            compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+          }),
+        },
+      });
+
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toEqual([]);
+      expect(client.calls).toContainEqual(["agent.notifications.ack", { eventId: 43 }]);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("retries a silent ack after a transient failure across the backoff window", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState:
+      | { pendingEvents: AgentEventWireRecord[]; presentedEventIds: Set<number> }
+      | undefined;
+    let ackAttempts = 0;
+    const baseResponse = client.response;
+    client.response = (method, params) => {
+      if (method === "agent.notifications.ack") {
+        ackAttempts += 1;
+        if (ackAttempts === 1) {
+          throw Object.assign(new Error("orchestrator busy"), { code: "ORCHESTRATOR_BUSY" });
+        }
+      }
+      return baseResponse(method, params);
+    };
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      });
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(43, "term_agent", {
+            compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+          }),
+        },
+      });
+
+      // The first silent ack fires after WAKE_SETTLE_MS and fails transiently,
+      // writing a future nextAttemptAt instead of being silently dropped.
+      await vi.advanceTimersByTimeAsync(500);
+      expect(ackAttempts).toBe(1);
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: 43 }],
+      ]);
+      expect(extensionState?.pendingEvents.some((item) => item.id === 43)).toBe(true);
+      expect(pi.hiddenMessages).toEqual([]);
+
+      // No 0ms spin: nothing is re-attempted until the backoff window elapses.
+      await vi.advanceTimersByTimeAsync(100);
+      expect(ackAttempts).toBe(1);
+
+      // After the backoff (250ms) and the settle (500ms) the ack is re-issued.
+      await vi.advanceTimersByTimeAsync(150);
+      expect(ackAttempts).toBe(1);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(ackAttempts).toBe(2);
+      expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
+        ["agent.notifications.ack", { eventId: 43 }],
+        ["agent.notifications.ack", { eventId: 43 }],
+      ]);
+      expect(extensionState?.pendingEvents.some((item) => item.id === 43)).toBe(false);
+      expect(pi.hiddenMessages).toEqual([]);
+      expect(ctx.notifications).toHaveLength(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+});
+
 describe("herdsman-pi disconnect regression (independent coverage)", () => {
   test("does not abort on a transient disconnect, invalidates the delivered batch, and advances the failed wake cursor", async () => {
     vi.useFakeTimers();
@@ -3564,6 +3795,7 @@ async function startExtension(
       pendingEvents: AgentEventWireRecord[];
       presentedEventIds: Set<number>;
     }) => void;
+    wakeFilter?: { enabled: boolean; extraPatterns: readonly string[] };
   } = {},
 ): Promise<() => Promise<void>> {
   const completions: Promise<void>[] = [];

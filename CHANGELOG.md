@@ -1,5 +1,6 @@
 ## [Unreleased]
 
+- 上游模型报错过滤：新增 `wake.filter_upstream_errors`（默认开）与 `wake.extra_upstream_error_patterns`，命中 429/529/overloaded/rate limit/网络超时等报错形文本时静默丢弃 outcome（不唤醒、不注入上下文、不通知、无兜底），但仍静默 Ack 以收敛 daemon 投递队列；长报告里顺带提到状态码不受影响。
 - 修复 status plan 等待超时误报并新增 discarded 生命周期。
 - 规范与协作基础设施：补齐 agent 协作骨架与开发规范（AGENTS.md 铁律、.agents/notes/ 决策笔记系统及索引脚本）。
 

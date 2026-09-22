@@ -1,25 +1,10 @@
 import { agentIdentityLabel } from "./agent-display.js";
 import { sanitizeText } from "./sanitize-text.js";
-import { appendFileSync, mkdirSync } from "node:fs";
-import { homedir } from "node:os";
-import { dirname, isAbsolute, join } from "node:path";
 import { stripVTControlCharacters } from "node:util";
+import { logHerdsmanPi } from "./logger.js";
 
-export type HerdsmanPiLogLevel = "info" | "warn" | "error";
-
-export function logHerdsmanPi(level: HerdsmanPiLogLevel, message: string): void {
-  try {
-    const configuredHome = process.env.HERDSMAN_HOME?.trim();
-    const home = configuredHome && isAbsolute(configuredHome) ? configuredHome : join(homedir(), ".herdsman");
-    const now = new Date();
-    const date = now.toISOString().slice(0, 10).replaceAll("-", "");
-    const file = join(home, "logs", `herdsman-pi-${date}.log`);
-    mkdirSync(dirname(file), { recursive: true });
-    appendFileSync(file, `${now.toISOString()} [${level}] ${message}\n`, "utf8");
-  } catch {
-    // Diagnostics must never write to the terminal or interrupt the extension.
-  }
-}
+export { logHerdsmanPi };
+export type { HerdsmanPiLogLevel } from "./logger.js";
 
 import {
   type AgentContextListItem,
@@ -41,6 +26,8 @@ import {
   formatAgentOutcomeUpdates,
   WAKE_SETTLE_MS,
 } from "./wake.js";
+import { loadWakeFilterConfig } from "./wake-filter-config.js";
+import type { WakeFilterConfig } from "./upstream-error.js";
 import { confirmSessionWrite } from "./turn-signal.js";
 
 type PiAgentMessage = {
@@ -173,6 +160,7 @@ type ExtensionOptions = {
   clientFactory?: () => HerdsmanDaemonClient;
   onTurnCompletionSignal?: (completion: Promise<void>) => void;
   onStateExposed?: (state: HerdsmanState) => void;
+  wakeFilter?: WakeFilterConfig;
 };
 
 const DEFAULT_HOME_NAME = ".herdsman";
@@ -242,6 +230,9 @@ export function defaultSocketPath() {
 export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
   return function herdsmanPiExtension(pi: PiApi): void {
     pi.registerMessageRenderer?.("herdsman-wake", renderAgentUpdateMessage);
+    // Read once per extension instance: config.yaml changes require a Pi restart,
+    // matching the daemon's startup-time config model.
+    const wakeFilter = options.wakeFilter ?? loadWakeFilterConfig();
 
     const state: HerdsmanState = {
       client: undefined,
@@ -293,7 +284,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         : state.isOrchestrator
           ? {
               kind: "on",
-              updateCount: projectAgentOutcomes(state.pendingEvents).outcomes.length,
+              updateCount: projectAgentOutcomes(state.pendingEvents, wakeFilter).outcomes.length,
             }
           : { kind: "off" };
       ctx.ui.setStatus?.("herdsman", formatHerdsmanFooterStatus(footerState));
@@ -338,28 +329,224 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.latestContext = isLocalOwner(response) ? response.context ?? undefined : undefined;
     };
 
+    const acknowledgeEventIds = async (
+      events: readonly AgentEventWireRecord[],
+      options: { notify: boolean },
+      ctx: PiContext,
+    ): Promise<void> => {
+      for (const event of [...events].sort((left, right) => left.id - right.id)) {
+        try {
+          // A missing client (disconnect) must never be treated as a successful
+          // acknowledgement: route it through the same failure path as a
+          // transient RPC error so the id keeps its backoff and stays pending.
+          if (!state.client) {
+            throw new Error("Herdsman Pi is not connected; cannot acknowledge notifications");
+          }
+          const ackResponse = (await state.client.request("agent.notifications.ack", {
+            eventId: event.id,
+          })) as { ackedEventId?: number; state?: { ackedEventId?: number } } | undefined;
+          pruneAcknowledgedEvents(ackResponse?.ackedEventId ?? ackResponse?.state?.ackedEventId);
+          state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+          // The id intentionally stays in presentedEventIds: the event was
+          // already presented this session and must not be injected again even
+          // if the daemon replays it (for example after a reconnect
+          // redelivery). The set is cleared only on role loss, scope change,
+          // or shutdown.
+          state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
+          setHerdsmanUi(ctx);
+        } catch (error) {
+          const failureCode = ackFailureCode(error);
+          const classification = classifyAckFailure(error);
+          const attempts = (event.attempts ?? 0) + 1;
+          const attemptedAt = Date.now();
+          const updatedEvent = {
+            ...event,
+            attempts,
+            lastAttemptAt: attemptedAt,
+            lastFailureCode: failureCode,
+          };
+          state.pendingEvents = state.pendingEvents.map((pending) =>
+            pending.id === event.id ? updatedEvent : pending,
+          );
+
+          if (classification === "terminal") {
+            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+            state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
+            if (/Only the current orchestrator can acknowledge notifications/i.test(failureCode)) {
+              state.isOrchestrator = false;
+              logHerdsmanPi(
+                "warn",
+                `[herdsman-pi] lost orchestrator ownership while acknowledging event ${event.id}`,
+              );
+            } else {
+              logHerdsmanPi(
+                "warn",
+                `[herdsman-pi] terminal acknowledgement failure eventId=${event.id} attempts=${attempts} code=${failureCode}`,
+              );
+            }
+            setHerdsmanUi(ctx);
+            continue;
+          }
+
+          if (attempts >= MAX_ACK_ATTEMPTS) {
+            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+            state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
+            logHerdsmanPi(
+              "warn",
+              `[herdsman-pi] acknowledgement moved to dead-letter eventId=${event.id} attempts=${attempts} code=${failureCode}`,
+            );
+            setHerdsmanUi(ctx);
+            continue;
+          }
+
+          if (classification === "resync") {
+            const resyncEvent = {
+              ...updatedEvent,
+              nextAttemptAt: attemptedAt + ackBackoffMs(attempts),
+            };
+            state.pendingEvents = state.pendingEvents.map((pending) =>
+              pending.id === event.id ? resyncEvent : pending,
+            );
+            try {
+              const response = (await state.client?.request(
+                "agent.orchestrator.get",
+                {},
+              )) as ConnectionStateResponse | undefined;
+              // Refresh pending data without applying the full connection response: that
+              // helper schedules a new wake, which would make this failed batch race
+              // with the current settlement and can replay an earlier event. The
+              // failed event remains pending and the next wake is scheduled by
+              // finishBatch(), so this round performs no additional acknowledgements.
+              if (response) addPendingEvents(response.events ?? [], ctx);
+              pruneAcknowledgedEvents(response?.state?.ackedEventId ?? response?.ackedEventId);
+              setHerdsmanUi(ctx);
+            } catch (resyncError) {
+              logHerdsmanPi(
+                "warn",
+                `[herdsman-pi] acknowledgement resync failed eventId=${event.id} attempts=${attempts} code=${ackFailureCode(resyncError)}`,
+              );
+            }
+            // The event stays pending with a backoff so the ack cursor can
+            // sweep it later, but it was already presented this session and is
+            // not re-presented: presentedEventIds keeps the guard until scope
+            // reset. Continue so one failed event does not block the rest of
+            // the batch.
+            continue;
+          }
+
+          state.pendingEvents = state.pendingEvents.map((pending) =>
+            pending.id === event.id
+              ? { ...pending, nextAttemptAt: attemptedAt + ackBackoffMs(attempts) }
+              : pending,
+          );
+          if (options.notify) {
+            ctx.ui.notify?.(
+              "Herdsman couldn’t acknowledge agent updates · updates remain pending",
+              "warning",
+            );
+          }
+          setHerdsmanUi(ctx);
+          // The event stays pending with a backoff so the ack cursor can sweep
+          // it later, but it was already presented this session and is not
+          // re-presented: presentedEventIds keeps the guard until scope reset.
+          continue;
+        }
+      }
+    };
+
+    // Upstream model errors wake nobody, but they still have to leave the
+    // daemon's pending queue or it never converges. The silent path therefore
+    // acknowledges them without sendMessage, without notify, and without
+    // touching presentedEventIds (reserved for genuinely presented outcomes).
+    const scheduleSilentUpstreamErrorAck = (
+      ctx: PiContext,
+      events: readonly AgentEventWireRecord[],
+    ) => {
+      if (state.wakeTimer || state.wakeRequested) return;
+      const scope = state.currentScope;
+      if (!state.isOrchestrator || !scope) return;
+      const generation = wakeGeneration;
+      const ownerHerdrSessionName = scope.herdrSessionName;
+      const ownerTerminalId = scope.terminalId;
+      const ownerWorkspaceId = scope.workspaceId;
+      state.wakeTimer = setTimeout(() => {
+        state.wakeTimer = undefined;
+        void (async () => {
+          if (
+            generation !== wakeGeneration ||
+            !state.isOrchestrator ||
+            state.currentScope?.herdrSessionName !== ownerHerdrSessionName ||
+            state.currentScope?.terminalId !== ownerTerminalId ||
+            state.currentScope?.workspaceId !== ownerWorkspaceId
+          ) {
+            return;
+          }
+          // A delivered batch or an in-flight ack owns the cursor; its
+          // settlement schedules the next sweep instead of racing this one.
+          if (state.deliveredBatch || state.ackInFlight) return;
+          if (!state.client || !state.connected) return;
+          state.ackInFlight = true;
+          setHerdsmanUi(ctx);
+          try {
+            await acknowledgeEventIds(events, { notify: false }, ctx);
+          } finally {
+            state.ackInFlight = false;
+            setHerdsmanUi(ctx);
+          }
+          scheduleWake(ctx);
+        })();
+      }, WAKE_SETTLE_MS);
+    };
+
     const scheduleWake = (ctx: PiContext | undefined) => {
       if (!ctx || !state.isOrchestrator || !state.currentScope || !pi.sendMessage) return;
       if (state.wakeTimer || state.wakeRequested) return;
-      const outcomes = projectAgentOutcomes(state.pendingEvents).outcomes.filter(
+      const projection = projectAgentOutcomes(state.pendingEvents, wakeFilter);
+      const outcomes = projection.outcomes.filter(
         (outcome) =>
           outcome.eventId > state.failedWakeThroughEventId &&
           !state.presentedEventIds.has(outcome.eventId),
       );
+      const suppressedEvents = projection.suppressedUpstreamErrorEventIds
+        .filter(
+          (eventId) =>
+            eventId > state.failedWakeThroughEventId && !state.presentedEventIds.has(eventId),
+        )
+        .map((eventId) => state.pendingEvents.find((pending) => pending.id === eventId))
+        .filter((event): event is AgentEventWireRecord => event !== undefined)
+        .sort((left, right) => left.id - right.id);
 
       const wakeable = outcomes.filter((outcome) =>
         isWakeableEvent(state.pendingEvents.find((pending) => pending.id === outcome.eventId)),
       );
       if (wakeable.length === 0) {
-        const nextAttemptAt = outcomes
-          .map((outcome) => state.pendingEvents.find((event) => event.id === outcome.eventId)?.nextAttemptAt)
-          .filter((value): value is number => value !== undefined)
+        // A suppressed upstream error that is now due must be silently
+        // acknowledged before any backoff timer is planted: planting the timer
+        // first would make scheduleSilentUpstreamErrorAck's entry guard
+        // (`if (state.wakeTimer || state.wakeRequested) return`) bounce the ack
+        // off its own timer and, once the backoff window has elapsed, the
+        // 0ms-timer + blocked-ack loop never converges the queue.
+        const dueSuppressed = suppressedEvents.filter(isWakeableEvent);
+        if (dueSuppressed.length > 0) {
+          scheduleSilentUpstreamErrorAck(ctx, dueSuppressed);
+          return;
+        }
+        // No suppressed event is due, so plant a backoff timer for the next
+        // future `nextAttemptAt`. Expired timestamps are excluded (strictly
+        // greater than now) so an already-past window does not produce a
+        // zero-delay spin.
+        const nextAttemptAt = [
+          ...outcomes.map((outcome) => outcome.eventId),
+          ...suppressedEvents.map((event) => event.id),
+        ]
+          .map((eventId) => state.pendingEvents.find((event) => event.id === eventId)?.nextAttemptAt)
+          .filter((value): value is number => value !== undefined && value > Date.now())
           .sort((left, right) => left - right)[0];
         if (nextAttemptAt !== undefined) {
           state.wakeTimer = setTimeout(() => {
             state.wakeTimer = undefined;
             scheduleWake(ctx);
-          }, Math.max(0, nextAttemptAt - Date.now()));
+          }, nextAttemptAt - Date.now());
         }
         return;
       }
@@ -428,7 +615,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           }
 
           const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
-          const batchOutcomes = projectAgentOutcomes(batchEvents).outcomes.filter(
+          const batchProjection = projectAgentOutcomes(batchEvents, wakeFilter);
+          const batchSuppressedIds = new Set(batchProjection.suppressedUpstreamErrorEventIds);
+          const batchOutcomes = batchProjection.outcomes.filter(
             (outcome) =>
               outcome.eventId > state.failedWakeThroughEventId &&
               !state.presentedEventIds.has(outcome.eventId) &&
@@ -458,7 +647,14 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
               {
                 content: formatAgentOutcomeUpdates(batchOutcomes),
                 customType: "herdsman-wake-context",
-                details: { eventIds: batchEvents.map((event) => event.id) },
+                // Suppressed upstream errors are dropped from the injected
+                // context, but every other pending id stays listed so the
+                // evidence trail for the decision still names what was pending.
+                details: {
+                  eventIds: batchEvents
+                    .filter((event) => !batchSuppressedIds.has(event.id))
+                    .map((event) => event.id),
+                },
                 display: false,
               },
               { deliverAs: "followUp", triggerTurn: true },
@@ -1059,116 +1255,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         return;
       }
 
-      for (const event of batch.events) {
-        try {
-          const ackResponse = (await state.client.request("agent.notifications.ack", {
-            eventId: event.id,
-          })) as { ackedEventId?: number; state?: { ackedEventId?: number } };
-          pruneAcknowledgedEvents(ackResponse?.ackedEventId ?? ackResponse?.state?.ackedEventId);
-          state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
-          // The id intentionally stays in presentedEventIds: the event was
-          // already presented this session and must not be injected again even
-          // if the daemon replays it (for example after a reconnect
-          // redelivery). The set is cleared only on role loss, scope change,
-          // or shutdown.
-          state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
-          setHerdsmanUi(ctx);
-        } catch (error) {
-          const failureCode = ackFailureCode(error);
-          const classification = classifyAckFailure(error);
-          const attempts = (event.attempts ?? 0) + 1;
-          const attemptedAt = Date.now();
-          const updatedEvent = {
-            ...event,
-            attempts,
-            lastAttemptAt: attemptedAt,
-            lastFailureCode: failureCode,
-          };
-          state.pendingEvents = state.pendingEvents.map((pending) =>
-            pending.id === event.id ? updatedEvent : pending,
-          );
-
-          if (classification === "terminal") {
-            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
-            state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
-            if (/Only the current orchestrator can acknowledge notifications/i.test(failureCode)) {
-              state.isOrchestrator = false;
-              logHerdsmanPi(
-                "warn",
-                `[herdsman-pi] lost orchestrator ownership while acknowledging event ${event.id}`,
-              );
-            } else {
-              logHerdsmanPi(
-                "warn",
-                `[herdsman-pi] terminal acknowledgement failure eventId=${event.id} attempts=${attempts} code=${failureCode}`,
-              );
-            }
-            setHerdsmanUi(ctx);
-            continue;
-          }
-
-          if (attempts >= MAX_ACK_ATTEMPTS) {
-            state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
-            state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
-            logHerdsmanPi(
-              "warn",
-              `[herdsman-pi] acknowledgement moved to dead-letter eventId=${event.id} attempts=${attempts} code=${failureCode}`,
-            );
-            setHerdsmanUi(ctx);
-            continue;
-          }
-
-          if (classification === "resync") {
-            const resyncEvent = {
-              ...updatedEvent,
-              nextAttemptAt: attemptedAt + ackBackoffMs(attempts),
-            };
-            state.pendingEvents = state.pendingEvents.map((pending) =>
-              pending.id === event.id ? resyncEvent : pending,
-            );
-            try {
-              const response = (await state.client.request(
-                "agent.orchestrator.get",
-                {},
-              )) as ConnectionStateResponse;
-              // Refresh pending data without applying the full connection response: that
-              // helper schedules a new wake, which would make this failed batch race
-              // with the current settlement and can replay an earlier event. The
-              // failed event remains pending and the next wake is scheduled by
-              // finishBatch(), so this round performs no additional acknowledgements.
-              addPendingEvents(response.events ?? [], ctx);
-              pruneAcknowledgedEvents(response.state?.ackedEventId ?? response.ackedEventId);
-              setHerdsmanUi(ctx);
-            } catch (resyncError) {
-              logHerdsmanPi(
-                "warn",
-                `[herdsman-pi] acknowledgement resync failed eventId=${event.id} attempts=${attempts} code=${ackFailureCode(resyncError)}`,
-              );
-            }
-            // The event stays pending with a backoff so the ack cursor can
-            // sweep it later, but it was already presented this session and is
-            // not re-presented: presentedEventIds keeps the guard until scope
-            // reset. Continue so one failed event does not block the rest of
-            // the batch.
-            continue;
-          }
-
-          state.pendingEvents = state.pendingEvents.map((pending) =>
-            pending.id === event.id
-              ? { ...pending, nextAttemptAt: attemptedAt + ackBackoffMs(attempts) }
-              : pending,
-          );
-          ctx.ui.notify?.(
-            "Herdsman couldn’t acknowledge agent updates · updates remain pending",
-            "warning",
-          );
-          setHerdsmanUi(ctx);
-          // The event stays pending with a backoff so the ack cursor can sweep
-          // it later, but it was already presented this session and is not
-          // re-presented: presentedEventIds keeps the guard until scope reset.
-          continue;
-        }
-      }
+      await acknowledgeEventIds(batch.events, { notify: true }, ctx);
       finishBatch();
     });
 

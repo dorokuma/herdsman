@@ -42,6 +42,7 @@ describe("Pi agent wake projection", () => {
     expect(projectAgentOutcomes(events)).toMatchObject({
       outcomes: [{ eventId: 3, kind: "completed", terminalId: "term_agent" }],
       rawEvents: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }],
+      suppressedUpstreamErrorEventIds: [],
     });
   });
 
@@ -232,5 +233,89 @@ describe("Pi agent wake projection", () => {
     expect(outcome).toMatchObject({ text: "red response" });
     if (!outcome) throw new Error("expected one agent outcome");
     expect(formatAgentOutcomeUpdates([outcome])).not.toContain("\u001b");
+  });
+
+  test("suppresses an upstream model error instead of projecting an outcome", () => {
+    const projection = projectAgentOutcomes([
+      event(43, "agent.done", {}, { text: "API Error: 429 rate_limit_error" }),
+    ]);
+
+    expect(projection.outcomes).toEqual([]);
+    expect(projection.suppressedUpstreamErrorEventIds).toEqual([43]);
+    expect(projection.rawEvents.map(({ id }) => id)).toEqual([43]);
+  });
+
+  test("suppresses an agent.failed outcome whose reason is an upstream model error", () => {
+    const projection = projectAgentOutcomes([
+      event(44, "agent.failed", {
+        from: "working",
+        name: "reviewer",
+        reason: "request timed out",
+        to: "done",
+      }),
+    ]);
+
+    expect(projection.outcomes).toEqual([]);
+    expect(projection.suppressedUpstreamErrorEventIds).toEqual([44]);
+  });
+
+  test("keeps a normal result as an outcome", () => {
+    const projection = projectAgentOutcomes([
+      event(45, "agent.done", {}, { text: "implemented the retry queue" }),
+    ]);
+
+    expect(projection.outcomes).toHaveLength(1);
+    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+  });
+
+  test("keeps a long report that only mentions 429 as an outcome", () => {
+    const report = `${"Investigated the flaky run and reproduced a 429 once. ".repeat(20)}End of report.`;
+    expect(report.length).toBeGreaterThan(400);
+    const projection = projectAgentOutcomes([event(46, "agent.done", {}, { text: report })]);
+
+    expect(projection.outcomes).toHaveLength(1);
+    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+  });
+
+  test("keeps a 429 outcome when the filter is disabled", () => {
+    const projection = projectAgentOutcomes(
+      [event(47, "agent.done", {}, { text: "API Error: 429 rate_limit_error" })],
+      { enabled: false, extraPatterns: [] },
+    );
+
+    expect(projection.outcomes).toHaveLength(1);
+    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+  });
+
+  test("suppresses a harmless short sentence matched by a custom pattern", () => {
+    const projection = projectAgentOutcomes(
+      [event(48, "agent.done", {}, { text: "waiting for checkpoint" })],
+      { enabled: true, extraPatterns: ["checkpoint"] },
+    );
+
+    expect(projection.outcomes).toEqual([]);
+    expect(projection.suppressedUpstreamErrorEventIds).toEqual([48]);
+  });
+
+  test("does not consume suppressed ids into seen so they stay visible as evidence", () => {
+    const projector = createAgentOutcomeProjector();
+    const suppressedEvent = event(
+      49,
+      "agent.done",
+      {},
+      { text: "API Error: 429 rate_limit_error" },
+    );
+    const normalEvent = event(50, "agent.done", {});
+
+    expect(projector([suppressedEvent])).toMatchObject({
+      outcomes: [],
+      rawEvents: [{ id: 49 }],
+      suppressedUpstreamErrorEventIds: [49],
+    });
+    expect(projector([suppressedEvent, normalEvent])).toMatchObject({
+      outcomes: [expect.objectContaining({ eventId: 50 })],
+      rawEvents: [{ id: 49 }, { id: 50 }],
+      suppressedUpstreamErrorEventIds: [49],
+    });
   });
 });
