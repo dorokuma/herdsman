@@ -41,7 +41,8 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
     const payload = asRecord(event.payload);
     const reason = stringValue(payload.reason);
     // Backward compatibility filter for legacy pre-upgrade failed rows with PLAN_WAITING_HISTORY
-    if (reason === "PLAN_WAITING_HISTORY") {
+    // and degraded retries that exceeded the bounded retry budget.
+    if (reason === "PLAN_WAITING_HISTORY" || reason === "degraded") {
       return undefined;
     }
     return "failed";

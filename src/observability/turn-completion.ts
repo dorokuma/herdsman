@@ -3,6 +3,7 @@ export const TURN_SIGNAL_RETENTION_MS = 10 * 60_000;
 
 export type TurnCompletionSignal = {
   confirmed: boolean;
+  expectedText?: string;
   herdrSessionName: string;
   paneId: string;
   terminalId: string;
@@ -12,6 +13,7 @@ export type TurnCompletionSignal = {
 
 export type TurnCompletionWaitResult = {
   confirmed: boolean;
+  expectedText?: string;
   received: boolean;
 };
 
@@ -35,6 +37,7 @@ export class TurnCompletionRegistry {
   readonly #latestByTerminal = new Map<string, TurnCompletionSignal>();
   readonly #now: () => number;
   readonly #setTimeout: (callback: () => void, delay: number) => TimerHandle;
+  readonly #sleep: (ms: number) => Promise<void>;
   readonly #timeoutMs: number;
   readonly #waitersByTerminal = new Map<string, Set<() => void>>();
 
@@ -43,12 +46,14 @@ export class TurnCompletionRegistry {
       clearTimeout?: (handle: TimerHandle) => void;
       now?: () => number;
       setTimeout?: (callback: () => void, delay: number) => TimerHandle;
+      sleep?: (ms: number) => Promise<void>;
       timeoutMs?: number;
     } = {},
   ) {
     this.#clearTimeout = options.clearTimeout ?? clearTimeout;
     this.#now = options.now ?? Date.now;
     this.#setTimeout = options.setTimeout ?? setTimeout;
+    this.#sleep = options.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
     this.#timeoutMs = options.timeoutMs ?? TURN_SIGNAL_WAIT_MS;
   }
 
@@ -76,7 +81,11 @@ export class TurnCompletionRegistry {
     const existing = this.#latestByTerminal.get(key);
     if (isNewSignal(existing)) {
       this.#latestByTerminal.delete(key);
-      return { confirmed: existing.confirmed, received: true };
+      return {
+        confirmed: existing.confirmed,
+        ...(existing.expectedText ? { expectedText: existing.expectedText } : {}),
+        received: true,
+      };
     }
     if (input.signal?.aborted) {
       return { confirmed: false, received: false };
@@ -94,7 +103,11 @@ export class TurnCompletionRegistry {
         if (received) this.#latestByTerminal.delete(key);
         resolve(
           received
-            ? { confirmed: latest.confirmed, received: true }
+            ? {
+                confirmed: latest.confirmed,
+                ...(latest.expectedText ? { expectedText: latest.expectedText } : {}),
+                received: true,
+              }
             : { confirmed: false, received: false },
         );
       };

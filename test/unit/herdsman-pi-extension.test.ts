@@ -886,6 +886,7 @@ describe("herdsman-pi orchestrator bridge", () => {
           "agent.turn.completed",
           {
             confirmed: false,
+            expectedText: "completed",
             herdrSessionName: "default",
             paneId: "wC:p3",
             terminalId: "term_pi",
@@ -1099,7 +1100,18 @@ describe("herdsman-pi orchestrator bridge", () => {
       expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
       expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 3 agent updates");
 
-      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit(
+        "message_end",
+        {
+          message: {
+            content: [{ type: "thinking", text: "hidden reasoning" }],
+            role: "assistant",
+            stopReason: "stop",
+            turnId: "turn-1",
+          },
+        },
+        ctx,
+      );
       expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
       await pi.emit("agent_settled", {}, ctx);
 
@@ -4416,6 +4428,7 @@ describe("herdsman-pi turn completion signal", () => {
         "agent.turn.completed",
         {
           confirmed: true,
+          expectedText: "completed",
           herdrSessionName: "default",
           paneId: "wB:p1",
           terminalId: "term_pi",
@@ -4468,6 +4481,53 @@ describe("herdsman-pi turn completion signal", () => {
       expect(client.calls.filter(([method]) => method === "agent.turn.completed")).toEqual([]);
     } finally {
       restoreEnv(previous);
+    }
+  });
+
+  test("omits expectedText from RPC when assistant message has no extractable text", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-pi-turn-"));
+    const sessionPath = join(dir, "pi-session.jsonl");
+    const previous = withHerdrEnv();
+    try {
+      writeFileSync(
+        sessionPath,
+        `${JSON.stringify({
+          message: {
+            content: [{ type: "thinking", text: "hidden reasoning" }],
+            role: "assistant",
+          },
+          type: "message",
+        })}
+`,
+      );
+      const client = createFakeClient();
+      const pi = createFakePi();
+      const ctx = fakeCtx({ idle: true, sessionFile: sessionPath });
+      const flushTurnCompletion = await startExtension(client, pi, ctx);
+      await pi.emit(
+        "message_end",
+        {
+          message: {
+            content: [{ type: "thinking", text: "hidden reasoning" }],
+            role: "assistant",
+            stopReason: "stop",
+            turnId: "turn-1",
+          },
+        },
+        ctx,
+      );
+      await flushTurnCompletion();
+      // The call must NOT contain expectedText when textFromContent returns null.
+      const turnCompletedCalls = client.calls.filter(
+        ([method]) => method === "agent.turn.completed",
+      );
+      expect(turnCompletedCalls.length).toBeGreaterThan(0);
+      for (const [, params] of turnCompletedCalls) {
+        expect(params).not.toHaveProperty("expectedText");
+      }
+    } finally {
+      restoreEnv(previous);
+      rmSync(dir, { force: true, recursive: true });
     }
   });
 });

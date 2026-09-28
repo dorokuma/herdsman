@@ -139,7 +139,12 @@ function lastByRole(
 }
 
 function excerpt(message: AgentHistoryMessage) {
-  return { ref: message.ref, text: sanitizeText(message.text).text, timestamp: message.timestamp };
+  return {
+    ref: message.ref,
+    ...(message.stopReason ? { stopReason: message.stopReason } : {}),
+    text: sanitizeText(message.text).text,
+    timestamp: message.timestamp,
+  };
 }
 
 function sanitizeHistoryMessage(message: AgentHistoryMessage): AgentHistoryMessage {

@@ -1,5 +1,5 @@
 import { agentIdentityLabel } from "./agent-display.js";
-import { sanitizeText } from "./sanitize-text.js";
+import { sanitizeText, textFromContent } from "./sanitize-text.js";
 import { stripVTControlCharacters } from "node:util";
 import { logHerdsmanPi } from "./logger.js";
 
@@ -1113,19 +1113,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     });
 
     const assistantMessageText = (message: Record<string, unknown>): string => {
-      const content = message.content;
-      if (typeof content === "string") return content;
-      if (!Array.isArray(content)) return "";
-      const parts: string[] = [];
-      for (const block of content) {
-        if (typeof block === "string") {
-          if (block.length > 0) parts.push(block);
-          continue;
-        }
-        const value = record(block);
-        if (typeof value.text === "string" && value.text.length > 0) parts.push(value.text);
-      }
-      return parts.join("\n");
+      const text = textFromContent(message.content);
+      if (text === null) return "";
+      return sanitizeText(text).text;
     };
 
     // Turn completion signal: after Pi's own final assistant message has been
@@ -1141,13 +1131,15 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const completion = (async () => {
         const check = await confirmSessionWrite({ expectedText, path: sessionPath });
         try {
-          await client.request("agent.turn.completed", {
+          const params: Record<string, unknown> = {
             confirmed: check.confirmed,
             herdrSessionName: scope.herdrSessionName,
             paneId: scope.paneId,
             terminalId: scope.terminalId,
             workspaceId: scope.workspaceId,
-          });
+          };
+          if (expectedText) params.expectedText = expectedText;
+          await client.request("agent.turn.completed", params);
         } catch (error) {
           logHerdsmanPi(
             "warn",

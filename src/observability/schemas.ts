@@ -87,6 +87,7 @@ export const agentOrchestratorAckInputSchema = Type.Object(
 export const agentTurnCompletedInputSchema = Type.Object(
   {
     confirmed: Type.Boolean(),
+    expectedText: Type.Optional(Type.String()),
     herdrSessionName: Type.String({ minLength: 1 }),
     paneId: Type.String({ minLength: 1 }),
     terminalId: Type.String({ minLength: 1 }),

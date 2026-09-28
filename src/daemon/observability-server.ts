@@ -450,6 +450,7 @@ export class ObservabilityRpcServer {
         const input = params as AgentTurnCompletedInput;
         this.#turnCompletions.record({
           confirmed: input.confirmed,
+          ...(input.expectedText ? { expectedText: input.expectedText } : {}),
           herdrSessionName: presence.herdrSessionName,
           paneId: presence.paneId,
           terminalId: presence.terminalId,

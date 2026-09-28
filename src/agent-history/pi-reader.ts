@@ -28,7 +28,16 @@ export class PiHistoryReader implements AgentHistoryReader {
       const refValue = messageRef(path, id ?? undefined, entry.line);
       if (role === "user" || role === "assistant") {
         const text = textFromContent(message.content);
-        if (text) messages.push({ ref: refValue, role, text, timestamp });
+        if (text) {
+          const stopReason = stringValue(message.stopReason);
+          messages.push({
+            ref: refValue,
+            role,
+            ...(stopReason ? { stopReason } : {}),
+            text,
+            timestamp,
+          });
+        }
       }
       if (role === "toolResult") {
         const text = textFromContent(message.content) ?? "";

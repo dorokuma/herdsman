@@ -157,6 +157,50 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
+  test("accepts agent.turn.completed with expectedText and delivers it to waiters", async () => {
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const { client, dir, harness } = await openServer({ turnCompletions: registry });
+    seedAgent(harness, dir);
+    await client.request("agent.orchestrator.register", {
+      herdrSocketPath: "/tmp/herdr/herdr.sock",
+      paneId: "wB:p1",
+      sessionRef: {
+        agent: "pi",
+        kind: "path",
+        source: "herdr:pi",
+        value: "/tmp/pi-session.jsonl",
+      },
+      subscriberId: "pi-session",
+      subscriberKind: "pi",
+      workspaceId: "wB",
+    });
+
+    await expect(
+      client.request("agent.turn.completed", {
+        confirmed: true,
+        expectedText: "final answer",
+        herdrSessionName: "default",
+        paneId: "wB:p1",
+        terminalId: "term_1",
+        workspaceId: "wB",
+      }),
+    ).resolves.toEqual({ accepted: true });
+
+    const waiter = registry.waitForSignal({
+      herdrSessionName: "default",
+      recordedAfterMs: 0,
+      terminalId: "term_1",
+    });
+    await expect(waiter).resolves.toEqual({
+      confirmed: true,
+      expectedText: "final answer",
+      received: true,
+    });
+
+    client.close();
+    harness.sqlite.close();
+  });
+
   test("serializes structured acknowledgement errors through the real RPC server and client", async () => {
     const { client, dir, harness } = await openServer();
     seedAgent(harness, dir);

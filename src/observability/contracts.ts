@@ -64,6 +64,7 @@ export type AgentHistoryRef = {
 
 export type AgentHistoryExcerpt = {
   ref: string;
+  stopReason?: string;
   text: string;
   timestamp: string | null;
 };
@@ -115,6 +116,7 @@ export type AgentHistoryMessage = {
   compact?: CompactToolResult;
   ref: string;
   role: "assistant" | "tool_result" | "user";
+  stopReason?: string;
   text: string;
   timestamp: string | null;
   toolName?: string;
@@ -216,8 +218,14 @@ export type PiPresenceRegistration = {
   workspaceId: string;
 };
 
+export type DegradedReason =
+  | "expected_text_mismatch"
+  | "no_advance_from_input"
+  | "non_terminal_assistant";
+
 export type AgentTurnCompletedInput = {
   confirmed: boolean;
+  expectedText?: string;
   herdrSessionName: string;
   paneId: string;
   terminalId: string;

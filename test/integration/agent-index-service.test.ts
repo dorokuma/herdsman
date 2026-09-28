@@ -211,10 +211,10 @@ describe("AgentIndexService", () => {
 
   test("S3: waits for a new history ref instead of advancing on a repeated old ref", async () => {
     const harness = openObservabilityDbHarness();
-    const registry = new TurnCompletionRegistry({ timeoutMs: 50 });
+    const registry = new TurnCompletionRegistry({ timeoutMs: 50, sleep: async () => {} });
     const oldHistory = {
       ...emptyCompactHistory("pi-jsonl"),
-      lastAssistantMessage: { ref: "x#entry=1", text: "old", timestamp: null },
+      lastAssistantMessage: { ref: "x#entry=1", text: "old", timestamp: null, stopReason: "stop" },
       messageCount: 2,
     };
     let calls = 0;
@@ -237,7 +237,12 @@ describe("AgentIndexService", () => {
           return {
             compactHistory: {
               ...oldHistory,
-              lastAssistantMessage: { ref: "x#entry=2", text: "old", timestamp: null },
+              lastAssistantMessage: {
+                ref: "x#entry=2",
+                text: "old",
+                timestamp: null,
+                stopReason: "stop",
+              },
             },
             historyRef: null,
             sourceFingerprint: null,
@@ -2036,7 +2041,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
   test("T2: pi retry without history advance throws PlanWaitingHistoryError and does not emit with warning", async () => {
     const harness = openObservabilityDbHarness();
     const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
-    const turnRegistry = new TurnCompletionRegistry();
+    const turnRegistry = new TurnCompletionRegistry({ sleep: async () => {} });
 
     try {
       const index = new AgentIndexService({
@@ -2117,7 +2122,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
 
   test("S2: pi retry window receives user prompt (messageCount increments without assistant change) -> stays in waiting; assistant ref changes -> emits", async () => {
     const harness = openObservabilityDbHarness();
-    const turnRegistry = new TurnCompletionRegistry();
+    const turnRegistry = new TurnCompletionRegistry({ sleep: async () => {} });
     let currentRef = "pi-ref-1";
     let currentText = "pi answer turn 1";
     let currentMsgCount = 2;
@@ -2134,7 +2139,12 @@ describe("AgentIndexService non-pi completed event generation", () => {
           return {
             compactHistory: {
               ...emptyCompactHistory("pi-jsonl"),
-              lastAssistantMessage: { ref: currentRef, text: currentText, timestamp: null },
+              lastAssistantMessage: {
+                ref: currentRef,
+                text: currentText,
+                timestamp: null,
+                stopReason: "stop",
+              },
               messageCount: currentMsgCount,
             },
             historyRef: null,
@@ -2164,7 +2174,12 @@ describe("AgentIndexService non-pi completed event generation", () => {
       agent,
       compactHistory: {
         ...emptyCompactHistory("pi-jsonl"),
-        lastAssistantMessage: { ref: "pi-ref-1", text: "pi answer turn 1", timestamp: null },
+        lastAssistantMessage: {
+          ref: "pi-ref-1",
+          text: "pi answer turn 1",
+          timestamp: null,
+          stopReason: "stop",
+        },
         messageCount: 2,
       },
       from: "working",
@@ -2180,7 +2195,12 @@ describe("AgentIndexService non-pi completed event generation", () => {
       agent,
       compactHistory: {
         ...emptyCompactHistory("pi-jsonl"),
-        lastAssistantMessage: { ref: "pi-ref-1", text: "pi answer turn 1", timestamp: null },
+        lastAssistantMessage: {
+          ref: "pi-ref-1",
+          text: "pi answer turn 1",
+          timestamp: null,
+          stopReason: "stop",
+        },
         messageCount: 2,
       },
       from: "working",
@@ -2231,6 +2251,104 @@ describe("AgentIndexService non-pi completed event generation", () => {
     expect(doneEvents).toHaveLength(2);
     expect(doneEvents[1]?.compactHistory?.lastAssistantMessage?.ref).toBe("pi-ref-2");
     expect(harness.statusEventPlans.get(p2Row.id).status).toBe("completed");
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("S4: terminated pi agent recovers after 77s with stop message after error", async () => {
+    const harness = openObservabilityDbHarness();
+    const turnRegistry = new TurnCompletionRegistry({ sleep: async () => {} });
+    let attempt = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          attempt += 1;
+          // First two attempts simulate the agent being terminated (error).
+          // Third attempt simulates recovery with a proper stop message.
+          if (attempt <= 2) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: "error-ref",
+                  text: "error: terminated",
+                  timestamp: null,
+                  stopReason: "error",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "stop-ref",
+                text: "final answer after recovery",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: turnRegistry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const plan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "error-ref",
+          text: "error: terminated",
+          timestamp: null,
+          stopReason: "error",
+        },
+        messageCount: 1,
+      },
+      from: "working",
+      to: "done",
+    });
+
+    turnRegistry.record({
+      confirmed: true,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    await index.drainPendingPlans();
+
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const doneEvents = events.filter((e) => e.type === "agent.done");
+    // The plan should eventually emit with the recovered stop message, not the error.
+    expect(doneEvents).toHaveLength(1);
+    expect(doneEvents[0]?.compactHistory?.lastAssistantMessage?.ref).toBe("stop-ref");
+    expect(doneEvents[0]?.compactHistory?.lastAssistantMessage?.text).toBe(
+      "final answer after recovery",
+    );
+    expect(harness.statusEventPlans.get(plan.id).status).toBe("completed");
 
     index.stopWaitingHistoryRetries();
     harness.sqlite.close();
@@ -3729,6 +3847,373 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       workspaceId: "wJ",
     });
     expect(allEvents.filter((event) => event.type === "agent.discarded")).toHaveLength(0);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("S5: waitForHistoryAdvance uses exponential backoff up to 16s and respects 30s total budget", async () => {
+    const harness = openObservabilityDbHarness();
+    const delays: number[] = [];
+    let clock = 0;
+    const now = () => clock;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "r1", text: "old", timestamp: null, stopReason: "stop" },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      now,
+      sleep: async (ms: number) => {
+        delays.push(ms);
+        clock += ms;
+      },
+      stores: harness,
+      turnCompletions: new TurnCompletionRegistry({ sleep: async () => {}, timeoutMs: 100 }),
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const plan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "r1", text: "old", timestamp: null, stopReason: "stop" },
+      },
+      from: "working",
+      to: "done",
+    });
+
+    const result = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "r1", text: "old", timestamp: null, stopReason: "stop" },
+      },
+      from: "working",
+      to: "done",
+      planId: plan.id,
+    });
+
+    // With fast-forwarded sleep the wait exhausts its attempts without advance.
+    expect(result?.type).toBe("agent.done");
+    expect(result?.payload).toEqual(
+      expect.objectContaining({
+        degraded: true,
+        degradedReason: "no_advance_from_input",
+      }),
+    );
+    // Verify backoff sequence started at 500 and capped at 16000.
+    expect(delays[0]).toBe(500);
+    expect(delays[delays.length - 1]).toBe(16000);
+    // Verify exponential growth (each delay >= previous, except cap).
+    for (let i = 1; i < delays.length; i++) {
+      expect(delays[i]).toBeGreaterThanOrEqual(delays.at(i - 1) as number);
+    }
+    // The loop may let one final sleep exceed 30s by up to one maxDelay step (16s),
+    // proving maxTotalMs is respected but not that it truncates mid-sleep.
+    expect(delays.reduce((sum, d) => sum + d, 0)).toBeLessThanOrEqual(31500);
+    expect(delays.length).toBeGreaterThan(0);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("S6: plan retry after 30s budget catches recovered stop message", async () => {
+    const harness = openObservabilityDbHarness();
+    const turnRegistry = new TurnCompletionRegistry({ sleep: async () => {} });
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "e1",
+                text: "error: terminated",
+                timestamp: null,
+                stopReason: "error",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: turnRegistry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const plan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "e1",
+          text: "error: terminated",
+          timestamp: null,
+          stopReason: "error",
+        },
+      },
+      from: "working",
+      to: "done",
+    });
+    // Promote to retry so the first drain enters the retry path.
+    harness.statusEventPlans.markRetry(plan.id, new Error("PLAN_WAITING_HISTORY"));
+
+    turnRegistry.record({
+      confirmed: true,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    await index.drainPendingPlans();
+    const updated = harness.statusEventPlans.get(plan.id);
+    expect(updated.status).toBe("pending");
+    expect(updated.attempts).toBe(2);
+
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("S7: degraded emission on expectedText mismatch after wait", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ sleep: async () => {}, timeoutMs: 3_000 });
+    let callCount = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          callCount += 1;
+          const old = {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "old-ref",
+                text: "old",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+          const intermediate = {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "m1",
+                text: "intermediate text",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+          const result = callCount <= 2 ? old : intermediate;
+          console.log(
+            "S7 mock callCount",
+            callCount,
+            "ref",
+            result.compactHistory.lastAssistantMessage?.ref,
+          );
+          return result;
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const pending = index.handleHerdrEvent(doneEvent);
+    setTimeout(() => {
+      registry.record({
+        confirmed: true,
+        expectedText: "final answer",
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        terminalId: "term_claude",
+        workspaceId: "wJ",
+      });
+    }, 10);
+
+    const result = await pending;
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: null,
+        }),
+        payload: expect.objectContaining({
+          degraded: true,
+          degradedReason: "expected_text_mismatch",
+        }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  }, 10_000);
+
+  test("S8: degraded event retries until history matches expectedText then completes", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ sleep: async () => {}, timeoutMs: 3_000 });
+    let callCount = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          callCount += 1;
+          if (callCount <= 2) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: callCount === 1 ? "old-ref" : "intermediate-ref",
+                  text: callCount === 1 ? "old" : "intermediate text",
+                  timestamp: null,
+                  stopReason: "stop",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          if (callCount === 3) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: "mismatch-ref",
+                  text: "still not final",
+                  timestamp: null,
+                  stopReason: "stop",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "final-ref",
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const plan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "old-ref",
+          text: "old",
+          timestamp: null,
+          stopReason: "stop",
+        },
+      },
+      from: "working",
+      to: "done",
+    });
+
+    registry.record({
+      confirmed: true,
+      expectedText: "final answer",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    await index.drainPendingPlans();
+    const updated = harness.statusEventPlans.get(plan.id);
+    expect(updated.status).toBe("pending");
+    expect(updated.attempts).toBeGreaterThanOrEqual(1);
+
+    const firstEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const firstDoneEvents = firstEvents.filter((e) => e.type === "agent.done");
+    expect(firstDoneEvents).toHaveLength(1);
+    expect(firstDoneEvents[0]?.compactHistory?.lastAssistantMessage).toBeNull();
+    expect(firstDoneEvents[0]?.payload).toMatchObject({
+      degraded: true,
+      degradedReason: "expected_text_mismatch",
+    });
+
+    await index.drainPendingPlans();
+    const secondUpdated = harness.statusEventPlans.get(plan.id);
+    expect(secondUpdated.status).toBe("completed");
+
+    const secondEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const secondDoneEvents = secondEvents.filter((e) => e.type === "agent.done");
+    expect(secondDoneEvents).toHaveLength(2);
+    expect(secondDoneEvents[1]?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
 
     index.stopWaitingHistoryRetries();
     harness.sqlite.close();

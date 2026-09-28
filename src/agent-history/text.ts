@@ -1,3 +1,6 @@
+// Sync guard: this is the daemon-side copy of textFromContent/sanitizeText.
+// The extension-side copy lives in packages/herdsman-pi/src/sanitize-text.ts.
+// Keep both implementations identical; see test/unit/agent-history-text.test.ts for parity tests.
 export function textFromContent(content: unknown): string | null {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return null;

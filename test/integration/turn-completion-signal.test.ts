@@ -81,6 +81,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
                     ref: "history",
                     text: "final answer",
                     timestamp: null,
+                    stopReason: "stop",
                   },
                 },
                 historyRef: null,
@@ -202,7 +203,12 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           return {
             compactHistory: {
               ...emptyCompactHistory("pi-jsonl"),
-              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+              lastAssistantMessage: {
+                ref: "history",
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
             },
             historyRef: null,
             sourceFingerprint: null,
@@ -256,6 +262,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           };
         },
       } as unknown as AgentHistoryService,
+      sleep: async () => {},
       stores: harness,
       turnCompletions: registry,
     });
@@ -304,6 +311,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           };
         },
       } as unknown as AgentHistoryService,
+      sleep: async () => {},
       stores: harness,
       turnCompletions: registry,
     });
@@ -496,6 +504,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           };
         },
       } as unknown as AgentHistoryService,
+      sleep: async () => {},
       stores: harness,
       turnCompletions: registry,
     });
@@ -538,7 +547,18 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     expect(events.find((e) => e.type === "agent.done")?.payload).toEqual(
       expect.objectContaining({ from: "working", to: "done" }),
     );
-    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
+    // Degraded plans are retried instead of completed, so the first drain leaves
+    // a pending plan with lastError="degraded".
+    const unfinished = harness.statusEventPlans.listUnfinished();
+    expect(unfinished).toHaveLength(1);
+    expect(unfinished[0]).toEqual(
+      expect.objectContaining({
+        fromStatus: "working",
+        toStatus: "done",
+        lastError: "degraded",
+        status: "pending",
+      }),
+    );
 
     harness.sqlite.close();
   }, 20_000);
@@ -558,7 +578,12 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           return {
             compactHistory: {
               ...emptyCompactHistory("pi-jsonl"),
-              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+              lastAssistantMessage: {
+                ref: "history",
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
             },
             historyRef: null,
             sourceFingerprint: null,
@@ -616,7 +641,12 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           return {
             compactHistory: {
               ...emptyCompactHistory("pi-jsonl"),
-              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+              lastAssistantMessage: {
+                ref: "history",
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
             },
             historyRef: null,
             sourceFingerprint: null,
@@ -635,7 +665,12 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       agentId: agent.id,
       compactHistory: {
         ...emptyCompactHistory("pi-jsonl"),
-        lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+        lastAssistantMessage: {
+          ref: "history",
+          text: "final answer",
+          timestamp: null,
+          stopReason: "stop",
+        },
       },
       fromStatus: "working",
       herdrSessionName: "default",
@@ -655,7 +690,12 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           return {
             compactHistory: {
               ...emptyCompactHistory("pi-jsonl"),
-              lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
+              lastAssistantMessage: {
+                ref: "history",
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
             },
             historyRef: null,
             sourceFingerprint: null,
@@ -770,6 +810,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
                 ref: snapshot.ref,
                 text: snapshot.text,
                 timestamp: null,
+                stopReason: "stop",
               },
             },
             historyRef: null,
@@ -810,7 +851,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   });
 
-  test("W13: pi timeout without advance clears lastAssistantMessage and sets noAdvance", async () => {
+  test("W13: pi timeout without advance emits degraded with null lastAssistant", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 0 });
     const index = new AgentIndexService({
@@ -825,7 +866,12 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           return {
             compactHistory: {
               ...emptyCompactHistory("pi-jsonl"),
-              lastAssistantMessage: { ref: "m1", text: "turn-1", timestamp: null },
+              lastAssistantMessage: {
+                ref: "m1",
+                text: "turn-1",
+                timestamp: null,
+                stopReason: "stop",
+              },
             },
             historyRef: null,
             sourceFingerprint: null,
@@ -841,11 +887,15 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     const result = await index.handleHerdrEvent(doneEvent);
     const done = result.events.find((event) => event.type === "agent.done");
     expect(done).toBeDefined();
+    // Degraded path clears lastAssistant so downstream consumers ignore empty payloads.
     expect(done?.compactHistory?.lastAssistantMessage).toBeNull();
     expect(done?.payload).toEqual(
-      expect.objectContaining({ noAdvance: true, staleSnapshot: false }),
+      expect.objectContaining({
+        degraded: true,
+        degradedReason: "no_advance_from_input",
+        staleSnapshot: false,
+      }),
     );
-    expect(JSON.stringify(done?.compactHistory)).not.toContain("turn-1");
     harness.sqlite.close();
   });
 
@@ -866,7 +916,12 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           return {
             compactHistory: {
               ...emptyCompactHistory("pi-jsonl"),
-              lastAssistantMessage: { ref: diskRef, text: diskText, timestamp: null },
+              lastAssistantMessage: {
+                ref: diskRef,
+                text: diskText,
+                timestamp: null,
+                stopReason: "stop",
+              },
             },
             historyRef: null,
             sourceFingerprint: null,
@@ -887,7 +942,232 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     const event = await index.executeStatusEventPlan(plan);
     expect(event?.type).toBe("agent.done");
     expect(event?.compactHistory?.lastAssistantMessage?.text).toBe("turn-2");
-    expect(event?.payload).not.toEqual(expect.objectContaining({ noAdvance: true }));
+    expect(event?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
     harness.sqlite.close();
   });
+
+  test("downgrades to waitForHistoryAdvance when signal expectedText does not match fresh lastAssistant", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    let calls = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          calls += 1;
+          // First return returns the mismatched text (simulating intermediate message).
+          // Second return returns the correct terminal message.
+          if (calls === 1) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: "m1",
+                  text: "intermediate text",
+                  timestamp: null,
+                  stopReason: "stop",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "m2",
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    calls = 0;
+    const pending = index.handleHerdrEvent(doneEvent);
+    // Record signal with expectedText that does NOT match the first fresh snapshot.
+    setTimeout(() => {
+      registry.record({
+        confirmed: true,
+        expectedText: "final answer",
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        terminalId: "term_claude",
+        workspaceId: "wJ",
+      });
+    }, 10);
+
+    const result = await pending;
+    // The daemon should have re-read history after the mismatch and emitted the
+    // correct terminal message (ref m2), not the intermediate m1.
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: expect.objectContaining({ ref: "m2", text: "final answer" }),
+        }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  }, 10_000);
+
+  test("signal fast path carries expectedText through sync waitForSignal resolution", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "m1",
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    // Record signal BEFORE handleHerdrEvent so waitForSignal hits the sync fast path.
+    registry.record({
+      confirmed: true,
+      expectedText: "final answer",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    const result = await index.handleHerdrEvent(doneEvent);
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: expect.objectContaining({ text: "final answer" }),
+        }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  }, 10_000);
+
+  test("signal fast path emits degraded when expectedText does not match sync snapshot", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    let callCount = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          callCount += 1;
+          if (callCount === 1) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: "m1",
+                  text: "intermediate text",
+                  timestamp: null,
+                  stopReason: "stop",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          if (callCount === 2) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: "m2",
+                  text: "still not final",
+                  timestamp: null,
+                  stopReason: "stop",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: "m3",
+                text: "still not final",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    // Record signal BEFORE handleHerdrEvent so waitForSignal hits the sync fast path.
+    registry.record({
+      confirmed: true,
+      expectedText: "final answer",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    const result = await index.handleHerdrEvent(doneEvent);
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: null,
+        }),
+        payload: expect.objectContaining({
+          degraded: true,
+          degradedReason: "expected_text_mismatch",
+        }),
+        type: "agent.done",
+      }),
+    );
+    harness.sqlite.close();
+  }, 10_000);
 });

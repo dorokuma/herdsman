@@ -1,6 +1,9 @@
 import { describe, expect, test } from "vitest";
-import { sanitizeText } from "@/agent-history/text.js";
-import { sanitizeText as sanitizePiText } from "../../packages/herdsman-pi/src/sanitize-text.js";
+import { sanitizeText, textFromContent } from "@/agent-history/text.js";
+import {
+  sanitizeText as sanitizePiText,
+  textFromContent as textFromPiContent,
+} from "../../packages/herdsman-pi/src/sanitize-text.js";
 
 describe("sanitizeText", () => {
   test("redacts bearer, credential assignments, and common sk- tokens", () => {
@@ -43,6 +46,33 @@ describe("sanitizeText", () => {
         expect(sanitized.text).toBe(`${token} [REDACTED]`);
         expect(sanitized.text).not.toContain("super-secret-token");
       }
+    }
+  });
+
+  test("textFromContent parity: daemon and pi implementations produce identical output", () => {
+    const cases: unknown[] = [
+      "plain text",
+      [{ type: "text", text: "block text" }],
+      [
+        { type: "thinking", text: "hidden reasoning" },
+        { type: "text", text: "visible" },
+      ],
+      [
+        { type: "reasoning", text: "secret thought" },
+        { type: "text", text: "answer" },
+      ],
+      [{ type: "text", text: "nested", content: [{ type: "text", text: "inner" }] }],
+      [{ type: "toolUse", text: "tool" }],
+    ];
+    for (const input of cases) {
+      expect(textFromContent(input as unknown)).toBe(textFromPiContent(input as unknown));
+    }
+  });
+
+  test("sanitizeText parity: daemon and pi implementations produce identical output", () => {
+    const inputs = ["plain", "Bearer abc123", "token=secret", "sk-abcdefghijklmnop"];
+    for (const input of inputs) {
+      expect(sanitizeText(input)).toEqual(sanitizePiText(input));
     }
   });
 });

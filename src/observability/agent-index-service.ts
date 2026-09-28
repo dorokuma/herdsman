@@ -48,6 +48,11 @@ export function historyHasAdvanced(
   return current.messageCount > (baseline?.messageCount ?? 0);
 }
 
+function isTerminalAssistant(compact: CompactAgentHistory | null | undefined): boolean {
+  const stopReason = compact?.lastAssistantMessage?.stopReason;
+  return stopReason === "stop" || stopReason === "length";
+}
+
 export type AgentIndexRefreshResult = {
   agents: AgentIndexRecord[];
   contextChangedScopes: AgentScope[];
@@ -146,6 +151,7 @@ export class AgentIndexService {
   readonly #sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   readonly #turnCompletions: TurnCompletionRegistry | undefined;
   readonly #waitingHistoryTimers = new Map<number, unknown>();
+  readonly #now: () => number;
 
   constructor(options: {
     clearRetry?: (timer: unknown) => void;
@@ -154,6 +160,7 @@ export class AgentIndexService {
     }) => Pick<HerdrSocketClient, "close" | "sessionSnapshot">;
     context?: AgentContextService;
     history?: AgentHistoryService;
+    now?: () => number;
     scheduleRetry?: (callback: () => void, delayMs: number) => unknown;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
     stores: AgentIndexServiceStores;
@@ -163,6 +170,7 @@ export class AgentIndexService {
     this.#clientFactory = options.clientFactory ?? ((input) => new HerdrSocketClient(input));
     this.#scheduleRetry = options.scheduleRetry ?? ((cb, delay) => setTimeout(cb, delay));
     this.#sleep = options.sleep ?? sleep;
+    this.#now = options.now ?? (() => Date.now());
     this.#stores = options.stores;
     this.#turnCompletions = options.turnCompletions;
     if (options.context) {
@@ -280,7 +288,7 @@ export class AgentIndexService {
         const store = this.#stores.statusEventPlans;
         if (!store) return;
         const current = store.get(planId);
-        if (current.status !== "pending" || current.lastError !== PLAN_WAITING_HISTORY) {
+        if (current.status !== "pending") {
           this.#clearWaitingTimer(planId);
           return;
         }
@@ -299,10 +307,6 @@ export class AgentIndexService {
     try {
       current = store.get(planId);
     } catch {
-      this.#clearWaitingTimer(planId);
-      return;
-    }
-    if (current.status !== "pending" || current.lastError !== PLAN_WAITING_HISTORY) {
       this.#clearWaitingTimer(planId);
       return;
     }
@@ -793,6 +797,46 @@ export class AgentIndexService {
         return undefined;
       }
       this.#clearWaitingTimer(row.id);
+      const eventPayload = event?.payload;
+      const isDegraded =
+        !!event &&
+        typeof eventPayload === "object" &&
+        eventPayload !== null &&
+        (eventPayload as Record<string, unknown>).degraded === true;
+      if (isDegraded) {
+        const updated = store.markRetry(row.id, new Error("degraded"));
+        if (!updated) {
+          return event;
+        }
+        if (updated.status === "pending") {
+          this.#scheduleWaitingHistoryRetry(row.id, plan);
+        } else {
+          this.#clearWaitingTimer(row.id);
+          if (updated.status === "discarded") {
+            return this.#appendPlanDiscardedEvent({
+              agent: plan.agent,
+              attempts: updated.attempts,
+              compactHistory: activePlan.compactHistory,
+              from: row.fromStatus,
+              planId: row.id,
+              reason: updated.lastError,
+              to: row.toStatus,
+            });
+          }
+          if (updated.status === "failed") {
+            return this.#appendPlanFailedEvent({
+              agent: plan.agent,
+              attempts: updated.attempts,
+              compactHistory: activePlan.compactHistory,
+              from: row.fromStatus,
+              planId: row.id,
+              reason: updated.lastError,
+              to: row.toStatus,
+            });
+          }
+        }
+        return event;
+      }
       store.markCompleted(row.id);
       return event;
     } catch (error) {
@@ -917,6 +961,10 @@ export class AgentIndexService {
     requireAssistantChange?: boolean;
   }): Promise<CompactAgentHistory | undefined> {
     const maxAttempts = input.maxAttempts ?? 8;
+    const baseDelay = 500;
+    const maxDelay = 16000;
+    const maxTotalMs = 30000;
+    let delay = baseDelay;
     let refreshed: { snapshot: { compactHistory: CompactAgentHistory } } = input.initial
       ? { snapshot: { compactHistory: input.initial } }
       : await this.#context.refreshAgent({
@@ -924,18 +972,30 @@ export class AgentIndexService {
           forceRefresh: true,
           identityChanged: false,
         });
+    const start = this.#now();
     for (
       let attempt = 0;
       attempt < maxAttempts &&
       !historyHasAdvanced(refreshed.snapshot.compactHistory, input.baseline, {
         requireAssistantChange: input.requireAssistantChange,
       }) &&
-      !input.controller.signal.aborted;
+      !input.controller.signal.aborted &&
+      this.#now() - start < maxTotalMs;
       attempt += 1
     ) {
-      await this.#sleep(500, input.controller.signal);
+      await this.#sleep(delay, input.controller.signal);
+      if (input.controller.signal.aborted) {
+        console.debug(
+          "Herdsman retrying status event plan because wait was aborted during history refresh",
+          {
+            agentId: input.agent.id,
+            herdrSessionName: input.agent.herdrSessionName,
+            paneId: input.agent.paneId,
+          },
+        );
+        throw new PlanWaitingHistoryError();
+      }
       if (
-        input.controller.signal.aborted ||
         this.#stores.agents.isPaneClosed({
           herdrSessionName: input.agent.herdrSessionName,
           paneId: input.agent.paneId,
@@ -943,9 +1003,8 @@ export class AgentIndexService {
         })
       ) {
         console.debug(
-          "Herdsman skipping status event generation because wait was aborted during history refresh",
+          "Herdsman skipping status event generation because pane closed during history refresh",
           {
-            aborted: input.controller.signal.aborted,
             agentId: input.agent.id,
             herdrSessionName: input.agent.herdrSessionName,
             paneId: input.agent.paneId,
@@ -958,6 +1017,7 @@ export class AgentIndexService {
         forceRefresh: true,
         identityChanged: false,
       });
+      delay = Math.min(delay * 2, maxDelay);
     }
     return refreshed.snapshot.compactHistory;
   }
@@ -1533,7 +1593,35 @@ export class AgentIndexService {
               identityChanged: false,
             })
           ).snapshot.compactHistory;
-          if (!isAlreadyEmittedInRetry && hasNonEmptyAssistantMessage(fresh)) {
+          if (
+            this.#stores.agents.isPaneClosed({
+              herdrSessionName: input.agent.herdrSessionName,
+              paneId: input.agent.paneId,
+              paneGeneration: input.agent.paneGeneration ?? null,
+            })
+          ) {
+            console.debug(
+              "Herdsman skipping status event generation because pane closed after turn signal",
+              {
+                agentId: input.agent.id,
+                herdrSessionName: input.agent.herdrSessionName,
+                paneId: input.agent.paneId,
+              },
+            );
+            return undefined;
+          }
+          const freshIsTerminal = isTerminalAssistant(fresh);
+          const expectedText = turn.expectedText?.trim();
+          const lastAssistantText = fresh.lastAssistantMessage?.text?.trim() ?? "";
+          const textMatches = !expectedText || lastAssistantText.endsWith(expectedText);
+          if (
+            !isAlreadyEmittedInRetry &&
+            freshIsTerminal &&
+            textMatches &&
+            hasNonEmptyAssistantMessage(fresh) &&
+            (isTerminalAssistant(input.compactHistory) ||
+              historyHasAdvanced(fresh, input.compactHistory))
+          ) {
             compactHistory = fresh;
           } else {
             const advanced = await this.#waitForHistoryAdvance({
@@ -1551,7 +1639,37 @@ export class AgentIndexService {
             ) {
               throw new PlanWaitingHistoryError();
             }
-            compactHistory = advanced;
+            if (
+              !isRetry &&
+              !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
+            ) {
+              compactHistory = { ...advanced, lastAssistantMessage: null };
+              payloadExtra = {
+                degraded: true,
+                degradedReason: "no_advance_from_input",
+                staleSnapshot: false,
+              };
+            } else {
+              const advancedText = advanced.lastAssistantMessage?.text?.trim() ?? "";
+              const advancedMatchesExpected = !expectedText || advancedText.endsWith(expectedText);
+              if (!advancedMatchesExpected) {
+                compactHistory = { ...advanced, lastAssistantMessage: null };
+                payloadExtra = {
+                  degraded: true,
+                  degradedReason: "expected_text_mismatch",
+                  staleSnapshot: false,
+                };
+              } else if (!isTerminalAssistant(advanced)) {
+                compactHistory = { ...advanced, lastAssistantMessage: null };
+                payloadExtra = {
+                  degraded: true,
+                  degradedReason: "non_terminal_assistant",
+                  staleSnapshot: false,
+                };
+              } else {
+                compactHistory = advanced;
+              }
+            }
           }
           console.log(
             `Herdsman emitted pi agent.${input.to} after turn completion signal (confirmed=${turn.confirmed})`,
@@ -1581,7 +1699,18 @@ export class AgentIndexService {
             !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
           ) {
             compactHistory = { ...advanced, lastAssistantMessage: null };
-            payloadExtra = { noAdvance: true, staleSnapshot: false };
+            payloadExtra = {
+              degraded: true,
+              degradedReason: "no_advance_from_input",
+              staleSnapshot: false,
+            };
+          } else if (!isTerminalAssistant(advanced)) {
+            compactHistory = { ...advanced, lastAssistantMessage: null };
+            payloadExtra = {
+              degraded: true,
+              degradedReason: "non_terminal_assistant",
+              staleSnapshot: false,
+            };
           } else {
             compactHistory = advanced;
           }
