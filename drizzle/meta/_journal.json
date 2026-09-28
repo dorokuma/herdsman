@@ -71,6 +71,13 @@
       "when": 1788403075026,
       "tag": "0009_high_lake",
       "breakpoints": true
+    },
+    {
+      "idx": 10,
+      "version": "6",
+      "when": 1790610020312,
+      "tag": "0010_legacy_degraded_cleanup",
+      "breakpoints": true
     }
   ]
 }

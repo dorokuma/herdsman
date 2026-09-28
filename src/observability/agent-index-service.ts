@@ -295,6 +295,19 @@ export class AgentIndexService {
         await this.#enqueueAgentPlan(plan.agent.id, () => this.#retryWaitingPlanRow(planId, plan));
       } catch (error) {
         console.debug("Herdsman waiting history retry callback error", error);
+      } finally {
+        const store = this.#stores.statusEventPlans;
+        if (store) {
+          const current = store.get(planId);
+          if (
+            current.status === "completed" ||
+            current.status === "cancelled" ||
+            current.status === "failed" ||
+            current.status === "discarded"
+          ) {
+            this.#clearWaitingTimer(planId);
+          }
+        }
       }
     }, 10_000);
     this.#waitingHistoryTimers.set(planId, timer);
@@ -553,19 +566,18 @@ export class AgentIndexService {
   async #drainPlanRow(row: StatusEventPlanRecord): Promise<void> {
     const store = this.#stores.statusEventPlans;
     if (!store) return;
-    let current: StatusEventPlanRecord;
+    let current: StatusEventPlanRecord | null;
     try {
-      current = store.get(row.id);
+      current = runSqliteTransaction(this.#stores.sqlite, () => {
+        const candidate = store.get(row.id);
+        if (candidate.status !== "pending") return null;
+        return candidate;
+      });
     } catch {
       this.#clearWaitingTimer(row.id);
       return;
     }
-    if (
-      current.status === "completed" ||
-      current.status === "cancelled" ||
-      current.status === "failed" ||
-      current.status === "discarded"
-    ) {
+    if (!current) {
       this.#clearWaitingTimer(row.id);
       return;
     }
@@ -701,7 +713,10 @@ export class AgentIndexService {
       this.#clearWaitingTimer(row.id);
       return undefined;
     }
-    store.markRunning(row.id);
+    if (!store.markRunning(row.id)) {
+      this.#clearWaitingTimer(row.id);
+      return undefined;
+    }
 
     let activePlan: StatusEventPlan = {
       ...plan,
@@ -804,12 +819,17 @@ export class AgentIndexService {
         eventPayload !== null &&
         (eventPayload as Record<string, unknown>).degraded === true;
       if (isDegraded) {
+        if (event) {
+          this.#stores.agentEvents.invalidateById(event.id, "degraded_retry");
+          Object.assign(event, { status: "invalidated", deliverable: 0 });
+        }
         const updated = store.markRetry(row.id, new Error("degraded"));
         if (!updated) {
-          return event;
+          return undefined;
         }
         if (updated.status === "pending") {
           this.#scheduleWaitingHistoryRetry(row.id, plan);
+          return undefined;
         } else {
           this.#clearWaitingTimer(row.id);
           if (updated.status === "discarded") {
@@ -835,7 +855,7 @@ export class AgentIndexService {
             });
           }
         }
-        return event;
+        return undefined;
       }
       store.markCompleted(row.id);
       return event;
@@ -1452,7 +1472,6 @@ export class AgentIndexService {
     input: StatusEventPlan,
   ): Promise<AgentEventRecord | undefined | typeof PLAN_CANCELLED> {
     // Invariant: compactHistory is always populated as an object before calling #appendStatusEvents; !input.compactHistory check below is defensive and unreachable in normal operation.
-    if (input.from === input.to || !input.compactHistory) return undefined;
     if (
       this.#stores.agents.isPaneClosed({
         herdrSessionName: input.agent.herdrSessionName,
@@ -1491,7 +1510,7 @@ export class AgentIndexService {
       }
       if (hasTerminalAfter && !input.herdrEventKey) {
         const isAgyHistory =
-          input.agent.agent === "agy" || input.compactHistory.source === "antigravity-sqlite";
+          input.agent.agent === "agy" || input.compactHistory?.source === "antigravity-sqlite";
         // For an agy/antigravity pane only a terminal event that already
         // represented a completed turn may count as the delivered baseline: an
         // `unknown -> idle` startup row would otherwise make the `working -> done`
@@ -1659,7 +1678,7 @@ export class AgentIndexService {
                   degradedReason: "expected_text_mismatch",
                   staleSnapshot: false,
                 };
-              } else if (!isTerminalAssistant(advanced)) {
+              } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = {
                   degraded: true,
@@ -1704,7 +1723,7 @@ export class AgentIndexService {
               degradedReason: "no_advance_from_input",
               staleSnapshot: false,
             };
-          } else if (!isTerminalAssistant(advanced)) {
+          } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
             compactHistory = { ...advanced, lastAssistantMessage: null };
             payloadExtra = {
               degraded: true,
@@ -1781,6 +1800,7 @@ export class AgentIndexService {
           compactHistory?.source !== "antigravity-sqlite" &&
           input.herdrEventKey &&
           latestTerminalForSkip &&
+          compactHistory &&
           hasNonEmptyAssistantMessage(compactHistory)
         ) {
           const currentMsg = compactHistory.lastAssistantMessage;
@@ -1926,7 +1946,7 @@ export class AgentIndexService {
         ? undefined
         : this.#appendAndAckSelfEvent({
             agentId: targetAgent.id,
-            compactHistory,
+            compactHistory: compactHistory ?? null,
             herdrSessionName: targetAgent.herdrSessionName,
             idempotencyKey: idempotencyKey(
               "agent.status.changed",
@@ -1946,7 +1966,7 @@ export class AgentIndexService {
       if (statusType) {
         return this.#appendAndAckSelfEvent({
           agentId: targetAgent.id,
-          compactHistory,
+          compactHistory: compactHistory ?? null,
           herdrSessionName: targetAgent.herdrSessionName,
           idempotencyKey: idempotencyKey(
             statusType,
