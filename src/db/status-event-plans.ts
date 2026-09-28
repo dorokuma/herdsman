@@ -289,24 +289,31 @@ export class StatusEventPlanStore {
     return Number(result.changes);
   }
 
-  markRunning(id: number): void {
+  markRunning(id: number): boolean {
     const now = Date.now();
-    this.#sqlite
-      .prepare("update status_event_plans set status = 'running', updated_at = ? where id = ?")
+    const result = this.#sqlite
+      .prepare(
+        "update status_event_plans set status = 'running', updated_at = ? where id = ? and status = 'pending'",
+      )
       .run(now, id);
+    return Number(result.changes) > 0;
   }
 
   markCompleted(id: number): void {
     const now = Date.now();
     this.#sqlite
-      .prepare("update status_event_plans set status = 'completed', updated_at = ? where id = ?")
+      .prepare(
+        "update status_event_plans set status = 'completed', updated_at = ? where id = ? and status in ('pending', 'running')",
+      )
       .run(now, id);
   }
 
   markCancelled(id: number): void {
     const now = Date.now();
     this.#sqlite
-      .prepare("update status_event_plans set status = 'cancelled', updated_at = ? where id = ?")
+      .prepare(
+        "update status_event_plans set status = 'cancelled', updated_at = ? where id = ? and status in ('pending', 'running')",
+      )
       .run(now, id);
   }
 

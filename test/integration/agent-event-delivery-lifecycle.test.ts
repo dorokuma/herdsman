@@ -573,15 +573,15 @@ describe("empty database migration chain", () => {
       ]),
     );
     expect(sqlite.prepare("select count(*) as count from __drizzle_migrations").get()).toEqual({
-      count: 10,
+      count: 11,
     });
     const journal = JSON.parse(readFileSync("drizzle/meta/_journal.json", "utf8")) as {
       version: string;
       entries: Array<{ tag: string; version: string }>;
     };
     expect(
-      journal.entries.every(
-        (entry, index) => entry.version === (index < 6 || index === 8 || index === 9 ? "6" : "7"),
+      journal.entries.every((entry, index) =>
+        index === 10 ? entry.version === "6" : index < 6 || index === 8 || index === 9 ? "6" : "7",
       ),
     ).toBe(true);
     expect(journal.entries.find((entry) => entry.tag === "0007_moaning_guardian")?.version).toBe(

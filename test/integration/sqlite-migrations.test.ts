@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
@@ -121,5 +121,32 @@ describe("SQLite migrations", () => {
     ]);
     expect(tombstoneColumns.find((column) => column.name === "pane_generation")?.notnull).toBe(0);
     sqlite.close();
+  });
+
+  test("all drizzle migration sql files are registered in the journal and when timestamps are monotonically increasing", () => {
+    const drizzleDir = join(process.cwd(), "drizzle");
+    const metaDir = join(drizzleDir, "meta");
+
+    // Read all .sql files in drizzle/ (exclude meta/ subdirectory).
+    const sqlFiles = readdirSync(drizzleDir)
+      .filter((name) => name.endsWith(".sql"))
+      .sort();
+    const sqlTags = sqlFiles.map((name) => name.slice(0, -4)); // strip .sql
+
+    // Read journal entries.
+    const journalPath = join(metaDir, "_journal.json");
+    const journal = JSON.parse(readFileSync(journalPath, "utf8"));
+    const journalTags = journal.entries.map((entry: { tag: string }) => entry.tag).sort();
+
+    // Every .sql file must have a matching journal entry.
+    expect(sqlTags).toEqual(journalTags);
+
+    // Journal when timestamps must be strictly monotonically increasing
+    // to prevent the high-water skip in applyMigrations from permanently
+    // skipping migrations on existing databases.
+    const whens = journal.entries.map((entry: { when: number }) => entry.when);
+    for (let i = 1; i < whens.length; i++) {
+      expect(whens[i]).toBeGreaterThan(whens[i - 1]);
+    }
   });
 });

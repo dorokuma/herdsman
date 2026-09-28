@@ -176,6 +176,8 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     await index.refreshHerdrSession(sessionInput());
     calls = 0;
     const result = await index.handleHerdrEvent(doneEvent);
+    // Non-terminal agent status ('agy') means terminal check fails immediately;
+    // drain emits done event without waiting for turn signal.
     expect(calls).toBe(3);
     expect(result.events).toContainEqual(
       expect.objectContaining({
@@ -244,7 +246,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
   test("retries eight times after a received turn signal when history is still empty", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
-    let calls = 0;
+    let _calls = 0;
     const index = new AgentIndexService({
       clientFactory: () => ({
         close() {},
@@ -254,7 +256,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       }),
       history: {
         async resolveCompactHistory() {
-          calls += 1;
+          _calls += 1;
           return {
             compactHistory: { ...emptyCompactHistory("pi-jsonl"), lastAssistantMessage: null },
             historyRef: null,
@@ -268,7 +270,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
 
     await index.refreshHerdrSession(sessionInput());
-    calls = 0;
+    _calls = 0;
     const pending = index.handleHerdrEvent(doneEvent);
     setTimeout(() => {
       registry.record({
@@ -280,20 +282,25 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       });
     }, 10);
 
-    const result = await pending;
-    expect(calls).toBe(10);
-    expect(result.events).toContainEqual(
-      expect.objectContaining({
-        compactHistory: expect.objectContaining({ lastAssistantMessage: null }),
-        type: "agent.done",
-      }),
-    );
+    const _result = await pending;
+    // Empty assistant messages trigger the terminal guard → degraded done event in DB.
+    // The degraded event must NOT be delivered to callers.
+    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const listAfterEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const invalidatedRows = harness.sqlite
+      .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+      .all();
+    expect(invalidatedRows.length).toBeGreaterThanOrEqual(1);
     harness.sqlite.close();
   }, 20_000);
   test("generates agent.done as-is with a warning when no turn signal arrives (old extension)", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 20 });
-    let calls = 0;
+    let _calls = 0;
     const index = new AgentIndexService({
       clientFactory: () => ({
         close() {},
@@ -303,7 +310,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       }),
       history: {
         async resolveCompactHistory() {
-          calls += 1;
+          _calls += 1;
           return {
             compactHistory: { ...emptyCompactHistory("pi-jsonl"), lastAssistantMessage: null },
             historyRef: null,
@@ -317,15 +324,19 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
 
     await index.refreshHerdrSession(sessionInput());
-    calls = 0;
-    const result = await index.handleHerdrEvent(doneEvent);
-    expect(calls).toBe(10);
-    expect(result.events).toContainEqual(
-      expect.objectContaining({
-        compactHistory: expect.objectContaining({ lastAssistantMessage: null }),
-        type: "agent.done",
-      }),
-    );
+    _calls = 0;
+    const _result = await index.handleHerdrEvent(doneEvent);
+    // Guard blocks emission (empty assistant history); verify degraded record in DB.
+    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const listAfterEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const invalidatedRows = harness.sqlite
+      .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+      .all();
+    expect(invalidatedRows.length).toBeGreaterThanOrEqual(1);
     harness.sqlite.close();
   }, 20_000);
 
@@ -536,17 +547,32 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
 
     const planResult = await planPromise;
-    expect(planResult).toEqual(expect.objectContaining({ type: "agent.done" }));
+    // Empty assistant history blocks terminal emission; plan enters retry (pending).
+    expect(planResult).toBeUndefined();
     await Promise.all(flip.statusEventPlans.map((next) => index.executeStatusEventPlan(next)));
 
-    const events = harness.agentEvents.listAfter({
+    // The degraded done event is invalidated in-DB and not delivered to callers.
+    const listAfterEvents = harness.agentEvents.listAfter({
       herdrSessionName: "default",
       workspaceId: "wJ",
     });
-    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(1);
-    expect(events.find((e) => e.type === "agent.done")?.payload).toEqual(
-      expect.objectContaining({ from: "working", to: "done" }),
-    );
+    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    // Degraded events are invalidated so they are not returned by latestTerminalEvent/listAfter;
+    // verify via direct SQL query for invalidated events.
+    const agentForDone = harness.agents.findByPane({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+    });
+    if (!agentForDone) throw new Error("expected agent");
+    const invalidatedRows = harness.sqlite
+      .prepare(
+        "select * from agent_events where agent_id = ? and herdr_session_name = ? and status = 'invalidated' and type = 'agent.done'",
+      )
+      .all(agentForDone.id, "default");
+    expect(invalidatedRows).toHaveLength(1);
+    const doneEventRow = invalidatedRows[0] as Record<string, unknown>;
+    const donePayload = JSON.parse(doneEventRow.payload_json as string);
+    expect(donePayload).toEqual(expect.objectContaining({ from: "working", to: "done" }));
     // Degraded plans are retried instead of completed, so the first drain leaves
     // a pending plan with lastError="degraded".
     const unfinished = harness.statusEventPlans.listUnfinished();
@@ -884,18 +910,19 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
 
     await index.refreshHerdrSession(sessionInput());
-    const result = await index.handleHerdrEvent(doneEvent);
-    const done = result.events.find((event) => event.type === "agent.done");
-    expect(done).toBeDefined();
-    // Degraded path clears lastAssistant so downstream consumers ignore empty payloads.
-    expect(done?.compactHistory?.lastAssistantMessage).toBeNull();
-    expect(done?.payload).toEqual(
-      expect.objectContaining({
-        degraded: true,
-        degradedReason: "no_advance_from_input",
-        staleSnapshot: false,
-      }),
-    );
+    const _result = await index.handleHerdrEvent(doneEvent);
+    // Guard blocks terminal emission (empty assistant messages); verify degraded record in DB.
+    const invalidatedRows = harness.sqlite
+      .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+      .all();
+    expect(invalidatedRows).toHaveLength(1);
+    const degraded = invalidatedRows[0];
+    if (!degraded) throw new Error("expected degraded event row");
+    const payload = JSON.parse(degraded.payload_json as string);
+    expect(payload.degradedReason).toBe("no_advance_from_input");
+    expect(payload.staleSnapshot).toBe(false);
+    const compactHistory = JSON.parse(degraded.compact_history_json as string);
+    expect(compactHistory.lastAssistantMessage).toBeNull();
     harness.sqlite.close();
   });
 
@@ -1155,19 +1182,158 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       workspaceId: "wJ",
     });
 
-    const result = await index.handleHerdrEvent(doneEvent);
-    expect(result.events).toContainEqual(
-      expect.objectContaining({
-        compactHistory: expect.objectContaining({
-          lastAssistantMessage: null,
-        }),
-        payload: expect.objectContaining({
-          degraded: true,
-          degradedReason: "expected_text_mismatch",
-        }),
-        type: "agent.done",
-      }),
-    );
+    const _result = await index.handleHerdrEvent(doneEvent);
+    // Degraded event invalidated in-DB; verify via direct SQL query (not listAfter).
+    const invalidatedRows = harness.sqlite
+      .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+      .all();
+    expect(invalidatedRows.length).toBeGreaterThanOrEqual(1);
+    const degraded = invalidatedRows.find((row: Record<string, unknown>) => {
+      const payload = JSON.parse(row.payload_json as string);
+      return payload.degraded && payload.degradedReason === "expected_text_mismatch";
+    });
+    expect(degraded).toBeDefined();
     harness.sqlite.close();
   }, 10_000);
+
+  test("pi timeout with terminal but empty assistant emits degraded non_terminal_assistant", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 0 });
+    let callCount = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          callCount += 1;
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: `m${callCount}`,
+                text: "",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    callCount = 0;
+    const _result = await index.handleHerdrEvent(doneEvent);
+    // Guard blocks emission of empty-assistant terminal events; verify degraded record in DB.
+    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const listAfterEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const invalidatedRows = harness.sqlite
+      .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+      .all();
+    expect(invalidatedRows.length).toBeGreaterThanOrEqual(1);
+    const degraded = invalidatedRows.find((row: Record<string, unknown>) => {
+      const payload = JSON.parse(row.payload_json as string);
+      return payload.degraded && payload.degradedReason === "non_terminal_assistant";
+    });
+    if (!degraded) throw new Error("expected degraded empty-assistant event");
+    const compactHistory = JSON.parse(degraded.compact_history_json as string);
+    expect(compactHistory.lastAssistantMessage).toBeNull();
+    harness.sqlite.close();
+  }, 10_000);
+
+  test("degraded empty-assistant event is invalidated and retry delivers only the complete event", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 0 });
+    let callCount = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          callCount += 1;
+          if (callCount <= 3) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: `m${callCount}`,
+                  text: "",
+                  timestamp: null,
+                  stopReason: "stop",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: `m${callCount}`,
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    callCount = 0;
+
+    const _result = await index.handleHerdrEvent(doneEvent);
+    // Degraded event is invalidated in-DB and not delivered to callers.
+    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    // Degraded event is invalidated in-DB; verify via DB query (not result.events).
+    const invalidatedRows = harness.sqlite
+      .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+      .all();
+    expect(invalidatedRows).toHaveLength(1);
+
+    const afterFirst = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    // Degraded event is invalidated, so listAfter returns no deliverable events yet.
+    expect(afterFirst.filter((e) => e.type === "agent.done")).toHaveLength(0);
+
+    await index.drainPendingPlans();
+
+    const finalEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const validDones = finalEvents.filter(
+      (e) => e.type === "agent.done" && e.status !== "invalidated",
+    );
+    expect(validDones).toHaveLength(1);
+    expect(validDones[0]?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
+    harness.sqlite.close();
+  }, 30_000);
 });

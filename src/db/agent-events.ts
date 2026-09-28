@@ -295,6 +295,7 @@ export class AgentEventStore {
         `select 1 from agent_events
          where agent_id = ? and herdr_session_name = ? and id > ?
            and type in ('agent.idle', 'agent.done', 'agent.blocked')
+           and status != 'invalidated'
          limit 1`,
       )
       .get(agentId, herdrSessionName, afterId);
@@ -307,6 +308,7 @@ export class AgentEventStore {
         `select * from agent_events
          where agent_id = ? and herdr_session_name = ?
            and type in ('agent.idle', 'agent.done', 'agent.blocked')
+           and status != 'invalidated'
          order by id desc limit 1`,
       )
       .get(agentId, herdrSessionName) as AgentEventRow | undefined;
