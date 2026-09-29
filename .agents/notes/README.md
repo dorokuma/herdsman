@@ -8,7 +8,7 @@
 2. **跨两个以上模块或跨仓库**（如 daemon、Pi extension、Herdr plugin、SQLite store 之间的协议与交互）。
 3. **否决看似更优方案**（记录为何不采用某种看似更好的设计）。
 4. **临时降级 / workaround / 特判**（如应对特定 agent、环境或竞态的特殊处理）。
-5. **与 upstream 的故意分歧**（与 upstream `ryonakae/herdsman` 或 upstream 规范的有意识差异）。
+5. **与既往规范的故意分歧**（与本仓既往规范的有意识差异）。
 6. **性能取值原因**（如轮询间隔、缓存上限、超时时间、tail window 大小等 magic number 的设定依据）。
 
 ## 豁免清单

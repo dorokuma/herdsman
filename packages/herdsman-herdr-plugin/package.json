@@ -1,7 +1,7 @@
 {
   "name": "herdsman-herdr-plugin",
   "version": "0.12.1",
-  "description": "Herdr companion plugin for Herdsman agent history. Forked from @ryonakae/herdsman.",
+  "description": "Herdr companion plugin for Herdsman agent history.",
   "private": true,
   "license": "MIT",
   "files": [
@@ -16,9 +16,6 @@
     "herdsman-herdr-plugin": "./index.mjs"
   },
   "author": "dorokuma",
-  "contributors": [
-    "Ryo Nakae (https://github.com/ryonakae)"
-  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/dorokuma/herdsman.git",

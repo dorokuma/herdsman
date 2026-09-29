@@ -2,7 +2,7 @@
 
 **Status:** Phase 1 core acceptance completed; extended routing/lifecycle phases pending
 
-**Goal:** Exercise Herdsman from `/Users/ryo.nakae/Dev/_sandbox/herdsman-test` as a real user would, covering structured agent history, the Herdsman Agent Skill, owner-only cached Pi context, and owner-only updates without risking the normal Herdsman runtime state.
+**Goal:** Exercise Herdsman from `/tmp/herdsman-test` as a real user would, covering structured agent history, the Herdsman Agent Skill, owner-only cached Pi context, and owner-only updates without risking the normal Herdsman runtime state.
 
 **Architecture:** Run one owner Pi, one off Pi, one Claude agent, and one shell observer in the same Herdr workspace. The owner receives a daemon-cached snapshot locally during normal prompts; an off Pi receives neither context nor updates. Use an isolated `HERDSMAN_HOME` for restart, disconnect, owner transfer, and unread-transfer scenarios so the normal `~/.herdsman` database is not changed by destructive tests.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Run all agent panes from `/Users/ryo.nakae/Dev/_sandbox/herdsman-test`.
+- Run all agent panes from `/tmp/herdsman-test`.
 - Do not reuse recorded Herdr workspace or pane ids. Re-read them because public ids can compact.
 - Enter `/herdsman [on|off|status]` in Pi, not in a shell.
 - Use Herdsman for structured status/history and Herdr for raw terminal output or pane control.
@@ -25,7 +25,7 @@
 
 ## Current Context
 
-- `/Users/ryo.nakae/Dev/_sandbox/herdsman-test/.pi/settings.json` loads `packages/herdsman-pi` from the local Herdsman checkout.
+- `/tmp/herdsman-test/.pi/settings.json` loads `packages/herdsman-pi` from the local Herdsman checkout.
 - Project skills `herdr` and `herdsman` are installed under `.agents/skills/` and Pi discovers both.
 - The installed `herdsman` wrapper executes this checkout's `dist/src/cli/herdsman.js`.
 - Herdsman daemon and CLI queries currently work against the normal `~/.herdsman` home.
@@ -54,7 +54,7 @@ The completed Phase 1 hidden-context evidence predates owner-only cached deliver
 - [ ] **Step 1: Verify versions and daemon health from a normal shell**
 
 ```bash
-cd /Users/ryo.nakae/Dev/_sandbox/herdsman-test
+cd /tmp/herdsman-test
 herdsman daemon status
 herdr --version
 pi --version
@@ -69,7 +69,7 @@ Expected:
 - [ ] **Step 2: Start or attach Herdr from the target directory**
 
 ```bash
-cd /Users/ryo.nakae/Dev/_sandbox/herdsman-test
+cd /tmp/herdsman-test
 herdr
 ```
 
@@ -199,7 +199,7 @@ Stop using the Phase 1 Pi processes before switching homes. In a fresh shell:
 export HERDSMAN_HOME=/tmp/herdsman-test-dogfood
 rm -rf "$HERDSMAN_HOME"
 herdsman daemon start
-cd /Users/ryo.nakae/Dev/_sandbox/herdsman-test
+cd /tmp/herdsman-test
 herdr --session herdsman-dogfood
 ```
 
@@ -469,9 +469,9 @@ A missed lifecycle event or disconnected stream could therefore leave the agent 
 
 ### 2026-07-14: Daemon exited when started from herdsman-test
 
-**Result:** daemon start returned PIDs `81747`, `87875`, and later `99872`, but each exited before a subsequent status check when launched from `/Users/ryo.nakae/Dev/_sandbox/herdsman-test`.
+**Result:** daemon start returned PIDs `81747`, `87875`, and later `99872`, but each exited before a subsequent status check when launched from `/tmp/herdsman-test`.
 
-**Cause:** `runObservabilityDaemonService()` passed relative migration folder `drizzle` to Drizzle. The child process inherited the user's project cwd, so it searched for `/Users/ryo.nakae/Dev/_sandbox/herdsman-test/drizzle/meta/_journal.json` and exited with `Can't find meta/_journal.json file`. Successful older daemons had been launched from the Herdsman checkout, which hid the cwd dependency.
+**Cause:** `runObservabilityDaemonService()` passed relative migration folder `drizzle` to Drizzle. The child process inherited the user's project cwd, so it searched for `/tmp/herdsman-test/drizzle/meta/_journal.json` and exited with `Can't find meta/_journal.json file`. Successful older daemons had been launched from the Herdsman checkout, which hid the cwd dependency.
 
 **Fix and evidence:** the daemon now searches upward from its own service module for `drizzle/meta/_journal.json` and passes that absolute package-root path to migrations. A unit test covers the built `dist/src/daemon` layout. Starting the rebuilt daemon from `herdsman-test` produced PID `10825`, remained reachable across repeated checks, and indexed `default/wJ` successfully.
 

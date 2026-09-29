@@ -19,7 +19,7 @@ const required = [
   "dist/src/cli/herdsman-daemon.js",
   "drizzle/meta/_journal.json",
 ];
-const topLevel = new Set(["LICENSE", "README.md", "README.ja.md", "package.json"]);
+const topLevel = new Set(["LICENSE", "README.md", "package.json"]);
 const unexpected = files.filter(
   (path) =>
     !topLevel.has(path) && !path.startsWith("dist/") && !path.startsWith("drizzle/"),

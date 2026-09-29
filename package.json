@@ -1,7 +1,7 @@
 {
   "name": "@dorokuma/herdsman",
   "version": "0.12.1",
-  "description": "Agent history daemon and runtime bridges for Herdr-managed coding agents. Forked from @ryonakae/herdsman.",
+  "description": "Agent history daemon and runtime bridges for Herdr-managed coding agents.",
   "type": "module",
   "files": [
     "dist",
@@ -75,8 +75,5 @@
   "lint-staged": {
     "*.{js,jsx,ts,tsx,json,jsonc}": "biome check --write --no-errors-on-unmatched"
   },
-  "author": "dorokuma",
-  "contributors": [
-    "Ryo Nakae (https://github.com/ryonakae)"
-  ]
+  "author": "dorokuma"
 }

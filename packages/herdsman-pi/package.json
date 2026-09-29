@@ -1,7 +1,7 @@
 {
   "name": "@dorokuma/herdsman-pi",
   "version": "0.12.1",
-  "description": "Pi extension bridge for Herdsman agent history. Forked from @ryonakae/herdsman.",
+  "description": "Pi extension bridge for Herdsman agent history.",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -34,9 +34,6 @@
     "@earendil-works/pi-tui": ">=0.80.6"
   },
   "author": "dorokuma",
-  "contributors": [
-    "Ryo Nakae (https://github.com/ryonakae)"
-  ],
   "bugs": {
     "url": "https://github.com/dorokuma/herdsman/issues"
   },

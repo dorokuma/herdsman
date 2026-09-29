@@ -237,7 +237,7 @@ Two npm publishes cannot be atomic. Use these rules when the root version exists
 1. Confirm the Pi version is absent with `npm view`.
 2. Delete only the local, unpushed tag: `git tag -d "$TAG"`.
 3. Export the next unused patch version: `export VERSION=0.3.2 TAG=v0.3.2`.
-4. Update all four version files and replace the Herdr tag in `README.md`, `README.ja.md`, and `packages/herdsman-herdr-plugin/README.md`.
+4. Update all four version files and replace the Herdr tag in `README.md` and `packages/herdsman-herdr-plugin/README.md`.
 5. Rebuild and reinstall both tarballs.
 6. Commit the replacement version and documentation, confirm the tree is clean, push `main`, and verify `HEAD` equals `origin/main`.
 7. Create a new local tag from the pushed replacement commit.

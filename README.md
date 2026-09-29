@@ -1,17 +1,6 @@
 ![Herdsman cover](./assets/herdsman-cover.png)
 
-
-## Credits / Acknowledgements
-
-herdsman is forked from ryonakae/herdsman at commit dfdd3a2 (v0.5.1). Thanks to the original author, Ryo Nakae, and the upstream project.
-
-Upstream: https://github.com/ryonakae/herdsman
-
 # Herdsman
-
-<!-- README-I18N:START -->
-**English** | [日本語](./README.ja.md)
-<!-- README-I18N:END -->
 
 Herdsman is a daemon-backed observability layer for coding agents running in Herdr. It provides two interfaces over the same durable agent index: pull-based CLI access to structured history, and owner-scoped Pi notifications with cached context and automatic wake.
 

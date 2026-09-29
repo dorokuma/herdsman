@@ -11,7 +11,7 @@ Herdsman は Herdr 管理の coding agent から agent snapshot、`agent.*` even
 
 ## ドキュメント・インデックス / Documentation Index
 
-- 現状ドキュメント: [README.md](README.md), [README.ja.md](README.ja.md), [docs/plans/](docs/plans/), [docs/releasing.md](docs/releasing.md)
+- 現状ドキュメント: [README.md](README.md), [docs/plans/](docs/plans/), [docs/releasing.md](docs/releasing.md)
 - 意思決定・踩坑ノート: [.agents/notes/](.agents/notes/)（規約: [.agents/notes/README.md](.agents/notes/README.md)）
 - 写完笔记刷新索引：scripts/notes-index.sh（本地生成 INDEX.md，不入 git）
 
