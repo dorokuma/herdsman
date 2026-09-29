@@ -1,5 +1,7 @@
 # Herdsman-Test Dogfooding Plan
 
+> **注记（2026-09-29）**：本文件中出现的 `herdsman daemon start|stop|restart` 已从 CLI 删除，daemon 启停改用 `systemctl restart|stop|start herdsman.service`；开发/验证要用前台入口时必须显式指定临时数据目录（`HERDSMAN_HOME=/tmp/<名字>`）。以下历史步骤保持原样。
+
 **Status:** Phase 1 core acceptance completed; extended routing/lifecycle phases pending
 
 **Goal:** Exercise Herdsman from `/tmp/herdsman-test` as a real user would, covering structured agent history, the Herdsman Agent Skill, owner-only cached Pi context, and owner-only updates without risking the normal Herdsman runtime state.
@@ -149,7 +151,7 @@ Expected: Herdsman preserves the meaningful messages while omitting terminal chr
 In Pi A, submit:
 
 ```text
-Herdsman hidden contextだけを使い、別ペインのagentが最後に依頼されたことと、最後に報告したことを説明してください。追加のCLI問い合わせはしないでください。
+只使用 Herdsman hidden context，说明另一个 pane 的 agent 最后被要求做什么、最后报告了什么。不要做额外的 CLI 查询。
 ```
 
 Expected: Pi A identifies the agent and accurately summarizes its latest user/assistant messages without invoking `herdsman agent get/read` during this turn.
@@ -159,7 +161,7 @@ Expected: Pi A identifies the agent and accurately summarizes its latest user/as
 In Pi A, submit:
 
 ```text
-別ペインのagentの現在の状態、直近20件の履歴、最後のtool resultを確認してください。
+确认另一个 pane 的 agent 的当前状态、最近 20 条历史、最后的 tool result。
 ```
 
 Expected:

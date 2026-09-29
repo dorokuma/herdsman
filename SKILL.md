@@ -16,13 +16,7 @@ Check the daemon before the first Herdsman query:
 herdsman daemon status
 ```
 
-If the JSON response has `state: "stopped"`, start it once:
-
-```bash
-herdsman daemon start
-```
-
-Do not restart or stop a running daemon unless the user asks.
+If the JSON response has `state: "stopped"`, the daemon is not running. Herdsman has no CLI start/stop command: for a development or throwaway environment run the daemon entrypoint in the foreground with an explicit temporary data directory (`HERDSMAN_HOME=/tmp/<name> node <package>/dist/src/cli/herdsman-daemon.js`; without `HERDSMAN_HOME` the resolved directory is the production data directory and the entrypoint refuses to start), and use `systemctl restart herdsman.service` on a systemd-managed production host. Do not stop or restart a daemon that is already running unless the user asks.
 
 ## Select the scope
 
