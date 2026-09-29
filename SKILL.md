@@ -16,7 +16,7 @@ Check the daemon before the first Herdsman query:
 herdsman daemon status
 ```
 
-If the JSON response has `state: "stopped"`, the daemon is not running. Herdsman has no CLI start/stop command: for a development or throwaway environment run the daemon entrypoint in the foreground with an explicit temporary data directory (`HERDSMAN_HOME=/tmp/<name> node <package>/dist/src/cli/herdsman-daemon.js`; without `HERDSMAN_HOME` the resolved directory is the production data directory and the entrypoint refuses to start), and use `systemctl restart herdsman.service` on a systemd-managed production host. Do not stop or restart a daemon that is already running unless the user asks.
+If the JSON response has `state: "stopped"`, the daemon is not running. Herdsman has no CLI start/stop command. On a production host the daemon is managed by the systemd unit `herdsman.service` and is meant to stay running (`systemctl restart herdsman.service`); for a development or throwaway environment, run the daemon entrypoint in the foreground with an explicit temporary data directory (`HERDSMAN_HOME=/tmp/<name> node <package>/dist/src/cli/herdsman-daemon.js`) instead of the production one. Do not stop or restart a daemon that is already running unless the user asks.
 
 ## Select the scope
 

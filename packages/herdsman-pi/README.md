@@ -12,7 +12,7 @@ pi install npm:@dorokuma/herdsman-pi
 herdsman daemon status
 ```
 
-Herdsman has no CLI start/stop command. For a development or throwaway environment, run the daemon entrypoint in the foreground with an explicit temporary data directory (`HERDSMAN_HOME=/tmp/<name> node <package>/dist/src/cli/herdsman-daemon.js`; without `HERDSMAN_HOME` it targets the production data directory and refuses to start); on the production host the daemon runs under the systemd unit `herdsman.service` (`systemctl restart herdsman.service`).
+Herdsman has no CLI start/stop command. On the production host the daemon runs under the systemd unit `herdsman.service` and stays running (`systemctl restart herdsman.service`); for a development or throwaway environment, run the daemon entrypoint in the foreground with an explicit temporary data directory (`HERDSMAN_HOME=/tmp/<name> node <package>/dist/src/cli/herdsman-daemon.js`) instead of the production one.
 
 When Pi runs inside Herdr, this extension connects to the Herdsman daemon and registers its exact Pi session path as presence identity. After register it sends `agent.ping` at least every 30 seconds so an idle owner is not dropped by the daemon heartbeat. It does not send per-turn tool-result or final-message telemetry.
 
