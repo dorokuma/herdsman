@@ -58,7 +58,7 @@ PATH="$HOME/.local/share/mise/installs/node/26.7.0/bin:$HOME/.local/share/mise/i
 
 - 生产 daemon：由 systemd 单元 `herdsman.service` 的 `ExecStart` 固定用 nvm v22.23.1 的 node 启动。
 - 提交门禁：`.husky/pre-commit` 显式把 mise 钉版前置进 PATH，实际跑 mise 的 node 26.7.0 + pnpm 11.9.0（与 `mise.toml` 一致）。
-- 普通 shell 里跑哪个版本以现场 `node -v` 为准：登录交互 bash 会先激活 mise（`/root/.bashrc` 在 nvm 之后激活 mise，mise 优先），而 daemon 派生的 shell 继承单元里的 PATH（nvm 优先）。
+- 普通 shell 里跑哪个版本以现场 `node -v` 为准：登录交互 bash 会先激活 mise（`/root/.bashrc` 在 nvm 之后激活 mise，mise 优先），而 daemon 派生的 shell 继承单元里的 PATH：**node 走 nvm 优先**（单元 PATH 含 `/root/.nvm/versions/node/v22.23.1/bin`）；**pnpm 走 nvm 前缀下的 corepack shim** `/root/.nvm/versions/node/v22.23.1/bin/pnpm`（单元 PATH 首位的 `/root/.local/bin/pnpm` 原本是一条指向 `/root/.hermes/node/lib/node_modules/pnpm/bin/pnpm.cjs` 的失效软链，目标一直不存在，故从未生效；该软链已删除）。
 - 支持面与生产面是 node 22（`package.json` 的 `engines.node >=22.12.0`，CI 也用 node 22），所以 mise 的 26.7.0 上绿不能替代生产面验证，部署或发布前必须再跑一次：
 
 ```bash
