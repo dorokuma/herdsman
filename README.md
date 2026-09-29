@@ -46,15 +46,13 @@ herdsman help
 
 Herdsman agent commands and Pi notifications require the daemon. The daemon watches all running Herdr sessions reported by `herdr session list --json`, rescans them every 60 seconds, and does not index stopped Herdr sessions. Runtime files live in `~/.herdsman` by default. Set `HERDSMAN_HOME` to use another directory.
 
-Run the daemon in the foreground for a development or throwaway environment, always with an explicit temporary data directory:
+On the production host the daemon is managed by the systemd unit `herdsman.service`, which keeps it running: use `systemctl restart herdsman.service` to restart it. There are no CLI start/stop/restart commands. `herdsman daemon status` reports the daemon state in either case.
+
+For development or verification, run the entrypoint in the foreground with an explicit temporary data directory, so the production data directory is not used as scratch space:
 
 ```bash
 HERDSMAN_HOME=/tmp/herdsman-dev node ./dist/src/cli/herdsman-daemon.js
 ```
-
-`HERDSMAN_HOME` defaults to `~/.herdsman`, which is the production data directory; the entrypoint refuses to start there unless it is launched by the systemd unit. Always pass an explicit `/tmp/...` directory for development or verification.
-
-There are no CLI start/stop/restart commands. On the production host the daemon is managed by the systemd unit `herdsman.service`, so use `systemctl restart herdsman.service` instead of running the entrypoint yourself. `herdsman daemon status` reports the daemon state in either case.
 
 ## Main commands
 

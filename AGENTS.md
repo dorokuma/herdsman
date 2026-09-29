@@ -13,9 +13,10 @@ Herdsman 是一个 TypeScript daemon / CLI，从 Herdr 管理的 coding agent �
 
 - 正式服务是 systemd 单元 `herdsman.service`（`/etc/systemd/system/herdsman.service`，`enabled`；`ExecStart` 直连全局安装的 `herdsman-daemon.js`）。
 - 启停用 `systemctl restart|stop|start herdsman.service`。判断进程归属看 `systemctl status herdsman.service` 与 `/proc/<MainPID>/cgroup`（`pgrep -af herdsman-daemon` 会误报）。
+- daemon 常驻、不在前台交互；进程异常退出（非零退出码，或被信号杀死且不属 SIGHUP/SIGINT/SIGTERM/SIGPIPE）时由 systemd 拉回（本机单元当前为 `Restart=on-failure`，`RestartSec=5` 约 5 秒后重试，连续失败受 `StartLimit*` 限制）；`systemctl stop` 是显式停止，不会被拉回。
 - 部署：`pnpm build` → `npm pack`（用 nvm 的 npm，使 `npm prefix -g` 落在 nvm 前缀）→ 把 tarball 全局安装 → `systemctl restart herdsman.service` → 按上一条核对。
 - 生产日志看 `journalctl -u herdsman.service`。`logs/herdsman.log` 是旧的，不用它判断生产状态。
-- 默认数据目录 `~/.herdsman` 即生产；开发/验证必须显式指定临时目录（`HERDSMAN_HOME=/tmp/<名字>`），前台入口在默认目录且非 systemd 托管时会拒绝启动。
+- 默认数据目录 `~/.herdsman` 即生产；开发/验证请显式指定临时目录（`HERDSMAN_HOME=/tmp/<名字>`），不要拿生产目录做实验。
 
 ## 文档・索引 / Documentation Index
 

@@ -417,7 +417,7 @@ export function acquireDaemonLock(lockPath: string, deps?: DaemonProcessDependen
 
   const formatLockHeldError = (pid?: number) => {
     const ownerInfo = pid !== undefined ? ` by PID ${pid}` : "";
-    return `Herdsman daemon operation lock is held${ownerInfo}: ${lockPath}. 确认无 daemon 操作在跑后可删除: ${lockPath}`;
+    return `Herdsman daemon operation lock is held${ownerInfo}: ${lockPath}. 先看 systemctl status herdsman.service 确认 daemon 状态；仅当确认无 daemon 与 CLI 操作在跑时才可删除锁文件（删掉会让新进程在新 inode 上重新加锁成功，可能出现两个实例同时跑）: ${lockPath}`;
   };
 
   const flockHandle = acquireFlockHandle(lockPath);

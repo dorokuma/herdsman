@@ -41,6 +41,55 @@ function tempDir(): string {
   return dir;
 }
 
+/**
+ * Polls `condition` until it holds, so a test never depends on a fixed sleep
+ * being long enough when the machine is loaded. Failing the timeout throws, so
+ * a real regression still fails instead of being masked by the wait.
+ */
+async function waitForCondition(
+  condition: () => boolean,
+  options: { description: string; intervalMs?: number; timeoutMs?: number },
+): Promise<void> {
+  const timeoutMs = options.timeoutMs ?? 5000;
+  const intervalMs = options.intervalMs ?? 20;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (condition()) return;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      throw new Error(`Timed out after ${timeoutMs}ms waiting for ${options.description}`);
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(intervalMs, remaining)));
+  }
+}
+
+// flock(2) syscall numbers are only a fallback signal for kernels that do not
+// expose wchan symbols; `wchan` is the primary check below.
+const FLOCK_SYSCALL_NUMBERS: Partial<Record<NodeJS.Architecture, string>> = {
+  arm64: "32",
+  x64: "73",
+};
+
+/**
+ * True once `pid` is parked inside the kernel acquiring the flock. A process
+ * that already owns a lock waits somewhere else (for `flock -x f <cmd>`: in
+ * `do_wait` for its `<cmd>` child), so this identifies a contending process
+ * instead of guessing how long a fixed delay should be.
+ */
+function isBlockedAcquiringFlock(pid: number): boolean {
+  try {
+    if (readFileSync(`/proc/${pid}/wchan`, "utf8").includes("locks_lock_inode_wait")) return true;
+  } catch {}
+  try {
+    const [syscallNumber, , operation] = readFileSync(`/proc/${pid}/syscall`, "utf8")
+      .trim()
+      .split(/\s+/);
+    const expected = FLOCK_SYSCALL_NUMBERS[process.arch];
+    if (expected !== undefined && syscallNumber === expected && operation === "0x2") return true;
+  } catch {}
+  return false;
+}
+
 describe("daemon process manager", () => {
   test("reports stopped when the pid file does not exist", async () => {
     const dir = tempDir();
@@ -319,7 +368,7 @@ describe("daemon process manager", () => {
     expect(readDaemonRuntimeRecord(recordPath)?.pid).toBe(1234);
   });
 
-  test("isFlockHeld correctly detects flock state and handles errors", () => {
+  test("isFlockHeld correctly detects flock state and handles errors", async () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");
 
@@ -330,6 +379,11 @@ describe("daemon process manager", () => {
     expect(isFlockHeld(lockPath)).toBe(true);
 
     release();
+    // release() signals the lock-holding child; the kernel only drops the flock
+    // once that process is gone, which can lag behind the signal under load.
+    await waitForCondition(() => !isFlockHeld(lockPath), {
+      description: "the released flock to be observable as free",
+    });
     expect(isFlockHeld(lockPath)).toBe(false);
   });
 
@@ -342,7 +396,7 @@ describe("daemon process manager", () => {
     expect(existsSync(`${lockPath}.owner.json`)).toBe(true);
 
     expect(() => acquireDaemonLock(lockPath)).toThrow(
-      /Herdsman daemon operation lock is held.*确认无 daemon 操作在跑后可删除/,
+      /Herdsman daemon operation lock is held.*systemctl status herdsman\.service.*仅当确认无 daemon 与 CLI 操作在跑时才可删除锁文件/s,
     );
 
     release();
@@ -500,35 +554,56 @@ describe("daemon process manager", () => {
   test("flock handle release does not busy wait when another process immediately holds lock", async () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");
+    // Written by the contender only after it owns the lock, and held far longer
+    // than the assertions below need, so nothing here races a `sleep` expiry.
+    const markerPath = join(dir, "next-holder-acquired");
 
     const handle = acquireFlockHandle(lockPath);
     expect(handle).not.toBeNull();
 
     // Start a background process blocked on acquiring the flock on lockPath
-    const childHoldingNext = spawn("flock", ["-x", lockPath, "sleep", "1"], {
-      detached: true,
-      stdio: "ignore",
-    });
+    const childHoldingNext = spawn(
+      "flock",
+      ["-x", lockPath, "sh", "-c", `printf TAKEN > "${markerPath}"; sleep 30`],
+      {
+        detached: true,
+        stdio: "ignore",
+      },
+    );
 
-    // Wait a brief moment for child to block on flock
-    await new Promise((res) => setTimeout(res, 20));
-
-    const start = Date.now();
-    handle?.release();
-    const elapsed = Date.now() - start;
-
-    // Release should return promptly (well below 100ms) without busy waiting for isFlockHeld
-    expect(elapsed).toBeLessThan(70);
-
-    // The lock is now immediately held by the next child process
-    expect(isFlockHeld(lockPath)).toBe(true);
-
+    // Wait until the contender is really parked inside flock(2) instead of
+    // assuming a fixed delay was long enough under load.
     try {
-      if (childHoldingNext.pid) process.kill(-childHoldingNext.pid, "SIGKILL");
-    } catch {}
-    try {
-      childHoldingNext.kill("SIGKILL");
-    } catch {}
+      await waitForCondition(
+        () => childHoldingNext.pid !== undefined && isBlockedAcquiringFlock(childHoldingNext.pid),
+        {
+          description: "the contending flock process to block on the lock",
+          intervalMs: 10,
+        },
+      );
+
+      const start = Date.now();
+      handle?.release();
+      const elapsed = Date.now() - start;
+
+      // Release should return promptly (well below 100ms) without busy waiting for isFlockHeld
+      expect(elapsed).toBeLessThan(70);
+
+      // The lock is now immediately held by the next child process
+      await waitForCondition(() => existsSync(markerPath), {
+        description: "the contender to take the lock over after release",
+      });
+      expect(isFlockHeld(lockPath)).toBe(true);
+    } finally {
+      // The contender holds the lock for 30s, so it must never outlive this test,
+      // not even when an assertion above fails.
+      try {
+        if (childHoldingNext.pid) process.kill(-childHoldingNext.pid, "SIGKILL");
+      } catch {}
+      try {
+        childHoldingNext.kill("SIGKILL");
+      } catch {}
+    }
   });
 
   test("acquireFlockHandle returns null if child process exits immediately after writing READY", () => {
