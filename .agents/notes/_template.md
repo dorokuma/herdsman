@@ -2,7 +2,7 @@
 status: active # active | superseded
 superseded_by: ""
 supersedes: ""
-# 模块可选值: observability, daemon, cli, config, db, herdr, shared, herdsman-pi, herdsman-herdr-plugin
+# 模块可选值: observability, daemon, cli, config, db, herdr, shared, herdsman-pi, herdsman-herdr-plugin, release
 模块: ""
 ---
 

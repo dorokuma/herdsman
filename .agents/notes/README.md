@@ -26,5 +26,6 @@
 
 1. **命名规范**：文件命名采用 `YYYYMMDD-slug.md`（如 `20260917-sqlite-wal-fingerprint.md`）。
 2. **模板引用**：请参考模板 [_template.md](_template.md) 编写。
-3. **不可变原则**：历史笔记原则上不改写；若被新决策取代，仅在旧笔记 frontmatter 中设置 `status: superseded` 与 `superseded_by`，并在正文头部添加指向新笔记的链接。
-4. **索引刷新**：添加或修改笔记后，运行 `scripts/notes-index.sh` 刷新本地索引 `INDEX.md`（该文件已加入 `.gitignore`，不提交到 git）。
+3. **frontmatter**：`status` 取 `active` | `superseded`；`模块:` 取 `observability` / `daemon` / `cli` / `config` / `db` / `herdr` / `shared` / `herdsman-pi` / `herdsman-herdr-plugin` / `release`（发布・版本流程），可选值与 [_template.md](_template.md) 的注释保持同步。
+4. **不可变原则**：历史笔记原则上不改写；若被新决策取代，仅在旧笔记 frontmatter 中设置 `status: superseded` 与 `superseded_by`，并在正文头部添加指向新笔记的链接。
+5. **索引刷新**：添加或修改笔记后，运行 `scripts/notes-index.sh` 刷新本地索引 `INDEX.md`（该文件已加入 `.gitignore`，不提交到 git）。

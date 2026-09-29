@@ -1,7 +1,9 @@
 set -e
 
-node_bin="$(mise where node)" || { echo "mise: cannot locate node" >&2; exit 1; }
-pnpm_dir="$(mise where pnpm)" || { echo "mise: cannot locate pnpm" >&2; exit 1; }
+command -v mise >/dev/null 2>&1 || { echo "mise: not found on PATH（提交门禁靠 mise 定位钉版 node/pnpm）" >&2; exit 1; }
+
+node_bin="$(mise where node)" || { echo "mise: cannot locate node（mise 在但取不到 node，未安装？跑 mise install）" >&2; exit 1; }
+pnpm_dir="$(mise where pnpm)" || { echo "mise: cannot locate pnpm（mise 在但取不到 pnpm，未安装？跑 mise install）" >&2; exit 1; }
 export PATH="$node_bin/bin:$pnpm_dir:$PATH"
 
 pnpm lint-staged
