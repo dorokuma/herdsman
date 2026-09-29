@@ -44,31 +44,68 @@ export function isDeliverableAgentEvent(
   ownerTerminalId: string,
 ): boolean {
   const failed = event.type === "agent.failed" || event.type === "agent.discarded";
+  const isRetainedInvalidated = event.status === "invalidated" && event.deliverable === 1;
+
+  // 1. 状态放行：允许 pending、delivered 以及关页保留的 invalidated 行
+  const statusAllowed =
+    event.status === "pending" || event.status === "delivered" || isRetainedInvalidated;
+  if (!statusAllowed) return false;
+
+  // 2. 基础范围过滤
+  if (
+    event.workspaceId !== scope.workspaceId ||
+    event.herdrSessionName !== scope.herdrSessionName ||
+    event.terminalId === null ||
+    event.terminalId === ownerTerminalId ||
+    event.type === "agent.status.changed" ||
+    (event.type === "agent.idle" && asRecord(event.payload).from !== "working")
+  ) {
+    return false;
+  }
+
+  // 3. 投递重试窗口守卫
+  if (
+    event.status !== "delivered" &&
+    event.nextAttemptAt !== null &&
+    event.nextAttemptAt !== undefined &&
+    event.nextAttemptAt > new Date()
+  ) {
+    return false;
+  }
+
+  // 4. 终端归属校验
+  if (event.status === "delivered" && event.deliveredToTerminalId !== ownerTerminalId) {
+    return false;
+  }
+
+  // 5. 核心：解耦对 live agent 表记录的依赖
+  // 当 pane 被关闭，retirePane 物理清除了 agents 表记录，此时 agent === undefined。
+  // 若该事件已被标记为保留作废态 (isRetainedInvalidated) 或 failed，直接从事件自身元数据验证有效性
+  if (failed || isRetainedInvalidated) {
+    const payload = asRecord(event.payload);
+    const agentKind = typeof payload.agent === "string" ? payload.agent : "pi";
+    if (
+      agentKind !== "pi" &&
+      (event.type === "agent.idle" || event.type === "agent.done") &&
+      !hasNonEmptyAssistantMessage(event.compactHistory)
+    ) {
+      return false;
+    }
+    return true;
+  }
+
+  // 6. 正常存活 pane 维持原有的严密代际与所属校验
+  if (agent === undefined) return false;
   return (
-    (event.status === "pending" || event.status === "delivered") &&
-    (event.status === "delivered" ||
-      event.nextAttemptAt === null ||
-      event.nextAttemptAt === undefined ||
-      event.nextAttemptAt <= new Date()) &&
-    (event.status === "pending" || event.deliveredToTerminalId === ownerTerminalId) &&
-    (failed || event.agentId !== null) &&
-    event.type !== "agent.status.changed" &&
-    !(event.type === "agent.idle" && asRecord(event.payload).from !== "working") &&
-    event.workspaceId === scope.workspaceId &&
-    event.herdrSessionName === scope.herdrSessionName &&
-    event.terminalId !== null &&
-    event.terminalId !== ownerTerminalId &&
-    (failed ||
-      (agent !== undefined &&
-        !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
-        !(
-          agent.agent !== "pi" &&
-          (event.type === "agent.idle" || event.type === "agent.done") &&
-          !hasNonEmptyAssistantMessage(event.compactHistory)
-        ) &&
-        agent.paneId === event.paneId &&
-        (event.paneGeneration === null || agent.paneGeneration === event.paneGeneration) &&
-        agent.workspaceId === scope.workspaceId))
+    !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
+    !(
+      agent.agent !== "pi" &&
+      (event.type === "agent.idle" || event.type === "agent.done") &&
+      !hasNonEmptyAssistantMessage(event.compactHistory)
+    ) &&
+    agent.paneId === event.paneId &&
+    (event.paneGeneration === null || agent.paneGeneration === event.paneGeneration) &&
+    agent.workspaceId === scope.workspaceId
   );
 }
 
@@ -190,19 +227,71 @@ export class AgentEventStore {
     paneGeneration?: string | null;
     invalidatedReason?: string;
   }): void {
+    this.#transaction(() => this.#invalidatePaneCore(input));
+  }
+
+  /**
+   * Direct invalidatePane without wrapping in a transaction.
+   *
+   * ONLY call this when the caller already holds an SQLite transaction
+   * (for example from AgentStore.replaceForSession). Calling this outside
+   * an explicit transaction will leave the two-step invalidation non-atomic
+   * with respect to other concurrent writers.
+   */
+  invalidatePaneDirect(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+    invalidatedReason?: string;
+  }): void {
+    this.#invalidatePaneCore(input);
+  }
+
+  #invalidatePaneCore(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+    invalidatedReason?: string;
+  }): void {
     const legacy = input.paneGeneration == null;
+    const now = this.#now();
+    const defaultReason =
+      input.invalidatedReason ?? (legacy ? "LEGACY_CLOSE_WITHOUT_GENERATION" : "PANE_CLOSED");
+    // 步骤 1：全量作废该 pane 当前所有活跃行，默认置为 deliverable = 0
+    // 当指定了明确 paneGeneration 时，只作废该代及更早代（<=）的遗留行，避免误杀新代事件。
+    const legacyOrMatched = legacy
+      ? "1 = 1"
+      : "(pane_generation = ? or pane_generation is null or pane_generation < ?)";
+    const legacyOrMatchedParams = legacy
+      ? []
+      : [input.paneGeneration ?? null, input.paneGeneration ?? null];
     this.#sqlite
       .prepare(
-        `update agent_events set deliverable = 0, status = 'invalidated', invalidated_reason = ?
-         where herdr_session_name = ? and pane_id = ?
-           and status not in ('acked', 'invalidated', 'failed')
-           and (${legacy ? "1 = 1" : "pane_generation = ?"})`,
+        `update agent_events
+             set deliverable = 0, status = 'invalidated', invalidated_reason = ?
+           where herdr_session_name = ? and pane_id = ? and status not in ('acked', 'invalidated', 'failed')
+             and ${legacyOrMatched}`,
+      )
+      .run(defaultReason, input.herdrSessionName, input.paneId, ...legacyOrMatchedParams);
+    // 步骤 2：对满足保留条件的完成类事件恢复 deliverable = 1
+    const genCondition = legacy ? "1 = 1" : "pane_generation = ?";
+    const genParams = legacy ? [] : [input.paneGeneration ?? null];
+    this.#sqlite
+      .prepare(
+        `update agent_events
+              set deliverable = 1, invalidated_reason = 'RETAINED_OUTCOME_PANE_CLOSED'
+            where herdr_session_name = ? and pane_id = ? and status = 'invalidated' and deliverable = 0 and invalidated_reason = ?
+              and (${genCondition})
+              and ((type = 'agent.done' and json_extract(payload_json, '$.from') = 'working')
+                or (type = 'agent.idle' and json_extract(payload_json, '$.from') = 'working'))
+              and created_at >= ?`,
       )
       .run(
-        input.invalidatedReason ?? (legacy ? "LEGACY_CLOSE_WITHOUT_GENERATION" : "PANE_CLOSED"),
         input.herdrSessionName,
         input.paneId,
-        ...(legacy ? [] : [input.paneGeneration ?? null]),
+        defaultReason,
+        ...genParams,
+        now - REDELIVERY_FRESHNESS_MS,
       );
   }
 
@@ -213,6 +302,20 @@ export class AgentEventStore {
       )
       .all(afterId, limit) as AgentEventRow[];
     return rows.map(mapAgentEvent);
+  }
+
+  markRetainedInvalidated(id: number): boolean {
+    return (
+      Number(
+        this.#sqlite
+          .prepare(
+            `update agent_events
+                set status = 'invalidated', deliverable = 1, invalidated_reason = 'RETAINED_OUTCOME_PANE_CLOSED'
+              where id = ? and status in ('pending', 'delivered')`,
+          )
+          .run(id).changes,
+      ) > 0
+    );
   }
 
   deleteReconcileCandidate(id: number): boolean {
@@ -236,7 +339,7 @@ export class AgentEventStore {
       this.#sqlite
         .prepare(
           `delete from agent_events
-           where status = 'invalidated' and coalesce(last_attempt_at, created_at) < ?`,
+           where status = 'invalidated' and deliverable = 0 and coalesce(last_attempt_at, created_at) < ?`,
         )
         .run(Date.now() - ageMs).changes,
     );
@@ -250,7 +353,9 @@ export class AgentEventStore {
   deleteSettledOlderThan(ageMs: number): number {
     return Number(
       this.#sqlite
-        .prepare(`delete from agent_events where status in ('acked', 'failed') and created_at < ?`)
+        .prepare(
+          `delete from agent_events where (status in ('acked', 'failed') or (status = 'invalidated' and deliverable = 1)) and created_at < ?`,
+        )
         .run(Date.now() - ageMs).changes,
     );
   }
@@ -352,7 +457,7 @@ export class AgentEventStore {
   ): AgentEventRecord[] {
     const clauses = [
       "id > ?",
-      "((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and id > ? and last_attempt_at >= ?))",
+      "((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and id > ? and last_attempt_at >= ?) or (status = 'invalidated' and deliverable = 1 and (next_attempt_at is null or next_attempt_at <= ?)))",
     ];
     const params: Array<number | string | null> = [
       input.afterEventId ?? 0,
@@ -360,6 +465,7 @@ export class AgentEventStore {
       input.ownerTerminalId ?? null,
       input.afterEventId ?? 0,
       this.#now() - REDELIVERY_FRESHNESS_MS,
+      this.#now(),
     ];
     if (input.herdrSessionName) {
       clauses.push("herdr_session_name = ?");
@@ -384,14 +490,21 @@ export class AgentEventStore {
     getAgent?: (agentId: string) => AgentIndexRecord | undefined;
   }): AgentEventRecord | undefined {
     const scope = { herdrSessionName: input.herdrSessionName, workspaceId: input.workspaceId };
+    // Retained rows (status='invalidated' and deliverable=1) outlive the live
+    // `agents` row because pane close physically clears it, so they must never
+    // be filtered by the existence guard. Every other row keeps the original
+    // "the agent is still indexed" check.
     const agentFilter = input.getAgent
       ? ""
-      : `and exists (
-             select 1 from agents
-             where agents.id = agent_events.agent_id
-               and agents.herdr_session_name = agent_events.herdr_session_name
-               and agents.workspace_id = agent_events.workspace_id
-               and agents.pane_id = agent_events.pane_id
+      : `and (
+             (status = 'invalidated' and deliverable = 1)
+             or exists (
+               select 1 from agents
+               where agents.id = agent_events.agent_id
+                 and agents.herdr_session_name = agent_events.herdr_session_name
+                 and agents.workspace_id = agent_events.workspace_id
+                 and agents.pane_id = agent_events.pane_id
+             )
            )`;
     let afterEventId = input.afterEventId;
     for (let page = 0; page < 50; page += 1) {
@@ -400,27 +513,35 @@ export class AgentEventStore {
         this.#now(),
         input.ownerTerminalId,
         this.#now() - REDELIVERY_FRESHNESS_MS,
+        this.#now(),
         input.herdrSessionName,
         input.workspaceId,
         input.ownerTerminalId,
       ];
-      const rows = this.#sqlite
-        .prepare(
-          `select * from agent_events
-           where id > ? and ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and last_attempt_at >= ?)) and herdr_session_name = ? and workspace_id = ?
-             and terminal_id is not null and terminal_id != ? and agent_id is not null
+      const sql = `select * from agent_events
+           where id > ? and ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and last_attempt_at >= ?) or (status = 'invalidated' and deliverable = 1 and (next_attempt_at is null or next_attempt_at <= ?))) and herdr_session_name = ? and workspace_id = ?
+             and terminal_id is not null and terminal_id != ?
+             and (agent_id is not null or (status = 'invalidated' and deliverable = 1))
              ${agentFilter}
-           order by id asc limit 1000`,
-        )
-        .all(...params) as AgentEventRow[];
+           order by id asc limit 1000`;
+      const rows = this.#sqlite.prepare(sql).all(...params) as AgentEventRow[];
       if (rows.length === 0) return undefined;
       for (const row of rows) {
         const event = mapAgentEvent(row);
         const agentId = event.agentId;
+        // Pane close physically removes the agents row and the ON DELETE SET NULL
+        // foreign key then clears agent_id on the retained event, so retained rows
+        // are evaluated from their own metadata instead of the live agent record.
+        const retained = event.status === "invalidated" && event.deliverable === 1;
+        if (agentId === null && !retained) continue;
         if (
-          agentId !== null &&
-          (!input.getAgent ||
-            isDeliverableAgentEvent(event, input.getAgent(agentId), scope, input.ownerTerminalId))
+          !input.getAgent ||
+          isDeliverableAgentEvent(
+            event,
+            agentId === null ? undefined : input.getAgent(agentId),
+            scope,
+            input.ownerTerminalId,
+          )
         )
           return event;
       }
@@ -434,18 +555,18 @@ export class AgentEventStore {
     return this.#transaction(() => {
       const now = this.#now();
       const idClause = ids && ids.length > 0 ? `and id in (${ids.map(() => "?").join(",")})` : "";
-      const params: Array<number | string> = [now, terminalId, now - REDELIVERY_FRESHNESS_MS];
+      const params: Array<number | string> = [now, terminalId, now - REDELIVERY_FRESHNESS_MS, now];
       if (ids && ids.length > 0) params.push(...ids);
       params.push(limit);
       const rows = this.#sqlite
         .prepare(
-          `select * from agent_events where ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and last_attempt_at >= ?)) ${idClause} order by id asc limit ?`,
+          `select * from agent_events where ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and last_attempt_at >= ?) or (status = 'invalidated' and deliverable = 1 and (next_attempt_at is null or next_attempt_at <= ?))) ${idClause} order by id asc limit ?`,
         )
         .all(...params) as AgentEventRow[];
       for (const row of rows) {
         this.#sqlite
           .prepare(
-            `update agent_events set status = 'delivered', deliverable = 1, delivery_attempts = ?, last_attempt_at = ?, delivered_to_terminal_id = ? where id = ? and status = 'pending'`,
+            `update agent_events set status = 'delivered', deliverable = 1, delivery_attempts = ?, last_attempt_at = ?, delivered_to_terminal_id = ? where id = ? and (status = 'pending' or (status = 'invalidated' and deliverable = 1))`,
           )
           .run(row.delivery_attempts + 1, now, terminalId, row.id);
       }
@@ -538,14 +659,14 @@ export class AgentEventStore {
       this.#sqlite
         .prepare(
           `update agent_events set status = 'acked', deliverable = 0
-           where herdr_session_name = ? and workspace_id = ? and id <= ? and status in ('pending', 'delivered')`,
+           where herdr_session_name = ? and workspace_id = ? and id <= ? and (status in ('pending', 'delivered') or (status = 'invalidated' and deliverable = 1))`,
         )
         .run(scope.herdrSessionName, scope.workspaceId, id);
       return;
     }
     this.#sqlite
       .prepare(
-        `update agent_events set status = 'acked', deliverable = 0 where id = ? and status in ('pending', 'delivered')`,
+        `update agent_events set status = 'acked', deliverable = 0 where id = ? and (status in ('pending', 'delivered') or (status = 'invalidated' and deliverable = 1))`,
       )
       .run(id);
   }
@@ -597,7 +718,7 @@ export function mapAgentEvent(row: AgentEventRow): AgentEventRecord {
     id: row.id,
     paneId: row.pane_id,
     paneGeneration: row.pane_generation,
-    deliverable: row.status === "pending" || row.status === "delivered" ? 1 : 0,
+    deliverable: row.deliverable,
     status: row.status,
     deliveryAttempts: row.delivery_attempts,
     lastAttemptAt: row.last_attempt_at === null ? null : new Date(row.last_attempt_at),

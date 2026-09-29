@@ -29,13 +29,18 @@ function setup() {
     agents: [{ agent: "codex", pane_id: "wA:live", terminal_id: "term-live", workspace_id: "wA" }],
   })[0];
   if (!agent) throw new Error("Expected indexed agent");
-  const append = (input: { paneId: string; terminalId: string; generation?: string }) =>
+  const append = (input: {
+    paneId: string;
+    terminalId: string;
+    generation?: string;
+    payload?: Record<string, unknown>;
+  }) =>
     harness.agentEvents.append({
       agentId: agent.id,
       herdrSessionName: "default",
       paneId: input.paneId,
       ...(input.generation === undefined ? {} : { paneGeneration: input.generation }),
-      payload: {},
+      payload: input.payload ?? {},
       terminalId: input.terminalId,
       type: "agent.done",
       workspaceId: "wA",
@@ -188,16 +193,16 @@ describe("startup reconcile dedicated coverage", () => {
     const staleCutoff = Date.now() - INVALIDATED_GRACE_MS - 1_000;
     harness.sqlite
       .prepare(
-        "update agent_events set status = 'invalidated', last_attempt_at = null, created_at = ? where id = ?",
+        "update agent_events set status = 'invalidated', deliverable = 0, last_attempt_at = null, created_at = ? where id = ?",
       )
       .run(staleCutoff, staleCreated.id);
     harness.sqlite
       .prepare(
-        "update agent_events set status = 'invalidated', last_attempt_at = ?, created_at = ? where id = ?",
+        "update agent_events set status = 'invalidated', deliverable = 0, last_attempt_at = ?, created_at = ? where id = ?",
       )
       .run(staleCutoff, Date.now(), staleDelivered.id);
     harness.sqlite
-      .prepare("update agent_events set status = 'invalidated' where id = ?")
+      .prepare("update agent_events set status = 'invalidated', deliverable = 1 where id = ?")
       .run(fresh.id);
     const result = await reconciler(harness, []).reconcile();
     expect(result).toEqual(reconcileResult({ invalidated: 2, purged: 0, released: 0 }));
@@ -578,5 +583,76 @@ describe("startup reconcile dedicated coverage", () => {
       }).changed,
     ).toBe(true);
     expect(harness.agentOrchestratorScopes.get(scope)?.owner).toBeNull();
+  });
+
+  test("negative cases: cross-generation mismatch discarded, non-outcome invalidated, settled TTL purged", async () => {
+    const { harness, append } = setup();
+    const _service = new AgentEventReconciler({
+      agentHistoryCache: harness.agentHistoryCache,
+      events: harness.agentEvents,
+      scopes: harness.agentOrchestratorScopes,
+      sessionList: async () => [session],
+      clientFactory: () =>
+        ({ close: vi.fn(), sessionSnapshot: async () => ({ snapshot: { panes: [] } }) }) as never,
+    });
+
+    // 1. Cross-generation mismatch: close with gen-2, but event carries gen-1.
+    const crossGen = append({ paneId: "wA:cross", terminalId: "term-cross", generation: "gen-1" });
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: "default",
+      paneId: "wA:cross",
+      paneGeneration: "gen-2",
+    });
+    expect(harness.agentEvents.get(crossGen.id)).toMatchObject({
+      status: "invalidated",
+      deliverable: 0,
+      invalidatedReason: "PANE_CLOSED",
+    });
+
+    // 2. Non-outcome event (agent.status.changed) is invalidated on pane close.
+    const nonOutcome = harness.agentEvents.append({
+      agentId: harness.agents.listForHerdrSession("default")[0]?.id ?? "",
+      herdrSessionName: "default",
+      paneId: "wA:live",
+      payload: {},
+      terminalId: "term-live",
+      type: "agent.status.changed",
+      workspaceId: "wA",
+    });
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: "default",
+      paneId: "wA:live",
+      paneGeneration: null,
+    });
+    expect(harness.agentEvents.get(nonOutcome.id)).toMatchObject({
+      status: "invalidated",
+      deliverable: 0,
+    });
+
+    // 3. Retained invalidated rows older than 7 days are purged by deleteSettledOlderThan.
+    const retained = append({
+      paneId: "wA:retained",
+      terminalId: "term-retained",
+      payload: { from: "working" },
+    });
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: "default",
+      paneId: "wA:retained",
+      paneGeneration: null,
+    });
+    const retainedRow = harness.agentEvents.get(retained.id);
+    expect(retainedRow.status).toBe("invalidated");
+    expect(retainedRow.deliverable).toBe(1);
+
+    // Fast-forward created_at beyond 7 days and run settled TTL cleanup.
+    const sevenDaysMs = 7 * 24 * 60 * 60 * 1000;
+    harness.sqlite
+      .prepare("update agent_events set created_at = ? where id = ?")
+      .run(Date.now() - sevenDaysMs - 1000, retained.id);
+    harness.agentEvents.deleteSettledOlderThan(sevenDaysMs);
+    const deleted = harness.sqlite
+      .prepare("select count(*) as count from agent_events where id = ?")
+      .get(retained.id) as { count: number };
+    expect(deleted.count).toBe(0);
   });
 });

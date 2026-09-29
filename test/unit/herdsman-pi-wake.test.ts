@@ -318,4 +318,55 @@ describe("Pi agent wake projection", () => {
       suppressedUpstreamErrorEventIds: [49],
     });
   });
+
+  test("suppresses a fallbackOutcome failed event for a pane already completed in the batch", () => {
+    // 合同 §5 补齐断言 2：先有一个已完成成功态的事件（agent.done，使
+    // completedPaneIds.has(paneId) 成立），随后送入 fallbackOutcome: true 的
+    // agent.failed，fallback 必须被严格压制（outcomes 长度为 0，零噪音唤醒）。
+    // 该完成态以“已呈现、不再携带唤醒目标”的证据形式留在批次里，因此本批次唯一
+    // 可能的 outcome 就是 fallback 本身。
+    const presentedCompletion = event(
+      60,
+      "agent.done",
+      { from: "working", to: "done" },
+      { terminalId: null },
+    );
+    const fallbackFailure = event(61, "agent.failed", {
+      fallbackOutcome: true,
+      from: "working",
+      name: "worker",
+      reason: "degraded",
+      to: "failed",
+    });
+    const projection = projectAgentOutcomes([presentedCompletion, fallbackFailure]);
+    expect(projection.outcomes).toHaveLength(0);
+    expect(projection.rawEvents.map(({ id }) => id)).toEqual([60, 61]);
+
+    // 对照 1：没有同 pane 完成态时，同一个 fallback 事件必须生成 failed outcome。
+    expect(projectAgentOutcomes([fallbackFailure]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 61, kind: "failed", reason: "degraded" }),
+    ]);
+
+    // 对照 2：完成态属于另一个 pane 时，fallback 不得被压制（两个 outcome 都产生）。
+    expect(
+      projectAgentOutcomes([
+        event(62, "agent.done", { from: "working", to: "done" }, { paneId: "wB:p9" }),
+        fallbackFailure,
+      ]).outcomes.map(({ eventId }) => eventId),
+    ).toEqual([61, 62]);
+
+    // 对照 3（生产形态）：同批次内可唤醒的完成事件本身生成 completed outcome，
+    // fallback 仍被压制，因此客户端不会出现“完成 + 降级失败”的双唤醒。
+    expect(
+      projectAgentOutcomes([
+        event(63, "agent.done", { from: "working", to: "done" }),
+        event(64, "agent.failed", {
+          fallbackOutcome: true,
+          from: "working",
+          reason: "degraded",
+          to: "failed",
+        }),
+      ]).outcomes.map(({ eventId }) => eventId),
+    ).toEqual([63]);
+  });
 });

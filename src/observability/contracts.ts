@@ -238,6 +238,15 @@ export type AgentQueryScope = {
   workspaceId?: string;
 };
 
+export const VALID_AGENT_EVENT_TYPES = new Set<string>([
+  "agent.status.changed",
+  "agent.idle",
+  "agent.done",
+  "agent.blocked",
+  "agent.failed",
+  "agent.discarded",
+]);
+
 export function parseAgentStatus(value: unknown): AgentStatus {
   return value === "blocked" ||
     value === "done" ||

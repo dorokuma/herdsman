@@ -43,6 +43,9 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
     // Backward compatibility filter for legacy pre-upgrade failed rows with PLAN_WAITING_HISTORY
     // and degraded retries that exceeded the bounded retry budget.
     if (reason === "PLAN_WAITING_HISTORY" || reason === "degraded") {
+      if (payload.fallbackOutcome === true) {
+        return "failed";
+      }
       return undefined;
     }
     return "failed";
@@ -65,11 +68,29 @@ function project(
   const rawEvents = [...uniqueEvents.values()].sort((left, right) => left.id - right.id);
   const outcomes: AgentOutcome[] = [];
   const suppressedUpstreamErrorEventIds: number[] = [];
+
+  // 维护单次扫描中已具备成功完成态的 pane 集合
+  const completedPaneIds = new Set<string>();
+  for (const event of rawEvents) {
+    if (
+      event.paneId &&
+      (event.type === "agent.done" || (event.type === "agent.idle" && asRecord(event.payload).from === "working"))
+    ) {
+      completedPaneIds.add(event.paneId);
+    }
+  }
+
   for (const event of rawEvents) {
     const kind = outcomeKind(event);
     if (!kind || !event.terminalId) continue;
     const payload = asRecord(event.payload);
     const paneId = event.paneId ?? null;
+
+    // 核心噪音门禁：若当前事件为 fallbackOutcome，但该 pane 存在任意成功的完成事件，直接压制
+    if (payload.fallbackOutcome === true && event.paneId && completedPaneIds.has(event.paneId)) {
+      continue; // 压制噪音，不产生 outcome
+    }
+
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
     const reason = kind === "failed" ? normalizeExcerpt(payload.reason) : undefined;
     // Upstream model errors are transient provider failures, not agent results:

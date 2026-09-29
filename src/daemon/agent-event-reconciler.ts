@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import type { AgentEventStore } from "@/db/agent-events.js";
+import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
 import type { StatusEventPlanStore } from "@/db/status-event-plans.js";
@@ -127,8 +128,34 @@ export class AgentEventReconciler {
         cursor = event.id;
         const panes = live.get(event.herdrSessionName);
         if (!panes) continue;
-        const present = panes.some((pane) => paneMatchesEvent(pane, event));
-        if (!present && this.#events.deleteReconcileCandidate(event.id)) invalidated += 1;
+        // 存活比对：代际匹配的存活 pane 继续正常保留
+        const matchingPane = panes.find((pane) => paneMatchesEvent(pane, event));
+        if (matchingPane) continue;
+        // 执行点补完（判别 1）：快照中存在同名 paneId 但 paneMatchesEvent 判定不兼容（属 E3 跨代冲突）
+        const samePaneExists = panes.some((pane) => pane.paneId === event.paneId);
+        if (samePaneExists) {
+          if (this.#events.deleteReconcileCandidate(event.id)) {
+            invalidated += 1;
+          }
+          continue;
+        }
+        // 执行点补完（判别 2）：paneId 在快照中完全缺失，评估保留资格与时限
+        const payload = (event.payload ?? {}) as { from?: string };
+        const now = Date.now();
+        const eventAgeMs = now - event.createdAt.getTime();
+        const isFresh = eventAgeMs <= REDELIVERY_FRESHNESS_MS; // E6 判定：300s 关页时限
+        const isRetainable =
+          event.deliverable === 1 &&
+          isFresh &&
+          ((event.type === "agent.done" && payload.from === "working") ||
+            (event.type === "agent.idle" && payload.from === "working"));
+        if (isRetainable) {
+          // 保留交付性，转移为保留作废态
+          this.#events.markRetainedInvalidated(event.id);
+          invalidated += 1;
+        } else if (this.#events.deleteReconcileCandidate(event.id)) {
+          invalidated += 1;
+        }
       }
     }
     invalidated += this.#events.deleteInvalidatedOlderThan(INVALIDATED_GRACE_MS);

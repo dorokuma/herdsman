@@ -21,6 +21,7 @@ import {
   type AgentStatus,
   type CompactAgentHistory,
   parseAgentStatus,
+  VALID_AGENT_EVENT_TYPES,
 } from "@/observability/contracts.js";
 import type { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { TURN_SIGNAL_WAIT_MS } from "@/observability/turn-completion.js";
@@ -152,6 +153,7 @@ export class AgentIndexService {
   readonly #turnCompletions: TurnCompletionRegistry | undefined;
   readonly #waitingHistoryTimers = new Map<number, unknown>();
   readonly #now: () => number;
+  readonly #onAgentEvent?: (event: AgentEventRecord) => void;
 
   constructor(options: {
     clearRetry?: (timer: unknown) => void;
@@ -165,6 +167,7 @@ export class AgentIndexService {
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
     stores: AgentIndexServiceStores;
     turnCompletions?: TurnCompletionRegistry;
+    onAgentEvent?: (event: AgentEventRecord) => void;
   }) {
     this.#clearRetry = options.clearRetry ?? ((timer) => clearTimeout(timer as NodeJS.Timeout));
     this.#clientFactory = options.clientFactory ?? ((input) => new HerdrSocketClient(input));
@@ -173,6 +176,7 @@ export class AgentIndexService {
     this.#now = options.now ?? (() => Date.now());
     this.#stores = options.stores;
     this.#turnCompletions = options.turnCompletions;
+    this.#onAgentEvent = options.onAgentEvent ?? (() => {});
     if (options.context) {
       this.#context = options.context;
     } else {
@@ -342,7 +346,12 @@ export class AgentIndexService {
         agentId: plan.agent.id,
         error: err,
       });
-      const updated = store.markRetry(planId, new PlanWaitingHistoryError());
+      const currentPlan = store.get(planId);
+      const retryError =
+        currentPlan.lastError === "degraded"
+          ? new Error("degraded")
+          : new PlanWaitingHistoryError();
+      const updated = store.markRetry(planId, retryError);
       if (!updated) {
         this.#clearWaitingTimer(planId);
         return;
@@ -378,7 +387,7 @@ export class AgentIndexService {
           to: plan.to,
           herdrSessionName: plan.agent.herdrSessionName,
         });
-        this.#appendPlanFailedEvent({
+        const failedEvent = this.#appendPlanFailedEvent({
           agent: plan.agent,
           attempts: updated.attempts,
           compactHistory: plan.compactHistory,
@@ -387,11 +396,17 @@ export class AgentIndexService {
           reason: updated.lastError,
           to: plan.to,
         });
+        if (VALID_AGENT_EVENT_TYPES.has(failedEvent.type)) {
+          this.#onAgentEvent?.(failedEvent);
+        }
       }
       return;
     }
 
-    await this.#runPlanRow(current, retryPlan);
+    const event = await this.#runPlanRow(current, retryPlan);
+    if (event && VALID_AGENT_EVENT_TYPES.has(event.type)) {
+      this.#onAgentEvent?.(event);
+    }
   }
 
   async executeStatusEventPlan(plan: StatusEventPlan): Promise<AgentEventRecord | undefined> {
@@ -419,7 +434,16 @@ export class AgentIndexService {
             to: plan.to,
             ...(plan.compactHistory ? { compactHistory: plan.compactHistory } : {}),
           });
-    return this.#enqueueAgentPlan(plan.agent.id, () => this.#runPlanRow(inserted, plan));
+    const result = await this.#enqueueAgentPlan(plan.agent.id, () =>
+      this.#runPlanRow(inserted, plan),
+    );
+    // Publication stays with the caller: every caller forwards this return value
+    // (`HerdrSessionWatchManager#submitPlan` -> `publishAgentEvent`, or the
+    // non-fast refresh/handle wrappers putting it into `events`). Pushing here as
+    // well would write the same `agent.event` twice on the socket, breaking the
+    // "exactly once" delivery contract. The retry-exhausted failed branch in
+    // `#retryWaitingPlanRow` keeps its own push because no caller sees its result.
+    return result;
   }
 
   async drainPendingPlans(): Promise<void> {
@@ -613,7 +637,9 @@ export class AgentIndexService {
       });
       activeCompact = refreshed.snapshot.compactHistory;
     } catch (err) {
-      const updated = store.markRetry(current.id, new PlanWaitingHistoryError());
+      const retryError =
+        current.lastError === "degraded" ? new Error("degraded") : new PlanWaitingHistoryError();
+      const updated = store.markRetry(current.id, retryError);
       if (!updated) {
         this.#clearWaitingTimer(current.id);
         return;
@@ -658,7 +684,7 @@ export class AgentIndexService {
           to: current.toStatus,
           reason: updated.lastError,
         });
-        this.#appendPlanFailedEvent({
+        const failedEvent = this.#appendPlanFailedEvent({
           agent,
           attempts: updated.attempts,
           compactHistory: current.compactHistory,
@@ -667,6 +693,9 @@ export class AgentIndexService {
           reason: updated.lastError,
           to: current.toStatus,
         });
+        if (VALID_AGENT_EVENT_TYPES.has(failedEvent.type)) {
+          this.#onAgentEvent?.(failedEvent);
+        }
       }
       return;
     }
@@ -678,7 +707,10 @@ export class AgentIndexService {
       to: current.toStatus,
       ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
     };
-    await this.#runPlanRow(current, plan);
+    const event = await this.#runPlanRow(current, plan);
+    if (event && VALID_AGENT_EVENT_TYPES.has(event.type)) {
+      this.#onAgentEvent?.(event);
+    }
   }
 
   #enqueueAgentPlan<T>(agentId: string, operation: () => Promise<T>): Promise<T> {
@@ -740,7 +772,13 @@ export class AgentIndexService {
           agentId: plan.agent.id,
           error: err,
         });
-        const updated = store.markRetry(row.id, new PlanWaitingHistoryError());
+        // Keep the degraded reason when the plan was already degraded by an
+        // earlier round: markRetry decides discarded (silent) vs failed (wakes)
+        // from this message, so passing PLAN_WAITING_HISTORY here would let a
+        // degraded plan exhaust silently.
+        const retryError =
+          row.lastError === "degraded" ? new Error("degraded") : new PlanWaitingHistoryError();
+        const updated = store.markRetry(row.id, retryError);
         if (!updated) {
           this.#clearWaitingTimer(row.id);
           return undefined;
@@ -861,7 +899,8 @@ export class AgentIndexService {
       return event;
     } catch (error) {
       if (error instanceof PlanWaitingHistoryError) {
-        const updated = store.markRetry(row.id, error);
+        const retryError = row.lastError === "degraded" ? new Error("degraded") : error;
+        const updated = store.markRetry(row.id, retryError);
         if (!updated) {
           this.#clearWaitingTimer(row.id);
           return undefined;
@@ -926,7 +965,8 @@ export class AgentIndexService {
         return undefined;
       }
       this.#clearWaitingTimer(row.id);
-      const updated = store.markRetry(row.id, error);
+      const retryError = row.lastError === "degraded" ? new Error("degraded") : error;
+      const updated = store.markRetry(row.id, retryError);
       if (!updated) {
         return undefined;
       }
@@ -1993,6 +2033,7 @@ export class AgentIndexService {
     agent: AgentIndexRecord;
     attempts: number;
     compactHistory: CompactAgentHistory | null | undefined;
+    fallbackOutcome?: boolean;
     from: AgentStatus;
     planId: number;
     reason: string | null;
@@ -2008,6 +2049,9 @@ export class AgentIndexService {
       );
       if (stitched) agent = stitched;
     }
+    const fallbackOutcome =
+      input.fallbackOutcome ??
+      ((input.to === "done" || input.to === "blocked") && input.reason === "degraded");
     return this.#appendAndAckSelfEvent({
       agentId: agent.id,
       compactHistory: input.compactHistory ?? null,
@@ -2018,6 +2062,7 @@ export class AgentIndexService {
       payload: {
         agent: agent.agent,
         attempts: input.attempts,
+        fallbackOutcome,
         from: input.from,
         herdrSessionName: agent.herdrSessionName,
         name: agent.name,

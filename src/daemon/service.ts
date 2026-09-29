@@ -24,6 +24,7 @@ import { createHerdrSessionListRunner, type HerdrSessionListRunner } from "@/her
 import { AgentContextService } from "@/observability/agent-context-service.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
+import type { AgentEventRecord } from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { AgentEventReconciler } from "./agent-event-reconciler.js";
 import { HerdrSessionWatchManager } from "./herdr-session-watch-manager.js";
@@ -154,8 +155,11 @@ export async function runObservabilityDaemonService(
     scopes: agentOrchestratorScopes,
   });
   const turnCompletions = new TurnCompletionRegistry();
+  let publishEvent = (_event: AgentEventRecord) => {};
+
   const index = new AgentIndexService({
     context: daemonServices.context,
+    onAgentEvent: (event) => publishEvent(event), // 闭包注入
     stores: {
       agentEvents,
       agentHistoryCache,
@@ -193,6 +197,7 @@ export async function runObservabilityDaemonService(
     turnCompletions,
   });
   connectedTerminal = (input) => server.isTerminalConnected(input);
+  publishEvent = (event) => server.publishAgentEvent(event); // 接通推送
   const watchManager = new HerdrSessionWatchManager({
     agents,
     herdrSessions,
