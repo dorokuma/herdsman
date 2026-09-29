@@ -519,6 +519,83 @@ describe("agent event delivery lifecycle", () => {
     ).toMatchObject({ id: pending.id });
   });
 
+  test("nextDeliverableAfter returns a retained row after the agents record is physically removed", () => {
+    const harness = prepareHarness();
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("Expected indexed agent");
+
+    // Non-retainable process evidence on the same pane: it must stay filtered
+    // out once the agents row is gone (the original existence guard).
+    const nonOutcome = harness.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      paneId: agent.paneId,
+      payload: { from: "working", to: "done" },
+      terminalId: "term-agent-2",
+      type: "agent.status.changed",
+      workspaceId: "wA",
+    });
+    // Fresh completion on the same pane: pane close retains it as a deliverable
+    // invalidated row so an idle orchestrator can still pick it up.
+    const retained = harness.agentEvents.append({
+      agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "done text", timestamp: null },
+      },
+      herdrSessionName: "default",
+      paneId: agent.paneId,
+      payload: { from: "working" },
+      terminalId: agent.terminalId,
+      type: "agent.done",
+      workspaceId: "wA",
+    });
+
+    // Pane close without generation + physical removal of the agents record.
+    harness.agents.replaceForSession({ herdrSessionName: "default", agents: [] });
+    expect(harness.sqlite.prepare("select count(*) as count from agents").get()).toEqual({
+      count: 0,
+    });
+    expect(
+      harness.sqlite
+        .prepare("select status, deliverable from agent_events where id = ?")
+        .get(nonOutcome.id),
+    ).toEqual({ status: "invalidated", deliverable: 0 });
+    expect(
+      harness.sqlite
+        .prepare("select status, deliverable from agent_events where id = ?")
+        .get(retained.id),
+    ).toEqual({ status: "invalidated", deliverable: 1 });
+    // Pane close physically deletes the agents row and the ON DELETE SET NULL
+    // foreign key then clears agent_id: this is the gate the regression covers.
+    expect(
+      harness.sqlite.prepare("select agent_id from agent_events where id = ?").get(retained.id),
+    ).toEqual({ agent_id: null });
+
+    // Without getAgent the SQL must still let the retained row through while
+    // keeping the live-agent existence guard for every other row.
+    const next = harness.agentEvents.nextDeliverableAfter({
+      afterEventId: 0,
+      herdrSessionName: "default",
+      ownerTerminalId: "term-owner",
+      workspaceId: "wA",
+    });
+    expect(next).toMatchObject({ id: retained.id, status: "invalidated", deliverable: 1 });
+
+    // Passing getAgent is the other supported shape: an already-removed agent
+    // must not block the retained row either.
+    expect(
+      harness.agentEvents.nextDeliverableAfter({
+        afterEventId: 0,
+        herdrSessionName: "default",
+        ownerTerminalId: "term-owner",
+        workspaceId: "wA",
+        getAgent: () => undefined,
+      }),
+    ).toMatchObject({ id: retained.id });
+    harness.sqlite.close();
+  });
+
   test("deleteInvalidatedOlderThan keeps fresh rows and ages from last_attempt_at", () => {
     const harness = prepareHarness();
     const staleCreated = appendEvent(harness, "term-stale-created");
@@ -529,16 +606,16 @@ describe("agent event delivery lifecycle", () => {
     const staleCutoff = Date.now() - graceMs - 1_000;
     harness.sqlite
       .prepare(
-        "update agent_events set status = 'invalidated', last_attempt_at = null, created_at = ? where id = ?",
+        "update agent_events set status = 'invalidated', deliverable = 0, last_attempt_at = null, created_at = ? where id = ?",
       )
       .run(staleCutoff, staleCreated.id);
     harness.sqlite
       .prepare(
-        "update agent_events set status = 'invalidated', last_attempt_at = ?, created_at = ? where id = ?",
+        "update agent_events set status = 'invalidated', deliverable = 0, last_attempt_at = ?, created_at = ? where id = ?",
       )
       .run(staleCutoff, Date.now(), staleDelivered.id);
     harness.sqlite
-      .prepare("update agent_events set status = 'invalidated' where id = ?")
+      .prepare("update agent_events set status = 'invalidated', deliverable = 1 where id = ?")
       .run(fresh.id);
     expect(harness.agentEvents.deleteInvalidatedOlderThan(graceMs)).toBe(2);
     expect(harness.sqlite.prepare("select id, status from agent_events order by id").all()).toEqual(
@@ -547,6 +624,50 @@ describe("agent event delivery lifecycle", () => {
         { id: pending.id, status: "pending" },
       ],
     );
+  });
+
+  test("delayed wake survives pane.closed without generation and wakes orchestrator upon idle", async () => {
+    const harness = prepareHarness();
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("Expected indexed agent");
+    const event = harness.agentEvents.append({
+      agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "done text", timestamp: null },
+      },
+      herdrSessionName: "default",
+      paneId: agent.paneId,
+      payload: { from: "working" },
+      terminalId: agent.terminalId,
+      type: "agent.done",
+      workspaceId: "wA",
+    });
+
+    // Simulate legacy close without generation.
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: "default",
+      paneId: agent.paneId,
+      paneGeneration: null,
+      invalidatedReason: "LEGACY_CLOSE_WITHOUT_GENERATION",
+    });
+
+    const row = harness.sqlite
+      .prepare("select status, deliverable from agent_events where id = ?")
+      .get(event.id) as { status: string; deliverable: number };
+    expect(row).toEqual({ status: "invalidated", deliverable: 1 });
+
+    // Orchestrator idle settle should still deliver the retained event.
+    const delivered = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wA",
+      afterEventId: 0,
+      ownerTerminalId: agent.terminalId ?? "term-other",
+    });
+    expect(
+      delivered.some((e) => e.id === event.id && e.status === "invalidated" && e.deliverable === 1),
+    ).toBe(true);
+    harness.sqlite.close();
   });
 });
 

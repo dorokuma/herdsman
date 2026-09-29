@@ -179,7 +179,7 @@ export class AgentStore {
         .filter((id) => !retainedIds.includes(id));
       for (const id of removedIds) this.#terminalTitleById.delete(id);
       for (const agent of existing.filter((candidate) => removedIds.includes(candidate.id))) {
-        this.#agentEvents.invalidatePane({
+        this.#agentEvents.invalidatePaneDirect({
           herdrSessionName: input.herdrSessionName,
           paneId: agent.pane_id,
           paneGeneration: agent.pane_generation,

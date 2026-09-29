@@ -9,19 +9,11 @@ import type {
   StatusEventPlan,
 } from "@/observability/agent-index-service.js";
 import type { AgentEventRecord, AgentIndexRecord, AgentScope } from "@/observability/contracts.js";
+import { VALID_AGENT_EVENT_TYPES } from "@/observability/contracts.js";
 
 export const ACTIVE_REVISION_POLL_MS = 10_000;
 export const FULL_RESCAN_MS = 60_000;
 export const PLAN_DRAIN_GRACE_MS = 12_000;
-
-const VALID_AGENT_EVENT_TYPES = new Set<string>([
-  "agent.status.changed",
-  "agent.idle",
-  "agent.done",
-  "agent.blocked",
-  "agent.failed",
-  "agent.discarded",
-]);
 
 type Client = Pick<HerdrSocketClient, "close" | "subscribeEvents">;
 

@@ -209,7 +209,12 @@ export class AgentOrchestratorService {
     // (acked/invalidated/failed/null), let the batch ack through: markAcked uses an
     // id <= cursor so the intermediate delivered events get acknowledged too. This
     // keeps one stuck delivered event from blocking the whole trailing batch.
-    if (next && next.status === "pending" && input.eventId > next.id) {
+    const isUnconsumedRetained =
+      next &&
+      next.status === "invalidated" &&
+      next.deliverable === 1 &&
+      (!next.deliveredToTerminalId || next.deliveredToTerminalId !== input.terminalId);
+    if (next && (next.status === "pending" || isUnconsumedRetained) && input.eventId > next.id) {
       throw new OrchestratorAckError({
         code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
         message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,

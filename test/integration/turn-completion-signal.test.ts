@@ -1336,4 +1336,89 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
     harness.sqlite.close();
   }, 30_000);
+
+  test("degraded empty-assistant event retry pushes to onAgentEvent and emits outcome exactly once", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 0 });
+    let callCount = 0;
+    const pushedEvents: AgentEventRecord[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          callCount += 1;
+          if (callCount <= 4) {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("pi-jsonl"),
+                lastAssistantMessage: {
+                  ref: `m${callCount}`,
+                  text: "",
+                  timestamp: null,
+                  stopReason: "stop",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: `m${callCount}`,
+                text: "final answer",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      onAgentEvent: (event) => {
+        pushedEvents.push(event);
+      },
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    callCount = 0;
+
+    const _result = await index.handleHerdrEvent(doneEvent);
+    // Degraded event is invalidated in-DB and not delivered to callers.
+    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const invalidatedRows = harness.sqlite
+      .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+      .all();
+    expect(invalidatedRows.length).toBeGreaterThanOrEqual(1);
+
+    await index.drainPendingPlans();
+
+    // The retry-generated successful event must be pushed exactly once.
+    expect(pushedEvents.filter((e) => e.type === "agent.done")).toHaveLength(1);
+    const pushedDone = pushedEvents.find((e) => e.type === "agent.done");
+    expect(pushedDone).toBeDefined();
+    expect(pushedDone?.status).toBe("pending");
+    expect(pushedDone?.deliverable).toBe(1);
+
+    const finalEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const validDones = finalEvents.filter(
+      (e) => e.type === "agent.done" && e.status !== "invalidated",
+    );
+    expect(validDones).toHaveLength(1);
+    expect(validDones[0]?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+    harness.sqlite.close();
+  }, 30_000);
 });

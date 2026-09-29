@@ -4,8 +4,10 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { AgentEventStore } from "@/db/agent-events.js";
+import { STATUS_PLAN_MAX_ATTEMPTS } from "@/db/status-event-plans.js";
 import { AgentIndexService, type StatusEventPlan } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
+import type { AgentEventRecord } from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
@@ -4342,4 +4344,144 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       rmSync(dir, { force: true, recursive: true });
     }
   });
+
+  test("degraded done exhausting retries emits deliverable fallback failed event", async () => {
+    const harness = openObservabilityDbHarness();
+    const pushedEvents: AgentEventRecord[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: null,
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      onAgentEvent: (event) => {
+        pushedEvents.push(event);
+      },
+      stores: harness,
+      turnCompletions: new TurnCompletionRegistry({ timeoutMs: 0 }),
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+
+    const initialAgent = harness.agents.listForHerdrSession("default")[0];
+    if (!initialAgent) throw new Error("expected agent");
+
+    // Insert a plan at max attempts - 1 so the next #runPlanRow execution hits the failed branch.
+    const plan = harness.statusEventPlans.insertPending({
+      agent: initialAgent,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS - 1; i += 1) {
+      const retried = harness.statusEventPlans.markRetry(plan.id, new Error("degraded"));
+      expect(retried?.status).toBe("pending");
+    }
+
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("expected agent");
+
+    // executeStatusEventPlan will run #runPlanRow with the near-exhausted plan.
+    const result = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: undefined,
+      from: "working",
+      planId: plan.id,
+      to: "done",
+    });
+
+    // #runPlanRow transitions the plan to failed and returns the fallback event.
+    // The single publication path forwards this return value (see below), so
+    // there is no onAgentEvent capture to fall back on here.
+    const failedEvent = result;
+    expect(failedEvent).toBeDefined();
+    expect(failedEvent?.type).toBe("agent.failed");
+    expect(failedEvent?.deliverable).toBe(1);
+    const payload = failedEvent?.payload as Record<string, unknown> | undefined;
+    expect(payload?.fallbackOutcome).toBe(true);
+
+    // 发布路径唯一：`executeStatusEventPlan` 只返回事件，不再自行推流；推流由调用方
+    // 转发该返回值完成（herdr-session-watch-manager.ts:360 #submitPlan -> service.ts:206
+    // -> observability-server.ts:244 publishAgentEvent）。index 内部若再推一次，
+    // socket 上会出现两条相同的 `agent.event`，破坏合同 §4 的“恰好一次”。
+    expect(result?.type).toBe("agent.failed");
+    expect(pushedEvents.filter((e) => e.type === "agent.failed")).toHaveLength(0);
+
+    harness.sqlite.close();
+  });
+
+  test("degraded retry row failing its retry-round refresh exhausts as wakeable failed", async () => {
+    const harness = openObservabilityDbHarness();
+    const pushedEvents: AgentEventRecord[] = [];
+    let historyCalls = 0;
+    let failFromCall = Number.POSITIVE_INFINITY;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          historyCalls += 1;
+          if (historyCalls >= failFromCall) throw new Error("simulated disk error");
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "ref-1", text: "old", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      onAgentEvent: (event) => pushedEvents.push(event),
+      stores: harness,
+      turnCompletions: new TurnCompletionRegistry({ timeoutMs: 0 }),
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("expected agent");
+
+    // A plan already degraded by earlier retry rounds (last_error = "degraded").
+    const plan = harness.statusEventPlans.insertPending({ agent, from: "working", to: "done" });
+    for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS - 1; i += 1) {
+      const retried = harness.statusEventPlans.markRetry(plan.id, new Error("degraded"));
+      expect(retried?.status).toBe("pending");
+    }
+    expect(harness.statusEventPlans.get(plan.id).lastError).toBe("degraded");
+
+    // Only the second refresh of this drain round fails: #drainPlanRow's own
+    // pre-refresh succeeds, then #runPlanRow's retry pre-refresh throws.
+    failFromCall = historyCalls + 2;
+    await index.drainPendingPlans();
+
+    // Exhaustion must surface as failed (wakeable fallback), never as a silent discard.
+    const row = harness.statusEventPlans.get(plan.id);
+    expect(row.status).toBe("failed");
+    expect(row.lastError).toBe("degraded");
+    expect(pushedEvents.filter((e) => e.type === "agent.discarded")).toHaveLength(0);
+    const failedEvent = pushedEvents.find((e) => e.type === "agent.failed");
+    expect(failedEvent).toBeDefined();
+    expect(failedEvent?.status).toBe("pending");
+    expect(failedEvent?.deliverable).toBe(1);
+    const payload = failedEvent?.payload as Record<string, unknown> | undefined;
+    expect(payload?.fallbackOutcome).toBe(true);
+
+    harness.sqlite.close();
+  }, 20_000);
 });
