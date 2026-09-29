@@ -1,8 +1,38 @@
 ## [Unreleased]
 
+## 0.13.0
+
+- CLI 接口移除：删除 `herdsman daemon start|stop|restart`，`herdsman daemon` 只保留只读 `status`；生产启停只走 systemd（`herdsman.service` 是唯一托管者），socket 报错文案改指 `systemctl status herdsman.service`。
+- daemon 启动行为回归简单：入口不再带“是否被 systemd 托管”的策略判断，只做参数校验后启动；同一数据目录同时只允许一个实例，仍由实例锁保证（flock，先拿锁再打开数据库），被拒的进程完全不碰数据库。锁被占用时的提示改指 `systemctl status herdsman.service`。
+- wake 投递链修复（r4f1）：保留行恢复两道取件闸门（放行 `deliverable=1` 的 invalidated 保留行，并去掉会排除保留行的 `agent_id is not null` 过滤），关页外键置空后仍可取件并当场 Ack 收敛；状态计划耗尽不再落到静默 `discarded`，改为保留 `degraded` 原因并走 `agent.failed` 兜底事件；`executeStatusEventPlan` 只返回事件，推流统一由调用方转发，消除 socket 上的重复 `agent.event`。
+- observability 加固：migration 0010 以单调 `when` 注册进 `_journal.json`，既有库经 `applyMigrations` 高水位跳过正常升级；空 wake 处理与状态计划收口（`#drainPlanRow` 事务去重、空 `compactHistory` 守卫、降级事件 `invalidateById`、`markRunning` 返回 boolean 由调用方收敛 CAS/重试）。
+- 测试：新增保留行关页存活与取件回归、耗尽兜底回归、S1-S4 断言、真实升级路径回归与 `when` 单调性断言；两条 flock 用例改为轮询到条件成立 + 明确超时，不再靠固定 sleep。
+- 仓库清理：移除上游项目痕迹（README / metadata / docs 索引与包校验脚本同步上游移除，删除 NOTICE 与 README.ja.md，LICENSE / CHANGELOG / 归档文档白名单保持不动）。
+- 工具链对齐：`AGENTS.md` 与 `docs/releasing.md` 的 PATH 示例改为 mise 的 node `26.7.0` 与 pnpm 安装目录本身（mise 的 pnpm 安装目录没有 `bin/`），并写清本机运行时事实：生产 daemon 由 systemd 单元固定用 nvm 的 node v22.23.1 启动；提交门禁把 mise 钉版前置，实际跑 mise 的 node 26.7.0 与 pnpm 11.9.0；普通 shell 以现场 `node -v` 为准。支持面与生产面是 node 22，因此部署/发布前要求用 nvm 的 v22.23.1 复跑一次 `pnpm check`。`.husky/pre-commit` 的 mise 定位改为带错误检查的写法（`|| { echo …; exit 1; }`），不再用 `export X=$(…)` 这种赋值内命令替换失败不中止的形式。
+- 发布流程文档：`npm publish` 直接用本机写权限的 CI/自动化 token（无交互 2FA），并记录 0.12.1 发布中观察到的 E404 CDN 传播与 E409 staged-version 处理。
+- 版本与引用同步：全仓 npm 包与 Herdr 插件配置同步至 0.13.0。两个 README 的 Herdr 安装 tag 保持指向已存在的 `v0.12.1`（`v0.13.0` 的 tag 尚未创建），发布提交时再替换。
+- **未发布**：仓库内版本号已递增到 0.13.0，但未打 tag、未发布到 npm；npm 上的 latest 仍是 0.12.1。本机生产用本地 tarball 安装本仓构建产物（不依赖 npm 发布），装后按部署流程重启，并用版本、PID、socket 逐条核对。
+
+## 0.12.1
+
+- Pi 终态门禁：turn completion 以可选 `expectedText` 指纹为准（daemon RPC 透传到 turn-completion registry，快路径与 wait 路径都覆盖），`stopReason` 非终态时不再发终态；降级语义改为 `lastAssistantMessage=null` + 明确原因（`expected_text_mismatch` / `no_advance_from_input` / `non_terminal_assistant`），降级计划回到有界重试，等历史补齐后重发真实终态。
+- 测试：新增真实重试路径 S6、端到端"降级→重试→完成" S8、快路径 mismatch 负例、RPC 级 `expectedText` 接受与跨实现文本一致性套件；`pnpm check` 绿（794 tests / 53 files）。
+- 范围：本版本包含 0.11.7 与 0.12.0（见下）的全部内容——那两次 bump 只改了四文件版本号、没有单独发布，内容随 0.12.1 一起发布。
+- 版本与引用同步：四文件版本号同步至 0.12.1（本版本只动了版本文件，未同步 README 安装 tag，故 README 仍写 `v0.11.6`）。
+
+## 0.12.0
+
 - 上游模型报错过滤：新增 `wake.filter_upstream_errors`（默认开）与 `wake.extra_upstream_error_patterns`，命中 429/529/overloaded/rate limit/网络超时等报错形文本时静默丢弃 outcome（不唤醒、不注入上下文、不通知、无兜底），但仍静默 Ack 以收敛 daemon 投递队列；长报告里顺带提到状态码不受影响。
-- 修复 status plan 等待超时误报并新增 discarded 生命周期。
-- 规范与协作基础设施：补齐 agent 协作骨架与开发规范（AGENTS.md 铁律、.agents/notes/ 决策笔记系统及索引脚本）。
+- 版本与引用同步：四文件版本号同步至 0.12.0。
+- **未发布**：本版本只做了仓库内 bump，没有打 tag，也没有发布到 npm。
+
+## 0.11.7
+
+- 修复 status plan 等待超时误报并新增 discarded 生命周期：`status_event_plans` 超时重试耗尽由 `failed` 改为 `discarded`，新增 `agent.discarded` 事件类型把观察者等待超时与 agent 崩溃解耦，CAS 条件更新防终态复活并清理残留重试定时器；`herdsman-pi` wait 对 `agent.discarded` 与 legacy 等待历史失败事件都不再误唤醒。
+- agy 迟到 idle 不再吃掉已完成 turn 的 ref：迟到 `unknown -> idle` startup plan 不再把最终 assistant ref 注册成 `agent.idle` 终态；仅当终态事件已代表完成 turn（`agent.done`，或 payload `from=working` 的 `agent.idle`）才把该 ref 当已投递基线，插入新 plan 时取消被取代的 pending idle plan（`cancelled` + `last_error='PLAN_SUPERSEDED'`，无 schema 变更）。
+- 规范与协作基础设施：补齐 agent 协作骨架与开发规范（AGENTS.md 铁律、`.agents/notes/` 决策笔记系统及索引脚本），并接上统一的 commit message 校验钩子（`.husky/commit-msg` 委托本机全局校验器）。
+- 版本与引用同步：四文件版本号同步至 0.11.7。
+- **未发布**：本版本只做了仓库内 bump，没有打 tag，也没有发布到 npm。
 
 ## 0.11.6
 

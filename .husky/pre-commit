@@ -1,6 +1,8 @@
 set -e
 
-export PATH="$(mise where node)/bin:$(mise where pnpm)/bin:$PATH"
+node_bin="$(mise where node)" || { echo "mise: cannot locate node" >&2; exit 1; }
+pnpm_dir="$(mise where pnpm)" || { echo "mise: cannot locate pnpm" >&2; exit 1; }
+export PATH="$node_bin/bin:$pnpm_dir:$PATH"
 
 pnpm lint-staged
 pnpm typecheck

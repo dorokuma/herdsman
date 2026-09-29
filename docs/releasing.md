@@ -15,9 +15,9 @@ Do not run `npm publish` from `packages/herdsman-herdr-plugin`. Its private pack
 Run releases from the repository root on `main`. Replace the version below with the version being released.
 
 ```bash
-export VERSION=0.3.1
+export VERSION=0.13.0
 export TAG="v$VERSION"
-export PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH"
+export PATH="$HOME/.local/share/mise/installs/node/26.7.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0:$PATH"
 
 git fetch origin main
 test "$(git branch --show-current)" = "main"
@@ -83,7 +83,20 @@ await writeFile(tomlPath, updated);
 NODE
 ```
 
-Review the four-file diff before continuing.
+Review the four-manifest diff before continuing.
+
+Then replace the Herdr install tag in both READMEs so they point at the tag being created. The tag does not exist until this release creates it, so never write a version that has no tag:
+
+- `README.md` (Herdr plugin section)
+- `packages/herdsman-herdr-plugin/README.md`
+
+```bash
+grep -rn -- '--ref v' README.md packages/herdsman-herdr-plugin/README.md
+```
+
+Both lines must show `--ref $TAG`.
+
+After both READMEs are updated, review the full version diff (four manifests plus both READMEs) before continuing.
 
 ## Validate source and package contents
 
@@ -136,7 +149,9 @@ git add \
   package.json \
   packages/herdsman-pi/package.json \
   packages/herdsman-herdr-plugin/package.json \
-  packages/herdsman-herdr-plugin/herdr-plugin.toml
+  packages/herdsman-herdr-plugin/herdr-plugin.toml \
+  README.md \
+  packages/herdsman-herdr-plugin/README.md
 git commit -m "chore(release): $VERSION"
 test -z "$(git status --porcelain)"
 git push origin main
@@ -236,7 +251,7 @@ Two npm publishes cannot be atomic. Use these rules when the root version exists
 
 1. Confirm the Pi version is absent with `npm view`.
 2. Delete only the local, unpushed tag: `git tag -d "$TAG"`.
-3. Export the next unused patch version: `export VERSION=0.3.2 TAG=v0.3.2`.
+3. Export the next unused version: the next unused patch by default; if this partial publication contains a breaking change, use the next unused minor instead. For example `export VERSION=0.3.2 TAG=v0.3.2`.
 4. Update all four version files and replace the Herdr tag in `README.md` and `packages/herdsman-herdr-plugin/README.md`.
 5. Rebuild and reinstall both tarballs.
 6. Commit the replacement version and documentation, confirm the tree is clean, push `main`, and verify `HEAD` equals `origin/main`.

@@ -14,8 +14,9 @@ Herdsman 是一个 TypeScript daemon / CLI，从 Herdr 管理的 coding agent �
 - 正式服务是 systemd 单元 `herdsman.service`（`/etc/systemd/system/herdsman.service`，`enabled`；`ExecStart` 直连全局安装的 `herdsman-daemon.js`）。
 - 启停用 `systemctl restart|stop|start herdsman.service`。判断进程归属看 `systemctl status herdsman.service` 与 `/proc/<MainPID>/cgroup`（`pgrep -af herdsman-daemon` 会误报）。
 - daemon 常驻、不在前台交互；进程异常退出（非零退出码，或被信号杀死且不属 SIGHUP/SIGINT/SIGTERM/SIGPIPE）时由 systemd 拉回（本机单元当前为 `Restart=on-failure`，`RestartSec=5` 约 5 秒后重试，连续失败受 `StartLimit*` 限制）；`systemctl stop` 是显式停止，不会被拉回。
-- 部署：`pnpm build` → `npm pack`（用 nvm 的 npm，使 `npm prefix -g` 落在 nvm 前缀）→ 把 tarball 全局安装 → `systemctl restart herdsman.service` → 按上一条核对。
+- 部署：`pnpm build` → `npm pack`（用 nvm 的 npm，使 `npm prefix -g` 落在 nvm 前缀）→ 把 tarball 全局安装 → `systemctl restart herdsman.service` → 按上一条核对。部署或发布前先按「验证步骤」用 nvm 的 v22.23.1 复跑一次 `pnpm check`（生产面是 node 22）。
 - 生产日志看 `journalctl -u herdsman.service`。`logs/herdsman.log` 是旧的，不用它判断生产状态。
+- 部署后核对：版本用 `PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" npm ls -g @dorokuma/herdsman`，或直接读 `"$HOME/.nvm/versions/node/v22.23.1/lib/node_modules/@dorokuma/herdsman/package.json"`（部署是装进 nvm 前缀的，而默认 shell 的 npm 可能走 mise 前缀、查不到该包，所以要带前缀或读绝对路径）；PID 看 `systemctl show -p MainPID herdsman.service`；socket 看 `herdsman daemon status`。**本地 tarball 安装的包，包内版本号不等于已部署内容**（同一个版本号可以是不同提交构建出来的），核对应把该批 tarball／批次一并记下。
 - 默认数据目录 `~/.herdsman` 即生产；开发/验证请显式指定临时目录（`HERDSMAN_HOME=/tmp/<名字>`），不要拿生产目录做实验。
 
 ## 文档・索引 / Documentation Index
@@ -50,8 +51,21 @@ Herdsman 是一个 TypeScript daemon / CLI，从 Herdr 管理的 coding agent �
 - Node / pnpm 的 PATH 较旧的环境，在执行验证命令前加上下面这行。
 
 ```bash
-PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH"
+PATH="$HOME/.local/share/mise/installs/node/26.7.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0:$PATH"
 ```
+
+本机（生产机）运行时事实，照它选运行时，不要对着版本号猜：
+
+- 生产 daemon：由 systemd 单元 `herdsman.service` 的 `ExecStart` 固定用 nvm v22.23.1 的 node 启动。
+- 提交门禁：`.husky/pre-commit` 显式把 mise 钉版前置进 PATH，实际跑 mise 的 node 26.7.0 + pnpm 11.9.0（与 `mise.toml` 一致）。
+- 普通 shell 里跑哪个版本以现场 `node -v` 为准：登录交互 bash 会先激活 mise（`/root/.bashrc` 在 nvm 之后激活 mise，mise 优先），而 daemon 派生的 shell 继承单元里的 PATH（nvm 优先）。
+- 支持面与生产面是 node 22（`package.json` 的 `engines.node >=22.12.0`，CI 也用 node 22），所以 mise 的 26.7.0 上绿不能替代生产面验证，部署或发布前必须再跑一次：
+
+```bash
+PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" pnpm check
+```
+
+- 上一条的 mise PATH 只在需要钉版（`mise.toml` 的 node 26.7.0 / pnpm 11.9.0）时前置使用。mise 的 pnpm 安装目录没有 `bin/`，PATH 里要写安装目录本身。
 
 ## 重要路径
 
