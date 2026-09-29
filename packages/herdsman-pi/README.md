@@ -4,13 +4,15 @@ Pi >= 0.80.6 extension for Herdsman agent history and automatic agent-update wak
 
 This package contains the runtime extension only. The Agent Skill remains at the repository root.
 
-Install the Herdsman CLI and Pi package, then start the daemon:
+Install the Herdsman CLI and Pi package, then check that the daemon is running:
 
 ```bash
 npm install --global @dorokuma/herdsman
 pi install npm:@dorokuma/herdsman-pi
-herdsman daemon start
+herdsman daemon status
 ```
+
+Herdsman has no CLI start/stop command. For a development or throwaway environment, run the daemon entrypoint in the foreground with an explicit temporary data directory (`HERDSMAN_HOME=/tmp/<name> node <package>/dist/src/cli/herdsman-daemon.js`; without `HERDSMAN_HOME` it targets the production data directory and refuses to start); on the production host the daemon runs under the systemd unit `herdsman.service` (`systemctl restart herdsman.service`).
 
 When Pi runs inside Herdr, this extension connects to the Herdsman daemon and registers its exact Pi session path as presence identity. After register it sends `agent.ping` at least every 30 seconds so an idle owner is not dropped by the daemon heartbeat. It does not send per-turn tool-result or final-message telemetry.
 

@@ -1,23 +1,17 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { resolve } from "node:path";
 import { argv, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 import { resolveRuntime, runtimePathsFromRecordOrDefault } from "@/config/runtime.js";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
-import {
-  getDaemonStatus,
-  readDaemonRuntimeRecord,
-  startDaemonProcess,
-  stopDaemonProcess,
-  withDaemonLock,
-} from "@/daemon/process-manager.js";
+import { getDaemonStatus, readDaemonRuntimeRecord } from "@/daemon/process-manager.js";
 import type { AgentGetResult, AgentListItem, AgentReadResult } from "@/observability/contracts.js";
 
 const CURRENT_HERDR_WORKSPACE_ERROR =
   "agent command requires HERDR_ENV=1 with HERDR_WORKSPACE_ID, --workspace <id>, --session <name>, or --all.";
 
-type DaemonAction = "restart" | "start" | "status" | "stop";
+type DaemonAction = "status";
 
 type AgentScope = {
   all?: boolean;
@@ -129,7 +123,7 @@ function scopedOrCurrent(scope: AgentScope, environment: NodeJS.ProcessEnv): Age
 
 export function helpText(): string {
   return `Usage:
-  herdsman daemon [start|stop|restart|status]
+  herdsman daemon status
   herdsman agent list [--all] [--workspace <id>] [--session <name>] [--json]
   herdsman agent get <target> [--workspace <id>] [--session <name>] [--json]
   herdsman agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]
@@ -267,7 +261,7 @@ async function main(): Promise<void> {
   const command = parseCliArgs(argv.slice(2));
   const runtime = resolveRuntimeForCommand();
   if (command.command === "daemon") {
-    await runDaemonCommand(command, runtime);
+    await runDaemonCommand(runtime);
     return;
   }
   await runCliCommand(command, {
@@ -278,78 +272,16 @@ async function main(): Promise<void> {
 }
 
 async function runDaemonCommand(
-  command: Extract<CliCommand, { command: "daemon" }>,
   runtime: ReturnType<typeof resolveRuntimeForCommand>,
 ): Promise<void> {
-  const lockPath = `${runtime.paths.pidPath}.lock`;
-  if (command.action === "status") {
-    console.log(
-      JSON.stringify(
-        await getDaemonStatus({
-          pidPath: runtime.paths.pidPath,
-          socketPath: runtime.paths.socketPath,
-        }),
-      ),
-    );
-    return;
-  }
-  if (command.action === "stop") {
-    const result = await withDaemonLock(lockPath, () =>
-      stopDaemonProcess({
+  console.log(
+    JSON.stringify(
+      await getDaemonStatus({
         pidPath: runtime.paths.pidPath,
         socketPath: runtime.paths.socketPath,
-        timeoutMs: 10_000,
       }),
-    );
-    console.log(JSON.stringify(result));
-    return;
-  }
-  if (command.action === "restart") {
-    const result = await withDaemonLock(lockPath, async () => {
-      await stopDaemonProcess({
-        pidPath: runtime.paths.pidPath,
-        socketPath: runtime.paths.socketPath,
-        timeoutMs: 10_000,
-      });
-      return await startDaemonProcess({
-        entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "herdsman-daemon.js"),
-        env: runtime.environment,
-        logPath: runtime.paths.logPath,
-        nodePath: process.execPath,
-        pidPath: runtime.paths.pidPath,
-        runtimeRecord: {
-          dbPath: runtime.paths.dbPath,
-          homeDir: runtime.homeDir,
-          logPath: runtime.paths.logPath,
-          pidPath: runtime.paths.pidPath,
-          socketPath: runtime.paths.socketPath,
-        },
-        runtimeRecordPath: runtime.paths.runtimeRecordPath,
-        socketPath: runtime.paths.socketPath,
-      });
-    });
-    console.log(JSON.stringify({ ...result, socketPath: runtime.paths.socketPath }));
-    return;
-  }
-  const result = await withDaemonLock(lockPath, () =>
-    startDaemonProcess({
-      entrypointPath: resolve(dirname(fileURLToPath(import.meta.url)), "herdsman-daemon.js"),
-      env: runtime.environment,
-      logPath: runtime.paths.logPath,
-      nodePath: process.execPath,
-      pidPath: runtime.paths.pidPath,
-      runtimeRecord: {
-        dbPath: runtime.paths.dbPath,
-        homeDir: runtime.homeDir,
-        logPath: runtime.paths.logPath,
-        pidPath: runtime.paths.pidPath,
-        socketPath: runtime.paths.socketPath,
-      },
-      runtimeRecordPath: runtime.paths.runtimeRecordPath,
-      socketPath: runtime.paths.socketPath,
-    }),
+    ),
   );
-  console.log(JSON.stringify({ ...result, socketPath: runtime.paths.socketPath }));
 }
 
 export function resolveRuntimeForCommand() {
@@ -380,7 +312,7 @@ function rejectExtra(args: string[]): void {
 }
 
 function isDaemonAction(value: string): value is DaemonAction {
-  return value === "restart" || value === "start" || value === "status" || value === "stop";
+  return value === "status";
 }
 
 function formatCliError(error: unknown): string {
@@ -391,7 +323,7 @@ function formatCliError(error: unknown): string {
     message.includes("Herdsman daemon socket closed") ||
     message.includes("Observability RPC socket closed")
   ) {
-    return `${message}\nRun \`herdsman daemon start\` before using Herdsman commands.`;
+    return `${message}\nHerdsman's daemon has no CLI start/stop commands; check the systemd-managed service with \`systemctl status herdsman.service\`.`;
   }
   return message;
 }

@@ -1,86 +1,93 @@
 # AGENTS.md
 
-Herdsman は Herdr 管理の coding agent から agent snapshot、`agent.*` event、orchestrator notification を作る TypeScript daemon / CLI です。まず `README.md` で使い方を確認し、仕様判断が必要なときだけ `docs/plans/` を見てください。
+Herdsman 是一个 TypeScript daemon / CLI，从 Herdr 管理的 coding agent 生成 agent snapshot、`agent.*` event 和 orchestrator notification。请先用 `README.md` 确认用法，只有在需要判断规格时才看 `docs/plans/`。
 
-## 鉄律 / Iron Rules
+## 铁律 / Iron Rules
 
-1. **构建・テスト・静的検査**: 実装変更後は `pnpm check`（typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 検証）を通し、CLI/package 変更時は `pnpm build` と `pnpm package:check` も通す。
+1. **构建・测试・静态检查**: 修改实现后必须通过 `pnpm check`（typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 验证）；改动 CLI/package 时还必须通过 `pnpm build` 和 `pnpm package:check`。
 2. **提交规范**——commit message 须过全局 commit-msg hook：Conventional Commits 类型白名单、≤72 字、冒号后一空格、禁噪声词与密钥。
 3. **决策/踩坑须记 .agents/notes/**：重大决策、架构调整、方案否决、临时降级/workaround/特判必须记入 `.agents/notes/`（满足六触发之一即写，详见 [.agents/notes/README.md](.agents/notes/README.md)）。
-4. **未コミット変更保護**: ユーザーや別プロセスの未コミット変更を戻さない。`node_modules/`、`dist/`、`*.sqlite` は commit しない。
+4. **未提交变更保护**: 不得回退用户或其他进程的未提交变更。`node_modules/`、`dist/`、`*.sqlite` 不要 commit。
 
-## ドキュメント・インデックス / Documentation Index
+## 本机运维 / Local Operations
 
-- 現状ドキュメント: [README.md](README.md), [docs/plans/](docs/plans/), [docs/releasing.md](docs/releasing.md)
-- 意思決定・踩坑ノート: [.agents/notes/](.agents/notes/)（規約: [.agents/notes/README.md](.agents/notes/README.md)）
+- 正式服务是 systemd 单元 `herdsman.service`（`/etc/systemd/system/herdsman.service`，`enabled`；`ExecStart` 直连全局安装的 `herdsman-daemon.js`）。
+- 启停用 `systemctl restart|stop|start herdsman.service`。判断进程归属看 `systemctl status herdsman.service` 与 `/proc/<MainPID>/cgroup`（`pgrep -af herdsman-daemon` 会误报）。
+- 部署：`pnpm build` → `npm pack`（用 nvm 的 npm，使 `npm prefix -g` 落在 nvm 前缀）→ 把 tarball 全局安装 → `systemctl restart herdsman.service` → 按上一条核对。
+- 生产日志看 `journalctl -u herdsman.service`。`logs/herdsman.log` 是旧的，不用它判断生产状态。
+- 默认数据目录 `~/.herdsman` 即生产；开发/验证必须显式指定临时目录（`HERDSMAN_HOME=/tmp/<名字>`），前台入口在默认目录且非 systemd 托管时会拒绝启动。
+
+## 文档・索引 / Documentation Index
+
+- 现状文档: [README.md](README.md), [docs/plans/](docs/plans/), [docs/releasing.md](docs/releasing.md)
+- 决策・踩坑笔记: [.agents/notes/](.agents/notes/)（规约: [.agents/notes/README.md](.agents/notes/README.md)）
 - 写完笔记刷新索引：scripts/notes-index.sh（本地生成 INDEX.md，不入 git）
 
-## 関連リポジトリ / Related Repositories
+## 关联仓库 / Related Repositories
 
 - `pi-cache-guardian`: 同为 Pi 生态插件
 - `herdsman-wt`: 本仓 worktree 挂载目录
 
-## よく使うコマンド
+## 常用命令
 
+- `mise install`: 安装 `mise.toml` 中的 Node.js / pnpm。
+- `pnpm install`: 安装依赖。
+- `pnpm check`: 一次性执行 typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 的验证。
+- `pnpm test`: 运行一次 Vitest。
+- `pnpm test:watch`: Vitest 的 watch。
+- `pnpm build`: 删除旧的 `dist` 后输出 TypeScript，并用 `tsc-alias` 解析 import alias。
+- `pnpm package:check`: 构建 root npm package，并验证 tarball 的 file allowlist。
+- `pnpm lint:fix`: 应用 Biome 的 lint/import/format fix。
+- `pnpm db:generate`: 从 `src/db/schema.ts` 生成 SQL migration。
+- `HERDSMAN_HOME=/tmp/herdsman pnpm db:migrate`: 对指定的 Herdsman home 的 SQLite DB 应用 migration。
 
-- `mise install`: `mise.toml` の Node.js / pnpm を入れる。
-- `pnpm install`: 依存関係を入れる。
-- `pnpm check`: typecheck、test、Biome、Drizzle、Pi package、Herdr plugin の検証をまとめて実行する。
-- `pnpm test`: Vitest を一回実行する。
-- `pnpm test:watch`: Vitest の watch。
-- `pnpm build`: 古い`dist`を削除してTypeScriptを出力し、`tsc-alias`でimport aliasを解決する。
-- `pnpm package:check`: root npm packageをbuildし、tarballのfile allowlistを検証する。
-- `pnpm lint:fix`: Biome の lint/import/format fix を適用する。
-- `pnpm db:generate`: `src/db/schema.ts` から SQL migration を生成する。
-- `HERDSMAN_HOME=/tmp/herdsman pnpm db:migrate`: 指定した Herdsman home の SQLite DB に migration を適用する。
+## 验证步骤
 
-## 検証手順
-
-- 実装変更後は `pnpm check` を通す。
-- CLI entrypoint、`dist`のimport解決、package内容に関わる変更では`pnpm build`と`pnpm package:check`も通す。
-- DB schema を変えたら `pnpm db:generate` を先に実行し、生成 SQL を確認してから migrate を見る。
-- Node / pnpm の PATH が古い環境では、検証コマンドの前に次を付ける。
+- 修改实现后必须通过 `pnpm check`。
+- 涉及 CLI entrypoint、`dist` 的 import 解析、package 内容的改动，还要通过 `pnpm build` 和 `pnpm package:check`。
+- 改了 DB schema 就先执行 `pnpm db:generate`，确认生成的 SQL 之后再看 migrate。
+- Node / pnpm 的 PATH 较旧的环境，在执行验证命令前加上下面这行。
 
 ```bash
 PATH="$HOME/.local/share/mise/installs/node/24.18.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0/bin:$PATH"
 ```
 
-## 重要パス
+## 重要路径
 
 - `src/observability/`: agent contract、cached agent context、agent index、orchestrator service。
-- `src/daemon/`: daemon JSON Lines RPC、process manager、service startup。
+- `src/daemon/`: daemon 的 JSON Lines RPC、process manager、service startup。
 - `src/cli/`: `herdsman` CLI entrypoint。
-- `src/config/`: runtime config schema と path/env 解決。
-- `src/db/`: SQLite connection、Drizzle schema、migration runner、observability store。
+- `src/config/`: runtime config schema 与 path/env 解析。
+- `src/db/`: SQLite 连接、Drizzle schema、migration runner、observability store。
 - `src/herdr/`: Herdr socket client、managed session client、session snapshot、workspace resolver。
-- `src/shared/`: JSON Lines framing などの共有 utility。
-- `packages/herdsman-pi/`: npmで公開するPi extension package。
-- `packages/herdsman-herdr-plugin/`: GitHub経由で配布するprivate Herdr integration。npmには公開しない。
+- `src/shared/`: JSON Lines framing 等共享 utility。
+- `packages/herdsman-pi/`: 通过 npm 发布的 Pi extension package。
+- `packages/herdsman-herdr-plugin/`: 通过 GitHub 分发的 private Herdr integration。不发布到 npm。
 - `test/unit/`: pure logic / contract tests。
-- `test/integration/`: SQLite / JSON Lines RPC など実体を使う tests。
-- `docs/plans/`: active plan。完了済み plan は `docs/plans/archived/` に置く。
+- `test/integration/`: 使用 SQLite / JSON Lines RPC 等实体的 tests。
+- `docs/plans/`: active plan。已完成的 plan 放到 `docs/plans/archived/`。
 
-## コーディング方針
+## 编码方针
 
-- チャットでの応答は日本語。
-- TypeScript は ESM + `NodeNext`。`src` 配下は `@/*` import alias を使う。
-- Runtime schema は TypeBox/Ajv、DB schema は Drizzle に寄せる。
-- 変更は既存の層に合わせる。transport、persistence、observability rules、runtime extension の責務を混ぜない。
-- Markdown docs は Biome gate の対象外。変更した docs はリンクとコマンドを目視で確認する。
-- README の利用例や詳細設計を AGENTS.md に重複させない。
+- 聊天中的回复使用中文。
+- TypeScript 是 ESM + `NodeNext`。`src` 下使用 `@/*` import alias。
+- Runtime schema 交给 TypeBox/Ajv，DB schema 交给 Drizzle。
+- 改动要贴合已有的层。不要把 transport、persistence、observability rules、runtime extension 的职责混在一起。
+- Markdown docs 不在 Biome gate 范围内。改过的 docs 要目视确认链接和命令。
+- 不要把 README 的用法示例或详细设计重复写进 AGENTS.md。
 
-## Plan / docs 運用
+## Plan / docs 运用
 
-- npmとGitHubのrelease手順は`docs/releasing.md`を正とする。公開するnpm packageはrootと`packages/herdsman-pi`の2つだけ。
-- Active plan は `docs/plans/` 配下に置く。完了済み plan は `docs/plans/archived/` 配下に移す。
-- 大きな plan は親 plan と子 plan に分ける。親は目的、方針、進捗、子 plan link に絞る。
-- 子 plan ディレクトリ名は親 plan ファイル名から `.md` を除いた名前と一致させる。
-- plan には `Status`、`Progress`、`Next steps` を置く。
-- plan 更新時は親子リンク、ディレクトリ名、README / AGENTS からの参照を確認する。
-- 完了済み plan の archive は docs-only commit に分ける。
+- npm 和 GitHub 的 release 步骤以 `docs/releasing.md` 为准。发布的 npm package 只有 root 和 `packages/herdsman-pi` 两个。
+- Active plan 放在 `docs/plans/` 下。已完成的 plan 移到 `docs/plans/archived/` 下。
+- 大的 plan 拆成父 plan 和子 plan。父 plan 只保留目的、方针、进度、子 plan link。
+- 子 plan 的目录名要与父 plan 文件名去掉 `.md` 后一致。
+- plan 里要有 `Status`、`Progress`、`Next steps`。
+- 更新 plan 时确认父子链接、目录名、README / AGENTS 的引用。
+- 已完成 plan 的 archive 单独拆成 docs-only commit。
 
 ## 注意
 
-- `node_modules/`, `dist/`, `*.sqlite` は commit しない。
-- `pnpm-workspace.yaml` は pnpm 11 の `allowBuilds` 用。workspace 化の意図で編集しない。
-- ユーザーや別プロセスの未コミット変更を戻さない。
+- `node_modules/`, `dist/`, `*.sqlite` 不要 commit。
+- `pnpm-workspace.yaml` 是给 pnpm 11 的 `allowBuilds` 用的。不要以 workspace 化为目的去编辑它。
+- 不得回退用户或其他进程的未提交变更。

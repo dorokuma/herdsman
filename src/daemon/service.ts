@@ -100,9 +100,11 @@ export class PeriodicReconcileScheduler {
 
 export async function runObservabilityDaemonService(
   input: {
+    applyMigrations?: typeof applyMigrations;
     connectSocket?: (socketPath: string) => Promise<boolean>;
     environment?: NodeJS.ProcessEnv | undefined;
     exit?: (code?: number) => void;
+    openSqlite?: typeof openSqlite;
     pid?: number;
     reconcileClearInterval?: (handle: ReturnType<typeof setInterval>) => void;
     reconcileIntervalMs?: number;
@@ -123,7 +125,29 @@ export async function runObservabilityDaemonService(
   mkdirSync(dirname(runtime.paths.socketPath), { mode: 0o700, recursive: true });
   chmodSync(dirname(runtime.paths.socketPath), 0o700);
 
-  const { sqlite } = openSqlite(runtime.paths.dbPath);
+  const currentPid = input.pid ?? process.pid;
+
+  let releaseInstanceLock: (() => void) | undefined;
+  const releaseInstanceLockIfHeld = () => {
+    if (releaseInstanceLock) {
+      releaseInstanceLock();
+      releaseInstanceLock = undefined;
+    }
+  };
+
+  // The bare daemon entrypoint (herdsman-daemon.js) takes an instance lock so
+  // two daemon processes cannot share one HERDSMAN_HOME. It is acquired before
+  // the SQLite database is opened: a second or orphaned daemon is rejected
+  // while it has not touched (opened, migrated, or locked) the database at all.
+  // The lock is released on graceful stop and on every startup failure path.
+  releaseInstanceLock = acquireDaemonLock(daemonInstanceLockPath(runtime.paths.pidPath), {
+    pid: currentPid,
+  });
+
+  const openSqliteImpl = input.openSqlite ?? openSqlite;
+  const applyMigrationsImpl = input.applyMigrations ?? applyMigrations;
+
+  const { sqlite } = openSqliteImpl(runtime.paths.dbPath);
   for (const path of [
     runtime.paths.dbPath,
     `${runtime.paths.dbPath}-wal`,
@@ -131,7 +155,7 @@ export async function runObservabilityDaemonService(
   ]) {
     if (existsSync(path)) chmodSync(path, 0o600);
   }
-  applyMigrations(sqlite, {
+  applyMigrationsImpl(sqlite, {
     migrationsFolder: resolveMigrationsFolder(dirname(fileURLToPath(import.meta.url))),
   });
 
@@ -217,7 +241,6 @@ export async function runObservabilityDaemonService(
   process.on("unhandledRejection", onUnhandledRejection);
   process.on("uncaughtException", onUncaughtException);
 
-  const currentPid = input.pid ?? process.pid;
   const signalTarget = input.signalTarget ?? process;
   const doExit = input.exit ?? exit;
 
@@ -225,13 +248,6 @@ export async function runObservabilityDaemonService(
   // start, reconcile): once the pid file is written the daemon must always
   // clean it up on a graceful shutdown, even if startup is still in progress.
   let reconcileScheduler: PeriodicReconcileScheduler | undefined;
-  let releaseInstanceLock: (() => void) | undefined;
-  const releaseInstanceLockIfHeld = () => {
-    if (releaseInstanceLock) {
-      releaseInstanceLock();
-      releaseInstanceLock = undefined;
-    }
-  };
   const stop = async () => {
     let exitCode = 0;
     try {
@@ -256,13 +272,6 @@ export async function runObservabilityDaemonService(
   signalTarget.once("SIGTERM", stop);
 
   try {
-    // The bare daemon entrypoint (herdsman-daemon.js) takes an instance lock
-    // distinct from the CLI operation lock so two daemon processes cannot
-    // share one HERDSMAN_HOME even when neither goes through the CLI. The lock
-    // is released on graceful stop and on every startup failure path.
-    releaseInstanceLock = acquireDaemonLock(daemonInstanceLockPath(runtime.paths.pidPath), {
-      pid: currentPid,
-    });
     await server.start();
     writeDaemonPidFile(runtime.paths.pidPath, currentPid);
     await reconciler.reconcile({ releaseStaleOwners: false });

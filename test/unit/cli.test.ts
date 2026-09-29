@@ -63,6 +63,22 @@ describe("herdsman CLI", () => {
     expect(() => parseCliArgs(["legacy-command"])).toThrow("Unknown command");
   });
 
+  test("keeps only the read-only daemon status action", () => {
+    // The daemon lifecycle commands were removed from the CLI: only the
+    // systemd-managed service owns start/stop/restart now.
+    for (const action of ["start", "stop", "restart"]) {
+      expect(() => parseCliArgs(["daemon", action])).toThrow(`Unknown daemon action: ${action}`);
+    }
+    expect(parseCliArgs(["daemon", "status"])).toEqual({ action: "status", command: "daemon" });
+    expect(parseCliArgs(["daemon"])).toEqual({ action: "status", command: "daemon" });
+
+    const help = helpText();
+    expect(help).toContain("herdsman daemon status");
+    for (const action of ["start", "stop", "restart"]) {
+      expect(help).not.toContain(`daemon ${action}`);
+    }
+  });
+
   test("renders help for agent commands", () => {
     expect(helpText()).toContain("herdsman agent list");
     expect(helpText()).toContain("herdsman agent get <target>");

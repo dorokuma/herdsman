@@ -6,9 +6,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
-  renameSync,
   rmSync,
-  statSync,
   writeFileSync,
 } from "node:fs";
 import { createConnection } from "node:net";
@@ -53,24 +51,12 @@ export type DaemonStatus =
       state: "running";
     };
 
-type DaemonSpawnProcess = (
-  command: string,
-  args: string[],
-  options: {
-    detached: boolean;
-    env: NodeJS.ProcessEnv;
-    stdio: ["ignore", number, number];
-  },
-) => { pid: number | undefined; unref(): void };
-
 export const DAEMON_ENTRYPOINT_NAMES = ["herdsman-daemon.js"] as const;
-export const CLI_ENTRYPOINT_NAMES = ["herdsman-daemon.js", "herdsman.js", "herdsman"] as const;
 
 /**
  * Instance lock path for the daemon's bare entrypoint (herdsman-daemon.js).
- * Deliberately distinct from the CLI operation lock (`${pidPath}.lock`) so a
- * daemon started outside the CLI does not collide with CLI start/stop/restart
- * operations, and vice versa.
+ * Kept distinct from the plain `${pidPath}.lock` name so a daemon that owns
+ * its home through this lock cannot collide with any other lock namespace.
  */
 export function daemonInstanceLockPath(pidPath: string): string {
   return `${pidPath}.instance.lock`;
@@ -80,13 +66,8 @@ const warnedUnknownIdentityPids = new Set<number>();
 
 export type DaemonProcessDependencies = {
   connectSocket?: (socketPath: string) => Promise<boolean>;
-  readinessProbe?: (socketPath: string) => Promise<boolean>;
   isProcessRunning?: (pid: number) => boolean;
   identityProbe?: (pid: number, expectedNames?: readonly string[]) => boolean | undefined;
-  killProcess?: (pid: number, signal: NodeJS.Signals) => void;
-  spawnProcess?: DaemonSpawnProcess;
-  waitMs?: (ms: number) => Promise<void>;
-  readinessTimeoutMs?: number;
   pid?: number | undefined;
 };
 export function readDaemonRuntimeRecord(path: string): DaemonRuntimeRecord | undefined {
@@ -130,28 +111,6 @@ export function removeDaemonPidFile(pidPath: string, expectedPid: number): boole
     // Never let pid clean-up failure abort shutdown
     return false;
   }
-}
-
-export function writeDaemonRuntimeRecord(path: string, record: DaemonRuntimeRecord): void {
-  mkdirSync(dirname(path), { mode: 0o700, recursive: true });
-  writeFileSync(path, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-}
-
-export async function prepareDaemonSocketPath(input: {
-  deps?: DaemonProcessDependencies;
-  socketPath: string;
-}): Promise<void> {
-  mkdirSync(dirname(input.socketPath), { mode: 0o700, recursive: true });
-  if (!existsSync(input.socketPath)) {
-    return;
-  }
-
-  const connectSocket = input.deps?.connectSocket ?? defaultConnectSocket;
-  if (await connectSocket(input.socketPath)) {
-    throw new Error(`Herdsman daemon socket is already reachable: ${input.socketPath}`);
-  }
-
-  rmSync(input.socketPath, { force: true });
 }
 
 export async function getDaemonStatus(input: {
@@ -226,188 +185,6 @@ export async function getDaemonStatus(input: {
     socketReachable: await connectSocket(input.socketPath),
     state: "running",
   };
-}
-
-export async function startDaemonProcess(input: {
-  deps?: DaemonProcessDependencies;
-  entrypointPath: string;
-  env: NodeJS.ProcessEnv;
-  logPath: string;
-  nodePath: string;
-  pidPath: string;
-  runtimeRecord: Omit<DaemonRuntimeRecord, "pid" | "startedAt" | "version">;
-  runtimeRecordPath: string;
-  socketPath: string;
-}): Promise<{ pid: number }> {
-  mkdirSync(dirname(input.pidPath), { mode: 0o700, recursive: true });
-  mkdirSync(dirname(input.logPath), { mode: 0o700, recursive: true });
-  const existing = await getDaemonStatus({
-    ...(input.deps !== undefined ? { deps: input.deps } : {}),
-    pidPath: input.pidPath,
-    socketPath: input.socketPath,
-  });
-  if (existing.state === "running") {
-    if (existing.socketReachable) {
-      const pid = "pid" in existing ? existing.pid : undefined;
-      throw new Error(
-        pid !== undefined
-          ? `Herdsman daemon is already running with pid ${pid}: ${existing.socketPath}`
-          : `Herdsman daemon is already running: ${existing.socketPath}`,
-      );
-    }
-    const pid = "pid" in existing ? existing.pid : undefined;
-    throw new Error(
-      `Herdsman daemon process is already running${pid !== undefined ? ` with pid ${pid}` : ""} but its socket is not reachable: ${existing.socketPath}`,
-    );
-  }
-  if (existing.stalePid !== undefined) rmSync(input.pidPath, { force: true });
-  let pidFd: number;
-  try {
-    pidFd = openSync(input.pidPath, "wx", 0o600);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw new Error(`Herdsman daemon is already running: ${input.pidPath}`);
-    }
-    throw error;
-  }
-  let childPid: number | undefined;
-  let childConfirmedDead = false;
-  try {
-    await prepareDaemonSocketPath({
-      ...(input.deps !== undefined ? { deps: input.deps } : {}),
-      socketPath: input.socketPath,
-    });
-    const logFd = openRotatedLog(input.logPath);
-    let child: { pid: number | undefined; unref(): void };
-    try {
-      child = (input.deps?.spawnProcess ?? spawnDaemonProcess)(
-        input.nodePath,
-        [input.entrypointPath],
-        {
-          detached: true,
-          env: input.env,
-          stdio: ["ignore", logFd, logFd],
-        },
-      );
-    } finally {
-      closeSync(logFd);
-    }
-
-    if (!child.pid) throw new Error("Failed to start Herdsman daemon: child pid was not assigned");
-    childPid = child.pid;
-    child.unref();
-    writeDaemonPidFile(input.pidPath, child.pid);
-    try {
-      const waitMs =
-        input.deps?.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-      const connectSocket = input.deps?.readinessProbe ?? defaultConnectSocket;
-      const deadline = Date.now() + (input.deps?.readinessTimeoutMs ?? 10_000);
-      while (Date.now() < deadline && !(await connectSocket(input.socketPath))) await waitMs(50);
-      if (!(await connectSocket(input.socketPath)))
-        throw new Error("Timed out waiting for Herdsman daemon socket");
-    } catch (error) {
-      const killProcess = input.deps?.killProcess ?? ((pid, signal) => process.kill(pid, signal));
-      const processIsRunning = input.deps?.isProcessRunning ?? isProcessRunning;
-      const waitMs =
-        input.deps?.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-      killProcess(child.pid, "SIGTERM");
-      const deadline = Date.now() + (input.deps?.readinessTimeoutMs ?? 10_000);
-      while (Date.now() < deadline && processIsRunning(child.pid)) await waitMs(50);
-      if (processIsRunning(child.pid)) {
-        killProcess(child.pid, "SIGKILL");
-        const killDeadline = Date.now() + (input.deps?.readinessTimeoutMs ?? 10_000);
-        while (Date.now() < killDeadline && processIsRunning(child.pid)) await waitMs(50);
-      }
-      if (!processIsRunning(child.pid)) {
-        childConfirmedDead = true;
-        rmSync(input.pidPath, { force: true });
-      }
-      throw error;
-    }
-    const record: DaemonRuntimeRecord = {
-      ...input.runtimeRecord,
-      startedAt: new Date().toISOString(),
-      version: 1,
-    };
-    // The runtime record no longer carries a pid: the pid file is the pid
-    // source of truth, and a stale pid here misleads liveness checks.
-    delete record.pid;
-    writeDaemonRuntimeRecord(input.runtimeRecordPath, record);
-    return { pid: child.pid };
-  } catch (error) {
-    if (childPid !== undefined && childConfirmedDead) rmSync(input.pidPath, { force: true });
-    throw error;
-  } finally {
-    closeSync(pidFd);
-  }
-}
-
-export async function stopDaemonProcess(input: {
-  deps?: DaemonProcessDependencies;
-  pidPath: string;
-  socketPath: string;
-  timeoutMs: number;
-}): Promise<{ alreadyStopped: boolean; pid?: number }> {
-  const deps = input.deps ?? {};
-  const status = await getDaemonStatus({
-    deps,
-    pidPath: input.pidPath,
-    socketPath: input.socketPath,
-  });
-  if (status.state === "stopped") {
-    rmSync(input.pidPath, { force: true });
-    return { alreadyStopped: true };
-  }
-
-  const killProcess = deps.killProcess ?? ((pid, signal) => process.kill(pid, signal));
-  const processIsRunning = deps.isProcessRunning ?? isProcessRunning;
-  const waitMs = deps.waitMs ?? ((ms) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
-  const pid = "pid" in status ? status.pid : undefined;
-  if (pid === undefined) {
-    const stalePid = "stalePid" in status ? status.stalePid : undefined;
-    if (status.state === "running" && stalePid !== undefined) {
-      throw new Error(
-        `Herdsman daemon socket is reachable at ${status.socketPath} but pid file ${status.pidPath} refers to stale PID ${stalePid}; the daemon is managed outside this pid file and cannot be stopped via CLI`,
-      );
-    }
-    throw new Error("Herdsman daemon status is missing a PID");
-  }
-
-  killProcess(pid, "SIGTERM");
-  const deadline = Date.now() + input.timeoutMs;
-  while (Date.now() < deadline) {
-    if (!processIsRunning(pid)) {
-      rmSync(input.pidPath, { force: true });
-      return { alreadyStopped: false, pid };
-    }
-    await waitMs(50);
-  }
-
-  killProcess(pid, "SIGKILL");
-  const killDeadline = Date.now() + input.timeoutMs;
-  while (Date.now() < killDeadline && processIsRunning(pid)) await waitMs(50);
-  if (!processIsRunning(pid)) {
-    rmSync(input.pidPath, { force: true });
-    return { alreadyStopped: false, pid };
-  }
-  throw new Error(`Timed out waiting for Herdsman daemon pid ${pid} to stop after SIGKILL`);
-}
-
-function openRotatedLog(path: string): number {
-  try {
-    if (statSync(path).size > 10 * 1024 * 1024) renameSync(path, `${path}.1`);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-  }
-  return openSync(path, "a", 0o600);
-}
-function spawnDaemonProcess(
-  command: string,
-  args: string[],
-  options: Parameters<DaemonSpawnProcess>[2],
-): { pid: number | undefined; unref(): void } {
-  const child = spawn(command, args, options);
-  return { pid: child.pid, unref: () => child.unref() };
 }
 
 type ProcessProbe = (pid: number, signal: 0) => unknown;
@@ -679,19 +456,6 @@ export function acquireDaemonLock(lockPath: string, deps?: DaemonProcessDependen
     }
     flockHandle.release();
   };
-}
-
-export async function withDaemonLock<T>(
-  lockPath: string,
-  action: () => Promise<T>,
-  deps?: DaemonProcessDependencies,
-): Promise<T> {
-  const release = acquireDaemonLock(lockPath, deps);
-  try {
-    return await action();
-  } finally {
-    release();
-  }
 }
 
 export function defaultConnectSocket(socketPath: string): Promise<boolean> {

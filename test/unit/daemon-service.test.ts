@@ -409,6 +409,50 @@ describe("daemon service lifecycle and socket guard", () => {
     }
   });
 
+  test("a daemon rejected by the instance lock never opens or migrates the database", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdsman-lock-nodb-"));
+    tempDirs.push(root);
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: root } });
+    mkdirSync(root, { recursive: true });
+
+    // Another daemon already owns this HERDSMAN_HOME.
+    const release = acquireDaemonLock(`${runtime.paths.pidPath}.instance.lock`, {
+      pid: process.pid,
+    });
+    const exitCodes: number[] = [];
+    const openSqliteSpy = vi.fn(() => {
+      throw new Error("openSqlite must not run when the instance lock is held");
+    });
+    const applyMigrationsSpy = vi.fn(() => {
+      throw new Error("applyMigrations must not run when the instance lock is held");
+    });
+
+    try {
+      await expect(
+        runObservabilityDaemonService({
+          applyMigrations: applyMigrationsSpy,
+          environment: { HERDSMAN_HOME: root },
+          exit: (code) => {
+            exitCodes.push(code ?? 0);
+          },
+          openSqlite: openSqliteSpy,
+          pid: 5555,
+          sessionList: async () => [],
+        }),
+      ).rejects.toThrow(/Herdsman daemon operation lock is held/);
+
+      // The lock is taken before the database is opened: the rejected daemon
+      // never touched the SQLite file.
+      expect(openSqliteSpy).not.toHaveBeenCalled();
+      expect(applyMigrationsSpy).not.toHaveBeenCalled();
+      expect(existsSync(runtime.paths.dbPath)).toBe(false);
+      expect(existsSync(runtime.paths.pidPath)).toBe(false);
+      expect(exitCodes).toHaveLength(0);
+    } finally {
+      release();
+    }
+  });
+
   test("releases instance lock, cleans up pid file and closes server if reconcile fails during startup", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdsman-reconcile-fail-"));
     tempDirs.push(root);
