@@ -97,7 +97,7 @@ describe("Pi agent wake projection", () => {
     expect(formatted).not.toContain("last assistant:");
   });
 
-  test("filters out agent.discarded without triggering wake even with PLAN_WAITING_HISTORY reason", () => {
+  test("projects agent.discarded as a wakeable failed outcome even with PLAN_WAITING_HISTORY reason", () => {
     const projection = projectAgentOutcomes([
       event(21, "agent.discarded", {
         agent: "claude",
@@ -108,11 +108,20 @@ describe("Pi agent wake projection", () => {
         to: "done",
       }),
     ]);
-    expect(projection.outcomes).toEqual([]);
+    // 终态失败必须能在编排者对话里被唤醒：观察者放弃等待也是一次没有结果的结果，
+    // 不再静默丢弃。
+    expect(projection.outcomes).toEqual([
+      expect.objectContaining({ eventId: 21, kind: "failed", reason: "PLAN_WAITING_HISTORY" }),
+    ]);
     expect(projection.rawEvents).toHaveLength(1);
+    const [outcome] = projection.outcomes;
+    if (!outcome) throw new Error("expected discarded outcome");
+    const formatted = formatAgentOutcomeUpdates([outcome]);
+    expect(formatted).toContain("- failed reviewer · Claude wB:p2");
+    expect(formatted).toContain("reason: PLAN_WAITING_HISTORY");
   });
 
-  test("filters out agent.discarded with custom discard reason without triggering wake", () => {
+  test("projects agent.discarded with a custom discard reason as a wakeable failed outcome", () => {
     const projection = projectAgentOutcomes([
       event(22, "agent.discarded", {
         agent: "claude",
@@ -123,8 +132,41 @@ describe("Pi agent wake projection", () => {
         to: "idle",
       }),
     ]);
-    expect(projection.outcomes).toEqual([]);
+    expect(projection.outcomes).toEqual([
+      expect.objectContaining({ eventId: 22, kind: "failed", reason: "TIMEOUT_DISCARD" }),
+    ]);
     expect(projection.rawEvents).toHaveLength(1);
+  });
+
+  test("keeps the existing suppression semantics for agent.discarded outcomes", () => {
+    // pane 级 fallback 压制不变：同批次已有该 pane 的成功完成态时，fallback 失败被压制。
+    expect(
+      projectAgentOutcomes([
+        event(70, "agent.done", { from: "working", to: "done" }, { terminalId: null }),
+        event(71, "agent.discarded", {
+          fallbackOutcome: true,
+          from: "working",
+          reason: "discarded",
+          to: "failed",
+        }),
+      ]).outcomes,
+    ).toEqual([]);
+    // 上游模型错误压制不变：discarded 的 reason 是上游错误时同样被抑制（不产生 outcome）。
+    const upstream = projectAgentOutcomes([
+      event(72, "agent.discarded", { from: "working", reason: "request timed out", to: "failed" }),
+    ]);
+    expect(upstream.outcomes).toEqual([]);
+    expect(upstream.suppressedUpstreamErrorEventIds).toEqual([72]);
+    // seen 去重不变：同一个 discarded id 在后续投影批次里不再产生 outcome。
+    const projector = createAgentOutcomeProjector();
+    const discarded = event(73, "agent.discarded", {
+      from: "working",
+      name: "worker",
+      reason: "TIMEOUT_DISCARD",
+      to: "failed",
+    });
+    expect(projector([discarded]).outcomes.map(({ eventId }) => eventId)).toEqual([73]);
+    expect(projector([discarded]).outcomes).toEqual([]);
   });
 
   test.each([

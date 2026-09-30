@@ -134,7 +134,11 @@ export class AgentEventReconciler {
         // 执行点补完（判别 1）：快照中存在同名 paneId 但 paneMatchesEvent 判定不兼容（属 E3 跨代冲突）
         const samePaneExists = panes.some((pane) => pane.paneId === event.paneId);
         if (samePaneExists) {
-          if (this.#events.deleteReconcileCandidate(event.id)) {
+          // 跨代冲突不能物理删掉尚未投递过的终态失败行：它必须在 reconciler
+          // 的下一轮扫描中活下去，直到拿到首次投递机会。
+          if (isRetainableTerminalFailure(event)) {
+            if (this.#events.markRetainedInvalidated(event.id)) invalidated += 1;
+          } else if (this.#events.deleteReconcileCandidate(event.id)) {
             invalidated += 1;
           }
           continue;
@@ -144,11 +148,15 @@ export class AgentEventReconciler {
         const now = Date.now();
         const eventAgeMs = now - event.createdAt.getTime();
         const isFresh = eventAgeMs <= REDELIVERY_FRESHNESS_MS; // E6 判定：300s 关页时限
+        // 终态失败行不走 300s 新鲜度窗口：它的保留窗口以「首次投递尝试」为界
+        // （delivery_attempts = 0），因为这条事件常常是在 pane 关闭（agents 行
+        // 物理删除）之后才补写出来的。agent.discarded 不保留。
         const isRetainable =
-          event.deliverable === 1 &&
-          isFresh &&
-          ((event.type === "agent.done" && payload.from === "working") ||
-            (event.type === "agent.idle" && payload.from === "working"));
+          isRetainableTerminalFailure(event) ||
+          (event.deliverable === 1 &&
+            isFresh &&
+            ((event.type === "agent.done" && payload.from === "working") ||
+              (event.type === "agent.idle" && payload.from === "working")));
         if (isRetainable) {
           // 保留交付性，转移为保留作废态
           this.#events.markRetainedInvalidated(event.id);
@@ -219,6 +227,21 @@ export class AgentEventReconciler {
 
 function stringValue(value: unknown): string | null {
   return typeof value === "string" && value.length > 0 ? value : null;
+}
+
+/**
+ * A terminal `agent.failed` row that has never been delivered must survive the
+ * reconcile sweep: when a plan reaches its failed state after the pane was
+ * retired, the event is written with `agent_id = null` and no live pane to match
+ * it, so the ordinary 300s freshness rule would physically delete the only
+ * remaining evidence of the failure before any orchestrator could see it. The
+ * window is bounded by the first delivery attempt (`delivery_attempts = 0`),
+ * which is paired with the retention whitelist in `#invalidatePaneCore` and with
+ * the invalidation gate in `AgentEventStore#reclaimDelivered`. `agent.discarded`
+ * is deliberately not retained.
+ */
+function isRetainableTerminalFailure(event: AgentEventRecord): boolean {
+  return event.type === "agent.failed" && event.deliverable === 1 && event.deliveryAttempts === 0;
 }
 
 /**

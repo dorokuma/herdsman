@@ -2933,17 +2933,35 @@ describe("batch2 window regressions", () => {
       )
       .run(legacyRow.id);
 
-    await index.drainPendingPlans();
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      await index.drainPendingPlans();
 
-    const failed = harness.agentEvents
-      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
-      .filter((event) => event.type === "agent.failed");
-    expect(failed).toHaveLength(1);
-    expect(failed[0]?.payload).toMatchObject({
-      from: "working",
-      reason: "RETRY_EXHAUSTED",
-      to: "done",
-    });
+      // 静默入库：写入后立即确认，只可查、不投递、不打扰当前 owner。
+      const failed = harness.sqlite
+        .prepare("select * from agent_events where type = 'agent.failed'")
+        .all() as Array<Record<string, unknown>>;
+      expect(failed).toHaveLength(1);
+      expect(failed[0]).toMatchObject({ agent_id: agent.id, deliverable: 0, status: "acked" });
+      expect(JSON.parse(String(failed[0]?.payload_json))).toMatchObject({
+        agentId: agent.id,
+        from: "working",
+        reason: "RETRY_EXHAUSTED",
+        to: "done",
+      });
+      expect(
+        harness.agentEvents.listAfter({ herdrSessionName: "default", workspaceId: "wJ" }),
+      ).toEqual([]);
+
+      // 存量补录只在日志里报数：能补 N 条 / 跳过 M 条。
+      expect(infoSpy).toHaveBeenCalledWith("Herdsman backfilled agent.failed rows", {
+        backfilled: 1,
+        skipped: 1,
+        total: 2,
+      });
+    } finally {
+      infoSpy.mockRestore();
+    }
     harness.sqlite.close();
   });
 
@@ -3017,20 +3035,36 @@ describe("batch2 window regressions", () => {
     }
     expect(harness.statusEventPlans.get(row.id).status).toBe("discarded");
 
-    await index.drainPendingPlans();
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      await index.drainPendingPlans();
 
-    const discarded = harness.agentEvents
-      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
-      .filter((event) => event.type === "agent.discarded");
-    expect(discarded).toHaveLength(1);
-    expect(discarded[0]?.payload).toMatchObject({
-      agentId: agent.id,
-      attempts: 8,
-      from: "working",
-      planId: row.id,
-      reason: "PLAN_WAITING_HISTORY",
-      to: "done",
-    });
+      // 静默入库：写入后立即确认，只可查、不投递、不打扰当前 owner。
+      const discarded = harness.sqlite
+        .prepare("select * from agent_events where type = 'agent.discarded'")
+        .all() as Array<Record<string, unknown>>;
+      expect(discarded).toHaveLength(1);
+      expect(discarded[0]).toMatchObject({ agent_id: agent.id, deliverable: 0, status: "acked" });
+      expect(JSON.parse(String(discarded[0]?.payload_json))).toMatchObject({
+        agentId: agent.id,
+        attempts: 8,
+        from: "working",
+        planId: row.id,
+        reason: "PLAN_WAITING_HISTORY",
+        to: "done",
+      });
+      expect(
+        harness.agentEvents.listAfter({ herdrSessionName: "default", workspaceId: "wJ" }),
+      ).toEqual([]);
+
+      expect(infoSpy).toHaveBeenCalledWith("Herdsman backfilled agent.discarded rows", {
+        backfilled: 1,
+        skipped: 0,
+        total: 1,
+      });
+    } finally {
+      infoSpy.mockRestore();
+    }
     harness.sqlite.close();
   });
 
@@ -3087,7 +3121,7 @@ describe("batch2 window regressions", () => {
     harness.sqlite.close();
   });
 
-  test("W6: plan failed after pane generation change emits with current generation and is deliverable", async () => {
+  test("W6: plan failed after pane generation change emits with current generation", async () => {
     const harness = openObservabilityDbHarness();
     const index = new AgentIndexService({
       clientFactory: () => ({
@@ -3161,24 +3195,35 @@ describe("batch2 window regressions", () => {
     }
     await index.drainPendingPlans();
 
-    const failed = harness.agentEvents
-      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
-      .filter((event) => event.type === "agent.failed");
+    const failed = harness.sqlite
+      .prepare("select * from agent_events where type = 'agent.failed'")
+      .all() as Array<Record<string, unknown>>;
     expect(failed).toHaveLength(1);
-    expect(failed[0]?.paneGeneration).toBe("gen-2");
-    expect(failed[0]?.payload).toMatchObject({ paneId: "wJ:p2" });
-
-    const pending = orchestrator.pending({
-      herdrSessionName: "default",
-      workspaceId: "wJ",
-      terminalId: "term_owner",
+    expect(failed[0]).toMatchObject({
+      agent_id: original.id,
+      deliverable: 0,
+      pane_generation: "gen-2",
+      status: "acked",
     });
-    expect(pending.map((event) => event.id)).toContain(failed[0]?.id);
+    expect(JSON.parse(String(failed[0]?.payload_json))).toMatchObject({
+      agentId: original.id,
+      paneId: "wJ:p2",
+    });
+
+    // 存量补录是静默入库：不投递给当前 owner。
+    expect(
+      orchestrator.pending({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+        terminalId: "term_owner",
+      }),
+    ).toEqual([]);
     harness.sqlite.close();
   });
 
   test("W6: agent.failed is still delivered to owner after agent row is deleted", async () => {
     const harness = openObservabilityDbHarness();
+    let failRefresh = false;
     const index = new AgentIndexService({
       clientFactory: () => ({
         close() {},
@@ -3186,11 +3231,24 @@ describe("batch2 window regressions", () => {
           return oneAgent("working", 10);
         },
       }),
-      history: history(() => undefined),
+      history: {
+        async resolveCompactHistory() {
+          if (failRefresh) throw new Error("simulated disk error");
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "ref-1", text: "old", timestamp: null },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
       stores: harness,
+      turnCompletions: new TurnCompletionRegistry({ timeoutMs: 0 }),
     });
     await index.refreshHerdrSession(sessionInput());
-    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    const agent = harness.agents.listForHerdrSession("default")[0];
     if (!agent) throw new Error("expected agent");
 
     const orchestrator = new AgentOrchestratorService({
@@ -3205,28 +3263,224 @@ describe("batch2 window regressions", () => {
       terminalId: "term_owner",
     });
 
-    const row = harness.statusEventPlans.insertPending({
+    // The plan is one round away from exhaustion when the pane is retired and the
+    // agents row is physically deleted: this is the H1 write path (the retry
+    // refresh fails and the terminal event is appended with the agent row gone).
+    const row = harness.statusEventPlans.insertPending({ agent, from: "working", to: "done" });
+    for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS - 1; i += 1) {
+      expect(harness.statusEventPlans.markRetry(row.id, new Error("degraded"))?.status).toBe(
+        "pending",
+      );
+    }
+    harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+    failRefresh = true;
+
+    const failed = await index.executeStatusEventPlan({
       agent,
+      compactHistory: undefined,
       from: "working",
+      planId: row.id,
       to: "done",
     });
-    for (let i = 0; i < 8; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("RETRY_EXHAUSTED"));
-    }
-    await index.drainPendingPlans();
-    const failed = harness.agentEvents
-      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
-      .filter((event) => event.type === "agent.failed");
-    expect(failed).toHaveLength(1);
 
-    harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+    expect(failed?.type).toBe("agent.failed");
+    // 修复前：agents 行不存在导致 FOREIGN KEY constraint failed，事件从未落库。
+    // 修复后：降级为孤儿行写入，原始 agent id 保留在 payload 里。
+    expect(failed?.agentId).toBeNull();
+    expect((failed?.payload as Record<string, unknown> | undefined)?.agentId).toBe(agent.id);
+    expect(harness.agentEvents.get(failed?.id ?? 0)).toMatchObject({
+      agentId: null,
+      deliverable: 1,
+      status: "pending",
+      type: "agent.failed",
+    });
 
     const pending = orchestrator.pending({
       herdrSessionName: "default",
       workspaceId: "wJ",
       terminalId: "term_owner",
     });
-    expect(pending.map((event) => event.id)).toContain(failed[0]?.id);
+    expect(pending.map((event) => event.id)).toContain(failed?.id);
+    harness.sqlite.close();
+  });
+
+  test("H1: an undelivered orphan failed row is not swept by a later cursor ack", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("expected agent");
+
+    const orchestrator = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    orchestrator.claim({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+      paneId: "wJ:owner",
+      terminalId: "term_owner",
+    });
+
+    // 孤儿终态行：agents 行已物理删除后补写，agent_id 为 null。
+    const orphan = harness.agentEvents.append({
+      agentId: null,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      payload: { agentId: agent.id, reason: "RETRY_EXHAUSTED" },
+      terminalId: "term_gone",
+      type: "agent.failed",
+      workspaceId: "wJ",
+    });
+    const later = harness.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      payload: { from: "working", to: "done" },
+      terminalId: "term_claude",
+      type: "agent.done",
+      workspaceId: "wJ",
+    });
+    expect(orphan.id).toBeLessThan(later.id);
+
+    // 顺序守卫必须能看到孤儿行，否则 ack 路径不会拦下后到的 cursor ack。
+    expect(
+      harness.agentEvents.nextDeliverableAfter({
+        afterEventId: 0,
+        herdrSessionName: "default",
+        ownerTerminalId: "term_owner",
+        workspaceId: "wJ",
+      }),
+    ).toMatchObject({ id: orphan.id });
+
+    // 只投递后一条，再尝试 ack：孤儿行未投递且位于 cursor 之前，ack 必须被拒绝，
+    // 而不是被 markAcked(id <= cursor) 静默扫成已确认。
+    expect(
+      harness.agentEvents.reservePending("term_owner", 100, [later.id]).map((event) => event.id),
+    ).toEqual([later.id]);
+    expect(() =>
+      orchestrator.ack({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+        terminalId: "term_owner",
+        eventId: later.id,
+      }),
+    ).toThrowError(/Only the next pending orchestrator event/);
+    expect(harness.agentEvents.get(orphan.id)).toMatchObject({
+      deliverable: 1,
+      status: "pending",
+    });
+    harness.sqlite.close();
+  });
+
+  test("H1: backfill stitches pane metadata by generation and never borrows a newer instance", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return snapshot(
+            [
+              agent({
+                pane_generation: "gen-1",
+                pane_id: "wJ:p2",
+                revision: 10,
+                terminal_id: "term_old",
+                workspace_id: "wJ",
+              }),
+            ],
+            [{ pane_id: "wJ:p2", revision: 10 }],
+          );
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const oldInstance = harness.agents.findByPane({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      paneGeneration: "gen-1",
+    });
+    if (!oldInstance) throw new Error("expected agent");
+
+    // The old instance's own event carries the metadata the stitch has to find.
+    harness.agentEvents.append({
+      agentId: oldInstance.id,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      paneGeneration: "gen-1",
+      payload: { from: "working", to: "done" },
+      terminalId: "term_old",
+      type: "agent.status.changed",
+      workspaceId: "wJ",
+    });
+
+    const row = harness.statusEventPlans.insertPending({
+      agent: oldInstance,
+      from: "working",
+      to: "done",
+    });
+    for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("RETRY_EXHAUSTED"));
+    }
+    expect(harness.statusEventPlans.get(row.id).status).toBe("failed");
+
+    // A newer instance reuses the same paneId. Its event is back-dated so only the
+    // generation filter can keep it away from the old plan.
+    const newcomer = harness.agentEvents.append({
+      agentId: null,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      paneGeneration: "gen-2",
+      payload: { from: "working", to: "done" },
+      terminalId: "term_new",
+      type: "agent.status.changed",
+      workspaceId: "wJ",
+    });
+    harness.sqlite
+      .prepare("update agent_events set created_at = ? where id = ?")
+      .run(row.createdAt.getTime() - 1, newcomer.id);
+
+    // Pane retired: the agents row is physically deleted and ON DELETE SET NULL
+    // clears agent_id on every event, so the legacy agent_id stitch finds nothing.
+    harness.sqlite.prepare("delete from agents where id = ?").run(oldInstance.id);
+
+    const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
+    try {
+      await index.drainPendingPlans();
+
+      const failed = harness.sqlite
+        .prepare("select * from agent_events where type = 'agent.failed'")
+        .all() as Array<Record<string, unknown>>;
+      expect(failed).toHaveLength(1);
+      // 旧 plan 的补录必须取旧实例的 metadata，绝不能挂到同 pane 的新实例上。
+      expect(failed[0]).toMatchObject({
+        agent_id: null,
+        pane_generation: "gen-1",
+        terminal_id: "term_old",
+        workspace_id: "wJ",
+      });
+      expect(failed[0]?.terminal_id).not.toBe("term_new");
+
+      expect(infoSpy).toHaveBeenCalledWith("Herdsman backfilled agent.failed rows", {
+        backfilled: 1,
+        skipped: 0,
+        total: 1,
+      });
+    } finally {
+      infoSpy.mockRestore();
+    }
     harness.sqlite.close();
   });
 

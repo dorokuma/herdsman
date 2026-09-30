@@ -459,6 +459,21 @@ describe("ObservabilityRpcServer", () => {
     await tick();
     expect(piA.notifications).toEqual([]);
 
+    // 孤儿终态事件（agents 行已物理删除，agent_id = null）仍然必须能推到 owner。
+    const orphanFailure = harness.agentEvents.append({
+      agentId: null,
+      herdrSessionName: "default",
+      paneId: "wB:p-b",
+      payload: { agentId: "agent-gone", reason: "RETRY_EXHAUSTED" },
+      terminalId: "term_b",
+      type: "agent.failed",
+      workspaceId: "wB",
+    });
+    server.publishAgentEvent(orphanFailure);
+    await expect(piA.waitForNotification("agent.event")).resolves.toMatchObject({
+      params: { event: { agentId: null, id: orphanFailure.id, type: "agent.failed" } },
+    });
+
     const replacementError = await piB
       .request("agent.orchestrator.set", { enabled: true })
       .catch((error: unknown) => error);

@@ -51,8 +51,9 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
     return "failed";
   }
   if (event.type === "agent.discarded") {
-    // 观察者放弃等待不唤醒编排者；真实故障由 agent.failed 负责唤醒，正常结束由 agent.done/idle 保底
-    return undefined;
+    // 观察者放弃等待也是终态失败：结果永远不会到达，必须能在编排者对话里被唤醒。
+    // 压制/死信语义保持既有实现（上游错误抑制、pane 级 fallback 压制、seen 去重）。
+    return "failed";
   }
   const payload = asRecord(event.payload);
   if (event.type === "agent.idle" && payload.from === "working") return "completed";

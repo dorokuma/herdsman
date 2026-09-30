@@ -199,6 +199,7 @@ export class AgentEventStore {
       : undefined;
     if (existing) return mapAgentEvent(existing);
 
+    const agentId = this.#resolveAppendAgentId(input.agentId ?? null);
     const result = this.#sqlite
       .prepare(
         `insert into agent_events
@@ -207,7 +208,7 @@ export class AgentEventStore {
       )
       .run(
         input.herdrSessionName,
-        input.agentId ?? null,
+        agentId,
         input.paneId ?? null,
         input.paneGeneration ?? null,
         input.workspaceId ?? null,
@@ -219,6 +220,25 @@ export class AgentEventStore {
         this.#now(),
       );
     return this.get(Number(result.lastInsertRowid));
+  }
+
+  /**
+   * Defence in depth for the terminal-event write path. A status plan can reach
+   * its terminal state after the pane was retired and its `agents` row was
+   * physically deleted; the foreign key would then reject the insert
+   * (`FOREIGN KEY constraint failed`) and the terminal outcome would be lost
+   * before it ever reached the store. Instead of throwing, the row is written as
+   * an orphan (`agent_id = null`) and logged, so the degradation is explicit
+   * rather than silent.
+   */
+  #resolveAppendAgentId(agentId: string | null): string | null {
+    if (agentId === null) return null;
+    const row = this.#sqlite.prepare("select 1 from agents where id = ? limit 1").get(agentId);
+    if (row) return agentId;
+    console.warn("Herdsman downgrading agent event to orphan because the agents row is gone", {
+      agentId,
+    });
+    return null;
   }
 
   invalidatePane(input: {
@@ -274,6 +294,10 @@ export class AgentEventStore {
       )
       .run(defaultReason, input.herdrSessionName, input.paneId, ...legacyOrMatchedParams);
     // 步骤 2：对满足保留条件的完成类事件恢复 deliverable = 1
+    // 关页保留只保到「首次投递尝试」为止：done/idle 沿用 300s 新鲜度窗口，
+    // agent.failed 则以 delivery_attempts = 0（尚未投递过）为界——失败结果常常
+    // 是在 pane/agents 行已经消失之后才写出来的，必须有一轮投递机会。
+    // agent.discarded 不保留。
     const genCondition = legacy ? "1 = 1" : "pane_generation = ?";
     const genParams = legacy ? [] : [input.paneGeneration ?? null];
     this.#sqlite
@@ -281,10 +305,11 @@ export class AgentEventStore {
         `update agent_events
               set deliverable = 1, invalidated_reason = 'RETAINED_OUTCOME_PANE_CLOSED'
             where herdr_session_name = ? and pane_id = ? and status = 'invalidated' and deliverable = 0 and invalidated_reason = ?
-              and (${genCondition})
-              and ((type = 'agent.done' and json_extract(payload_json, '$.from') = 'working')
-                or (type = 'agent.idle' and json_extract(payload_json, '$.from') = 'working'))
-              and created_at >= ?`,
+              and ((${genCondition})
+                 and ((type = 'agent.done' and json_extract(payload_json, '$.from') = 'working')
+                   or (type = 'agent.idle' and json_extract(payload_json, '$.from') = 'working'))
+                 and created_at >= ?
+                or (type = 'agent.failed' and delivery_attempts = 0))`,
       )
       .run(
         input.herdrSessionName,
@@ -492,12 +517,18 @@ export class AgentEventStore {
     const scope = { herdrSessionName: input.herdrSessionName, workspaceId: input.workspaceId };
     // Retained rows (status='invalidated' and deliverable=1) outlive the live
     // `agents` row because pane close physically clears it, so they must never
-    // be filtered by the existence guard. Every other row keeps the original
-    // "the agent is still indexed" check.
+    // be filtered by the existence guard. Orphan terminal rows (`agent.failed` /
+    // `agent.discarded` written after the agents row vanished) have the same
+    // problem: they carry `agent_id = null` and still have to be visible here,
+    // because otherwise the cursor ack (`markAcked(id <= cursor)`) would silently
+    // swallow an event that was never delivered. Every other row keeps the
+    // original "the agent is still indexed" check.
+    const orphanTerminalFilter = `or type in ('agent.failed', 'agent.discarded')`;
     const agentFilter = input.getAgent
       ? ""
       : `and (
              (status = 'invalidated' and deliverable = 1)
+             ${orphanTerminalFilter}
              or exists (
                select 1 from agents
                where agents.id = agent_events.agent_id
@@ -521,7 +552,7 @@ export class AgentEventStore {
       const sql = `select * from agent_events
            where id > ? and ((status = 'pending' and (next_attempt_at is null or next_attempt_at <= ?)) or (status = 'delivered' and delivered_to_terminal_id = ? and last_attempt_at >= ?) or (status = 'invalidated' and deliverable = 1 and (next_attempt_at is null or next_attempt_at <= ?))) and herdr_session_name = ? and workspace_id = ?
              and terminal_id is not null and terminal_id != ?
-             and (agent_id is not null or (status = 'invalidated' and deliverable = 1))
+             and (agent_id is not null or (status = 'invalidated' and deliverable = 1) ${orphanTerminalFilter})
              ${agentFilter}
            order by id asc limit 1000`;
       const rows = this.#sqlite.prepare(sql).all(...params) as AgentEventRow[];
@@ -532,8 +563,11 @@ export class AgentEventStore {
         // Pane close physically removes the agents row and the ON DELETE SET NULL
         // foreign key then clears agent_id on the retained event, so retained rows
         // are evaluated from their own metadata instead of the live agent record.
+        // Orphan terminal rows follow the same rule (their own payload/metadata is
+        // the only remaining source of truth).
         const retained = event.status === "invalidated" && event.deliverable === 1;
-        if (agentId === null && !retained) continue;
+        const orphanTerminal = event.type === "agent.failed" || event.type === "agent.discarded";
+        if (agentId === null && !retained && !orphanTerminal) continue;
         if (
           !input.getAgent ||
           isDeliverableAgentEvent(
@@ -595,12 +629,18 @@ export class AgentEventStore {
           and agents.pane_id = agent_events.pane_id
       )`;
       // Branch (b): the agent pane is closed/retired, so the delivered event is
-      // invalidated instead of being reclaimed and redelivered.
+      // invalidated instead of being reclaimed and redelivered. This is also the
+      // point where the "retained until the first delivery attempt" window of a
+      // terminal `agent.failed` row ends and the ordinary invalidated + 1h
+      // collection takes over. `reservePending` is the only writer that sets
+      // status = 'delivered' and it always increments delivery_attempts, so the
+      // explicit `delivery_attempts >= 1` guard states the invariant that no row
+      // may leave the retained window before it was handed to an owner once.
       const invalidated = this.#sqlite
         .prepare(
           `update agent_events
            set deliverable = 0, status = 'invalidated', invalidated_reason = 'PANE_CLOSED_RECLAIM'
-           where status = 'delivered' and last_attempt_at < ? and not ${agentPaneOpen}`,
+           where status = 'delivered' and delivery_attempts >= 1 and last_attempt_at < ? and not ${agentPaneOpen}`,
         )
         .run(cutoff).changes;
       // Branch (c): the pane is still open but the delivery terminal no longer

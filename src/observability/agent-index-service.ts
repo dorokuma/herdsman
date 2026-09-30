@@ -324,7 +324,17 @@ export class AgentIndexService {
         }
         await this.#enqueueAgentPlan(plan.agent.id, () => this.#retryWaitingPlanRow(planId, plan));
       } catch (error) {
-        console.debug("Herdsman waiting history retry callback error", error);
+        // A failed retry callback used to be a silent `console.debug`; the row it
+        // was supposed to advance can then sit in `pending` forever with no
+        // signal at all, so the failure is reported as a warning with the row
+        // identity attached.
+        console.warn("Herdsman waiting history retry callback failed", {
+          planId,
+          agentId: plan.agent.id,
+          herdrSessionName: plan.agent.herdrSessionName,
+          paneId: plan.agent.paneId,
+          error,
+        });
       } finally {
         const store = this.#stores.statusEventPlans;
         if (store) {
@@ -399,6 +409,7 @@ export class AgentIndexService {
           attempts: updated.attempts,
           compactHistory: plan.compactHistory,
           from: plan.from,
+          planCreatedAt: currentPlan.createdAt.getTime(),
           planId,
           reason: updated.lastError,
           to: plan.to,
@@ -418,6 +429,7 @@ export class AgentIndexService {
           attempts: updated.attempts,
           compactHistory: plan.compactHistory,
           from: plan.from,
+          planCreatedAt: currentPlan.createdAt.getTime(),
           planId,
           reason: updated.lastError,
           to: plan.to,
@@ -498,8 +510,22 @@ export class AgentIndexService {
       }
     });
     // Individual rows may reject (after markRetry) but the drain itself never
-    // rejects: every row is either drained, cancelled, or retried.
-    await Promise.allSettled(tasks);
+    // rejects: every row is either drained, cancelled, or retried. A rejected
+    // row is still an anomaly (its own drain path threw), so it is reported
+    // instead of being silently folded into the settled results.
+    const results = await Promise.allSettled(tasks);
+    const rejected = results.flatMap((result) =>
+      result.status === "rejected" ? [result.reason] : [],
+    );
+    if (rejected.length > 0) {
+      console.error("Herdsman status event plan drain rejected rows", {
+        rejected: rejected.length,
+        total: results.length,
+        errors: rejected.map((reason) =>
+          reason instanceof Error ? reason.message : String(reason),
+        ),
+      });
+    }
     await this.#backfillFailedPlanEvents();
     await this.#backfillDiscardedPlanEvents();
   }
@@ -507,34 +533,63 @@ export class AgentIndexService {
   async #backfillFailedPlanEvents(): Promise<void> {
     const store = this.#stores.statusEventPlans;
     if (!store) return;
+    let backfilled = 0;
+    let skipped = 0;
     for (const row of store.listFailed()) {
-      if (row.lastError === PLAN_WAITING_HISTORY) continue;
-      const existing = this.#stores.sqlite
-        .prepare("select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?")
-        .get(row.herdrSessionName, `agent.failed:plan:${row.id}`);
-      if (existing) continue;
-      let agent: AgentIndexRecord | undefined;
+      // Per-row isolation: one unresolvable or unwritable row must not abort the
+      // whole backfill round. The legacy loop had no guard, so the first
+      // `FOREIGN KEY constraint failed` threw out of `drainPendingPlans` and no
+      // later row was ever attempted.
       try {
-        agent = this.#stores.agents.get(row.agentId);
-      } catch {
-        agent = this.#minimalAgentFromLatestEvent(row.agentId, row.herdrSessionName);
-        if (!agent) {
-          console.warn("Herdsman skipping agent.failed backfill; no agent row or events", {
-            agentId: row.agentId,
-            herdrSessionName: row.herdrSessionName,
-            planId: row.id,
-          });
+        if (row.lastError === PLAN_WAITING_HISTORY) {
+          skipped += 1;
           continue;
         }
+        const existing = this.#stores.sqlite
+          .prepare(
+            "select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?",
+          )
+          .get(row.herdrSessionName, `agent.failed:plan:${row.id}`);
+        if (existing) {
+          skipped += 1;
+          continue;
+        }
+        const agent = this.#resolveBackfillAgent(row);
+        if (!agent) {
+          skipped += 1;
+          continue;
+        }
+        const event = this.#appendPlanFailedEvent({
+          agent,
+          attempts: row.attempts,
+          compactHistory: row.compactHistory,
+          from: row.fromStatus,
+          planCreatedAt: row.createdAt.getTime(),
+          planId: row.id,
+          reason: row.lastError,
+          to: row.toStatus,
+        });
+        // Stock terminal results are ingested silently: the row is written, then
+        // immediately acknowledged/non-deliverable, so it stays queryable without
+        // waking the current owner with a long-past failure.
+        this.#stores.agentEvents.markAcked(event.id);
+        backfilled += 1;
+      } catch (error) {
+        skipped += 1;
+        console.warn("Herdsman skipping agent.failed backfill row", {
+          agentId: row.agentId,
+          herdrSessionName: row.herdrSessionName,
+          paneId: row.paneId,
+          planId: row.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
-      this.#appendPlanFailedEvent({
-        agent,
-        attempts: row.attempts,
-        compactHistory: row.compactHistory,
-        from: row.fromStatus,
-        planId: row.id,
-        reason: row.lastError,
-        to: row.toStatus,
+    }
+    if (backfilled > 0 || skipped > 0) {
+      console.info("Herdsman backfilled agent.failed rows", {
+        backfilled,
+        skipped,
+        total: backfilled + skipped,
       });
     }
   }
@@ -542,47 +597,120 @@ export class AgentIndexService {
   async #backfillDiscardedPlanEvents(): Promise<void> {
     const store = this.#stores.statusEventPlans;
     if (!store) return;
+    let backfilled = 0;
+    let skipped = 0;
     for (const row of store.listDiscarded()) {
-      const existing = this.#stores.sqlite
-        .prepare("select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?")
-        .get(row.herdrSessionName, `agent.discarded:plan:${row.id}`);
-      if (existing) continue;
-      let agent: AgentIndexRecord | undefined;
       try {
-        agent = this.#stores.agents.get(row.agentId);
-      } catch {
-        agent = this.#minimalAgentFromLatestEvent(row.agentId, row.herdrSessionName);
-        if (!agent) {
-          console.warn("Herdsman skipping agent.discarded backfill; no agent row or events", {
-            agentId: row.agentId,
-            herdrSessionName: row.herdrSessionName,
-            planId: row.id,
-          });
+        const existing = this.#stores.sqlite
+          .prepare(
+            "select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?",
+          )
+          .get(row.herdrSessionName, `agent.discarded:plan:${row.id}`);
+        if (existing) {
+          skipped += 1;
           continue;
         }
+        const agent = this.#resolveBackfillAgent(row);
+        if (!agent) {
+          skipped += 1;
+          continue;
+        }
+        const event = this.#appendPlanDiscardedEvent({
+          agent,
+          attempts: row.attempts,
+          compactHistory: row.compactHistory,
+          from: row.fromStatus,
+          planCreatedAt: row.createdAt.getTime(),
+          planId: row.id,
+          reason: row.lastError,
+          to: row.toStatus,
+        });
+        // Same silent-ingest contract as the failed backfill.
+        this.#stores.agentEvents.markAcked(event.id);
+        backfilled += 1;
+      } catch (error) {
+        skipped += 1;
+        console.warn("Herdsman skipping agent.discarded backfill row", {
+          agentId: row.agentId,
+          herdrSessionName: row.herdrSessionName,
+          paneId: row.paneId,
+          planId: row.id,
+          error: error instanceof Error ? error.message : String(error),
+        });
       }
-      this.#appendPlanDiscardedEvent({
-        agent,
-        attempts: row.attempts,
-        compactHistory: row.compactHistory,
-        from: row.fromStatus,
-        planId: row.id,
-        reason: row.lastError,
-        to: row.toStatus,
+    }
+    if (backfilled > 0 || skipped > 0) {
+      console.info("Herdsman backfilled agent.discarded rows", {
+        backfilled,
+        skipped,
+        total: backfilled + skipped,
       });
     }
   }
 
-  #minimalAgentFromLatestEvent(
-    agentId: string,
-    herdrSessionName: string,
-  ): AgentIndexRecord | undefined {
+  /**
+   * Resolves the metadata a terminal plan outcome may use to reach an
+   * orchestrator: the live `agents` row when it still exists, otherwise a
+   * minimal record stitched from the pane's own event history.
+   */
+  #resolveBackfillAgent(row: StatusEventPlanRecord): AgentIndexRecord | undefined {
+    try {
+      return this.#stores.agents.get(row.agentId);
+    } catch {
+      const stitched = this.#minimalAgentFromLatestEvent({
+        agentId: row.agentId,
+        createdBefore: row.createdAt.getTime(),
+        herdrSessionName: row.herdrSessionName,
+        paneGeneration: row.paneGeneration,
+        paneId: row.paneId,
+      });
+      if (!stitched) {
+        console.warn("Herdsman skipping terminal event backfill; no agent row or pane events", {
+          agentId: row.agentId,
+          herdrSessionName: row.herdrSessionName,
+          paneId: row.paneId,
+          planId: row.id,
+        });
+      }
+      return stitched;
+    }
+  }
+
+  /**
+   * Reconstructs the minimum agent metadata a terminal event needs from the
+   * pane's own event history.
+   *
+   * The lookup is keyed by `(herdr_session_name, pane_id)` plus the plan's
+   * `pane_generation`, and is bounded by `createdBefore` (the plan row's
+   * `created_at`). Matching on `agent_id` alone cannot work here: physical
+   * deletion of the `agents` row runs `ON DELETE SET NULL` over every event, so
+   * the legacy stitch always came back empty, and a pane-id-only match would
+   * happily stitch an old failure onto a newer instance of the same pane. The
+   * generation and time bounds are what keep the two apart.
+   */
+  #minimalAgentFromLatestEvent(input: {
+    agentId: string;
+    createdBefore: number;
+    herdrSessionName: string;
+    paneGeneration: string | null;
+    paneId: string;
+  }): AgentIndexRecord | undefined {
+    const generationClause =
+      input.paneGeneration === null ? "pane_generation is null" : "pane_generation = ?";
+    const params: Array<number | string> = [
+      input.herdrSessionName,
+      input.paneId,
+      input.createdBefore,
+    ];
+    if (input.paneGeneration !== null) params.push(input.paneGeneration);
     const latest = this.#stores.sqlite
       .prepare(
         `select pane_id, pane_generation, terminal_id, workspace_id, herdr_session_name
-         from agent_events where agent_id = ? order by id desc limit 1`,
+         from agent_events
+         where herdr_session_name = ? and pane_id = ? and created_at <= ? and ${generationClause}
+         order by id desc limit 1`,
       )
-      .get(agentId) as
+      .get(...params) as
       | {
           herdr_session_name: string;
           pane_generation: string | null;
@@ -600,8 +728,8 @@ export class AgentIndexService {
       firstSeenAt: new Date(0),
       focused: false,
       foregroundCwd: null,
-      herdrSessionName: latest.herdr_session_name || herdrSessionName,
-      id: agentId,
+      herdrSessionName: latest.herdr_session_name || input.herdrSessionName,
+      id: input.agentId,
       lastSeenAt: new Date(0),
       name: null,
       paneId: latest.pane_id,
@@ -697,6 +825,7 @@ export class AgentIndexService {
           attempts: updated.attempts,
           compactHistory: current.compactHistory,
           from: current.fromStatus,
+          planCreatedAt: current.createdAt.getTime(),
           planId: current.id,
           reason: updated.lastError,
           to: current.toStatus,
@@ -715,6 +844,7 @@ export class AgentIndexService {
           attempts: updated.attempts,
           compactHistory: current.compactHistory,
           from: current.fromStatus,
+          planCreatedAt: current.createdAt.getTime(),
           planId: current.id,
           reason: updated.lastError,
           to: current.toStatus,
@@ -827,6 +957,7 @@ export class AgentIndexService {
               attempts: updated.attempts,
               compactHistory: plan.compactHistory,
               from: row.fromStatus,
+              planCreatedAt: row.createdAt.getTime(),
               planId: row.id,
               reason: updated.lastError,
               to: row.toStatus,
@@ -846,6 +977,7 @@ export class AgentIndexService {
               attempts: updated.attempts,
               compactHistory: plan.compactHistory,
               from: row.fromStatus,
+              planCreatedAt: row.createdAt.getTime(),
               planId: row.id,
               reason: updated.lastError,
               to: row.toStatus,
@@ -902,6 +1034,7 @@ export class AgentIndexService {
               attempts: updated.attempts,
               compactHistory: activePlan.compactHistory,
               from: row.fromStatus,
+              planCreatedAt: row.createdAt.getTime(),
               planId: row.id,
               reason: updated.lastError,
               to: row.toStatus,
@@ -913,6 +1046,7 @@ export class AgentIndexService {
               attempts: updated.attempts,
               compactHistory: activePlan.compactHistory,
               from: row.fromStatus,
+              planCreatedAt: row.createdAt.getTime(),
               planId: row.id,
               reason: updated.lastError,
               to: row.toStatus,
@@ -949,6 +1083,7 @@ export class AgentIndexService {
               attempts: updated.attempts,
               compactHistory: activePlan.compactHistory,
               from: row.fromStatus,
+              planCreatedAt: row.createdAt.getTime(),
               planId: row.id,
               reason: updated.lastError,
               to: row.toStatus,
@@ -968,6 +1103,7 @@ export class AgentIndexService {
               attempts: updated.attempts,
               compactHistory: activePlan.compactHistory,
               from: row.fromStatus,
+              planCreatedAt: row.createdAt.getTime(),
               planId: row.id,
               reason: updated.lastError,
               to: row.toStatus,
@@ -1010,6 +1146,7 @@ export class AgentIndexService {
           attempts: updated.attempts,
           compactHistory: activePlan.compactHistory,
           from: row.fromStatus,
+          planCreatedAt: row.createdAt.getTime(),
           planId: row.id,
           reason: updated.lastError,
           to: row.toStatus,
@@ -1029,6 +1166,7 @@ export class AgentIndexService {
           attempts: updated.attempts,
           compactHistory: activePlan.compactHistory,
           from: row.fromStatus,
+          planCreatedAt: row.createdAt.getTime(),
           planId: row.id,
           reason: updated.lastError,
           to: row.toStatus,
@@ -2073,31 +2211,56 @@ export class AgentIndexService {
     }
   }
 
+  /**
+   * Resolves the metadata a terminal plan outcome is attributed to and whether
+   * the event may keep its `agent_id` foreign key.
+   *
+   * A live `agents` row wins because it carries the current pane generation.
+   * Once the row is gone (pane retired / physically deleted) the plan's own
+   * pane/session/generation are the authority, refined by the newest event of
+   * the same pane + generation that predates the plan, so an old failure is
+   * never stitched onto a newer instance of the same pane. The event is still
+   * written in that case, but as an orphan (`agentRowPresent: false`).
+   */
+  #resolvePlanOutcomeAgent(
+    agent: AgentIndexRecord,
+    planCreatedAt: number | undefined,
+  ): { agent: AgentIndexRecord; agentRowPresent: boolean } {
+    try {
+      return { agent: this.#stores.agents.get(agent.id), agentRowPresent: true };
+    } catch {
+      const stitched = this.#minimalAgentFromLatestEvent({
+        agentId: agent.id,
+        // The plan row's own creation time is the upper bound: anything newer on
+        // the same pane belongs to a later instance.
+        createdBefore: planCreatedAt ?? Date.now(),
+        herdrSessionName: agent.herdrSessionName,
+        paneGeneration: agent.paneGeneration ?? null,
+        paneId: agent.paneId,
+      });
+      return { agent: stitched ?? agent, agentRowPresent: false };
+    }
+  }
+
   #appendPlanFailedEvent(input: {
     agent: AgentIndexRecord;
     attempts: number;
     compactHistory: CompactAgentHistory | null | undefined;
     fallbackOutcome?: boolean;
     from: AgentStatus;
+    planCreatedAt?: number;
     planId: number;
     reason: string | null;
     to: AgentStatus;
   }): AgentEventRecord {
-    let agent = input.agent;
-    try {
-      agent = this.#stores.agents.get(input.agent.id);
-    } catch {
-      const stitched = this.#minimalAgentFromLatestEvent(
-        input.agent.id,
-        input.agent.herdrSessionName,
-      );
-      if (stitched) agent = stitched;
-    }
+    const originalAgentId = input.agent.id;
+    const resolved = this.#resolvePlanOutcomeAgent(input.agent, input.planCreatedAt);
+    const agent = resolved.agent;
     const fallbackOutcome =
       input.fallbackOutcome ??
       ((input.to === "done" || input.to === "blocked") && input.reason === "degraded");
     return this.#appendAndAckSelfEvent({
-      agentId: agent.id,
+      agentId: resolved.agentRowPresent ? agent.id : null,
       compactHistory: input.compactHistory ?? null,
       herdrSessionName: agent.herdrSessionName,
       idempotencyKey: `agent.failed:plan:${input.planId}`,
@@ -2105,6 +2268,9 @@ export class AgentIndexService {
       paneGeneration: agent.paneGeneration ?? null,
       payload: {
         agent: agent.agent,
+        // The original id survives in the payload even when the row had to be
+        // written as an orphan, so the failure stays traceable to its agent.
+        agentId: originalAgentId,
         attempts: input.attempts,
         fallbackOutcome,
         from: input.from,
@@ -2127,22 +2293,16 @@ export class AgentIndexService {
     attempts: number;
     compactHistory: CompactAgentHistory | null | undefined;
     from: AgentStatus;
+    planCreatedAt?: number;
     planId: number;
     reason: string | null;
     to: AgentStatus;
   }): AgentEventRecord {
-    let agent = input.agent;
-    try {
-      agent = this.#stores.agents.get(input.agent.id);
-    } catch {
-      const stitched = this.#minimalAgentFromLatestEvent(
-        input.agent.id,
-        input.agent.herdrSessionName,
-      );
-      if (stitched) agent = stitched;
-    }
+    const originalAgentId = input.agent.id;
+    const resolved = this.#resolvePlanOutcomeAgent(input.agent, input.planCreatedAt);
+    const agent = resolved.agent;
     return this.#appendAndAckSelfEvent({
-      agentId: agent.id,
+      agentId: resolved.agentRowPresent ? agent.id : null,
       compactHistory: input.compactHistory ?? null,
       herdrSessionName: agent.herdrSessionName,
       idempotencyKey: `agent.discarded:plan:${input.planId}`,
@@ -2150,7 +2310,7 @@ export class AgentIndexService {
       paneGeneration: agent.paneGeneration ?? null,
       payload: {
         agent: agent.agent,
-        agentId: agent.id,
+        agentId: originalAgentId,
         attempts: input.attempts,
         from: input.from,
         herdrSessionName: agent.herdrSessionName,
