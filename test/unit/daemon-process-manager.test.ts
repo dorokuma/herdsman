@@ -642,6 +642,41 @@ exit 0
     }
   });
 
+  test("a failed or truncated /proc/<pid>/stat read never counts as a dead lock-holding child", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    // Models procfs breaking while the child is provably alive: READY is only
+    // published after `flock -n` succeeded and the child is parked in `cat`
+    // holding the flock. Every case below must still hand back a handle, and that
+    // handle must really own the flock — so a second acquisition without the seam
+    // has to be refused (double-master regression surface) and the lock must be
+    // observably free again once the handle is released.
+    const expectSurvivingHolder = async (readProcessStat: (pid: number) => string) => {
+      const handle = acquireFlockHandle(lockPath, { readProcessStat });
+      expect(handle).not.toBeNull();
+      expect(acquireFlockHandle(lockPath)).toBeNull();
+      handle?.release();
+      await waitForCondition(() => !isFlockHeld(lockPath), {
+        description: "the released flock to be observable as free",
+      });
+      expect(isFlockHeld(lockPath)).toBe(false);
+    };
+
+    // A read error carrying an errno (EIO) proves nothing about liveness.
+    await expectSurvivingHolder(() => {
+      throw Object.assign(new Error("input/output error"), { code: "EIO" });
+    });
+
+    // A read error without any `code` is just as inconclusive.
+    await expectSurvivingHolder(() => {
+      throw new Error("procfs read failed");
+    });
+
+    // Empty/truncated stat content (procfs reports `st_size` 0) parses to nothing.
+    await expectSurvivingHolder(() => "");
+  });
+
   test("stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters", async () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");

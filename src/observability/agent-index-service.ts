@@ -1737,9 +1737,14 @@ export class AgentIndexService {
    * specific `degradedReason`, but the plan row itself only stores the synthetic
    * `degraded` marker (`row.lastError`), so without this line the cause is
    * invisible in the daemon log. It cannot ride along in the failed-event payload
-   * either: every `#appendPlanFailedEvent` call site only has `row.lastError`, and
-   * giving the append site the specific reason would mean persisting a new plan
-   * field (schema change). Log-only on purpose — no behaviour change.
+   * either: for most append sites only `row.lastError` is at hand, so handing them
+   * the specific reason would mean persisting a new plan field (schema change).
+   * That is not universal — at least three call sites in this file already have the
+   * specific reason in their own call stack (`:1074` the status event payload's
+   * `degradedReason`, `:1136` the `PlanWaitingHistoryError`, `:1203` the generic
+   * `Error`), so routing the reason into the payload does not necessarily require a
+   * schema change. Log-only on purpose — no behaviour change (see
+   * .agents/notes/20260930-terminal-event-delivery-open-items.md A1).
    *
    * `plan.planId` is the row correlation that already exists on
    * `StatusEventPlan` (see `executeStatusEventPlan`); it is `null` for the
