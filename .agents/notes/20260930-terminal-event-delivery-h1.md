@@ -87,6 +87,8 @@ plan 走到终态时 `agents` 行可能已被物理删除（关页/退役），�
 ## 遗留 / 下一轮
 
 > 本段口径：双审第二关（oracle）对 H1 的裁定。除 F1 本轮已在本分支修掉外，其余各项**不在 H1 内扩范围**。
+> 后续轮次（R5 及 oracle 的 H1/R2 反问）产生的观察项、挂账 chore 与两批提交边界不在此重复，
+> 集中登记于 [双审观察项与挂账台账](20260930-terminal-event-delivery-open-items.md)。
 
 0. **F1（跨代关页吞掉未投递孤儿 failed 行）——本轮已在 H1 内修掉**：`src/db/agent-events.ts:308-312`
    （`#invalidatePaneCore` 步骤 2）把 `(${genCondition})` 从整段最外层移入 done/idle 分支，
