@@ -223,7 +223,8 @@ describe("Pi agent wake projection", () => {
     ]).outcomes;
     const formatted = formatAgentOutcomeUpdates(outcomes);
 
-    expect(WAKE_SETTLE_MS).toBe(500);
+    // 0ms：空闲判定后立即投递，不再有 settle 窗口。
+    expect(WAKE_SETTLE_MS).toBe(0);
     expect(formatted.indexOf("[HERDSMAN WAKE POLICY]")).toBeLessThan(
       formatted.indexOf("[HERDSMAN AGENT UPDATES]"),
     );

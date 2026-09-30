@@ -4177,7 +4177,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     harness.sqlite.close();
   });
 
-  test("S5: waitForHistoryAdvance uses exponential backoff up to 16s and respects 30s total budget", async () => {
+  test("S5: waitForHistoryAdvance spins at a fixed 200ms and respects the 1500ms budget", async () => {
     const harness = openObservabilityDbHarness();
     const delays: number[] = [];
     let clock = 0;
@@ -4252,17 +4252,153 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     // Verify the plan is pending (retry was scheduled).
     const updatedPlan = harness.statusEventPlans.get(plan.id);
     expect(updatedPlan.status).toBe("pending");
-    // Verify backoff sequence: first delay 500ms, final delay capped at 16000ms.
-    expect(delays[0]).toBe(500);
-    if (delays.length > 0) {
-      expect(delays[delays.length - 1]).toBe(16000);
-    }
-    // Verify exponential growth (each delay >= previous, except cap).
-    for (let i = 1; i < delays.length; i++) {
-      expect(delays[i]).toBeGreaterThanOrEqual(delays.at(i - 1) as number);
-    }
-    // The loop may let one final sleep exceed 30s by up to one maxDelay step (16s).
-    expect(delays.reduce((sum, d) => sum + d, 0)).toBeLessThanOrEqual(31500);
+    // Verify the fixed interval: every step is 200ms and nothing doubles.
+    expect(delays).toHaveLength(8);
+    expect(new Set(delays.slice(0, -1))).toEqual(new Set([200]));
+    // The last step is clamped to the remaining budget, so the whole wait stays
+    // inside maxTotalMs (1500ms) instead of overshooting by one step.
+    expect(delays.at(-1)).toBeLessThanOrEqual(200);
+    expect(delays.reduce((sum, d) => sum + d, 0)).toBeLessThanOrEqual(1500);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("S9: a synthetic degraded retry reason never re-arms the waiting-history ring", async () => {
+    const harness = openObservabilityDbHarness();
+    const scheduledDelays: number[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "r1", text: "old", timestamp: null, stopReason: "stop" },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: (_callback, delayMs) => {
+        scheduledDelays.push(delayMs);
+        return undefined;
+      },
+      sleep: async () => {},
+      stores: harness,
+      // No turn signal: the round takes the degraded path (no history advance).
+      turnCompletions: new TurnCompletionRegistry({ sleep: async () => {}, timeoutMs: 0 }),
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const baseline = {
+      ...emptyCompactHistory("pi-jsonl"),
+      lastAssistantMessage: { ref: "r1", text: "old", timestamp: null, stopReason: "stop" },
+    };
+    const degradedPlan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: baseline,
+      from: "working",
+      to: "done",
+    });
+
+    await index.executeStatusEventPlan({
+      agent,
+      compactHistory: baseline,
+      from: "working",
+      to: "done",
+      planId: degradedPlan.id,
+    });
+
+    // The degraded round is retried (pending + lastError=degraded) but the 10s
+    // waiting-history ring is not armed by that synthetic reason.
+    expect(harness.statusEventPlans.get(degradedPlan.id)).toMatchObject({
+      lastError: "degraded",
+      status: "pending",
+    });
+    expect(scheduledDelays).toEqual([]);
+
+    // Control: a genuine PlanWaitingHistoryError still re-arms the ring.
+    const waitingPlan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: baseline,
+      from: "working",
+      to: "done",
+    });
+    harness.statusEventPlans.markRetry(waitingPlan.id, new Error("PLAN_WAITING_HISTORY"));
+    await index.drainPendingPlans();
+    expect(scheduledDelays).toContain(10_000);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("S10: a degraded row cannot re-arm the ring through the PlanWaitingHistoryError catch", async () => {
+    const harness = openObservabilityDbHarness();
+    const scheduledDelays: number[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "pi");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: { ref: "r1", text: "old", timestamp: null, stopReason: "stop" },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: (_callback, delayMs) => {
+        scheduledDelays.push(delayMs);
+        return undefined;
+      },
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: new TurnCompletionRegistry({ sleep: async () => {}, timeoutMs: 0 }),
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const baseline = {
+      ...emptyCompactHistory("pi-jsonl"),
+      lastAssistantMessage: { ref: "r1", text: "old", timestamp: null, stopReason: "stop" },
+    };
+    const degradedPlan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: baseline,
+      from: "working",
+      to: "done",
+    });
+
+    // The row already carries the synthetic `degraded` reason (the assistant
+    // content was missing, not the history). The retry drain then hits a genuine
+    // PlanWaitingHistoryError; before this fix that alone re-armed the 10s ring,
+    // which is the last way a degraded round could stay in it.
+    harness.statusEventPlans.markRetry(degradedPlan.id, new Error("degraded"));
+    await index.drainPendingPlans();
+    expect(harness.statusEventPlans.get(degradedPlan.id)).toMatchObject({
+      lastError: "degraded",
+      status: "pending",
+    });
+    expect(scheduledDelays).toEqual([]);
 
     index.stopWaitingHistoryRetries();
     harness.sqlite.close();
@@ -4394,9 +4530,10 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     });
 
     await index.refreshHerdrSession(sessionInput());
-    // Pre-record signal so drain picks it up synchronously.
+    // Pre-record signal so drain picks it up synchronously. Unconfirmed: only an
+    // unconfirmed turn keeps the degraded / invalidation retry path.
     registry.record({
-      confirmed: true,
+      confirmed: false,
       expectedText: "final answer",
       herdrSessionName: "default",
       paneId: "wJ:p2",
@@ -4509,7 +4646,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     });
 
     registry.record({
-      confirmed: true,
+      confirmed: false,
       expectedText: "final answer",
       herdrSessionName: "default",
       paneId: "wJ:p2",
@@ -4520,6 +4657,8 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     await index.drainPendingPlans();
     // First drain emitted a degraded event (expected_text_mismatch) and called
     // markRetry, which invalidated the event in DB and set plan to pending.
+    // Only an UNconfirmed turn may still be degraded: a client-confirmed turn is
+    // delivered directly (see the confirmed-turn regression tests below).
     const firstInvalidatedRows = harness.sqlite
       .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
       .all();
@@ -4536,7 +4675,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
 
     // Re-record the turn signal for the retry drain (the first drain consumed it).
     registry.record({
-      confirmed: true,
+      confirmed: false,
       expectedText: "final answer",
       herdrSessionName: "default",
       paneId: "wJ:p2",

@@ -110,6 +110,18 @@ export class PlanWaitingHistoryError extends Error {
 }
 
 /**
+ * Invariant for the waiting-history retry ring: only a genuine
+ * `PlanWaitingHistoryError` may (re)arm the 10s timer. It is the single signal
+ * that the agent history legitimately has not advanced yet. Synthetic retry
+ * reasons such as `degraded` are still recorded on the row, but they never
+ * authorize another spin: the pending row is drained by the next refresh
+ * instead, so a degraded round cannot keep the ring alive on its own.
+ */
+function retryRingAuthorized(error: unknown): error is PlanWaitingHistoryError {
+  return error instanceof PlanWaitingHistoryError;
+}
+
+/**
  * Sentinel returned by #appendStatusEvents when the plan must be CANCELLED
  * rather than skipped (skip still maps to completed in #runPlanRow). The agent
  * row is gone, so appending would create an undeliverable dangling event.
@@ -393,7 +405,9 @@ export class AgentIndexService {
         return;
       }
       if (updated.status === "pending") {
-        this.#scheduleWaitingHistoryRetry(planId, plan);
+        // Invariant: a synthetic retry reason never re-arms the ring (see
+        // retryRingAuthorized); the pending row waits for the next refresh.
+        if (retryRingAuthorized(retryError)) this.#scheduleWaitingHistoryRetry(planId, plan);
       } else if (updated.status === "discarded") {
         this.#clearWaitingTimer(planId);
         console.info("Herdsman status event plan discarded after max attempts", {
@@ -804,13 +818,18 @@ export class AgentIndexService {
           agentId: agent.id,
           error: err,
         });
-        this.#scheduleWaitingHistoryRetry(current.id, {
-          agent,
-          compactHistory: current.compactHistory,
-          from: current.fromStatus,
-          to: current.toStatus,
-          ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
-        });
+        // Invariant: the ring is only re-armed by a genuine
+        // PlanWaitingHistoryError; a degraded row stays pending for the next
+        // refresh to drain instead of spinning this callback again.
+        if (retryRingAuthorized(retryError)) {
+          this.#scheduleWaitingHistoryRetry(current.id, {
+            agent,
+            compactHistory: current.compactHistory,
+            from: current.fromStatus,
+            to: current.toStatus,
+            ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
+          });
+        }
       } else if (updated.status === "discarded") {
         this.#clearWaitingTimer(current.id);
         console.info("Herdsman plan marked discarded during drain", {
@@ -909,6 +928,9 @@ export class AgentIndexService {
     let activePlan: StatusEventPlan = {
       ...plan,
       attempts: row.attempts,
+      // Row correlation for observability (see `#logDegradedRelease`): the plan
+      // id is only known here, where the store row is in hand.
+      planId: row.id,
     };
     if (row.attempts > 0) {
       try {
@@ -921,6 +943,7 @@ export class AgentIndexService {
           ...plan,
           attempts: row.attempts,
           compactHistory: refreshed.snapshot.compactHistory,
+          planId: row.id,
         };
       } catch (err) {
         console.warn("Herdsman failed to refresh agent before running retry row, keeping waiting", {
@@ -940,7 +963,10 @@ export class AgentIndexService {
           return undefined;
         }
         if (updated.status === "pending") {
-          this.#scheduleWaitingHistoryRetry(row.id, plan);
+          // Invariant: only a genuine PlanWaitingHistoryError authorizes the
+          // ring; a degraded pre-refresh round records the synthetic reason and
+          // waits for the next refresh instead.
+          if (retryRingAuthorized(retryError)) this.#scheduleWaitingHistoryRetry(row.id, plan);
         } else {
           this.#clearWaitingTimer(row.id);
           if (updated.status === "discarded") {
@@ -1019,12 +1045,16 @@ export class AgentIndexService {
           this.#stores.agentEvents.invalidateById(event.id, "degraded_retry");
           Object.assign(event, { status: "invalidated", deliverable: 0 });
         }
-        const updated = store.markRetry(row.id, new Error("degraded"));
+        const degradedError = new Error("degraded");
+        const updated = store.markRetry(row.id, degradedError);
         if (!updated) {
           return undefined;
         }
         if (updated.status === "pending") {
-          this.#scheduleWaitingHistoryRetry(row.id, plan);
+          // Invariant: `degraded` is a synthetic reason, so it never authorizes
+          // the retry ring; the row stays pending and the next refresh
+          // re-drains it.
+          if (retryRingAuthorized(degradedError)) this.#scheduleWaitingHistoryRetry(row.id, plan);
           return undefined;
         } else {
           this.#clearWaitingTimer(row.id);
@@ -1066,7 +1096,12 @@ export class AgentIndexService {
           return undefined;
         }
         if (updated.status === "pending") {
-          this.#scheduleWaitingHistoryRetry(row.id, plan);
+          // Invariant: only a genuine PlanWaitingHistoryError authorizes the
+          // ring. A row that already carries the synthetic `degraded` reason is
+          // recorded as degraded again and waits for the next refresh instead of
+          // re-arming the 10s timer, so this catch cannot be used as a back door
+          // that lets a degraded round keep the ring alive.
+          if (retryRingAuthorized(retryError)) this.#scheduleWaitingHistoryRetry(row.id, plan);
         } else {
           this.#clearWaitingTimer(row.id);
           if (updated.status === "discarded") {
@@ -1132,6 +1167,10 @@ export class AgentIndexService {
       if (!updated) {
         return undefined;
       }
+      // Invariant: only a genuine PlanWaitingHistoryError re-arms the retry ring,
+      // and that case was handled above. On this generic path `retryError` is
+      // either the synthetic `degraded` reason or an unrelated failure, so no
+      // spin is scheduled: a still-pending row is drained by the next refresh.
       if (updated.status === "discarded") {
         console.info("Herdsman status event plan discarded after max attempts", {
           planId: row.id,
@@ -1185,10 +1224,12 @@ export class AgentIndexService {
     requireAssistantChange?: boolean;
   }): Promise<CompactAgentHistory | undefined> {
     const maxAttempts = input.maxAttempts ?? 8;
-    const baseDelay = 500;
-    const maxDelay = 16000;
-    const maxTotalMs = 30000;
-    let delay = baseDelay;
+    // Fixed 200ms interval, no exponential backoff: the history cache either
+    // advances shortly after the turn signal or it does not, and a doubling
+    // delay only pushed the first deliverable terminal event tens of seconds
+    // away. The whole window is hard bounded by maxTotalMs.
+    const baseDelay = 200;
+    const maxTotalMs = 1500;
     let refreshed: { snapshot: { compactHistory: CompactAgentHistory } } = input.initial
       ? { snapshot: { compactHistory: input.initial } }
       : await this.#context.refreshAgent({
@@ -1207,7 +1248,12 @@ export class AgentIndexService {
       this.#now() - start < maxTotalMs;
       attempt += 1
     ) {
-      await this.#sleep(delay, input.controller.signal);
+      // Clamp the last step to the remaining budget so the total wait never
+      // exceeds maxTotalMs even though the loop condition is checked before
+      // sleeping.
+      const remaining = maxTotalMs - (this.#now() - start);
+      if (remaining <= 0) break;
+      await this.#sleep(Math.min(baseDelay, remaining), input.controller.signal);
       if (input.controller.signal.aborted) {
         console.debug(
           "Herdsman retrying status event plan because wait was aborted during history refresh",
@@ -1241,7 +1287,6 @@ export class AgentIndexService {
         forceRefresh: true,
         identityChanged: false,
       });
-      delay = Math.min(delay * 2, maxDelay);
     }
     return refreshed.snapshot.compactHistory;
   }
@@ -1687,6 +1732,30 @@ export class AgentIndexService {
     }
   }
 
+  /**
+   * Observability for a degraded release. The emitted status event carries the
+   * specific `degradedReason`, but the plan row itself only stores the synthetic
+   * `degraded` marker (`row.lastError`), so without this line the cause is
+   * invisible in the daemon log. It cannot ride along in the failed-event payload
+   * either: every `#appendPlanFailedEvent` call site only has `row.lastError`, and
+   * giving the append site the specific reason would mean persisting a new plan
+   * field (schema change). Log-only on purpose — no behaviour change.
+   *
+   * `plan.planId` is the row correlation that already exists on
+   * `StatusEventPlan` (see `executeStatusEventPlan`); it is `null` for the
+   * row-less in-memory plans executed without the SQLite store.
+   */
+  #logDegradedRelease(plan: StatusEventPlan, degradedReason: string): void {
+    console.warn("Herdsman emitted degraded status event", {
+      agentId: plan.agent.id,
+      attempts: plan.attempts ?? 0,
+      degradedReason,
+      herdrSessionName: plan.agent.herdrSessionName,
+      paneId: plan.agent.paneId,
+      planId: plan.planId ?? null,
+    });
+  }
+
   async #appendStatusEvents(
     input: StatusEventPlan,
   ): Promise<AgentEventRecord | undefined | typeof PLAN_CANCELLED> {
@@ -1853,7 +1922,25 @@ export class AgentIndexService {
           const expectedText = turn.expectedText?.trim();
           const lastAssistantText = fresh.lastAssistantMessage?.text?.trim() ?? "";
           const textMatches = !expectedText || lastAssistantText.endsWith(expectedText);
+          // A client-confirmed turn is a deliverable terminal state: `confirmed`
+          // means Pi verified the final assistant message is on disk, so a
+          // confirmed round is delivered straight through and is never marked
+          // degraded (which is what made #runPlanRow run
+          // invalidateById(..., "degraded_retry") on already-written content).
+          const confirmedTerminal = turn.confirmed === true;
+          const degradeOrRelease = (degradedReason: string): Record<string, unknown> => {
+            if (confirmedTerminal) return { staleSnapshot: false };
+            this.#logDegradedRelease(input, degradedReason);
+            return { degraded: true, degradedReason, staleSnapshot: false };
+          };
           if (
+            confirmedTerminal &&
+            freshIsTerminal &&
+            textMatches &&
+            hasNonEmptyAssistantMessage(fresh)
+          ) {
+            compactHistory = fresh;
+          } else if (
             !isAlreadyEmittedInRetry &&
             freshIsTerminal &&
             textMatches &&
@@ -1883,28 +1970,16 @@ export class AgentIndexService {
               !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
             ) {
               compactHistory = { ...advanced, lastAssistantMessage: null };
-              payloadExtra = {
-                degraded: true,
-                degradedReason: "no_advance_from_input",
-                staleSnapshot: false,
-              };
+              payloadExtra = degradeOrRelease("no_advance_from_input");
             } else {
               const advancedText = advanced.lastAssistantMessage?.text?.trim() ?? "";
               const advancedMatchesExpected = !expectedText || advancedText.endsWith(expectedText);
               if (!advancedMatchesExpected) {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
-                payloadExtra = {
-                  degraded: true,
-                  degradedReason: "expected_text_mismatch",
-                  staleSnapshot: false,
-                };
+                payloadExtra = degradeOrRelease("expected_text_mismatch");
               } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
-                payloadExtra = {
-                  degraded: true,
-                  degradedReason: "non_terminal_assistant",
-                  staleSnapshot: false,
-                };
+                payloadExtra = degradeOrRelease("non_terminal_assistant");
               } else {
                 compactHistory = advanced;
               }
@@ -1938,6 +2013,7 @@ export class AgentIndexService {
             !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
           ) {
             compactHistory = { ...advanced, lastAssistantMessage: null };
+            this.#logDegradedRelease(input, "no_advance_from_input");
             payloadExtra = {
               degraded: true,
               degradedReason: "no_advance_from_input",
@@ -1945,6 +2021,7 @@ export class AgentIndexService {
             };
           } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
             compactHistory = { ...advanced, lastAssistantMessage: null };
+            this.#logDegradedRelease(input, "non_terminal_assistant");
             payloadExtra = {
               degraded: true,
               degradedReason: "non_terminal_assistant",

@@ -113,7 +113,29 @@ type HerdsmanState = {
   roleMutationInFlight: boolean;
   sessionRef: AgentSessionRef | undefined;
   subscriberId: string | undefined;
+  /**
+   * Delivery queue: events handed to Pi whose acknowledgement is still
+   * outstanding. Id-keyed so a repeated id is stored exactly once (deliver
+   * once), and every consumer sorts by id. Entries are only removed by an
+   * acknowledgement (success or dead-letter) or by a role/scope reset that also
+   * clears `presentedEventIds`, so releasing a deferred wake can never lose an
+   * unconfirmed event.
+   */
+  unackedDelivered: Map<number, AgentEventWireRecord>;
   wakeDeferredUntilSettled: boolean;
+  /** Wall-clock start of the current bounded wake deferral, if any. */
+  wakeDeferredSince: number | undefined;
+  /**
+   * Set once the hard deferral budget elapsed: the next pass injects the batch
+   * from the current state instead of deferring again.
+   */
+  wakeForcedRelease: boolean;
+  /**
+   * Event content queued for a busy orchestrator. Injected through the
+   * `context` hook so the running turn sees the update without being
+   * interrupted.
+   */
+  wakeContext: { content: string; eventIds: number[] } | undefined;
   wakeRequested: boolean;
   wakeRequestedThroughEventId: number;
   wakeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -170,6 +192,15 @@ const RECONNECTING_MESSAGE = "Herdsman is reconnecting · try again shortly";
 export const MAX_ACK_ATTEMPTS = 5;
 export const ACK_BACKOFF_CAP_MS = 30_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
+/** Retry interval used while a wake cannot be injected (busy orchestrator). */
+export const WAKE_BUSY_SPIN_MS = 100;
+/**
+ * Hard upper bound for every deferred wake. Once it elapses the scheduler stops
+ * waiting for the orchestrator to become idle or for a settlement to arrive and
+ * forces the injection decision from the current state, so a wake can never be
+ * parked forever.
+ */
+export const WAKE_DEFERRED_TIMEOUT_MS = 5_000;
 
 type AckFailureClass = "terminal" | "resync" | "transient";
 
@@ -252,7 +283,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       runActive: false,
       sessionRef: undefined,
       subscriberId: undefined,
+      unackedDelivered: new Map(),
       wakeDeferredUntilSettled: false,
+      wakeDeferredSince: undefined,
+      wakeForcedRelease: false,
+      wakeContext: undefined,
       wakeRequested: false,
       wakeRequestedThroughEventId: 0,
       wakeTimer: undefined,
@@ -295,18 +330,59 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (state.wakeTimer) clearTimeout(state.wakeTimer);
       state.wakeTimer = undefined;
       state.wakeDeferredUntilSettled = false;
+      state.wakeDeferredSince = undefined;
+      state.wakeForcedRelease = false;
     };
 
     const cancelWake = () => {
       cancelWakeTimer();
       state.wakeRequested = false;
       state.wakeRequestedThroughEventId = 0;
+      // A wake queued for a busy orchestrator belongs to the role/scope that
+      // queued it: dropping it here keeps a stale event body out of the context
+      // of whatever session takes over next.
+      state.wakeContext = undefined;
     };
 
     const clearAgentContext = () => {
       state.latestContext = undefined;
       state.pinnedContext = undefined;
       state.runActive = false;
+    };
+
+    const unackedDeliveredAscending = (): AgentEventWireRecord[] =>
+      [...state.unackedDelivered.values()].sort((left, right) => left.id - right.id);
+
+    /**
+     * Merges freshly injected events into the delivery queue.
+     *
+     * Invariants (Phase 1 completeness fix):
+     *  - a new batch is merged into the queue, never substituted for it, so an
+     *    unconfirmed batch keeps riding along with the next delivery instead of
+     *    being stranded;
+     *  - the result is id-ascending and id-deduped, so the same id is never
+     *    delivered (or acknowledged) twice;
+     *  - entries are only ever removed by `dropUnackedDelivered` (acknowledged or
+     *    dead-lettered) or by a role/scope reset, so releasing the deferred wake
+     *    cannot drop an unconfirmed event.
+     */
+    const mergeUnackedDelivered = (
+      incoming: readonly AgentEventWireRecord[],
+    ): AgentEventWireRecord[] => {
+      for (const event of incoming) {
+        if (!state.unackedDelivered.has(event.id)) state.unackedDelivered.set(event.id, event);
+      }
+      return unackedDeliveredAscending();
+    };
+
+    /**
+     * Drops one event from the delivery queue. The only callers are the two
+     * acknowledgement outcomes (accepted, or terminally refused by the daemon)
+     * and the role/scope reset, which clears the whole stream together with
+     * `presentedEventIds`.
+     */
+    const dropUnackedDelivered = (eventId: number): void => {
+      state.unackedDelivered.delete(eventId);
     };
 
     const pruneAcknowledgedEvents = (ackedEventId: number | undefined) => {
@@ -320,6 +396,13 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       // set is bounded by the number of events presented per session and is
       // cleared on role loss, scope change, and shutdown.
       state.pendingEvents = state.pendingEvents.filter((event) => event.id > ackedEventId);
+      // The delivery queue follows the same watermark: an event covered by the
+      // advanced acknowledgement cursor is confirmed even when its own ack was
+      // superseded (the daemon acknowledges by watermark), so it leaves the
+      // queue and is never re-acknowledged.
+      for (const eventId of [...state.unackedDelivered.keys()]) {
+        if (eventId <= ackedEventId) state.unackedDelivered.delete(eventId);
+      }
     };
 
     const isWakeableEvent = (event: AgentEventWireRecord | undefined) =>
@@ -347,6 +430,10 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           })) as { ackedEventId?: number; state?: { ackedEventId?: number } } | undefined;
           pruneAcknowledgedEvents(ackResponse?.ackedEventId ?? ackResponse?.state?.ackedEventId);
           state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+          // The event is confirmed: it leaves the delivery queue for good, which
+          // is what keeps the acknowledgement watermark monotonic (ids are acked
+          // in ascending order and never re-issued).
+          dropUnackedDelivered(event.id);
           // The id intentionally stays in presentedEventIds: the event was
           // already presented this session and must not be injected again even
           // if the daemon replays it (for example after a reconnect
@@ -357,7 +444,14 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         } catch (error) {
           const failureCode = ackFailureCode(error);
           const classification = classifyAckFailure(error);
-          const attempts = (event.attempts ?? 0) + 1;
+          // The attempt counter is read from the live projection, not from the
+          // delivery-queue snapshot the caller iterated over: a stale base would
+          // pin the counter at 1 for good and make the MAX_ACK_ATTEMPTS
+          // dead-letter branch unreachable for every event retried here.
+          const attempts =
+            (state.pendingEvents.find((pending) => pending.id === event.id)?.attempts ??
+              event.attempts ??
+              0) + 1;
           const attemptedAt = Date.now();
           const updatedEvent = {
             ...event,
@@ -368,9 +462,20 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.pendingEvents = state.pendingEvents.map((pending) =>
             pending.id === event.id ? updatedEvent : pending,
           );
+          // Keep the delivery-queue entry in step with the live accounting: the
+          // same event may be retried later (another settlement, or a redelivery
+          // that re-attaches it to a new batch), and that attempt must resume
+          // from this counter instead of restarting at 1.
+          if (state.unackedDelivered.has(event.id)) {
+            state.unackedDelivered.set(event.id, updatedEvent);
+          }
 
           if (classification === "terminal") {
             state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+            // A terminally refused event is dead-lettered by the daemon
+            // (failedWakeThroughEventId is the dead-letter barrier), so it can
+            // never be confirmed later; it leaves the delivery queue as well.
+            dropUnackedDelivered(event.id);
             state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
             if (/Only the current orchestrator can acknowledge notifications/i.test(failureCode)) {
               state.isOrchestrator = false;
@@ -390,6 +495,10 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
           if (attempts >= MAX_ACK_ATTEMPTS) {
             state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
+            // Dead-lettered by this client: the id is behind the dead-letter
+            // barrier from now on, so it can never be confirmed later and leaves
+            // the delivery queue with the pending projection.
+            dropUnackedDelivered(event.id);
             state.failedWakeThroughEventId = Math.max(state.failedWakeThroughEventId, event.id);
             logHerdsmanPi(
               "warn",
@@ -498,6 +607,36 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }, WAKE_SETTLE_MS);
     };
 
+    /**
+     * Arms the bounded deferral for a wake that cannot be injected right now.
+     *
+     * The retry spins every `WAKE_BUSY_SPIN_MS` while the orchestrator is busy
+     * and flips `wakeForcedRelease` once `WAKE_DEFERRED_TIMEOUT_MS` has elapsed,
+     * so the next pass injects the batch from the current state (as a queued,
+     * non-triggering follow-up) instead of waiting for an idle signal or a
+     * settlement that may never arrive.
+     */
+    const scheduleDeferredWake = (ctx: PiContext) => {
+      state.wakeDeferredUntilSettled = true;
+      const since = state.wakeDeferredSince ?? Date.now();
+      state.wakeDeferredSince = since;
+      const remaining = WAKE_DEFERRED_TIMEOUT_MS - (Date.now() - since);
+      if (remaining <= 0) state.wakeForcedRelease = true;
+      if (state.wakeTimer) return;
+      state.wakeTimer = setTimeout(() => {
+        state.wakeTimer = undefined;
+        if (state.wakeForcedRelease && state.deliveredBatch && ctx.isIdle?.() !== false) {
+          // The hard deadline only releases the delivery — it never discards an
+          // unconfirmed event. The batch record is dropped so a wake turn that
+          // is no longer running cannot gate later wakes, but its events stay in
+          // the delivery queue (`unackedDelivered`) and are re-attached to the
+          // batch injected right below, which acknowledges them once it settles.
+          state.deliveredBatch = undefined;
+        }
+        scheduleWake(ctx);
+      }, Math.max(0, Math.min(WAKE_BUSY_SPIN_MS, remaining)));
+    };
+
     const scheduleWake = (ctx: PiContext | undefined) => {
       if (!ctx || !state.isOrchestrator || !state.currentScope || !pi.sendMessage) return;
       if (state.wakeTimer || state.wakeRequested) return;
@@ -551,8 +690,12 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         return;
       }
 
-      if (state.deliveredBatch || state.ackInFlight || ctx.isIdle?.() === false) {
-        state.wakeDeferredUntilSettled = true;
+      // An in-flight batch owns the ack cursor and a busy orchestrator must not
+      // be interrupted, so neither is woken immediately — but both are deferred
+      // on a bounded spin (never parked until an event that may never come).
+      const inFlight = state.deliveredBatch !== undefined || state.ackInFlight;
+      if (!state.wakeForcedRelease && (inFlight || ctx.isIdle?.() === false)) {
+        scheduleDeferredWake(ctx);
         return;
       }
       const generation = wakeGeneration;
@@ -571,9 +714,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             state.wakeTimer = undefined;
             return;
           }
-          if (ctx.isIdle?.() === false) {
+          if (ctx.isIdle?.() === false && !state.wakeForcedRelease) {
             state.wakeTimer = undefined;
-            state.wakeDeferredUntilSettled = true;
+            scheduleDeferredWake(ctx);
             return;
           }
 
@@ -608,9 +751,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             state.wakeTimer = undefined;
             return;
           }
-          if (ctx.isIdle?.() === false) {
+          if (ctx.isIdle?.() === false && !state.wakeForcedRelease) {
             state.wakeTimer = undefined;
-            state.wakeDeferredUntilSettled = true;
+            scheduleDeferredWake(ctx);
             return;
           }
 
@@ -628,24 +771,24 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             return;
           }
           const current = batchOutcomes;
-          const deliveredBatch: DeliveredBatch = {
-            abortedByUser: false,
-            assistantFinalSucceeded: false,
-            events: batchEvents.filter((event) =>
-              batchOutcomes.some((outcome) => outcome.eventId === event.id),
-            ),
-            hasSubstantiveWork: false,
-            invalidated: false,
-            ownerTerminalId,
-            herdsmanTriggered: true,
-          };
+          const incomingEvents = batchEvents.filter((event) =>
+            batchOutcomes.some((outcome) => outcome.eventId === event.id),
+          );
+          const previousBatch = state.deliveredBatch;
           state.wakeTimer = undefined;
           state.wakeRequested = true;
           state.wakeRequestedThroughEventId = current.at(-1)?.eventId ?? 0;
+          // Dual-track injection: an idle orchestrator gets a triggered
+          // follow-up turn (immediate delivery), while a busy one is not
+          // interrupted — the same content is queued as a non-triggering
+          // follow-up and additionally exposed through the `context` hook so the
+          // running turn can already see it.
+          const orchestratorBusy = ctx.isIdle?.() === false;
+          const wakeContent = formatAgentOutcomeUpdates(batchOutcomes);
           try {
             pi.sendMessage?.(
               {
-                content: formatAgentOutcomeUpdates(batchOutcomes),
+                content: wakeContent,
                 customType: "herdsman-wake-context",
                 // Suppressed upstream errors are dropped from the injected
                 // context, but every other pending id stays listed so the
@@ -657,11 +800,44 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
                 },
                 display: false,
               },
-              { deliverAs: "followUp", triggerTurn: true },
+              orchestratorBusy
+                ? { deliverAs: "followUp", triggerTurn: false }
+                : { deliverAs: "followUp", triggerTurn: true },
             );
+            // A queued (non-triggering) delivery keeps the content available to
+            // the current turn through the context hook until it is settled or
+            // superseded by the next injection.
+            state.wakeContext = orchestratorBusy
+              ? { content: wakeContent, eventIds: batchOutcomes.map((outcome) => outcome.eventId) }
+              : undefined;
+            state.wakeForcedRelease = false;
+            state.wakeDeferredSince = undefined;
             // Only expose the batch after the hidden context was accepted by pi. This
             // keeps an injection failure eligible for daemon redelivery.
-            state.deliveredBatch = deliveredBatch;
+            //
+            // The batch is the delivery queue plus this injection: previously
+            // unconfirmed events are merged (never replaced) so that a forced
+            // release always leaves both the old and the new events deliverable
+            // and acknowledgeable in id order. The turn-consumption flags of a
+            // still-running previous batch are carried over, because they
+            // describe whether the content already reached the orchestrator.
+            //
+            // `hasSubstantiveWork` is the sole gate that decides whether an
+            // ownership/scope change may abort the in-flight turn (see loseRole
+            // and resetForScopeChange), and aborting is only ever allowed for a
+            // *pure* Herdsman wake turn. A busy orchestrator gets the batch as a
+            // non-triggering queued follow-up, which rides the user's own turn:
+            // that turn is not a Herdsman wake turn, so it must never be aborted
+            // on our behalf and the flag is set here.
+            state.deliveredBatch = {
+              abortedByUser: previousBatch?.abortedByUser ?? false,
+              assistantFinalSucceeded: previousBatch?.assistantFinalSucceeded ?? false,
+              events: mergeUnackedDelivered(incomingEvents),
+              hasSubstantiveWork: orchestratorBusy || (previousBatch?.hasSubstantiveWork ?? false),
+              invalidated: false,
+              ownerTerminalId,
+              herdsmanTriggered: true,
+            };
             state.wakeRequested = false;
             state.wakeRequestedThroughEventId = 0;
             // Record the presentation so a reclaim redelivery of the same id is
@@ -718,7 +894,13 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       // A transient disconnect (reconnect) keeps the presentation guard so an
       // event already presented in this scope session is not presented again;
       // only a genuine role/scope loss or shutdown resets it.
-      if (!options.preservePresented) state.presentedEventIds.clear();
+      if (!options.preservePresented) {
+        state.presentedEventIds.clear();
+        // The delivery queue dies with the presentation guard: once the guard is
+        // gone the daemon's pending events can be presented (and acknowledged)
+        // again, so keeping the old queue would only risk a stale id.
+        state.unackedDelivered.clear();
+      }
       state.reconnectingFromOn = false;
       setHerdsmanUi(ctx);
     };
@@ -749,6 +931,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.failedWakeThroughEventId = 0;
       state.pendingEvents = [];
       state.presentedEventIds.clear();
+      state.unackedDelivered.clear();
       setHerdsmanUi(ctx);
     };
 
@@ -866,6 +1049,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           // already acked events are covered by the server cursor
           // (pruneAcknowledgedEvents below).
           state.deliveredBatch = undefined;
+          state.wakeContext = undefined;
         }
         // Otherwise the batch's wake turn is still in flight: keep it so the
         // settlement acknowledges it and the events are not re-presented.
@@ -1107,6 +1291,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       loseRole(activeContext);
       state.deliveredBatch = undefined;
       state.presentedEventIds.clear();
+      state.unackedDelivered.clear();
       state.client?.close();
       state.client = undefined;
       activeContext = undefined;
@@ -1190,23 +1375,43 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     pi.on("context", (event: { messages: PiAgentMessage[] }) => {
       const messages = event.messages.filter((message) => !isNormalHerdsmanContext(message));
+      const additions: PiAgentMessage[] = [];
       const snapshot = state.pinnedContext;
-      if (!snapshot || snapshot.agents.length === 0) return { messages };
-      return {
-        messages: [
-          ...messages,
-          {
-            content: formatHiddenAgentContext({
-              agents: snapshot.agents,
-              workspaceId: snapshot.workspaceId,
-            }),
-            customType: "herdsman-agent-context",
-            display: false,
-            role: "custom",
-            timestamp: Date.now(),
-          },
-        ],
-      };
+      if (snapshot && snapshot.agents.length > 0) {
+        additions.push({
+          content: formatHiddenAgentContext({
+            agents: snapshot.agents,
+            workspaceId: snapshot.workspaceId,
+          }),
+          customType: "herdsman-agent-context",
+          display: false,
+          role: "custom",
+          timestamp: Date.now(),
+        });
+      }
+      // A wake queued for a busy orchestrator is not allowed to interrupt the
+      // running tool chain, so its content is additionally pinned to the current
+      // context: the orchestrator sees the child-agent outcome in this turn
+      // without a triggered follow-up. The entry is dropped again by
+      // isNormalHerdsmanContext, so at most one copy is present per call.
+      //
+      // `eventIds` mirrors what this turn actually presents (the freshly injected
+      // outcomes): events carried over in the delivery queue were already shown
+      // to the orchestrator in the turn that presented them, so they are not
+      // re-listed here. The queued follow-up message itself keeps the wider
+      // `details.eventIds` set (everything still unconfirmed).
+      const queuedWake = state.wakeContext;
+      if (queuedWake) {
+        additions.push({
+          content: queuedWake.content,
+          customType: "herdsman-wake-queued",
+          details: { eventIds: queuedWake.eventIds },
+          display: false,
+          role: "custom",
+          timestamp: Date.now(),
+        });
+      }
+      return additions.length === 0 ? { messages } : { messages: [...messages, ...additions] };
     });
 
     pi.on("agent_settled", async (_event: unknown, ctx: PiContext) => {
@@ -1231,9 +1436,40 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const finishBatch = () => {
         state.ackInFlight = false;
         state.wakeDeferredUntilSettled = false;
+        state.wakeDeferredSince = undefined;
+        state.wakeForcedRelease = false;
+        state.wakeContext = undefined;
         setHerdsmanUi(ctx);
         scheduleWake(ctx);
       };
+
+      // The delivery queue — not the injection snapshot — is what gets
+      // acknowledged: it holds every event handed to Pi that is still
+      // unconfirmed (a release merges batches instead of replacing them), is
+      // id-ascending, and an id leaves it only when the daemon accepts it.
+      //
+      // An event whose own acknowledgement already failed is left out here: it is
+      // never retried by this path (the daemon's cursor advance sweeps it, and a
+      // retry would reset its attempt/backoff accounting), but it stays in the
+      // queue until that cursor or a scope reset confirms it. A failed or
+      // dead-lettered acknowledgement thus never depends on the timing of the
+      // release to stay recoverable.
+      //
+      // Restricting to a *live* row with `attempts === 0` has two holes on
+      // purpose. `?? 0` covers an event the live projection no longer holds at
+      // all (the server stopped listing it, or `failedWakeThroughEventId`
+      // filters it out): the projection cannot tell us it already failed, so the
+      // event gets one more attempt — a deliberate self-healing opportunity that
+      // then accumulates on the queue copy's counter and can reach
+      // MAX_ACK_ATTEMPTS instead of restarting at 1 every round.
+      const ackable = unackedDeliveredAscending().filter(
+        (event) =>
+          (state.pendingEvents.find((pending) => pending.id === event.id)?.attempts ?? 0) === 0,
+      );
+      if (ackable.length === 0) {
+        finishBatch();
+        return;
+      }
 
       if (
         (!batch.assistantFinalSucceeded && !batch.abortedByUser) ||
@@ -1247,7 +1483,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         return;
       }
 
-      await acknowledgeEventIds(batch.events, { notify: true }, ctx);
+      await acknowledgeEventIds(ackable, { notify: true }, ctx);
       finishBatch();
     });
 
@@ -1334,6 +1570,7 @@ export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string
 function isNormalHerdsmanContext(message: PiAgentMessage): boolean {
   return (
     message.customType === "herdsman-agent-context" ||
+    message.customType === "herdsman-wake-queued" ||
     contentIncludesMarker(message.content, "[HERDSMAN AGENT CONTEXT]")
   );
 }
