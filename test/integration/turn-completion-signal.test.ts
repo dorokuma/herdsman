@@ -243,7 +243,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     );
     harness.sqlite.close();
   }, 10_000);
-  test("retries eight times after a received turn signal when history is still empty", async () => {
+  test("delivers a confirmed empty-history turn without invalidating it as degraded", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
     let _calls = 0;
@@ -283,18 +283,22 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     }, 10);
 
     const _result = await pending;
-    // Empty assistant messages trigger the terminal guard → degraded done event in DB.
-    // The degraded event must NOT be delivered to callers.
-    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    // A client-confirmed turn is a deliverable terminal state: it stays
+    // deliverable even when the refreshed snapshot still carries no assistant
+    // excerpt, and it is never invalidated as a degraded retry.
+    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(1);
     const listAfterEvents = harness.agentEvents.listAfter({
       herdrSessionName: "default",
       workspaceId: "wJ",
     });
-    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    const deliveredDones = listAfterEvents.filter((e) => e.type === "agent.done");
+    expect(deliveredDones).toHaveLength(1);
+    expect(deliveredDones[0]).toMatchObject({ deliverable: 1, status: "pending" });
+    expect(deliveredDones[0]?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
     const invalidatedRows = harness.sqlite
       .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
       .all();
-    expect(invalidatedRows.length).toBeGreaterThanOrEqual(1);
+    expect(invalidatedRows).toHaveLength(0);
     harness.sqlite.close();
   }, 20_000);
   test("generates agent.done as-is with a warning when no turn signal arrives (old extension)", async () => {
@@ -547,18 +551,18 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
 
     const planResult = await planPromise;
-    // Empty assistant history blocks terminal emission; plan enters retry (pending).
-    expect(planResult).toBeUndefined();
+    // A confirmed turn is delivered even with an empty assistant snapshot: the
+    // plan completes instead of entering the degraded retry.
+    expect(planResult?.type).toBe("agent.done");
+    expect(planResult?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
     await Promise.all(flip.statusEventPlans.map((next) => index.executeStatusEventPlan(next)));
 
-    // The degraded done event is invalidated in-DB and not delivered to callers.
     const listAfterEvents = harness.agentEvents.listAfter({
       herdrSessionName: "default",
       workspaceId: "wJ",
     });
-    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
-    // Degraded events are invalidated so they are not returned by latestTerminalEvent/listAfter;
-    // verify via direct SQL query for invalidated events.
+    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(1);
+    // A confirmed turn is never invalidated as degraded; verify via direct SQL.
     const agentForDone = harness.agents.findByPane({
       herdrSessionName: "default",
       paneId: "wJ:p2",
@@ -569,22 +573,21 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
         "select * from agent_events where agent_id = ? and herdr_session_name = ? and status = 'invalidated' and type = 'agent.done'",
       )
       .all(agentForDone.id, "default");
-    expect(invalidatedRows).toHaveLength(1);
-    const doneEventRow = invalidatedRows[0] as Record<string, unknown>;
-    const donePayload = JSON.parse(doneEventRow.payload_json as string);
-    expect(donePayload).toEqual(expect.objectContaining({ from: "working", to: "done" }));
-    // Degraded plans are retried instead of completed, so the first drain leaves
-    // a pending plan with lastError="degraded".
-    const unfinished = harness.statusEventPlans.listUnfinished();
-    expect(unfinished).toHaveLength(1);
-    expect(unfinished[0]).toEqual(
-      expect.objectContaining({
-        fromStatus: "working",
-        toStatus: "done",
-        lastError: "degraded",
-        status: "pending",
-      }),
+    expect(invalidatedRows).toHaveLength(0);
+    // The delivered row keeps its terminal payload and stays deliverable.
+    const doneRows = harness.sqlite
+      .prepare(
+        "select * from agent_events where agent_id = ? and herdr_session_name = ? and type = 'agent.done'",
+      )
+      .all(agentForDone.id, "default") as Array<Record<string, unknown>>;
+    expect(doneRows).toHaveLength(1);
+    expect(doneRows[0]).toMatchObject({ deliverable: 1, status: "pending" });
+    expect(JSON.parse(String(doneRows[0]?.payload_json))).toEqual(
+      expect.objectContaining({ from: "working", to: "done" }),
     );
+    // Both plans settle: the confirmed done plan completes and the flipped
+    // working plan does not linger in a degraded retry.
+    expect(harness.statusEventPlans.listUnfinished()).toEqual([]);
 
     harness.sqlite.close();
   }, 20_000);
@@ -1107,7 +1110,7 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   }, 10_000);
 
-  test("signal fast path emits degraded when expectedText does not match sync snapshot", async () => {
+  test("confirmed mismatch on the sync snapshot fast path stays deliverable", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
     let callCount = 0;
@@ -1183,16 +1186,22 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     });
 
     const _result = await index.handleHerdrEvent(doneEvent);
-    // Degraded event invalidated in-DB; verify via direct SQL query (not listAfter).
+    // A confirmed turn whose refreshed snapshot still does not match expectedText
+    // is delivered as a terminal event instead of being invalidated as a
+    // degraded retry: the client already confirmed the write reached disk.
+    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(1);
     const invalidatedRows = harness.sqlite
       .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
       .all();
-    expect(invalidatedRows.length).toBeGreaterThanOrEqual(1);
-    const degraded = invalidatedRows.find((row: Record<string, unknown>) => {
-      const payload = JSON.parse(row.payload_json as string);
-      return payload.degraded && payload.degradedReason === "expected_text_mismatch";
-    });
-    expect(degraded).toBeDefined();
+    expect(invalidatedRows).toHaveLength(0);
+    const doneRows = harness.sqlite
+      .prepare("select * from agent_events where type = 'agent.done'")
+      .all() as Array<Record<string, unknown>>;
+    expect(doneRows).toHaveLength(1);
+    expect(doneRows[0]).toMatchObject({ deliverable: 1, status: "pending" });
+    expect(JSON.parse(String(doneRows[0]?.payload_json))).not.toEqual(
+      expect.objectContaining({ degraded: true }),
+    );
     harness.sqlite.close();
   }, 10_000);
 

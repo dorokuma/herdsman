@@ -465,6 +465,79 @@ describe("startup reconcile dedicated coverage", () => {
     ).toEqual({ count: 0 });
   });
 
+  test("H1: keeps an undelivered orphan agent.failed row past the 300s freshness window", async () => {
+    const { harness } = setup();
+    const failure = harness.agentEvents.append({
+      agentId: null,
+      herdrSessionName: "default",
+      paneId: "wA:gone",
+      payload: { agentId: "agent-gone", reason: "RETRY_EXHAUSTED" },
+      terminalId: "term-gone",
+      type: "agent.failed",
+      workspaceId: "wA",
+    });
+    const discarded = harness.agentEvents.append({
+      agentId: null,
+      herdrSessionName: "default",
+      paneId: "wA:gone-2",
+      payload: { agentId: "agent-gone", reason: "PLAN_WAITING_HISTORY" },
+      terminalId: "term-gone-2",
+      type: "agent.discarded",
+      workspaceId: "wA",
+    });
+    // Both are older than the 300s freshness window that governs the completion
+    // retention rule: the failure must survive on its own rule (no delivery
+    // attempt yet), while discarded keeps the ordinary delete path.
+    const stale = Date.now() - REDELIVERY_FRESHNESS_MS - 1_000;
+    harness.sqlite
+      .prepare("update agent_events set created_at = ? where id in (?, ?)")
+      .run(stale, failure.id, discarded.id);
+
+    await reconciler(harness, [{ pane_id: "wA:other", terminal_id: "term-other" }]).reconcile();
+
+    // 保留到首次投递尝试为止：孤儿失败行转为保留作废态，不被物理删除。
+    expect(harness.agentEvents.get(failure.id)).toMatchObject({
+      deliverable: 1,
+      deliveryAttempts: 0,
+      status: "invalidated",
+    });
+    expect(harness.agentEvents.get(failure.id).invalidatedReason).toBe(
+      "RETAINED_OUTCOME_PANE_CLOSED",
+    );
+    // discarded 不保留：仍然被物理删除。
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id = ?")
+        .get(discarded.id),
+    ).toEqual({ count: 0 });
+  });
+
+  test("H1: deletes an orphan agent.failed row once the first delivery attempt happened", async () => {
+    const { harness } = setup();
+    const attempted = harness.agentEvents.append({
+      agentId: null,
+      herdrSessionName: "default",
+      paneId: "wA:gone",
+      payload: { agentId: "agent-gone", reason: "RETRY_EXHAUSTED" },
+      terminalId: "term-gone",
+      type: "agent.failed",
+      workspaceId: "wA",
+    });
+    // A row that was already handed to an owner once no longer holds the
+    // retained window: the ordinary sweep applies again.
+    harness.sqlite
+      .prepare("update agent_events set delivery_attempts = 1, last_attempt_at = ? where id = ?")
+      .run(Date.now() - REDELIVERY_FRESHNESS_MS - 1_000, attempted.id);
+
+    await reconciler(harness, [{ pane_id: "wA:other", terminal_id: "term-other" }]).reconcile();
+
+    expect(
+      harness.sqlite
+        .prepare("select count(*) as count from agent_events where id = ?")
+        .get(attempted.id),
+    ).toEqual({ count: 0 });
+  });
+
   test("g: purges released scopes older than the 30-day TTL but keeps recent and active ones", async () => {
     const { harness } = setup();
     harness.agentOrchestratorScopes.claim({

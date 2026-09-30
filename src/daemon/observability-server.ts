@@ -242,7 +242,23 @@ export class ObservabilityRpcServer {
   }
 
   publishAgentEvent(event: AgentEventRecord): void {
-    if (!event.workspaceId || !event.terminalId || !event.agentId) return;
+    // `agentId` is intentionally not required: a terminal event written after the
+    // agents row was physically removed still has to reach the orchestrator. The
+    // workspace/terminal scope is required, because without it the event cannot be
+    // routed at all.
+    if (!event.workspaceId || !event.terminalId) {
+      // Dead letter: accepted as permanently undeliverable, but never silently.
+      if (event.type === "agent.failed" || event.type === "agent.discarded") {
+        console.warn("Herdsman terminal agent event has no deliverable scope (dead letter)", {
+          eventId: event.id,
+          herdrSessionName: event.herdrSessionName,
+          terminalId: event.terminalId,
+          type: event.type,
+          workspaceId: event.workspaceId,
+        });
+      }
+      return;
+    }
     // Status changes are persisted for history but never routed as worker wake events.
     if (event.type === "agent.status.changed") return;
     if ((event.status !== "pending" && event.status !== "delivered") || event.deliverable !== 1) {

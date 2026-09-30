@@ -596,6 +596,162 @@ describe("agent event delivery lifecycle", () => {
     harness.sqlite.close();
   });
 
+  test("pane close retains an unattempted agent.failed outcome but neither discarded nor an attempted failure", () => {
+    const harness = prepareHarness();
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("Expected indexed agent");
+    const appendTerminal = (type: "agent.discarded" | "agent.failed") =>
+      harness.agentEvents.append({
+        agentId: agent.id,
+        herdrSessionName: "default",
+        paneId: "wA:p1",
+        payload: { agentId: agent.id, reason: "RETRY_EXHAUSTED" },
+        terminalId: agent.terminalId,
+        type,
+        workspaceId: "wA",
+      });
+    const failure = appendTerminal("agent.failed");
+    const discarded = appendTerminal("agent.discarded");
+    const attempted = appendTerminal("agent.failed");
+    harness.sqlite
+      .prepare("update agent_events set delivery_attempts = 1, last_attempt_at = ? where id = ?")
+      .run(Date.now(), attempted.id);
+
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: "default",
+      paneId: "wA:p1",
+      paneGeneration: null,
+      invalidatedReason: "LEGACY_CLOSE_WITHOUT_GENERATION",
+    });
+
+    // 只保 failed，且只保到首次投递尝试为止。
+    expect(harness.agentEvents.get(failure.id)).toMatchObject({
+      deliverable: 1,
+      invalidatedReason: "RETAINED_OUTCOME_PANE_CLOSED",
+      status: "invalidated",
+    });
+    expect(harness.agentEvents.get(discarded.id)).toMatchObject({
+      deliverable: 0,
+      invalidatedReason: "LEGACY_CLOSE_WITHOUT_GENERATION",
+      status: "invalidated",
+    });
+    expect(harness.agentEvents.get(attempted.id)).toMatchObject({
+      deliverable: 0,
+      invalidatedReason: "LEGACY_CLOSE_WITHOUT_GENERATION",
+      status: "invalidated",
+    });
+  });
+
+  test("pane close with a new generation still retains unattempted failed rows of older and null generations", () => {
+    const harness = prepareHarness();
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("Expected indexed agent");
+    const appendFailed = (paneGeneration: string | null) =>
+      harness.agentEvents.append({
+        agentId: agent.id,
+        herdrSessionName: "default",
+        paneId: "wA:p1",
+        paneGeneration,
+        payload: { agentId: agent.id, reason: "RETRY_EXHAUSTED" },
+        terminalId: agent.terminalId,
+        type: "agent.failed",
+        workspaceId: "wA",
+      });
+    // The pane is reopened as a new generation: the failed outcome of the
+    // previous generation (and the legacy row written without one) is still
+    // unattempted and must keep its single delivery chance.
+    const previousGeneration = appendFailed("gen-1");
+    const generationless = appendFailed(null);
+
+    harness.agentEvents.invalidatePane({
+      herdrSessionName: "default",
+      paneId: "wA:p1",
+      paneGeneration: "gen-2",
+      invalidatedReason: "PANE_CLOSED",
+    });
+
+    expect(harness.agentEvents.get(previousGeneration.id)).toMatchObject({
+      deliverable: 1,
+      invalidatedReason: "RETAINED_OUTCOME_PANE_CLOSED",
+      status: "invalidated",
+    });
+    expect(harness.agentEvents.get(generationless.id)).toMatchObject({
+      deliverable: 1,
+      invalidatedReason: "RETAINED_OUTCOME_PANE_CLOSED",
+      status: "invalidated",
+    });
+  });
+
+  test("a retained orphan failed row is invalidated by reclaim after its first delivery attempt", () => {
+    const harness = prepareHarness();
+    const failure = harness.agentEvents.append({
+      agentId: null,
+      herdrSessionName: "default",
+      paneId: "wA:gone",
+      payload: { agentId: "agent-gone", reason: "RETRY_EXHAUSTED" },
+      terminalId: "term-gone",
+      type: "agent.failed",
+      workspaceId: "wA",
+    });
+    // Retained state as produced by #invalidatePaneCore / the reconciler.
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'invalidated', deliverable = 1, invalidated_reason = 'RETAINED_OUTCOME_PANE_CLOSED' where id = ?",
+      )
+      .run(failure.id);
+
+    // 首次投递尝试消费掉保留窗口。
+    expect(harness.agentEvents.reservePending("term-owner").map((event) => event.id)).toEqual([
+      failure.id,
+    ]);
+    expect(harness.agentEvents.get(failure.id)).toMatchObject({
+      deliverable: 1,
+      deliveryAttempts: 1,
+      status: "delivered",
+    });
+
+    // 投递后回归现有 invalidated + 1 小时回收。
+    harness.sqlite
+      .prepare("update agent_events set last_attempt_at = ? where id = ?")
+      .run(Date.now() - 100_000, failure.id);
+    expect(harness.agentEvents.reclaimDelivered(60_000)).toBe(1);
+    expect(harness.agentEvents.get(failure.id)).toMatchObject({
+      deliverable: 0,
+      invalidatedReason: "PANE_CLOSED_RECLAIM",
+      status: "invalidated",
+    });
+    expect(harness.agentEvents.reservePending("term-owner")).toEqual([]);
+  });
+
+  test("append downgrades a dangling agentId to an orphan row instead of failing the FK", () => {
+    const harness = prepareHarness();
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const failure = harness.agentEvents.append({
+        // The agents row was deleted concurrently: an FK failure here would drop
+        // the terminal outcome entirely.
+        agentId: "agent-gone",
+        herdrSessionName: "default",
+        paneId: "wA:p1",
+        payload: { agentId: "agent-gone", reason: "RETRY_EXHAUSTED" },
+        terminalId: "term-agent",
+        type: "agent.failed",
+        workspaceId: "wA",
+      });
+      expect(harness.agentEvents.get(failure.id)).toMatchObject({
+        agentId: null,
+        deliverable: 1,
+        status: "pending",
+      });
+      expect(warnSpy).toHaveBeenCalledWith(
+        "Herdsman downgrading agent event to orphan because the agents row is gone",
+        { agentId: "agent-gone" },
+      );
+    } finally {
+      warnSpy.mockRestore();
+    }
+  });
+
   test("deleteInvalidatedOlderThan keeps fresh rows and ages from last_attempt_at", () => {
     const harness = prepareHarness();
     const staleCreated = appendEvent(harness, "term-stale-created");

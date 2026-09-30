@@ -1660,7 +1660,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     ["agent.done", {}],
     ["agent.blocked", {}],
     ["agent.idle", { from: "working", to: "idle" }],
-  ])("wakes once at 500 ms for %s", async (type, payload) => {
+  ])("wakes immediately on idle for %s", async (type, payload) => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
@@ -1676,9 +1676,9 @@ describe("herdsman-pi orchestrator bridge", () => {
         },
       });
 
-      await vi.advanceTimersByTimeAsync(499);
+      // 空闲直投：不再等待 settle 窗口，0ms 微任务内完成注入。
       expect(pi.hiddenMessages).toEqual([]);
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(0);
       expect(pi.customMessages).toEqual([]);
       expect(pi.hiddenMessages).toEqual([
         [
@@ -1837,6 +1837,106 @@ describe("herdsman-pi orchestrator bridge", () => {
       await pi.emit("agent_settled", {}, ctx);
       await vi.advanceTimersByTimeAsync(500);
       expect(pi.hiddenMessages).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("force-releases a busy wake as a queued follow-up after the 5s hard timeout", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: false });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      client.emitStream({ method: "agent.event", params: { event: event(63, "term_agent") } });
+
+      // Bounded 100ms spin: while the orchestrator stays busy nothing is
+      // injected, and nothing is parked without a timer either.
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(pi.hiddenMessages).toEqual([]);
+
+      // 5s hard timeout (WAKE_DEFERRED_TIMEOUT_MS): the deferral ends on its own
+      // and the update is queued as a non-triggering follow-up instead of
+      // waiting for a settle that never arrives.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
+
+      // The queued content is also pinned to the current context so the running
+      // tool chain sees it without being interrupted.
+      const contextMessages = await pi.emitContext([], ctx);
+      const queuedMessage = contextMessages.find(
+        (message) => (message as { customType?: string }).customType === "herdsman-wake-queued",
+      ) as { content?: unknown; details?: { eventIds?: number[] } } | undefined;
+      expect(String(queuedMessage?.content)).toContain("AGENT UPDATES");
+      // The queued entry carries the same provenance as the follow-up message.
+      expect(queuedMessage?.details?.eventIds).toEqual([63]);
+      expect(ctx.aborts).toBe(0);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("merges an unconfirmed batch into the next release instead of dropping or duplicating it", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const base = client.response;
+    const ackedIds: number[] = [];
+    client.response = (method, params) => {
+      if (method === "agent.notifications.ack") {
+        const { eventId } = params as { eventId: number };
+        ackedIds.push(eventId);
+        // The daemon answers with the advanced watermark for every accepted id.
+        return { acknowledged: true, ackedEventId: eventId };
+      }
+      return base(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+
+      // 1) Idle orchestrator: the first event is delivered immediately.
+      client.emitStream({ method: "agent.event", params: { event: event(81, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(String(pi.hiddenMessages[0]?.[0]?.content)).toContain("event: 81");
+      await pi.emit("agent_start", {}, ctx);
+      // The wake turn keeps running, so the delivered batch stays unconfirmed.
+      ctx.setIdle(false);
+
+      // 2) A second event arrives while that batch is still unconfirmed.
+      client.emitStream({ method: "agent.event", params: { event: event(82, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(ackedIds).toEqual([]);
+
+      // 3) The 5s hard timeout only releases the delivery: the new batch is
+      // merged into the unconfirmed one instead of replacing it. The release is
+      // still a non-interrupting queued follow-up, its content re-presents only
+      // the fresh event (81 was already shown), and its ids cover both.
+      await vi.advanceTimersByTimeAsync(5_000);
+      expect(pi.hiddenMessages).toHaveLength(2);
+      const releasedWake = pi.hiddenMessages[1]?.[0];
+      expect(String(releasedWake?.content)).toContain("event: 82");
+      expect(String(releasedWake?.content)).not.toContain("event: 81");
+      expect(pi.hiddenMessages[1]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
+      expect(releasedWake?.details).toEqual({ eventIds: [81, 82] });
+
+      // 4) The settlement confirms the merged queue at once: ascending ids, each
+      // id exactly once (the watermark only ever moves forward), so neither the
+      // old nor the new event is stranded.
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(ackedIds).toEqual([81, 82]);
+      expect(new Set(ackedIds).size).toBe(ackedIds.length);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -2354,6 +2454,87 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
+  test("accumulates ack attempts for an event whose live row vanished and dead-letters it at the cap", async () => {
+    vi.useFakeTimers();
+    const logHome = mkdtempSync(join(tmpdir(), "herdsman-pi-ack-attempts-"));
+    const previousHome = process.env.HERDSMAN_HOME;
+    process.env.HERDSMAN_HOME = logHome;
+    const stranded = event(71, "term_agent");
+    const client = createWakeClient();
+    const base = client.response;
+    const ackAttempts: number[] = [];
+    client.response = (method, params) => {
+      if (method === "agent.notifications.ack") {
+        const { eventId } = params as { eventId: number };
+        ackAttempts.push(eventId);
+        // A transient failure: the daemon is busy, the event stays pending.
+        const error = new Error("ORCHESTRATOR_BUSY") as Error & { code?: string };
+        error.code = "ORCHESTRATOR_BUSY";
+        throw error;
+      }
+      return base(method, params);
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    const attemptsFor = (eventId: number) => ackAttempts.filter((id) => id === eventId).length;
+    const settleWake = async () => {
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("stop"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+    };
+    try {
+      await startExtension(client, pi, ctx);
+
+      client.emitStream({ method: "agent.event", params: { event: stranded } });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      await settleWake();
+      expect(attemptsFor(stranded.id)).toBe(1);
+
+      // The server stops listing the event: the live projection loses the row
+      // while the delivery queue keeps it (the queue is only touched by an
+      // acknowledgement or a scope reset).
+      client.currentEvents.delete(stranded.id);
+
+      for (const id of [72, 73, 74, 75]) {
+        client.emitStream({ method: "agent.event", params: { event: event(id, "term_agent") } });
+        await vi.advanceTimersByTimeAsync(0);
+        await settleWake();
+      }
+      // Five failed attempts in total: the counter accumulated on the queue copy
+      // instead of restarting at 1 with every settlement.
+      expect(attemptsFor(stranded.id)).toBe(5);
+
+      // Dead-lettered at the cap: the event left the delivery queue, so a later
+      // settlement no longer re-attempts it.
+      client.emitStream({ method: "agent.event", params: { event: event(76, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(0);
+      await settleWake();
+      expect(attemptsFor(stranded.id)).toBe(5);
+      expect(attemptsFor(76)).toBe(1);
+
+      const log = readFileSync(
+        join(
+          logHome,
+          "logs",
+          `herdsman-pi-${new Date().toISOString().slice(0, 10).replaceAll("-", "")}.log`,
+        ),
+        "utf8",
+      );
+      expect(log).toContain(
+        "acknowledgement moved to dead-letter eventId=71 attempts=5 code=ORCHESTRATOR_BUSY",
+      );
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+      rmSync(logHome, { recursive: true, force: true });
+      if (previousHome === undefined) delete process.env.HERDSMAN_HOME;
+      else process.env.HERDSMAN_HOME = previousHome;
+    }
+  });
+
   test("does not re-present an already-presented event after a reconnect clears its unstarted batch", async () => {
     vi.useFakeTimers();
     const pending = event(88, "term_agent");
@@ -2457,7 +2638,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("defers pending updates past a normal user run and acknowledges only its wake", async () => {
+  test("defers pending updates while a busy user run is in progress and acknowledges only its wake", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     client.response = (method) =>
@@ -2465,13 +2646,14 @@ describe("herdsman-pi orchestrator bridge", () => {
         ? connectionResponse({ context: contextSnapshot("normal") })
         : { acknowledged: true };
     const pi = createFakePi();
-    const ctx = fakeCtx({ idle: true });
+    // The orchestrator is busy when the update arrives, so the wake is deferred
+    // instead of being injected into the running user turn.
+    const ctx = fakeCtx({ idle: false });
     const previous = withHerdrEnv();
     try {
       await startExtension(client, pi, ctx);
       client.emitStream({ method: "agent.event", params: { event: event(101, "term_agent") } });
       await vi.advanceTimersByTimeAsync(250);
-      ctx.setIdle(false);
       await pi.emit("agent_start", {}, ctx);
       const normalContext = await pi.emitContext([], ctx);
       await vi.advanceTimersByTimeAsync(250);
@@ -2603,13 +2785,17 @@ describe("herdsman-pi orchestrator bridge", () => {
       return { acknowledged: true };
     };
     const pi = createFakePi();
-    const ctx = fakeCtx({ idle: true });
+    // Busy orchestrator: event 107 is deferred (spinning, not yet injected) when
+    // the terminal moves workspaces, so that stale deferral must be dropped.
+    const ctx = fakeCtx({ idle: false });
     const previous = withHerdrEnv();
     try {
       await startExtension(client, pi, ctx);
       client.emitStream({ method: "agent.event", params: { event: event(107, "term_agent") } });
       await vi.advanceTimersByTimeAsync(250);
+      expect(pi.hiddenMessages).toEqual([]);
       moved = true;
+      ctx.setIdle(true);
       client.emitStream({
         method: "agent.orchestrator.changed",
         params: { change: movedRoleChange() },
@@ -2676,7 +2862,9 @@ describe("herdsman-pi orchestrator bridge", () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
-    const ctx = fakeCtx({ idle: true });
+    // Busy orchestrator: the wake stays deferred, so the first role loss has
+    // nothing injected to abort.
+    const ctx = fakeCtx({ idle: false });
     const previous = withHerdrEnv();
     try {
       await startExtension(client, pi, ctx);
@@ -2695,6 +2883,7 @@ describe("herdsman-pi orchestrator bridge", () => {
         params: { change: roleChange("term_other", "term_pi") },
       });
       await vi.advanceTimersByTimeAsync(500);
+      ctx.setIdle(true);
       client.emitStream({ method: "agent.event", params: { event: event(112, "term_agent") } });
       await vi.advanceTimersByTimeAsync(500);
       await pi.emit("agent_start", {}, ctx);
@@ -2704,6 +2893,41 @@ describe("herdsman-pi orchestrator bridge", () => {
       });
 
       expect(ctx.aborts).toBe(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("never aborts a user turn that a queued busy-path batch rides on", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    // The orchestrator is busy: the user's own turn is running.
+    const ctx = fakeCtx({ idle: false });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+      await pi.emit("agent_start", {}, ctx);
+
+      // The 5s hard release hands the batch over as a non-triggering queued
+      // follow-up: it rides the user's turn instead of starting a Herdsman wake
+      // turn.
+      client.emitStream({ method: "agent.event", params: { event: event(121, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(5_100);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      expect(pi.hiddenMessages[0]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
+
+      // Ownership moves away while that user turn is still running. The batch was
+      // never a pure Herdsman wake turn, so it must not be aborted on our behalf
+      // ("Never abort a normal user-triggered turn").
+      client.emitStream({
+        method: "agent.orchestrator.changed",
+        params: { change: roleChange("term_pi", "term_other", "wB:p-other") },
+      });
+      await vi.advanceTimersByTimeAsync(100);
+      expect(ctx.aborts).toBe(0);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -2735,11 +2959,11 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("cancels an owner wake timer on shutdown", async () => {
+  test("cancels a deferred owner wake on shutdown", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
-    const ctx = fakeCtx({ idle: true });
+    const ctx = fakeCtx({ idle: false });
     const previous = withHerdrEnv();
     try {
       await startExtension(client, pi, ctx);
@@ -2814,11 +3038,8 @@ describe("herdsman-pi upstream error wake filter", () => {
       expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
       expect(ctx.statuses.get("herdsman")).not.toContain("agent updates");
       const notifications = ctx.notifications.length;
-      await vi.advanceTimersByTimeAsync(499);
-      expect(pi.hiddenMessages).toEqual([]);
-      expect(client.calls.some(([method]) => method === "agent.notifications.ack")).toBe(false);
-
-      await vi.advanceTimersByTimeAsync(1);
+      // 抑制的上游错误不再等 settle 窗口：0ms 内静默 ack，但仍不注入、不通知。
+      await vi.advanceTimersByTimeAsync(0);
       expect(pi.hiddenMessages).toEqual([]);
       expect(ctx.notifications).toHaveLength(notifications);
       expect(client.calls).toContainEqual(["agent.notifications.ack", { eventId: 43 }]);
@@ -2982,9 +3203,9 @@ describe("herdsman-pi upstream error wake filter", () => {
         },
       });
 
-      // The first silent ack fires after WAKE_SETTLE_MS and fails transiently,
+      // The first silent ack fires on the 0ms wake tick and fails transiently,
       // writing a future nextAttemptAt instead of being silently dropped.
-      await vi.advanceTimersByTimeAsync(500);
+      await vi.advanceTimersByTimeAsync(0);
       expect(ackAttempts).toBe(1);
       expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
         ["agent.notifications.ack", { eventId: 43 }],
@@ -2995,11 +3216,11 @@ describe("herdsman-pi upstream error wake filter", () => {
       // No 0ms spin: nothing is re-attempted until the backoff window elapses.
       await vi.advanceTimersByTimeAsync(100);
       expect(ackAttempts).toBe(1);
-
-      // After the backoff (250ms) and the settle (500ms) the ack is re-issued.
-      await vi.advanceTimersByTimeAsync(150);
+      await vi.advanceTimersByTimeAsync(149);
       expect(ackAttempts).toBe(1);
-      await vi.advanceTimersByTimeAsync(500);
+
+      // After the 250ms backoff the ack is re-issued on the next wake tick.
+      await vi.advanceTimersByTimeAsync(2);
       expect(ackAttempts).toBe(2);
       expect(client.calls.filter(([method]) => method === "agent.notifications.ack")).toEqual([
         ["agent.notifications.ack", { eventId: 43 }],

@@ -3,7 +3,10 @@ import { agentIdentityLabel } from "./agent-display.js";
 import type { AgentEventWireRecord } from "./daemon-client.js";
 import { DEFAULT_WAKE_FILTER_CONFIG, isUpstreamModelError, type WakeFilterConfig } from "./upstream-error.js";
 
-export const WAKE_SETTLE_MS = 500;
+// 0ms: once the orchestrator is known to be idle the wake is injected on the
+// next microtask (0ms timer) instead of waiting out a settle window. Delivery
+// latency is owned by the bounded deferral in the extension, not by this delay.
+export const WAKE_SETTLE_MS = 0;
 
 export type AgentOutcome = {
   agent: string;
@@ -51,8 +54,9 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
     return "failed";
   }
   if (event.type === "agent.discarded") {
-    // 观察者放弃等待不唤醒编排者；真实故障由 agent.failed 负责唤醒，正常结束由 agent.done/idle 保底
-    return undefined;
+    // 观察者放弃等待也是终态失败：结果永远不会到达，必须能在编排者对话里被唤醒。
+    // 压制/死信语义保持既有实现（上游错误抑制、pane 级 fallback 压制、seen 去重）。
+    return "failed";
   }
   const payload = asRecord(event.payload);
   if (event.type === "agent.idle" && payload.from === "working") return "completed";
