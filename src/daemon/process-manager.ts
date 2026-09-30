@@ -251,6 +251,18 @@ export type FlockHandle = {
   release: () => void;
 };
 
+export type FlockHandleDependencies = {
+  /**
+   * Internal seam kept for tests only: replaces the `/proc/<pid>/stat` read used
+   * by the child liveness check. Omitting it is byte-for-byte equivalent to the
+   * production read (`readFileSync("/proc/<pid>/stat", "utf8")`); tests pass a
+   * reader that simulates an unreadable or truncated procfs, which deliberately
+   * changes what the liveness check concludes — that is the whole point of the
+   * seam.
+   */
+  readProcessStat?: (pid: number) => string;
+};
+
 /**
  * Checks whether a kernel flock is currently held on lockPath by an active process.
  * Spawns non-blocking `flock -x -n <lockPath> true`.
@@ -278,17 +290,33 @@ export function isFlockHeld(lockPath: string): boolean {
   throw new Error(`flock probe exited with unexpected status ${res.status} on ${lockPath}`);
 }
 
-function isChildProcessActive(pid: number): boolean {
+function isChildProcessActive(
+  pid: number,
+  readProcessStat: (pid: number) => string = (targetPid) =>
+    readFileSync(`/proc/${targetPid}/stat`, "utf8"),
+): boolean {
   if (existsSync("/proc")) {
     try {
-      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const stat = readProcessStat(pid);
       const lastParen = stat.lastIndexOf(")");
-      if (lastParen === -1) return false;
+      // procfs reports st_size 0, so the read has no size hint and can come back
+      // truncated/empty. Unparsable content proves nothing about liveness, so it
+      // must not be read as "the process is gone".
+      if (lastParen === -1) return true;
       const rest = stat.slice(lastParen + 2).trim();
       const state = rest.charAt(0);
+      // Z/X are exited (the kernel already dropped their flock) while T is only
+      // stopped but still holds it. T stays grouped with Z/X on purpose: this batch
+      // splits the errno cases only. See A7 in
+      // .agents/notes/20260930-terminal-event-delivery-open-items.md.
       return state !== "Z" && state !== "X" && state !== "T";
-    } catch {
-      return false;
+    } catch (error) {
+      // Only the kernel proving the pid is gone counts as dead: ENOENT (no
+      // /proc/<pid>/stat entry) or ESRCH. Any other failure (EACCES, EPERM, EIO,
+      // unknown) means "cannot tell", and a lock-holding child must never be
+      // SIGKILLed because of a transient procfs read failure.
+      const code = (error as NodeJS.ErrnoException | null | undefined)?.code;
+      return code !== "ENOENT" && code !== "ESRCH";
     }
   }
   try {
@@ -305,7 +333,10 @@ function isChildProcessActive(pid: number): boolean {
  * The parent process waits for the READY handshake confirmation.
  * The lock file is a persistent regular file and is NEVER removed to prevent inode reuse race conditions.
  */
-export function acquireFlockHandle(lockPath: string): FlockHandle | null {
+export function acquireFlockHandle(
+  lockPath: string,
+  deps?: FlockHandleDependencies,
+): FlockHandle | null {
   mkdirSync(dirname(lockPath), { mode: 0o700, recursive: true });
   // Ensure persistent lock file exists and is never removed
   const fd = openSync(lockPath, "a", 0o600);
@@ -333,7 +364,7 @@ export function acquireFlockHandle(lockPath: string): FlockHandle | null {
     if (existsSync(ackFile)) {
       try {
         const content = readFileSync(ackFile, "utf8");
-        if (content.startsWith("READY") && isChildProcessActive(child.pid)) {
+        if (content.startsWith("READY") && isChildProcessActive(child.pid, deps?.readProcessStat)) {
           acquired = true;
           try {
             rmSync(ackFile, { force: true });
@@ -343,7 +374,7 @@ export function acquireFlockHandle(lockPath: string): FlockHandle | null {
       } catch {}
     }
     // Check if child exited (e.g. flock returned 1 because lock is held by another process)
-    if (!isChildProcessActive(child.pid)) {
+    if (!isChildProcessActive(child.pid, deps?.readProcessStat)) {
       break;
     }
     const until = Date.now() + 1;
@@ -354,7 +385,7 @@ export function acquireFlockHandle(lockPath: string): FlockHandle | null {
     rmSync(ackFile, { force: true });
   } catch {}
 
-  if (!acquired || !isChildProcessActive(child.pid)) {
+  if (!acquired || !isChildProcessActive(child.pid, deps?.readProcessStat)) {
     try {
       if (child.pid) process.kill(-child.pid, "SIGKILL");
     } catch {}
@@ -383,7 +414,7 @@ export function acquireFlockHandle(lockPath: string): FlockHandle | null {
       if (child.pid) {
         const deadline = Date.now() + 100;
         while (Date.now() < deadline) {
-          if (!isChildProcessActive(child.pid)) {
+          if (!isChildProcessActive(child.pid, deps?.readProcessStat)) {
             break;
           }
           const until = Date.now() + 1;
