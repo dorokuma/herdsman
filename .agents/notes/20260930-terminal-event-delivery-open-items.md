@@ -251,6 +251,95 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
   注记（防误读）：该笔记里「`packages/herdsman-pi/src/wake.ts` 处于未提交修改状态」是**写作时点的事实**，
   在 H1 于 `b59ac96` 提交后**已过时**——历史笔记不改写，`wake.ts` 的 H1 部分自 `b59ac96` 起已进 `HEAD`。
 
+### D. 本批（daemon 操作锁 release 屏障）残余不变量台账
+
+> **追加小节**（2026-10-01，`fix/daemon-lock-release-barrier` 批次提交前收口轮；来源轮次＝「实现轮 → 双审 → 收口轮」）。
+> 主体决策、机理与实测见 [`20260930-daemon-lock-release-barrier.md`](20260930-daemon-lock-release-barrier.md)——该笔记第 51 行那段已由本轮的收口重写（去掉证据不足的定量归因、补上本轮一手延迟数据）。
+> 口径：只登记**本批未消除**的残余项；「现有兜底」＝本批已落地的机制，不是未来计划；数字凡属**本轮一手实测**均标 harness 与 n/臂，凡引自他轮的写明来源。**只增不改**，不与 A/B/C 各节重复（A7/A8 只留指针）。
+
+| # | 残余项 | 来源轮次 | 状态 | 核对锚点 |
+| --- | --- | --- | --- | --- |
+| D1 | `children` 文件不可用 → release 屏障降级为只盯 flock 进程，可能带锁返回 | 收口轮（本批）；残余率引自收口轮测量 | **接受**（已加每进程一次告警；残余由 acquire 重试兜底） | `src/daemon/process-manager.ts:312-333`（读 `:312`、告警 `:326`） |
+| D2 | release 的 100ms 预算耗尽时仍可能带锁返回 | 本批（A｜release 屏障） | **接受**（best-effort 预算，设计取舍） | `src/daemon/process-manager.ts:574` |
+| D3 | acquire 硬上界 ≈**1000ms+ε**；deadline 耗尽后即使锁已空闲也返回失败 | 本批（B｜有界重试）＋收口轮实测 | **接受**（预算语义＝设计取舍） | `src/daemon/process-manager.ts:371`、`:452`、`:515` |
+| D4 | 无 `owner.json` 的外来持锁最多 4 次 spawn 后报 held；失败延迟 p50 ~2ms → ~11ms（有界） | 本批（B）；本轮一手重测 | **接受**（有界） | `src/daemon/process-manager.ts:391`；harness `/tmp/lockrace-docs/measure.ts` |
+| D5 | owner 闸门依赖 `isProcessRunning`（`kill(pid,0)`，EPERM 也算活）→ 僵尸 / pid 复用的 `owner.json` 会闸掉重试 | 本批（B｜重试闸门） | **接受**（退化为旧行为，不产生新错误） | `src/daemon/process-manager.ts:401-413`、`:216-223` |
+| D6 | `isChildProcessActive` 把 `T/Z/X` 都视为已退出 → helper 被 `SIGSTOP` 时 release 提前返回 | 既有（A7 同源） | **挂账**（待 owner 拍板等待语义；本批只做 errno 分流） | `src/daemon/process-manager.ts:353`；见 A7 |
+| D7 | 200 轮压测在**并行复跑**下逼近 5s vitest 超时（CI 单进程无风险） | 收口轮 + 本轮重测 | **挂账 → 另开独立 chore** | `/tmp/lockrace-final/concurrent3way/summary.txt`；本批笔记第 51 行 |
+| D8 | D1 的告警分支**无自动化用例**（覆盖靠实验验证 + 审计） | 收口轮（本批） | **挂账**（要钉需新增缝或 `vi.mock("node:fs")`） | `src/daemon/process-manager.ts:326`；`test/unit/daemon-process-manager.test.ts` 内无 `readChildPids` 引用 |
+
+#### D1｜`children` 文件不可用 → release 屏障降级为只盯 flock 进程
+
+- **现象**：`readChildPids` 读 `/proc/<pid>/task/<pid>/children` 失败时按约定返回 `[]`，于是 `helperPids` 只剩 flock 父进程；release 可能在 fd 共享者（`sh -c` 那段命令进程）仍活着时就返回，锁还在自己一侧多持几 ms。
+- **触发条件**：非 Linux，或内核未开 `CONFIG_PROC_CHILDREN` / procfs 被精简、该文件不可读。**本机不可达**（本机 /proc 有 children），只能靠注入缝构造。
+- **影响**：release → 极小间隔 → acquire 的那一发可能 `EWOULDBLOCK`（即本批要修的现象复现）；不产生双主控（只是提前返回，锁仍在持有者手里）。
+- **现有兜底**：① acquire 侧 4 次有界重试（1ms 间隔，共用同一 1000ms 窗口）；② 每进程一次的 `[herdsman]` 告警（模块级 `warnedChildPidsUnavailable`，只在 `/proc` 存在时打），让「退化」可见而不是静默。
+- **状态**：**接受**（设计取舍）。残余实测 **1/6000（回退路径 + B）**——数字引自收口轮测量（本批笔记正文），**本批收口未独立复现**；该分支无自动化用例（见 D8）。
+- **核对**：`grep -n "warnedChildPidsUnavailable\|readChildPids" src/daemon/process-manager.ts`。
+
+#### D2｜release 的 100ms 预算耗尽时仍可能带锁返回
+
+- **现象**：release 的收尾是 best-effort 同步自旋，`deadline = Date.now() + 100` 到期即返回，不报错、不重试。
+- **触发条件**：helper 一侧的 fd 持有者在极端调度延迟下 >100ms 才退出（或那 100ms 被同进程的事件循环阻塞吃掉——同步自旋本身就阻塞事件循环）。
+- **影响**：与 D1 同形状：release 返回时锁可能仍被自己一侧持有，紧接着的 acquire 首发生败。
+- **现有兜底**：acquire 有界重试（B）；release 的 100ms 预算**不涨**（关停路径预算见 `.agents/notes/20260929-daemon-shutdown-budget.md`）。
+- **状态**：**接受**（best-effort 预算，设计取舍）；本轮一手 release 延迟（harness 同上，n=200/臂）free 形状 p50 两臂均 0.94ms、max ≤3.94ms，未见预算被打满。
+- **核对**：`grep -n "Date.now() + 100" src/daemon/process-manager.ts`。
+
+#### D3｜acquire 硬上界 ≈1000ms+ε；deadline 耗尽后即使锁已空闲也返回失败
+
+- **现象**：`deadline = Date.now() + ACQUIRE_WINDOW_MS(1000)`；attempt 之间与 `spawnFlockHelper` 内部窗口都按它钳制（`Math.min(ACQUIRE_WINDOW_MS, deadline - Date.now())`）；用尽即 `return null`，上层 `acquireDaemonLock` 抛 `operation lock is held`。
+- **触发条件**：单次 acquire 被外部因素拉满窗口（例如 helper 不写 READY 且一直持着锁、4 次 attempt 用尽）。
+- **影响**：可能在「锁其实已经空闲」时返回失败；诊断信息通常不带 ` by PID `（`owner.json` 已消失）。这是预算语义，不是漏检。
+- **现有兜底**：无自动重试（有意：窗口内拿不到就失败）；调用方 50ms 后重试即成功（本批早前实测，见本批笔记「背景」）。
+- **状态**：**接受**（预算语义）。上界实测（病理构造，收口轮）：收紧前 1958/1959/1958ms → 收紧后 **1000/1000/1000ms**（`/tmp/lockrace-close2/item2/run.sh`）。
+- **核对**：`grep -n "ACQUIRE_WINDOW_MS\|deadline" src/daemon/process-manager.ts`。
+
+#### D4｜无 `owner.json` 的外来持锁：最多 4 次 spawn 后失败
+
+- **现象**：外来进程真持锁、但没有（或已被删除）`owner.json` 时，`hasLiveLockOwner` 判 false → 闸门放行 → 同一窗口内最多 4 次 spawn helper。
+- **触发条件**：持锁者不是本工具登记的 owner（无 `owner.json`），且持续持锁（含「上一任持有者正在拆除」的残余窗口）。
+- **影响**：该路径失败延迟从「一次 spawn」变成「≤4 次 spawn + 3×1ms」；**有界**，不会无限等。
+- **现有兜底**：`ACQUIRE_MAX_ATTEMPTS = 4` 与 1000ms 窗口双重有界；`SIGKILL` 组 + ack 清理沿用旧结构。
+- **状态**：**接受**（有界）。**本轮一手实测**（harness `/tmp/lockrace-docs/measure.ts`，node v22.23.1，两臂同轮、顺序对调各 1 轮，n=25/臂/轮 = **50/臂**）：HEAD `ce17071` p50 1.99–2.13ms / max ≤2.78ms → 现行 p50 11.03–11.06ms / max ≤11.70ms。（早前轮次曾记 max 61ms，本机本轮未复现，本表以本轮实测为准。）
+- **核对**：`grep -n "ACQUIRE_MAX_ATTEMPTS" src/daemon/process-manager.ts`。
+
+#### D5｜owner 闸门依赖 `isProcessRunning`（EPERM 也算活）
+
+- **现象**：`hasLiveLockOwner` 用 `isProcessRunning(pid)`（即 `kill(pid, 0)`；`EPERM` 返回 true）判活；僵尸进程、pid 被复用、或「存在但无权限」都会被判成「活 owner」，于是**一次都不重试**。
+- **触发条件**：`owner.json` 指向僵尸 / 已被复用的 pid。
+- **影响**：只丢掉了「本来可能成功的那次重试」，行为等同修复前（一次 spawn 后失败）；不引入新错误、不改错误文案。
+- **现有兜底**：无（也不需要，语义与修复前一致）；调用方重试即好。
+- **状态**：**接受**（闸门的已知保守性）。
+- **核对**：`grep -n "hasLiveLockOwner\|isProcessRunning" src/daemon/process-manager.ts`。
+
+#### D6｜`isChildProcessActive` 把 `T` 与 `Z/X` 同样判死
+
+- **现象**：判活表达式是 `state !== "Z" && state !== "X" && state !== "T"`；`T`（`SIGSTOP` / ptrace / cgroup freezer）**内核仍持锁**，却被判死。
+- **触发条件**：helper（或外部持锁者）在 release / acquire 判定窗口内被停止。
+- **影响**：release 侧提前放行 → 同 D1 形状（可能带锁返回）；acquire 侧同一判活也会把停止态 helper 判死（可 `SIGKILL` 掉正在持锁的子进程并返回 null）→ 上层误报 `operation lock is held`（与 A7 同源）。
+- **现有兜底**：本批只做 errno 分流，`T` 语义未动；acquire 有界重试部分兜底。
+- **状态**：**挂账**（＝ A7，待 owner 拍板「等待语义」；不属本批范围）。
+- **核对**：`grep -n 'state !== "Z"' src/daemon/process-manager.ts`；A7。
+
+#### D7｜200 轮压测在并行复跑下逼近 5s vitest 超时
+
+- **现象**：`stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters` 单跑中位约 1.39s（本轮：`/tmp/lockrace-final/single/summary.txt`），但并行复跑时逼近 vitest 默认 5s。
+- **触发条件**：同一机器同时跑多份全量测试（本机复核 / 本地复跑场景）；**CI 单进程不触发**。
+- **影响**：本地并行复跑时该用例假失败（`Test timed out in 5000ms`），非产品缺陷；本批使它变慢约 +320~350ms（本轮交错实测，见本批笔记第 51 行）。
+- **现有兜底**：无（测试侧）。
+- **状态**：**挂账 → 另开独立 chore**（提高该用例超时或改 `vi.waitFor`）；不阻塞本批。
+- **核对**：`/tmp/lockrace-final/concurrent3way/summary.txt`、`/tmp/lockrace-final/concurrent-default5s/summary.txt`；本批笔记第 51 行。
+
+#### D8｜D1 的告警分支无自动化用例
+
+- **现象**：`readChildPids` 的 catch + 一次性 `console.warn` 分支没有测试覆盖；既有回归用例都走「procfs 正常」路径（`readChildPids` 未导出、测试文件里零引用）。
+- **触发条件**：只有在改这段代码或做审计时才暴露——回归不会被测试拦住。
+- **影响**：将来若改坏该告警 / 回退语义，测试不会失败（回归面缺口）。
+- **现有兜底**：收口轮的实验验证（`/tmp/lockrace-close2/warnprobe/` 注入缝副本）+ 审计复核。
+- **状态**：**挂账**（可选；要钉需新增注入缝或 `vi.mock("node:fs")`，本批未做）。
+- **核对**：`grep -n "console.warn" src/daemon/process-manager.ts`；`grep -n "readChildPids" test/unit/daemon-process-manager.test.ts`（应为空）。
+
 ## 被放弃的方案（必填）
 
 - **把这些观察项写进 Phase 1 / H1 笔记正文**：违反 README「不可变原则」（历史笔记原则上不改写），

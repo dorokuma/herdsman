@@ -290,6 +290,47 @@ export function isFlockHeld(lockPath: string): boolean {
   throw new Error(`flock probe exited with unexpected status ${res.status} on ${lockPath}`);
 }
 
+/**
+ * One-shot flag for the degraded release barrier. Module scope on purpose: the
+ * missing `/proc/<pid>/task/<pid>/children` file is a property of the kernel/
+ * procfs, not of a single lock, so one warning per process is enough. This runs
+ * on every successful acquisition, so it must never flood the log.
+ */
+let warnedChildPidsUnavailable = false;
+
+/**
+ * Reads the direct children of `pid` from procfs. `flock` forks so it can wait
+ * for the command it runs, and that command inherits the flock file descriptor,
+ * so those children are the other processes keeping the flock alive. Returns []
+ * when procfs does not expose the children file (or on a non-Linux host); the
+ * caller then falls back to watching the flock process alone.
+ *
+ * The fallback is a silent degradation of the release barrier, so it announces
+ * itself once per process when procfs is present but the file cannot be read.
+ * The return contract, the control flow and the hot path stay untouched.
+ */
+function readChildPids(pid: number): number[] {
+  try {
+    return readFileSync(`/proc/${pid}/task/${pid}/children`, "utf8")
+      .split(/\s+/)
+      .map((part) => Number(part))
+      .filter((value) => Number.isInteger(value) && value > 0);
+  } catch {
+    // `/proc` exists on every supported platform, so a failure here means the
+    // children file itself is unavailable (or unreadable). That is exactly the
+    // case where release() only waits for the flock process and the residual
+    // "released but still held for a few ms" window is left to the bounded
+    // acquire retry.
+    if (existsSync("/proc") && !warnedChildPidsUnavailable) {
+      warnedChildPidsUnavailable = true;
+      console.warn(
+        `[herdsman] /proc/${pid}/task/${pid}/children is unavailable: release barrier degraded to watching the flock process alone, residual races are absorbed by the bounded acquire retry`,
+      );
+    }
+    return [];
+  }
+}
+
 function isChildProcessActive(
   pid: number,
   readProcessStat: (pid: number) => string = (targetPid) =>
@@ -327,23 +368,72 @@ function isChildProcessActive(
   }
 }
 
+const ACQUIRE_WINDOW_MS = 1000;
 /**
- * Acquires an exclusive non-blocking flock on lockPath using a child process.
- * The child process runs `flock -x -n <lockPath> sh -c 'printf READY > <ackFile>; exec cat'`.
- * The parent process waits for the READY handshake confirmation.
- * The lock file is a persistent regular file and is NEVER removed to prevent inode reuse race conditions.
+ * Bounded retries for a single acquisition, and the delay between them.
+ *
+ * `flock -n` also fails while a *previous* holder is still finishing its
+ * kernel-side teardown (see the release post-condition below): the kernel drops
+ * the flock only once the last process holding the descriptor is gone, which can
+ * lag behind the signal for a few milliseconds. Retrying inside the same
+ * acquisition window turns that spurious "lock is held" into a success.
+ *
+ * The budget is deliberately small because it is also spent on the legitimate
+ * "another process holds the lock" path (the `operation lock is held` error),
+ * which must stay fast: with a live owner registered the retries are skipped
+ * entirely (see hasLiveLockOwner), and the worst case that remains is one extra
+ * helper spawn plus one delay per failed attempt. Measured on the 200-round
+ * contention stress test (5s vitest timeout): 1.05s before this change, 1.08s
+ * with the release barrier only, 1.37s with the retries (424 helpers spawned
+ * instead of 400); a 2ms delay instead of 1ms costs 1.43s but never spawns a
+ * wasted helper.
  */
-export function acquireFlockHandle(
+const ACQUIRE_MAX_ATTEMPTS = 4;
+const ACQUIRE_RETRY_DELAY_MS = 1;
+
+/**
+ * True when `<lockPath>.owner.json` names a process that is still alive, i.e. the
+ * lock is held on purpose rather than left behind by a holder that is currently
+ * being torn down. `acquireDaemonLock` writes that record, and it is dropped
+ * before the flock helper is signalled, so a live owner means retrying cannot
+ * help — that path keeps the diagnostic "lock is held" error fast.
+ */
+function hasLiveLockOwner(lockPath: string): boolean {
+  try {
+    const ownerPath = `${lockPath}.owner.json`;
+    if (!existsSync(ownerPath)) {
+      return false;
+    }
+    const data = JSON.parse(readFileSync(ownerPath, "utf8")) as Partial<DaemonLockOwner>;
+    if (typeof data.pid !== "number" || !Number.isInteger(data.pid) || data.pid <= 0) {
+      return false;
+    }
+    return isProcessRunning(data.pid);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Spawns one flock helper and waits for its READY handshake. On success returns
+ * the child together with every pid that holds its flock file descriptor (see
+ * readChildPids); on failure the helper has already been killed, its ack file
+ * removed, and null is returned.
+ *
+ * `deadline` is the caller's shared acquisition deadline (epoch ms). The helper
+ * window is clamped to whatever is left of it so a single attempt can never
+ * spend a fresh 1000ms after the retry loop already burned the previous one:
+ * without the clamp the worst case was 2x the documented bound (~2s), reachable
+ * when a helper stays alive without publishing READY (ack file unwritable while
+ * the lock file is writable, e.g. a full filesystem). The 1000ms ceiling itself
+ * is unchanged.
+ */
+function spawnFlockHelper(
   lockPath: string,
+  ackFile: string,
+  deadline: number,
   deps?: FlockHandleDependencies,
-): FlockHandle | null {
-  mkdirSync(dirname(lockPath), { mode: 0o700, recursive: true });
-  // Ensure persistent lock file exists and is never removed
-  const fd = openSync(lockPath, "a", 0o600);
-  closeSync(fd);
-
-  const ackFile = `${lockPath}.ack.${process.pid}.${Date.now()}.${randomUUID()}`;
-
+) {
   const child = spawn(
     "flock",
     ["-x", "-n", lockPath, "sh", "-c", `printf READY > "${ackFile}"; exec cat`],
@@ -358,14 +448,20 @@ export function acquireFlockHandle(
   }
 
   const start = Date.now();
+  // Remaining budget of the shared window, capped by the single-attempt ceiling.
+  const windowMs = Math.min(ACQUIRE_WINDOW_MS, deadline - Date.now());
   let acquired = false;
+  let helperPids: number[] = [];
 
-  while (Date.now() - start < 1000) {
+  while (Date.now() - start < windowMs) {
     if (existsSync(ackFile)) {
       try {
         const content = readFileSync(ackFile, "utf8");
         if (content.startsWith("READY") && isChildProcessActive(child.pid, deps?.readProcessStat)) {
           acquired = true;
+          // Read the fd-sharing pids while the helper is provably alive: release()
+          // needs them, and they cannot be discovered after the flock parent dies.
+          helperPids = [child.pid, ...readChildPids(child.pid)];
           try {
             rmSync(ackFile, { force: true });
           } catch {}
@@ -395,6 +491,61 @@ export function acquireFlockHandle(
     return null;
   }
 
+  return { child, helperPids };
+}
+
+/**
+ * Acquires an exclusive non-blocking flock on lockPath using a child process.
+ * The child process runs `flock -x -n <lockPath> sh -c 'printf READY > <ackFile>; exec cat'`.
+ * The parent process waits for the READY handshake confirmation, retrying a
+ * bounded number of times when the helper exits without it (that also happens
+ * while a previous holder is still being torn down), and gives up after
+ * ACQUIRE_MAX_ATTEMPTS or when the acquisition window is spent.
+ * The lock file is a persistent regular file and is NEVER removed to prevent inode reuse race conditions.
+ */
+export function acquireFlockHandle(
+  lockPath: string,
+  deps?: FlockHandleDependencies,
+): FlockHandle | null {
+  mkdirSync(dirname(lockPath), { mode: 0o700, recursive: true });
+  // Ensure persistent lock file exists and is never removed
+  const fd = openSync(lockPath, "a", 0o600);
+  closeSync(fd);
+
+  const deadline = Date.now() + ACQUIRE_WINDOW_MS;
+  let helper: ReturnType<typeof spawnFlockHelper> = null;
+
+  for (let attempt = 1; attempt <= ACQUIRE_MAX_ATTEMPTS; attempt += 1) {
+    // One ack file per attempt: a dying helper must never be able to publish the
+    // handshake of the next attempt (the name is unique via randomUUID anyway).
+    const ackFile = `${lockPath}.ack.${process.pid}.${Date.now()}.${randomUUID()}`;
+    helper = spawnFlockHelper(lockPath, ackFile, deadline, deps);
+    if (helper) {
+      break;
+    }
+    if (attempt === ACQUIRE_MAX_ATTEMPTS || Date.now() + ACQUIRE_RETRY_DELAY_MS >= deadline) {
+      break;
+    }
+    // A live registered owner means the lock is genuinely held, not mid-release:
+    // retrying cannot help, it would only delay the diagnostic "lock is held"
+    // error. Checked on both sides of the delay because the holder publishes its
+    // owner record a moment after its flock lands, so a contention window that is
+    // already owned is dropped without even waiting.
+    if (hasLiveLockOwner(lockPath)) {
+      break;
+    }
+    const until = Date.now() + ACQUIRE_RETRY_DELAY_MS;
+    while (Date.now() < until) {}
+    if (hasLiveLockOwner(lockPath)) {
+      break;
+    }
+  }
+
+  if (!helper) {
+    return null;
+  }
+
+  const { child, helperPids } = helper;
   child.unref();
 
   let released = false;
@@ -412,9 +563,17 @@ export function acquireFlockHandle(
         child.stdin?.destroy();
       } catch {}
       if (child.pid) {
+        // Post-condition: the flock is free again. Signalling the helper is not
+        // enough — the kernel only drops the flock once the last process holding
+        // the descriptor is gone, and the helper's command child shares it, so
+        // waiting for the flock process alone returns while the lock is still
+        // held. Wait for every fd-holding helper pid inside the same best-effort
+        // budget; a zombie counts as gone (the kernel already closed its fds). If
+        // it is still held when the budget is spent we return anyway and the
+        // bounded acquire-side retry absorbs the remainder.
         const deadline = Date.now() + 100;
         while (Date.now() < deadline) {
-          if (!isChildProcessActive(child.pid, deps?.readProcessStat)) {
+          if (!helperPids.some((pid) => isChildProcessActive(pid, deps?.readProcessStat))) {
             break;
           }
           const until = Date.now() + 1;

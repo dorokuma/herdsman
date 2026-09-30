@@ -606,6 +606,238 @@ describe("daemon process manager", () => {
     }
   });
 
+  /** Resolves a binary on PATH, to be called before a test overrides PATH. */
+  function resolveOnPath(name: string): string {
+    for (const dir of (process.env.PATH ?? "").split(":")) {
+      const candidate = join(dir, name);
+      if (existsSync(candidate)) return candidate;
+    }
+    throw new Error(`${name} not found on PATH`);
+  }
+
+  // The flock handle learns about the command process sharing its fd from
+  // `/proc/<pid>/task/<pid>/children`; when procfs does not expose that file the
+  // release barrier degrades to watching the flock process alone (the documented
+  // fallback), so there is nothing to assert on such a kernel.
+  const hasProcChildren = existsSync(`/proc/${process.pid}/task/${process.pid}/children`);
+
+  test.skipIf(!hasProcChildren)(
+    "flock handle release waits for every helper process that shares the lock fd",
+    () => {
+      const dir = tempDir();
+      const lockPath = join(dir, "herdsman.pid.lock");
+      const binDir = join(dir, "bin");
+      const holderPidFile = join(dir, "holder.pid");
+      const fakeFlock = join(binDir, "flock");
+      const realFlock = resolveOnPath("flock");
+      const setsid = resolveOnPath("setsid");
+      mkdirSync(binDir, { mode: 0o700, recursive: true });
+      // `flock` forks and the command it runs inherits the flock fd, so the real
+      // helper has two fd holders and the kernel only drops the flock once the
+      // last of them is gone. This fake keeps that topology but moves the real
+      // holder into its own session, where the release-time `kill(-pgid, SIGKILL)`
+      // cannot reach it: a deterministic stand-in for the kernel-side teardown
+      // lag, in which the process acquireFlockHandle watches is gone while the
+      // flock itself is still held.
+      writeFileSync(
+        fakeFlock,
+        `#!/bin/sh
+ack=$(echo "$*" | grep -o '[^ "]*\\.ack\\.[^ "]*')
+if [ -z "$ack" ]; then
+  # Not a handshake invocation (e.g. the isFlockHeld probe): behave normally.
+  exec ${realFlock} "$@"
+fi
+${setsid} ${realFlock} -x -n ${lockPath} sh -c "printf READY > \\"$ack\\"; exec sleep 30" >/dev/null 2>&1 &
+printf %s "$!" > ${holderPidFile}
+n=0
+while [ ! -f "$ack" ] && [ $n -lt 200 ]; do
+  n=$((n + 1))
+  sleep 0.005
+done
+exec cat
+`,
+        { mode: 0o755 },
+      );
+
+      const origPath = process.env.PATH;
+      process.env.PATH = `${binDir}:${origPath}`;
+      let holderPid: number | undefined;
+      try {
+        const handle = acquireFlockHandle(lockPath);
+        expect(handle).not.toBeNull();
+        holderPid = Number(readFileSync(holderPidFile, "utf8"));
+
+        const start = Date.now();
+        handle?.release();
+        const elapsed = Date.now() - start;
+
+        // The holder is still alive, so release() must spend its whole
+        // best-effort budget waiting for it...
+        expect(elapsed).toBeGreaterThanOrEqual(90);
+        // ...and it must not report the lock as free while the holder owns it.
+        expect(isFlockHeld(lockPath)).toBe(true);
+      } finally {
+        process.env.PATH = origPath;
+        if (holderPid !== undefined) {
+          try {
+            process.kill(-holderPid, "SIGKILL");
+          } catch {}
+        }
+      }
+    },
+  );
+
+  test.skipIf(!hasProcChildren)(
+    "flock handle release() returns only once the lock is observably free",
+    () => {
+      const dir = tempDir();
+      const lockPath = join(dir, "herdsman.pid.lock");
+      const binDir = join(dir, "bin");
+      const holderScript = join(binDir, "holder.sh");
+      const holderPidFile = join(dir, "holder.pid");
+      const releaseTrigger = join(dir, "holder.release");
+      const fakeFlock = join(binDir, "flock");
+      const realFlock = resolveOnPath("flock");
+      const setsid = resolveOnPath("setsid");
+      mkdirSync(binDir, { mode: 0o700, recursive: true });
+      // The real holder runs in its own session, so the release-time
+      // `kill(-pgid, SIGKILL)` cannot reach it, and — unlike the sibling test
+      // above — it *exits by itself*: it publishes READY, waits for the trigger
+      // file this test writes immediately before calling release() (so it is
+      // provably still holding then), and then holds for 40ms more. That makes
+      // the core post-condition directly assertable: release() has to wait for
+      // the surviving fd holder before it returns, so the lock must already be
+      // free when it does. Bounded trigger wait (2s) keeps a failing run from
+      // leaving the lock held in the temp directory.
+      writeFileSync(
+        holderScript,
+        `#!/bin/sh
+printf READY > "$1"
+n=0
+while [ ! -f "$2" ] && [ $n -lt 400 ]; do
+  n=$((n + 1))
+  sleep 0.005
+done
+sleep 0.04
+`,
+        { mode: 0o755 },
+      );
+      writeFileSync(
+        fakeFlock,
+        `#!/bin/sh
+ack=$(echo "$*" | grep -o '[^ "]*\\.ack\\.[^ "]*')
+if [ -z "$ack" ]; then
+  # Not a handshake invocation (e.g. the isFlockHeld probe): behave normally.
+  exec ${realFlock} "$@"
+fi
+${setsid} ${realFlock} -x -n ${lockPath} ${holderScript} "$ack" ${releaseTrigger} >/dev/null 2>&1 &
+printf %s "$!" > ${holderPidFile}
+n=0
+while [ ! -f "$ack" ] && [ $n -lt 200 ]; do
+  n=$((n + 1))
+  sleep 0.005
+done
+exec cat
+`,
+        { mode: 0o755 },
+      );
+
+      const origPath = process.env.PATH;
+      process.env.PATH = `${binDir}:${origPath}`;
+      let holderPid: number | undefined;
+      try {
+        const handle = acquireFlockHandle(lockPath);
+        expect(handle).not.toBeNull();
+        holderPid = Number(readFileSync(holderPidFile, "utf8"));
+        expect(Number.isInteger(holderPid) && holderPid > 0).toBe(true);
+        // The holder is parked before its short hold, so the lock really is held
+        // right now — the barrier below is what makes it free again in time.
+        expect(isFlockHeld(lockPath)).toBe(true);
+
+        // Release the holder from its pre-hold wait, then tear our helper down.
+        writeFileSync(releaseTrigger, "");
+        const start = Date.now();
+        handle?.release();
+        const elapsed = Date.now() - start;
+
+        // The post-condition this whole barrier exists for: once release() has
+        // returned, the lock is free for the next acquirer.
+        expect(isFlockHeld(lockPath)).toBe(false);
+        // Loose upper bound only: release() returns as soon as the holder is
+        // gone instead of serving the whole 100ms budget. The lower bound is
+        // deliberately not asserted here (that is the sibling test's job) to
+        // keep this one free of scheduling flake.
+        expect(elapsed).toBeLessThan(90);
+      } finally {
+        process.env.PATH = origPath;
+        if (holderPid !== undefined) {
+          try {
+            process.kill(-holderPid, "SIGKILL");
+          } catch {}
+        }
+      }
+    },
+  );
+
+  test("acquireFlockHandle retries a bounded number of lock-helper exits, but not while a live owner is registered", () => {
+    const dir = tempDir();
+    const binDir = join(dir, "bin");
+    const counterFile = join(dir, "attempts");
+    const succeedFromFile = join(dir, "succeed-from-attempt");
+    const fakeFlock = join(binDir, "flock");
+    const realFlock = resolveOnPath("flock");
+    mkdirSync(binDir, { mode: 0o700, recursive: true });
+    // Stands in for `flock -n` failing because a *previous* holder is still
+    // finishing its kernel-side teardown: exit 1 without publishing READY until
+    // the attempt number in succeedFromFile, then behave like the real flock.
+    writeFileSync(
+      fakeFlock,
+      `#!/bin/sh
+attempts=$(cat ${counterFile} 2>/dev/null || echo 0)
+attempts=$((attempts + 1))
+printf %s "$attempts" > ${counterFile}
+if [ "$attempts" -lt "$(cat ${succeedFromFile})" ]; then
+  exit 1
+fi
+exec ${realFlock} "$@"
+`,
+      { mode: 0o755 },
+    );
+
+    const origPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${origPath}`;
+    try {
+      // The helper loses a race against a holder that is already gone: the next
+      // attempt must take the lock instead of reporting it as held.
+      writeFileSync(succeedFromFile, "2");
+      const recovered = acquireFlockHandle(join(dir, "recovered.lock"));
+      expect(recovered).not.toBeNull();
+      expect(readFileSync(counterFile, "utf8")).toBe("2");
+      recovered?.release();
+
+      // A lock that really stays taken is still reported as held, after a bounded
+      // number of attempts instead of an unbounded wait inside the same window.
+      writeFileSync(succeedFromFile, "999");
+      writeFileSync(counterFile, "0");
+      expect(acquireFlockHandle(join(dir, "held.lock"))).toBeNull();
+      const attempts = Number(readFileSync(counterFile, "utf8"));
+      expect(attempts).toBeGreaterThan(1);
+      expect(attempts).toBeLessThanOrEqual(5);
+
+      // A live registered owner means the lock is held on purpose: retrying
+      // cannot help, so the diagnostic "lock is held" path stays immediate.
+      writeFileSync(succeedFromFile, "1");
+      const ownedLock = join(dir, "owned.lock");
+      const releaseOwner = acquireDaemonLock(ownedLock);
+      writeFileSync(counterFile, "0");
+      expect(acquireFlockHandle(ownedLock)).toBeNull();
+      expect(readFileSync(counterFile, "utf8")).toBe("1");
+      releaseOwner();
+    } finally {
+      process.env.PATH = origPath;
+    }
+  });
+
   test("acquireFlockHandle returns null if child process exits immediately after writing READY", () => {
     const dir = tempDir();
     const lockPath = join(dir, "herdsman.pid.lock");
