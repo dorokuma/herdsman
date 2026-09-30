@@ -1,5 +1,16 @@
 ## [Unreleased]
 
+## 0.13.1
+
+- daemon 优雅关停总预算：`stop()` 的关闭序列（index drain → reconcile scheduler → watch manager → RPC server）改为跑在一个 `SHUTDOWN_BUDGET_MS = 5000` 的总预算下，每步按剩余预算限时并保留 `SHUTDOWN_MIN_STEP_MS = 250` 兜底；超时只记 warn 并继续下一步、退出码仍为 0（SIGTERM 是有意停止，非零退出码会被 `Restart=on-failure` 拉回来），`finally` 的清理（pid 文件 / 实例锁 / socket）不受预算影响。修的事故形态是「任一步永不返回 → 10s 内不退出 → 被 `TimeoutStopSec=10` SIGKILL → 跳过清理并留下 flock 助手子进程」。
+- 关停先 abort 再 drain：daemon 持有一个关停 `AbortController`，`stop()` 一开始即 abort——`agent-index-service` 的在飞状态等待（历史窗口 / turn completion / readiness polling）按「等价于 pane closed、plan 行保持可重试」结束，关停后新注册的 waiter 立即 abort；`herdr-session-watch-manager` 同步停 tick 并拆掉全部 watcher（`PLAN_DRAIN_GRACE_MS` 12000 → 3000，必须 ≤ 关闭预算），预算切掉 watchManager 那一步也不会留下活 watcher。
+- 外围调用加超时与硬上限：`herdr-socket-client` 的请求加 `HERDR_REQUEST_TIMEOUT_MS = 2000`（超时=失败，成功路径语义不变），`herdr session list` 的 `execFile` 加 `HERDR_SESSION_LIST_TIMEOUT_MS = 2000` 并补 `killSignal: "SIGKILL"`（默认 SIGTERM 可被子进程无视，且迟到成功会被当成成功）。
+- 关停日志与二次信号幂等：关停进入 / abort / 每步开始（剩余预算与限时）/ 每步结束（耗时）/ 超时 / 结束（总耗时与退出码）都有日志（只含步骤名、毫秒数与 `pid` / `exitCode` 这类非敏感运行标识）；第一次 SIGTERM 进入关停时重新挂上 SIGINT/SIGTERM，第二个信号做最小清理后 `exit(0)`，不再落到 Node 默认动作留下 pid / socket / 锁残留；在飞 tick 的 rejection 就地 `.catch`——关停预算截断 `watchManager.stop` 时 daemon 自己的 `unhandledRejection` 监听器已被移除，未处理的 rejection 会按 Node 默认行为终止进程并跳过清理。
+- 回归测试：daemon 关停预算 / 超时跳过 / `finally` 清理 / 第二次信号，watch manager 收到 shutdown signal 立即拆 watcher 与在飞 tick 抛错不逃逸，socket client 对静默对端超时；隔离目录端到端复测：假 herdr socket 完全不应答时 SIGTERM 后 2.01s 优雅退出（exit 0），pid 文件 / RPC socket / 实例锁均清除。
+- 文档批次（同版本收录）：提交门禁失败提示可区分（`.husky/pre-commit` 的 mise 缺失与工具未装分开提示）；`AGENTS.md` 与 `docs/releasing.md` 澄清运行时事实（生产 daemon 走 nvm 的 node v22.23.1、提交门禁走 mise 的 node 26.7.0、普通 shell 以现场 `node -v` 为准，部署前用生产面复跑 `pnpm check`）；`.agents/notes/` 的模块枚举补 `release`。
+- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.13.1；两个 README 的 Herdr 安装 tag 保持指向已存在的 `v0.12.1`（`v0.13.1` 的 tag 尚未创建），tag 替换在发布提交时执行。
+- **未发布**：仓库内版本号已递增到 0.13.1，但未打 tag、未发布到 npm；npm 上的 latest 仍是 0.12.1。本机生产用本地 tarball 安装本仓构建产物（不依赖 npm 发布），装后按部署流程重启，并用版本、PID、socket 逐条核对。
+
 ## 0.13.0
 
 - CLI 接口移除：删除 `herdsman daemon start|stop|restart`，`herdsman daemon` 只保留只读 `status`；生产启停只走 systemd（`herdsman.service` 是唯一托管者），socket 报错文案改指 `systemctl status herdsman.service`。

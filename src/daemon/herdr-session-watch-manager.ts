@@ -13,7 +13,13 @@ import { VALID_AGENT_EVENT_TYPES } from "@/observability/contracts.js";
 
 export const ACTIVE_REVISION_POLL_MS = 10_000;
 export const FULL_RESCAN_MS = 60_000;
-export const PLAN_DRAIN_GRACE_MS = 12_000;
+/**
+ * Grace for status event plans still executing when the manager stops. Must stay
+ * below the daemon shutdown budget (SHUTDOWN_BUDGET_MS in src/daemon/service.ts,
+ * 5000ms) and therefore below the unit's TimeoutStopSec (10s): a drain grace
+ * longer than the stop timeout is what let SIGTERM end in systemd SIGKILL.
+ */
+export const PLAN_DRAIN_GRACE_MS = 3_000;
 
 type Client = Pick<HerdrSocketClient, "close" | "subscribeEvents">;
 
@@ -49,6 +55,7 @@ export class HerdrSessionWatchManager {
   readonly #retiringWatcherLoops = new Set<Promise<void>>();
   readonly #inFlightPlans = new Set<Promise<void>>();
   readonly #sessionList: HerdrSessionListRunner;
+  readonly #shutdownSignal: AbortSignal | undefined;
   readonly #watchers = new Map<string, Watcher>();
   #lastFullRescanAt = 0;
   #lifecycleGeneration = 0;
@@ -70,6 +77,12 @@ export class HerdrSessionWatchManager {
     onAgentIndexRefreshed?(input: { agents: AgentIndexRecord[]; herdrSessionName: string }): void;
     reconnectDelayMs?: number;
     sessionList: HerdrSessionListRunner;
+    /**
+     * Aborted when the daemon starts shutting down. Watchers stop as soon as it
+     * aborts instead of waiting for the daemon to reach its watchManager.stop()
+     * step, so teardown also happens when the shutdown budget cuts that step short.
+     */
+    shutdownSignal?: AbortSignal;
   }) {
     this.#activeRevisionPollMs = options.activeRevisionPollMs ?? ACTIVE_REVISION_POLL_MS;
     this.#agents = options.agents;
@@ -82,6 +95,23 @@ export class HerdrSessionWatchManager {
     this.#onAgentIndexRefreshed = options.onAgentIndexRefreshed ?? (() => undefined);
     this.#reconnectDelayMs = options.reconnectDelayMs ?? 1_000;
     this.#sessionList = options.sessionList;
+    this.#shutdownSignal = options.shutdownSignal;
+    if (this.#shutdownSignal?.aborted) {
+      void this.#beginShutdown().catch((error) => {
+        console.warn("Herdsman Herdr session watch shutdown failed", {
+          error: error instanceof Error ? error.message : String(error),
+          step: "begin-shutdown",
+        });
+      });
+    } else {
+      this.#shutdownSignal?.addEventListener(
+        "abort",
+        () => {
+          void this.#beginShutdown().catch(() => undefined);
+        },
+        { once: true },
+      );
+    }
   }
 
   async start(): Promise<void> {
@@ -92,19 +122,29 @@ export class HerdrSessionWatchManager {
     if (this.#stopping || generation !== this.#lifecycleGeneration) return;
     this.#scheduler = setInterval(() => {
       if (!this.#tickInFlight) {
-        this.#tickInFlight = this.#tick().finally(() => {
-          this.#tickInFlight = undefined;
-        });
+        // The rejection handler must be attached here, not only in stop(): when
+        // the shutdown budget abandons the watchManager.stop step, stop() never
+        // reaches its own `.catch`. By then stop() has also removed the daemon's
+        // own unhandledRejection/uncaughtException listeners, so an in-flight
+        // tick that throws has no listener left: the rejection falls through to
+        // Node's default action, which throws and ends the process with exit code
+        // 1, skipping the daemon's finally cleanup.
+        this.#tickInFlight = this.#tick()
+          .catch((error) => {
+            console.warn("Herdsman Herdr session watch tick failed", {
+              error: error instanceof Error ? error.message : String(error),
+              step: "active-revision-poll",
+            });
+          })
+          .finally(() => {
+            this.#tickInFlight = undefined;
+          });
       }
     }, this.#activeRevisionPollMs);
   }
 
   async stop(): Promise<void> {
-    this.#stopping = true;
-    this.#lifecycleGeneration += 1;
-    if (this.#scheduler) clearInterval(this.#scheduler);
-    this.#scheduler = undefined;
-    await this.#abortWatchers();
+    await this.#beginShutdown();
     await this.#tickInFlight?.catch(() => undefined);
     await Promise.all([...this.#retiringWatcherLoops]);
     if (this.#inFlightPlans.size > 0) {
@@ -115,6 +155,19 @@ export class HerdrSessionWatchManager {
       });
     }
     await this.#abortWatchers();
+  }
+
+  /**
+   * Synchronous teardown entry: stop scheduling ticks and abort every watcher.
+   * Shared by stop() and by the daemon shutdown signal so an aborted shutdown
+   * can never leave watchers (and their sockets) running.
+   */
+  #beginShutdown(): Promise<void> {
+    this.#stopping = true;
+    this.#lifecycleGeneration += 1;
+    if (this.#scheduler) clearInterval(this.#scheduler);
+    this.#scheduler = undefined;
+    return this.#abortWatchers();
   }
 
   async rescanNow(): Promise<void> {

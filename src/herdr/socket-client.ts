@@ -3,7 +3,16 @@ import { encodeJsonLine, JsonLineDecoder } from "@/shared/json-lines.js";
 
 export type HerdrRequestId = string;
 
+/**
+ * Local Herdr sockets answer immediately, so a request that is still unanswered
+ * after this window is treated as failed. Without it a peer that stops replying
+ * (or a socket that accepts but never writes) parks the caller forever, which is
+ * how the daemon used to hang past the unit's TimeoutStopSec on shutdown.
+ */
+export const HERDR_REQUEST_TIMEOUT_MS = 2_000;
+
 export type HerdrSocketClientOptions = {
+  requestTimeoutMs?: number;
   socketPath: string;
 };
 
@@ -40,12 +49,14 @@ export class HerdrSocketClient {
   readonly #decoder = new JsonLineDecoder();
   readonly #pending = new Map<HerdrRequestId, PendingRequest>();
   readonly #subscribers = new Set<EventSubscriber>();
+  readonly #requestTimeoutMs: number;
   readonly #socket: Socket;
   readonly #socketPath: string;
   #eventsSubscribed = false;
   #nextId = 1;
 
   constructor(options: HerdrSocketClientOptions) {
+    this.#requestTimeoutMs = options.requestTimeoutMs ?? HERDR_REQUEST_TIMEOUT_MS;
     this.#socketPath = options.socketPath;
     this.#socket = createConnection(options.socketPath);
     this.#socket.on("data", (chunk) => this.#handleData(chunk));
@@ -65,22 +76,41 @@ export class HerdrSocketClient {
     this.#nextId += 1;
 
     return new Promise((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      const clearTimer = () => {
+        if (timer === undefined) return;
+        clearTimeout(timer);
+        timer = undefined;
+      };
       const onAbort = () => {
         if (!this.#pending.has(id)) return;
+        clearTimer();
         this.#pending.delete(id);
         reject(new Error("Herdr request aborted"));
       };
       this.#pending.set(id, {
         reject: (error) => {
+          clearTimer();
           signal?.removeEventListener("abort", onAbort);
           reject(error);
         },
         resolve: (value) => {
+          clearTimer();
           signal?.removeEventListener("abort", onAbort);
           resolve(value);
         },
       });
       signal?.addEventListener("abort", onAbort, { once: true });
+      // The timer only fires for a request the peer never answered; a resolved
+      // request clears it, so the success path keeps its current semantics.
+      timer = setTimeout(() => {
+        if (!this.#pending.has(id)) return;
+        clearTimer();
+        this.#pending.delete(id);
+        signal?.removeEventListener("abort", onAbort);
+        reject(new Error(`Herdr ${method} request timed out after ${this.#requestTimeoutMs}ms`));
+      }, this.#requestTimeoutMs);
+      timer.unref();
       this.#socket.write(encodeJsonLine({ id, method, params }));
     });
   }
@@ -195,11 +225,16 @@ export class HerdrSocketClient {
       const decoder = new JsonLineDecoder();
       const socket = createConnection(this.#socketPath);
       let settled = false;
+      let timer: NodeJS.Timeout | undefined;
       const finish = (result: { error?: Error; value?: unknown }) => {
         if (settled) {
           return;
         }
         settled = true;
+        if (timer !== undefined) {
+          clearTimeout(timer);
+          timer = undefined;
+        }
         socket.destroy();
         if (result.error) {
           reject(result.error);
@@ -208,7 +243,17 @@ export class HerdrSocketClient {
         resolve(result.value);
       };
 
+      // A peer that accepts the connection but never answers must not park the
+      // caller forever: fail the request once the timeout elapses.
+      timer = setTimeout(() => {
+        finish({
+          error: new Error(`Herdr ${method} request timed out after ${this.#requestTimeoutMs}ms`),
+        });
+      }, this.#requestTimeoutMs);
+      timer.unref();
+
       socket.on("connect", () => socket.write(encodeJsonLine({ id, method, params })));
+
       socket.on("data", (chunk) => {
         for (const message of decoder.push(chunk.toString("utf8"))) {
           const response = message as HerdrResponse;

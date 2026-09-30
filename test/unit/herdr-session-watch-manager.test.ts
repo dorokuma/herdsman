@@ -453,6 +453,102 @@ describe("HerdrSessionWatchManager", () => {
     harness.sqlite.close();
   });
 
+  test("a shutdown signal aborts watchers before stop() is reached", async () => {
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    const shutdown = new AbortController();
+    let closes = 0;
+    let sessions = 0;
+    const manager = managerFor(harness, {
+      clientFactory: () => ({
+        close() {
+          closes += 1;
+        },
+        async *subscribeEvents(_params, options) {
+          if (options?.signal?.aborted) return;
+          await new Promise<void>((resolve) =>
+            options?.signal?.addEventListener("abort", () => resolve(), { once: true }),
+          );
+        },
+      }),
+      index: {
+        async handleHerdrEvent() {
+          return { contextChangedScopes: [], events: [] };
+        },
+        async refreshHerdrSession() {
+          return result([agentRecord("wB:p2", "wB", "working")]);
+        },
+      },
+      sessionList: async () => {
+        sessions += 1;
+        return [entry()];
+      },
+      shutdownSignal: shutdown.signal,
+    });
+    await manager.start();
+    expect(closes).toBe(0);
+    expect(sessions).toBe(1);
+
+    // Aborting the daemon shutdown signal must tear the watcher down right away:
+    // waiting for the watchManager.stop() step would let a shutdown budget that
+    // is already spent abandon the step and leave the watcher running.
+    shutdown.abort();
+    expect(closes).toBe(1);
+    await manager.stop();
+
+    await manager.rescanNow();
+    expect(closes).toBe(1);
+    harness.sqlite.close();
+  });
+
+  test("logs a failing active-revision tick and stop() still resolves", async () => {
+    vi.useFakeTimers();
+    const harness = openObservabilityDbHarness();
+    seedAgent(harness, "working");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const unhandled: unknown[] = [];
+    const onUnhandledRejection = (reason: unknown) => unhandled.push(reason);
+    process.on("unhandledRejection", onUnhandledRejection);
+    let sessions = 0;
+    const manager = managerFor(harness, {
+      activeRevisionPollMs: 10,
+      fullRescanMs: 60,
+      index: {
+        async handleHerdrEvent() {
+          return { contextChangedScopes: [], events: [] };
+        },
+        async refreshHerdrSession() {
+          return result([agentRecord("wB:p2", "wB", "working")]);
+        },
+      },
+      sessionList: async () => {
+        sessions += 1;
+        if (sessions > 1) throw new Error("session list boom");
+        return [entry()];
+      },
+    });
+    try {
+      await manager.start();
+      // The tick at the full-rescan boundary rejects. The handler has to be
+      // attached where #tickInFlight is assigned: when the shutdown budget
+      // abandons the watchManager.stop step, stop() never reaches its own
+      // `.catch`, so an in-flight tick that throws would escape as an
+      // unhandled rejection instead of being logged.
+      await vi.advanceTimersByTimeAsync(60);
+      await Promise.resolve();
+      expect(warnSpy).toHaveBeenCalledWith(
+        "Herdsman Herdr session watch tick failed",
+        expect.objectContaining({ error: "session list boom", step: "active-revision-poll" }),
+      );
+      expect(unhandled).toEqual([]);
+      await expect(manager.stop()).resolves.toBeUndefined();
+    } finally {
+      process.off("unhandledRejection", onUnhandledRejection);
+      warnSpy.mockRestore();
+      harness.sqlite.close();
+    }
+  });
+
   test("stop() settles after PLAN_DRAIN_GRACE_MS even when a plan never finishes", async () => {
     vi.useFakeTimers();
     const harness = openObservabilityDbHarness();

@@ -5,12 +5,16 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { resolveRuntime } from "@/config/runtime.js";
 import { AgentEventReconciler } from "@/daemon/agent-event-reconciler.js";
+import { PLAN_DRAIN_GRACE_MS } from "@/daemon/herdr-session-watch-manager.js";
 import { acquireDaemonLock } from "@/daemon/process-manager.js";
 import {
   PeriodicReconcileScheduler,
   RECONCILE_INTERVAL_MS,
   resolveMigrationsFolder,
   runObservabilityDaemonService,
+  runShutdownSteps,
+  SHUTDOWN_BUDGET_MS,
+  SHUTDOWN_MIN_STEP_MS,
 } from "@/daemon/service.js";
 
 const tempDirs: string[] = [];
@@ -22,6 +26,28 @@ function killChildProcesses(): void {
   for (const child of children.splice(0)) {
     if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
   }
+}
+
+function createSignalTarget() {
+  const listeners: Record<string, (() => Promise<void> | void)[]> = {};
+  return {
+    listeners,
+    target: {
+      once: (event: "SIGINT" | "SIGTERM", listener: () => Promise<void> | void) => {
+        if (!listeners[event]) listeners[event] = [];
+        listeners[event].push(listener);
+      },
+      off: (event: "SIGINT" | "SIGTERM", listener: () => Promise<void> | void) => {
+        listeners[event] = (listeners[event] ?? []).filter((l) => l !== listener);
+      },
+    },
+    emit: async (event: "SIGINT" | "SIGTERM") => {
+      const list = listeners[event]?.splice(0) ?? [];
+      for (const listener of list) {
+        await listener();
+      }
+    },
+  };
 }
 
 afterEach(() => {
@@ -169,29 +195,203 @@ describe("periodic reconcile scheduling", () => {
   });
 });
 
-describe("daemon service lifecycle and socket guard", () => {
-  function createSignalTarget() {
-    const listeners: Record<string, (() => Promise<void> | void)[]> = {};
-    return {
-      listeners,
-      target: {
-        once: (event: "SIGINT" | "SIGTERM", listener: () => Promise<void> | void) => {
-          if (!listeners[event]) listeners[event] = [];
-          listeners[event].push(listener);
-        },
-        off: (event: "SIGINT" | "SIGTERM", listener: () => Promise<void> | void) => {
-          listeners[event] = (listeners[event] ?? []).filter((l) => l !== listener);
-        },
-      },
-      emit: async (event: "SIGINT" | "SIGTERM") => {
-        const list = listeners[event]?.splice(0) ?? [];
-        for (const listener of list) {
-          await listener();
-        }
-      },
-    };
-  }
+describe("shutdown budget", () => {
+  test("keeps the whole sequence clear of the unit's TimeoutStopSec", () => {
+    // stop() runs four steps; once the budget is spent each remaining step still
+    // gets SHUTDOWN_MIN_STEP_MS, so this is the sequence's worst case.
+    const steps = 4;
+    expect(SHUTDOWN_BUDGET_MS + (steps - 1) * SHUTDOWN_MIN_STEP_MS).toBeLessThan(10_000);
+    // The plan drain grace runs inside the watchManager.stop() step.
+    expect(PLAN_DRAIN_GRACE_MS).toBeLessThanOrEqual(SHUTDOWN_BUDGET_MS);
+  });
 
+  test("bounds a wedged step, continues in order, and reports the timeout", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const ran: string[] = [];
+
+    const startedAt = Date.now();
+    await runShutdownSteps(
+      [
+        { name: "drain", run: () => new Promise<void>(() => {}) },
+        {
+          name: "scheduler",
+          run: async () => {
+            ran.push("scheduler");
+          },
+        },
+        { name: "server", run: () => void ran.push("server") },
+      ],
+      { budgetMs: 200 },
+    );
+    const elapsedMs = Date.now() - startedAt;
+
+    expect(ran).toEqual(["scheduler", "server"]);
+    expect(elapsedMs).toBeGreaterThanOrEqual(200);
+    expect(elapsedMs).toBeLessThan(2_000);
+    expect(warn).toHaveBeenCalledWith(
+      "Herdsman daemon shutdown step timed out; continuing",
+      expect.objectContaining({ budgetMs: 200, step: "drain" }),
+    );
+    expect(
+      log.mock.calls
+        .filter((call) => call[0] === "Herdsman daemon shutdown step starting")
+        .map((call) => (call[1] as { step: string }).step),
+    ).toEqual(["drain", "scheduler", "server"]);
+    warn.mockRestore();
+    log.mockRestore();
+  });
+
+  test("propagates a genuine step failure instead of masking it behind the budget", async () => {
+    const ran: string[] = [];
+    await expect(
+      runShutdownSteps(
+        [
+          {
+            name: "boom",
+            run: () => {
+              throw new Error("shutdown step exploded");
+            },
+          },
+          { name: "later", run: () => void ran.push("later") },
+        ],
+        { budgetMs: 200 },
+      ),
+    ).rejects.toThrow("shutdown step exploded");
+    expect(ran).toEqual([]);
+  });
+
+  test("keeps SIGTERM inside the budget when a shutdown step is wedged, and still cleans up", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdsman-shutdown-budget-"));
+    tempDirs.push(root);
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: root } });
+    mkdirSync(root, { recursive: true });
+
+    const exitCodes: number[] = [];
+    const signals = createSignalTarget();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let sessionListCalls = 0;
+    let tick: (() => void) | undefined;
+
+    await runObservabilityDaemonService({
+      environment: { HERDSMAN_HOME: root },
+      exit: (code) => {
+        exitCodes.push(code ?? 0);
+      },
+      pid: 2468,
+      // Call 1 is the startup reconcile, call 2 the watcher rescan. Every call
+      // after that never settles, wedging the periodic reconcile run and with it
+      // the reconcileScheduler.stop() shutdown step: without the budget, stop()
+      // would never return and systemd would SIGKILL the daemon.
+      sessionList: () => {
+        sessionListCalls += 1;
+        return sessionListCalls <= 2 ? Promise.resolve([]) : new Promise<never[]>(() => {});
+      },
+      reconcileClearInterval: () => {},
+      reconcileIntervalMs: 1,
+      reconcileSetInterval: (callback) => {
+        tick = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      },
+      shutdownBudgetMs: 300,
+      signalTarget: signals.target,
+    });
+
+    expect(readFileSync(runtime.paths.pidPath, "utf8")).toBe("2468\n");
+    tick?.();
+    await vi.waitFor(() => expect(sessionListCalls).toBeGreaterThanOrEqual(3));
+
+    const startedAt = Date.now();
+    await signals.emit("SIGTERM");
+    const elapsedMs = Date.now() - startedAt;
+
+    // Far below the unit's 10s TimeoutStopSec even though a step is wedged.
+    expect(elapsedMs).toBeLessThan(3_000);
+    expect(exitCodes).toEqual([0]);
+    expect(warn).toHaveBeenCalledWith(
+      "Herdsman daemon shutdown step timed out; continuing",
+      expect.objectContaining({ step: "reconcileScheduler.stop" }),
+    );
+    // The wedged step was skipped, not fatal: every other step still ran, so the
+    // pid file, socket and instance lock are all cleaned up.
+    expect(
+      log.mock.calls
+        .filter((call) => call[0] === "Herdsman daemon shutdown step finished")
+        .map((call) => (call[1] as { step: string }).step),
+    ).toEqual(["index.drainInFlightPlans", "watchManager.stop", "server.stop"]);
+    expect(existsSync(runtime.paths.pidPath)).toBe(false);
+    expect(existsSync(runtime.paths.socketPath)).toBe(false);
+    expect(existsSync(`${runtime.paths.pidPath}.instance.lock.owner.json`)).toBe(false);
+    const release = acquireDaemonLock(`${runtime.paths.pidPath}.instance.lock`);
+    release();
+  });
+
+  test("a second SIGTERM forces the exit instead of leaving pid and socket behind", async () => {
+    const root = mkdtempSync(join(tmpdir(), "herdsman-second-signal-"));
+    tempDirs.push(root);
+    const runtime = resolveRuntime({ environment: { HERDSMAN_HOME: root } });
+    mkdirSync(root, { recursive: true });
+
+    const exitCodes: number[] = [];
+    const signals = createSignalTarget();
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    let sessionListCalls = 0;
+    let tick: (() => void) | undefined;
+
+    await runObservabilityDaemonService({
+      environment: { HERDSMAN_HOME: root },
+      exit: (code) => {
+        exitCodes.push(code ?? 0);
+      },
+      pid: 1357,
+      sessionList: () => {
+        sessionListCalls += 1;
+        return sessionListCalls <= 2 ? Promise.resolve([]) : new Promise<never[]>(() => {});
+      },
+      reconcileClearInterval: () => {},
+      reconcileIntervalMs: 1,
+      reconcileSetInterval: (callback) => {
+        tick = callback;
+        return 1 as unknown as ReturnType<typeof setInterval>;
+      },
+      shutdownBudgetMs: 400,
+      signalTarget: signals.target,
+    });
+
+    tick?.();
+    await vi.waitFor(() => expect(sessionListCalls).toBeGreaterThanOrEqual(3));
+
+    // The first SIGTERM starts a shutdown that is stuck on the wedged step.
+    const firstStop = signals.emit("SIGTERM");
+    // The second one must be handled by us: falling through to Node's default
+    // SIGTERM action would kill the process before any cleanup runs.
+    await signals.emit("SIGTERM");
+
+    expect(warn).toHaveBeenCalledWith(
+      "Herdsman daemon received a second shutdown signal; forcing exit",
+      expect.objectContaining({ pid: 1357 }),
+    );
+    expect(exitCodes).toEqual([0]);
+    // Proof the exit came from the forced path: the graceful sequence was still
+    // running when it happened.
+    expect(log).not.toHaveBeenCalledWith("Herdsman daemon shutdown finished", expect.anything());
+    expect(existsSync(runtime.paths.pidPath)).toBe(false);
+    expect(existsSync(runtime.paths.socketPath)).toBe(false);
+    expect(existsSync(`${runtime.paths.pidPath}.instance.lock.owner.json`)).toBe(false);
+    const release = acquireDaemonLock(`${runtime.paths.pidPath}.instance.lock`);
+    release();
+
+    await firstStop;
+    warn.mockRestore();
+    log.mockRestore();
+  });
+});
+
+describe("daemon service lifecycle and socket guard", () => {
   test("refuses to start and preserves socket when socket is reachable", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdsman-guard-"));
     tempDirs.push(root);
