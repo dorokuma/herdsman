@@ -149,6 +149,7 @@ export class AgentIndexService {
   >();
   readonly #scheduleRetry: (callback: () => void, delayMs: number) => unknown;
   readonly #sessionOperationTail = new Map<string, Promise<void>>();
+  readonly #shutdownSignal: AbortSignal | undefined;
   readonly #sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   readonly #turnCompletions: TurnCompletionRegistry | undefined;
   readonly #waitingHistoryTimers = new Map<number, unknown>();
@@ -164,6 +165,13 @@ export class AgentIndexService {
     history?: AgentHistoryService;
     now?: () => number;
     scheduleRetry?: (callback: () => void, delayMs: number) => unknown;
+    /**
+     * Aborted when the daemon starts shutting down. In-flight status waits
+     * (history-advance window, turn completion, readiness polling) are aborted
+     * with it so draining plans cannot outlive the shutdown budget, and waits
+     * registered after the abort return immediately instead of sleeping.
+     */
+    shutdownSignal?: AbortSignal;
     sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
     stores: AgentIndexServiceStores;
     turnCompletions?: TurnCompletionRegistry;
@@ -173,6 +181,8 @@ export class AgentIndexService {
     this.#clientFactory = options.clientFactory ?? ((input) => new HerdrSocketClient(input));
     this.#scheduleRetry = options.scheduleRetry ?? ((cb, delay) => setTimeout(cb, delay));
     this.#sleep = options.sleep ?? sleep;
+    this.#shutdownSignal = options.shutdownSignal;
+    this.#shutdownSignal?.addEventListener("abort", () => this.abortPendingWaits(), { once: true });
     this.#now = options.now ?? (() => Date.now());
     this.#stores = options.stores;
     this.#turnCompletions = options.turnCompletions;
@@ -270,6 +280,22 @@ export class AgentIndexService {
       this.#clearRetry(timer);
     }
     this.#waitingHistoryTimers.clear();
+  }
+
+  /**
+   * Aborts every in-flight status wait (history advance, turn completion,
+   * readiness polling). Called on shutdown through the shutdown signal; the
+   * waiters treat an abort exactly like a closed pane, so no event is appended
+   * for a half-observed transition and the plan row stays retryable.
+   */
+  abortPendingWaits(): void {
+    for (const [key, controllers] of this.#activeWaiters) {
+      for (const controller of controllers) {
+        controller.abort();
+      }
+      controllers.clear();
+      this.#activeWaiters.delete(key);
+    }
   }
 
   async drainInFlightPlans(): Promise<void> {
@@ -1473,8 +1499,23 @@ export class AgentIndexService {
     });
   }
 
+  /**
+   * Distinguishes the two reasons an in-flight wait can be aborted. A closed pane
+   * makes the transition moot, so the plan is skipped; a daemon shutdown leaves
+   * the pane alive, so the plan must stay retryable instead of being completed
+   * without ever emitting the transition (it is drained on the next start).
+   */
+  #throwIfShutdownAbort(controller: AbortController): void {
+    if (controller.signal.aborted && this.#shutdownSignal?.aborted) {
+      throw new PlanWaitingHistoryError();
+    }
+  }
+
   #registerActiveWaiter(agent: AgentIndexRecord, controller: AbortController): () => void {
     const key = `${agent.herdrSessionName}\0${agent.paneId}\0${agent.paneGeneration ?? ""}`;
+    // A wait that starts after shutdown already aborted must not sleep at all:
+    // abort it up front so the caller short-circuits like a closed pane.
+    if (this.#shutdownSignal?.aborted) controller.abort();
     let set = this.#activeWaiters.get(key);
     if (!set) {
       set = new Set();
@@ -1641,6 +1682,7 @@ export class AgentIndexService {
               paneId: input.agent.paneId,
             },
           );
+          this.#throwIfShutdownAbort(controller);
           return undefined;
         }
 
@@ -1877,6 +1919,7 @@ export class AgentIndexService {
                   paneId: input.agent.paneId,
                 },
               );
+              this.#throwIfShutdownAbort(controller);
               return undefined;
             }
             try {
@@ -1930,6 +1973,7 @@ export class AgentIndexService {
             paneId: input.agent.paneId,
           },
         );
+        this.#throwIfShutdownAbort(controller);
         return undefined;
       }
 

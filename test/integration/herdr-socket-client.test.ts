@@ -310,6 +310,21 @@ describe("HerdrSocketClient", () => {
     client.close();
   });
 
+  test("fails requests a silent peer never answers instead of hanging", async () => {
+    // The server accepts the connection and never writes a response: before the
+    // request timeout this parked the caller (and daemon shutdown) forever.
+    const { socketPath } = await openFakeHerdrServer(() => {});
+
+    const client = new HerdrSocketClient({ requestTimeoutMs: 50, socketPath });
+    await expect(client.sessionSnapshot()).rejects.toThrow(
+      "Herdr session.snapshot request timed out after 50ms",
+    );
+    await expect(client.getPane({ pane_id: "w1:p1" })).rejects.toThrow(
+      "Herdr pane.get request timed out after 50ms",
+    );
+    client.close();
+  });
+
   test("rejects the event stream when the Herdr socket closes", async () => {
     const { socketPath } = await openFakeHerdrServer((socket, request) => {
       socket.end(encodeJsonLine({ id: request.id, result: { subscribed: true } }));

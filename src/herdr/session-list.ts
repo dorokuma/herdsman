@@ -3,6 +3,17 @@ import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * `herdr session list` is a local CLI call; cap it so a wedged `herdr` process
+ * cannot park the daemon (and its shutdown path) indefinitely. Kept well below
+ * the daemon shutdown budget so callers time out inside their own step.
+ *
+ * The timeout is only a hard cap together with `killSignal: "SIGKILL"` below:
+ * execFile's default killSignal is SIGTERM, which the child may ignore, and a
+ * late success then reaches the callback without an error and counts as one.
+ */
+export const HERDR_SESSION_LIST_TIMEOUT_MS = 2_000;
+
 export type HerdrSessionListEntry = {
   default?: boolean;
   name: string;
@@ -14,13 +25,16 @@ export type HerdrSessionListEntry = {
 export type HerdrSessionListRunner = () => Promise<HerdrSessionListEntry[]>;
 
 export function createHerdrSessionListRunner(
-  options: { command?: string; env?: NodeJS.ProcessEnv } = {},
+  options: { command?: string; env?: NodeJS.ProcessEnv; timeoutMs?: number } = {},
 ): HerdrSessionListRunner {
   const command = options.command ?? "herdr";
+  const timeout = options.timeoutMs ?? HERDR_SESSION_LIST_TIMEOUT_MS;
   return async () => {
     const { stdout } = await execFileAsync(command, ["session", "list", "--json"], {
       env: options.env ?? process.env,
       encoding: "utf8",
+      killSignal: "SIGKILL",
+      timeout,
     });
     return normalizeHerdrSessionList(stdout);
   };

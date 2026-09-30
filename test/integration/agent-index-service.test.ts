@@ -987,6 +987,74 @@ describe("AgentIndexService non-pi completed event generation", () => {
     harness.sqlite.close();
   });
 
+  test("S11: shutdown abort releases an in-flight ready wait and keeps the plan retryable", async () => {
+    const harness = openObservabilityDbHarness();
+    const shutdown = new AbortController();
+    let waiting = false;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: null,
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      // Stands in for the real readiness window (500ms x 8): only an abort can
+      // end this wait, so the plan stays in flight until the daemon aborts it.
+      shutdownSignal: shutdown.signal,
+      sleep: (_ms, signal) =>
+        new Promise<void>((resolve) => {
+          waiting = true;
+          signal?.addEventListener("abort", () => resolve(), { once: true });
+        }),
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const handling = index.handleHerdrEvent({
+      event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+      ...sessionInput(),
+    });
+    await vi.waitFor(() => expect(waiting).toBe(true));
+
+    let drained = false;
+    const draining = index.drainInFlightPlans().then(() => {
+      drained = true;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    // Parked in the readiness wait: draining it would have to wait the window out,
+    // which is what pushed the daemon past the unit's TimeoutStopSec.
+    expect(drained).toBe(false);
+
+    shutdown.abort();
+    await draining;
+    expect(drained).toBe(true);
+    await expect(handling).resolves.toMatchObject({ events: [] });
+
+    // Nothing was emitted for the half-observed transition, and the plan row stays
+    // retryable for the next daemon start instead of being completed silently.
+    expect(
+      harness.agentEvents.listAfter({ herdrSessionName: "default", workspaceId: "wJ" }),
+    ).toEqual([]);
+    expect(harness.statusEventPlans.listUnfinished()).toMatchObject([
+      { attempts: 1, lastError: "PLAN_WAITING_HISTORY", status: "pending" },
+    ]);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
   test("C2: agy working -> idle with non-empty assistant message writes paired status.changed and idle events", async () => {
     const harness = openObservabilityDbHarness();
     const index = new AgentIndexService({
