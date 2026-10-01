@@ -1,5 +1,11 @@
 import { describe, expect, test } from "vitest";
-import { helpText, parseCliArgs, runCliCommand, shouldRunCliMain } from "@/cli/herdsman.js";
+import {
+  formatDaemonStatus,
+  helpText,
+  parseCliArgs,
+  runCliCommand,
+  shouldRunCliMain,
+} from "@/cli/herdsman.js";
 
 type FakeClient = {
   calls: unknown[];
@@ -69,14 +75,102 @@ describe("herdsman CLI", () => {
     for (const action of ["start", "stop", "restart"]) {
       expect(() => parseCliArgs(["daemon", action])).toThrow(`Unknown daemon action: ${action}`);
     }
-    expect(parseCliArgs(["daemon", "status"])).toEqual({ action: "status", command: "daemon" });
-    expect(parseCliArgs(["daemon"])).toEqual({ action: "status", command: "daemon" });
+    expect(parseCliArgs(["daemon", "status"])).toEqual({
+      action: "status",
+      command: "daemon",
+      text: false,
+    });
+    expect(parseCliArgs(["daemon"])).toEqual({ action: "status", command: "daemon", text: false });
+    expect(parseCliArgs(["daemon", "status", "--text"])).toEqual({
+      action: "status",
+      command: "daemon",
+      text: true,
+    });
+    expect(() => parseCliArgs(["daemon", "status", "--bogus"])).toThrow("Invalid argument");
 
     const help = helpText();
     expect(help).toContain("herdsman daemon status");
+    // The two supervision facts are user-visible, so their caveats (unmanaged
+    // is not "unsupervised", NRestarts is reset by reset-failed / stop+start)
+    // ship with the help text itself.
+    expect(help).toContain("unmanaged");
+    expect(help).toContain("NRestarts");
     for (const action of ["start", "stop", "restart"]) {
       expect(help).not.toContain(`daemon ${action}`);
     }
+  });
+
+  test("renders daemon status text with the supervision facts and an explicit unavailable marker", () => {
+    expect(
+      formatDaemonStatus({
+        managedBy: "systemd:herdsman.service",
+        pid: 4242,
+        pidPath: "/tmp/herdsman.pid",
+        restartCount: 3,
+        socketPath: "/tmp/herdsman.sock",
+        socketReachable: true,
+        state: "running",
+      }),
+    ).toBe(
+      [
+        "state: running",
+        "pid: 4242",
+        "socketReachable: true",
+        "managedBy: systemd:herdsman.service",
+        "restartCount: 3",
+      ].join("\n"),
+    );
+
+    // Managed but the probe failed: the missing count is spelled out as
+    // unavailable instead of vanishing.
+    expect(
+      formatDaemonStatus({
+        managedBy: "systemd:herdsman.service",
+        pid: 4242,
+        pidPath: "/tmp/herdsman.pid",
+        socketPath: "/tmp/herdsman.sock",
+        socketReachable: true,
+        state: "running",
+      }),
+    ).toContain("managedBy: systemd:herdsman.service\nrestartCount: unavailable");
+
+    // Not the herdsman system unit: `NRestarts` belongs to that unit, so the
+    // text view keeps it out entirely — same as the JSON.
+    expect(
+      formatDaemonStatus({
+        managedBy: "unmanaged",
+        pid: 4242,
+        pidPath: "/tmp/herdsman.pid",
+        socketPath: "/tmp/herdsman.sock",
+        socketReachable: true,
+        state: "running",
+      }),
+    ).toBe(
+      ["state: running", "pid: 4242", "socketReachable: true", "managedBy: unmanaged"].join("\n"),
+    );
+
+    // `unknown` is not a systemd unit either.
+    expect(
+      formatDaemonStatus({
+        managedBy: "unknown",
+        pid: 4242,
+        pidPath: "/tmp/herdsman.pid",
+        socketPath: "/tmp/herdsman.sock",
+        socketReachable: true,
+        state: "running",
+      }),
+    ).toBe(
+      ["state: running", "pid: 4242", "socketReachable: true", "managedBy: unknown"].join("\n"),
+    );
+
+    // No daemon pid: the supervision facts are absent from the text output too.
+    expect(
+      formatDaemonStatus({
+        pidPath: "/tmp/herdsman.pid",
+        socketPath: "/tmp/herdsman.sock",
+        state: "stopped",
+      }),
+    ).toBe("state: stopped");
   });
 
   test("renders help for agent commands", () => {

@@ -1,5 +1,7 @@
 ## [Unreleased]
 
+- `daemon status` 增加只读监督事实：默认 JSON 多两个**可选**键 `managedBy`（pid 的 `/proc/<pid>/cgroup` 是否落在 herdsman.service 系统单元内 → `systemd:herdsman.service` / `unmanaged` / `unknown`）与 `restartCount`（`systemctl show herdsman.service -p NRestarts --value`，仅在 `managedBy` 为该单元时才探测，其它情况省略该键），并新增人类可读视图 `herdsman daemon status --text`（拿不到的 `restartCount` 显式写 `unavailable`）。默认 stdout 仍是 JSON，既有字段、`state` 取值与退出码语义零变化。口径：`unmanaged` 只表示"不归 herdsman.service 系统单元管"，不代表没人托管、也不代表可以杀；`restartCount` 是 systemd 的 `NRestarts`，`reset-failed`、`stop`+`start`、单元未加载都会把它清零，所以 `0` 不等于"从没崩过"。探针超时是硬上界：`spawnSync` 带 `killSignal: "SIGKILL"`，会无视 SIGTERM 的子进程也会被终止（默认 SIGTERM 时可被卡死 shim 拖住 8s）。
+
 ## 0.13.1
 
 - daemon 优雅关停总预算：`stop()` 的关闭序列（index drain → reconcile scheduler → watch manager → RPC server）改为跑在一个 `SHUTDOWN_BUDGET_MS = 5000` 的总预算下，每步按剩余预算限时并保留 `SHUTDOWN_MIN_STEP_MS = 250` 兜底；超时只记 warn 并继续下一步、退出码仍为 0（SIGTERM 是有意停止，非零退出码会被 `Restart=on-failure` 拉回来），`finally` 的清理（pid 文件 / 实例锁 / socket）不受预算影响。修的事故形态是「任一步永不返回 → 10s 内不退出 → 被 `TimeoutStopSec=10` SIGKILL → 跳过清理并留下 flock 助手子进程」。
