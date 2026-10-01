@@ -61,8 +61,15 @@ export class RpcTestClient {
     });
   }
 
-  async waitForNotification(method: string): Promise<RpcMessage> {
-    for (let attempts = 0; attempts < 100; attempts += 1) {
+  /**
+   * Polls the local notification buffer against a test-infrastructure budget,
+   * not a product assertion: 2ms per attempt, 1000 attempts ~= 2s wall clock.
+   * The previous 100 attempts (~200ms) was too tight for the whole suite under
+   * parallel replay load (see D9/D10 in
+   * .agents/notes/20260930-terminal-event-delivery-open-items.md).
+   */
+  async waitForNotification(method: string, attempts = 1_000): Promise<RpcMessage> {
+    for (let attempt = 0; attempt < attempts; attempt += 1) {
       const index = this.notifications.findIndex((message) => message.method === method);
       if (index >= 0) return this.notifications.splice(index, 1)[0] as RpcMessage;
       await new Promise((resolve) => setTimeout(resolve, 2));

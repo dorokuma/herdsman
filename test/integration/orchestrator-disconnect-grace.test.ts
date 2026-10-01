@@ -1,7 +1,7 @@
 import { existsSync, mkdtempSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { createAgentHistoryService } from "@/agent-history/service.js";
 import { ObservabilityRpcServer } from "@/daemon/observability-server.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
@@ -36,7 +36,7 @@ describe("orchestrator connection grace", () => {
     const closed = owner.waitForClose();
     scheduler.advance(40);
     await closed;
-    await socketTick();
+    await waitForTerminalDisconnect(server);
 
     expect(
       server.isTerminalConnected({ herdrSessionName: "default", terminalId: "term_owner" }),
@@ -105,7 +105,7 @@ describe("orchestrator connection grace", () => {
 
   test("expires an absent owner and broadcasts after the disconnect grace", async () => {
     const scheduler = new ManualScheduler();
-    const { harness, orchestrator, socketPath } = await openServer(scheduler);
+    const { harness, orchestrator, server, socketPath } = await openServer(scheduler);
     const owner = await RpcTestClient.connect(socketPath);
     const observer = await RpcTestClient.connect(socketPath);
     await Promise.all([register(owner, "owner"), register(observer, "observer")]);
@@ -116,7 +116,7 @@ describe("orchestrator connection grace", () => {
     ]);
 
     owner.close();
-    await socketTick();
+    await waitForTerminalDisconnect(server);
     scheduler.advance(49);
     expect(orchestrator.status(scope)?.owner?.terminalId).toBe("term_owner");
     scheduler.advance(1);
@@ -165,7 +165,7 @@ describe("orchestrator connection grace", () => {
     await owner.request("agent.orchestrator.set", { enabled: true });
 
     owner.close();
-    await socketTick();
+    await waitForTerminalDisconnect(server);
     const agents = moveOwnerAgent(harness);
     server.reconcileAgentLocations({ agents, herdrSessionName: "default" });
     const destination = { herdrSessionName: "default", workspaceId: "wC" };
@@ -273,7 +273,7 @@ describe("orchestrator connection grace", () => {
 
   test("delivered events are shortcut-reclaimed once disconnect grace expires and scope owner is cleared", async () => {
     const scheduler = new ManualScheduler();
-    const { harness, orchestrator, socketPath } = await openServer(scheduler);
+    const { harness, orchestrator, server, socketPath } = await openServer(scheduler);
     const owner = await RpcTestClient.connect(socketPath);
     await register(owner, "owner");
     await owner.request("agent.orchestrator.set", { enabled: true });
@@ -297,7 +297,7 @@ describe("orchestrator connection grace", () => {
     expect(reserved[0]?.status).toBe("delivered");
 
     owner.close();
-    await socketTick();
+    await waitForTerminalDisconnect(server);
 
     scheduler.advance(60);
     // Disconnect grace expired: scope owner was cleared by observability server
@@ -444,6 +444,52 @@ function register(client: RpcTestClient, subscriberId: string): Promise<unknown>
   });
 }
 
+/**
+ * Deterministic barrier: returns once the observability server has actually
+ * processed the close of `term_owner`'s socket.
+ *
+ * Why "no presence" implies "grace timer is already armed":
+ * `ObservabilityRpcServer#handleSocketClose` (src/daemon/observability-server.ts:613)
+ * removes the socket from the terminal registry at `:618`, whose
+ * `#unregisterTerminalSocket` (`:702-709`) drops `#socketsByTerminal[key]` as
+ * soon as the set is empty, and only then arms the disconnect timer in the same
+ * synchronous turn at `:621` -> `#scheduleDisconnect` (`:624-636`, timer due at
+ * `now() + disconnectGraceMs`). `isTerminalConnected` (`:727-729`) is a direct
+ * read of that same registry, so a `false` observation cannot happen before the
+ * timer exists.
+ *
+ * The fixed wall-clock sleep this replaced (`socketTick`, 20ms) carried no such
+ * implication: under CPU starvation the close callback can be scheduled after
+ * the sleep returns, and the following `scheduler.advance(...)` then runs before
+ * the grace timer is registered -- the virtual timer is orphaned and the owner
+ * is never released (D10 in
+ * .agents/notes/20260930-terminal-event-delivery-open-items.md).
+ *
+ * Premises: (1) valid only while the server is not stopped (`:621` guards the
+ * timer with `!this.#stopping`; `stop()` clears the registry at `:209-213`) — on a
+ * stopped server the predicate is false immediately and the barrier returns without
+ * any guarantee; the following advance(...) then fires nothing, so the grace-dependent
+ * owner assertions of the current call sites fail loudly (:49/:123/:174/:306) — never a
+ * silent pass. (2) needs `:618`+`:621` in one synchronous turn -- with an interposed
+ * `await`, the barrier may return before the timer is armed; the outcome is then either
+ * green (when the arm still lands before the next advance(...)) or a loud downstream
+ * assertion failure (orphaned timer). It can never silently mask a broken release.
+ */
+async function waitForTerminalDisconnect(server: ObservabilityRpcServer): Promise<void> {
+  await vi.waitFor(
+    () =>
+      expect(
+        server.isTerminalConnected({ herdrSessionName: "default", terminalId: "term_owner" }),
+      ).toBe(false),
+    { interval: 10, timeout: 5_000 },
+  );
+}
+
+/**
+ * Fixed settle window, kept only for the "assert that nothing happened" shapes
+ * (`:144`, `:149`, `:253`) where waiting longer can only make the assertion
+ * weaker, never flakier. Do not use it to wait for an observable effect.
+ */
 async function socketTick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }

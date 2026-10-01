@@ -481,8 +481,15 @@ describe("ObservabilityRpcServer", () => {
     expect((replacementError as Error).message).toContain("ORCHESTRATOR_SCOPE_ALREADY_CLAIMED");
 
     piA.close();
-    await new Promise((resolve) => setTimeout(resolve, 75));
-    const replacement = await piB.request("agent.orchestrator.set", { enabled: true });
+    // Wait for the server to observe piA's close (which drops the terminal
+    // presence and lets term_b reclaim the scope) instead of sleeping a fixed
+    // 75ms. A rejected `agent.orchestrator.set` is side-effect free: the scope
+    // store throws ORCHESTRATOR_SCOPE_ALREADY_CLAIMED before it writes anything
+    // (src/db/agent-orchestrator-scopes.ts:254-262), so polling it is safe.
+    const replacement = await vi.waitFor(
+      () => piB.request("agent.orchestrator.set", { enabled: true }),
+      { interval: 10, timeout: 5_000 },
+    );
     expect(replacement).toMatchObject({
       changed: true,
       events: [expect.objectContaining({ id: self.id })],

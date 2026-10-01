@@ -75,5 +75,5 @@ describe("npm publication metadata", () => {
     const entries = Array.isArray(packed) ? packed : [packed];
     const files = entries.flatMap((entry) => entry.files ?? []).map((file) => file.path);
     expect(files).toContain("LICENSE");
-  });
+  }, 30_000);
 });

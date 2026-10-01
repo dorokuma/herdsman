@@ -607,7 +607,12 @@ describe("daemon service lifecycle and socket guard", () => {
     } finally {
       killChildProcesses();
     }
-  });
+    // The default 5s budget only measures scaffolding here, not a product SLA:
+    // this case spawns a real `node --import tsx` daemon (process boot + tsx
+    // transpile + whole module graph + migrations), and its own internal
+    // vi.waitFor budget above is 20s -- longer than the enclosing test deadline.
+    // Parallel-replay evidence: .agents/notes/20260930-terminal-event-delivery-open-items.md D9.
+  }, 30_000);
 
   test("a daemon rejected by the instance lock never opens or migrates the database", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdsman-lock-nodb-"));

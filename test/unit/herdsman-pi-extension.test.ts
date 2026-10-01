@@ -4750,5 +4750,10 @@ describe("herdsman-pi turn completion signal", () => {
       restoreEnv(previous);
       rmSync(dir, { force: true, recursive: true });
     }
-  });
+    // ~61% of the default 5s budget even in an isolated single run (3025ms
+    // measured), i.e. above the >50% bar for raising only this case's budget:
+    // D16 in .agents/notes/20260930-terminal-event-delivery-open-items.md.
+    // ~3s is intrinsic: TURN_SIGNAL_TIMEOUT_MS = 3_000 (packages/herdsman-pi/src/turn-signal.ts:3)
+    // and this case's expectedText="" makes the candidate.length > 0 guard always false.
+  }, 30_000);
 });

@@ -4881,7 +4881,12 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     expect(pushedEvents.filter((e) => e.type === "agent.failed")).toHaveLength(0);
 
     harness.sqlite.close();
-  });
+    // ~80% of the default 5s budget even in an isolated single run (4014ms
+    // measured), i.e. above the >50% bar for raising only this case's budget:
+    // D16 in .agents/notes/20260930-terminal-event-delivery-open-items.md.
+    // ~4s is intrinsic: retries at src/observability/agent-index-service.ts:2123-2124
+    // sleep 500ms x8, and this case's history has no assistant message, so all 8 burn.
+  }, 30_000);
 
   test("degraded retry row failing its retry-round refresh exhausts as wakeable failed", async () => {
     const harness = openObservabilityDbHarness();
