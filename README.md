@@ -128,7 +128,7 @@ Set `filter_upstream_errors: false` to restore waking on every outcome. `HERDSMA
 Install the optional plugin from the GitHub release tag:
 
 ```bash
-herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.12.1 --yes
+herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.13.2 --yes
 ```
 
 Use the release tag that matches the installed Herdsman CLI version.
