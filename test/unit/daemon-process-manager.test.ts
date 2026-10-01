@@ -29,6 +29,69 @@ import {
 } from "@/daemon/process-manager.js";
 import { managedByFromCgroup, readSystemdRestartCount } from "@/daemon/service-supervision.js";
 
+/**
+ * D1/D8 (`.agents/notes/20260930-terminal-event-delivery-open-items.md`): when
+ * `readChildPids` cannot read `/proc/<pid>/task/<pid>/children`, the release
+ * barrier degrades to watching the flock process alone, and it announces that
+ * once per process. This host's procfs does expose the children file, so that
+ * failure is unreachable without injection — hence the mock below.
+ *
+ * It is a *partial* mock: `importOriginal` keeps the real module and only
+ * `readFileSync` is wrapped, and only for the children-file path *shape*
+ * (`/proc/<digits>/task/<digits>/children`; production always passes the same pid
+ * twice, the regex does not require the two to be equal). Nothing is replaced by a
+ * fake module, and the wrapper is a pure pass-through unless a case raises
+ * `failChildrenRead`, so every other case in this file (stat reads, ack/lock/owner
+ * files, runtime records) keeps the real implementation and its real behaviour.
+ */
+const fsInjection = vi.hoisted(() => ({
+  /** Content of the last successful children read: the fd-sharing helper pids. */
+  childrenContent: [] as string[],
+  /** Path of every children read, so a case can tell which pid it probed. */
+  childrenReads: [] as string[],
+  childrenPathPattern: /^\/proc\/(\d+)\/task\/(\d+)\/children$/,
+  /** Raised only inside the cases that want the read to fail. */
+  failChildrenRead: false,
+}));
+
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const readFileSyncWithChildrenSeam = (path: unknown, options?: unknown) => {
+    const target = String(path);
+    if (fsInjection.childrenPathPattern.test(target)) {
+      fsInjection.childrenReads.push(target);
+      if (fsInjection.failChildrenRead) {
+        // Shaped like the production trigger: `CONFIG_PROC_CHILDREN` off / a
+        // stripped-down procfs means the file is simply not there to read.
+        throw Object.assign(new Error(`ENOENT: no such file or directory, open '${target}'`), {
+          code: "ENOENT",
+        });
+      }
+      const content = actual.readFileSync(target, "utf8");
+      fsInjection.childrenContent.push(content);
+      return content;
+    }
+    return (actual.readFileSync as unknown as (p: unknown, o?: unknown) => string | Buffer)(
+      path,
+      options,
+    );
+  };
+  return {
+    ...actual,
+    default: actual,
+    readFileSync: readFileSyncWithChildrenSeam as unknown as typeof actual.readFileSync,
+  };
+});
+
+/** The flock pid the most recent children read belongs to. */
+function flockPidOfLastChildrenRead(): number {
+  const path = fsInjection.childrenReads.at(-1);
+  const pid = Number(fsInjection.childrenPathPattern.exec(path ?? "")?.[1]);
+  expect(Number.isInteger(pid)).toBe(true);
+  expect(pid).toBeGreaterThan(0);
+  return pid;
+}
+
 const tempDirs: string[] = [];
 
 afterEach(() => {
@@ -1244,6 +1307,128 @@ exec /bin/sh "$@"
     });
     expect(isFlockHeld(lockPath)).toBe(false);
   });
+
+  // Deliberately unguarded, unlike the two neighbouring cases that `skipIf` on
+  // `hasProcChildren`: this one injects the read failure, so it holds on any Linux
+  // host — including a kernel whose procfs does not expose the children file, where
+  // that same code path is simply real.
+  test("an unreadable children file warns exactly once per process (D1 degraded barrier)", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+    fsInjection.failChildrenRead = true;
+    try {
+      // The one-shot flag is module state nothing outside the module can reset, so
+      // this case works on a fresh copy of the module: "exactly once" then holds no
+      // matter what the cases before it did, instead of depending on this case
+      // running first.
+      vi.resetModules();
+      const { acquireFlockHandle: acquireWithFreshWarningState } = await import(
+        "@/daemon/process-manager.js"
+      );
+
+      // Two successful acquisitions with the children file unreadable: the second
+      // must stay silent. That is the point of the module-level flag — the
+      // degradation is a property of the kernel/procfs, not of one lock, so it must
+      // not warn on every acquisition.
+      const first = acquireWithFreshWarningState(lockPath);
+      expect(first).not.toBeNull();
+      first?.release();
+      const second = acquireWithFreshWarningState(lockPath);
+      expect(second).not.toBeNull();
+      second?.release();
+
+      expect(warnSpy).toHaveBeenCalledTimes(1);
+      // Pins the D1 warning itself rather than any unrelated `console.warn`: it
+      // names the children file that could not be read and the degraded barrier.
+      const message = String(warnSpy.mock.calls[0]?.[0]);
+      expect(message).toContain("/children is unavailable");
+      expect(message).toContain("release barrier degraded");
+      expect(message).toMatch(/^\[herdsman\] \/proc\/\d+\/task\/\d+\/children/);
+    } finally {
+      fsInjection.failChildrenRead = false;
+      warnSpy.mockRestore();
+    }
+
+    await waitForCondition(() => !isFlockHeld(lockPath), {
+      description: "the flock to be observable as free after the degraded releases",
+    });
+  });
+
+  test.skipIf(!hasProcChildren)(
+    "an unreadable children file leaves release watching the flock process alone (D1 degradation)",
+    async () => {
+      const dir = tempDir();
+      const lockPath = join(dir, "herdsman.pid.lock");
+      // This case triggers the D1 fallback on purpose; the warning itself is pinned by
+      // the case above, so keep it out of the test output here.
+      const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      // The release barrier's observation surface is the seam below: it is called once
+      // per helper pid the barrier waits for (`helperPids.some(...)`, which stops at the
+      // first pid that is still alive), so recording its arguments shows exactly which
+      // pids a release watched. The flock pid is reported as already gone — the state a
+      // freshly SIGKILLed helper is in — so the wait loop must look at the next entry
+      // if the list has one.
+      const pidsWatchedByRelease: number[] = [];
+      let flockPid = 0;
+      const releaseWatchSeam = (pid: number) => {
+        pidsWatchedByRelease.push(pid);
+        if (pid === flockPid) return `${pid} (flock) Z 0 0 0`;
+        return readFileSync(`/proc/${pid}/stat`, "utf8");
+      };
+
+      try {
+        // Degraded: the children file cannot be read, so `helperPids` holds the flock
+        // process alone and release must not wait on anything else.
+        fsInjection.failChildrenRead = true;
+        const degraded = acquireFlockHandle(lockPath, { readProcessStat: releaseWatchSeam });
+        expect(degraded).not.toBeNull();
+        flockPid = flockPidOfLastChildrenRead();
+        // Load-bearing self-check: every assertion in this case rests on the seam
+        // reporting the flock pid as *gone*. Relax that state to a live one and the wait
+        // loop short-circuits on the flock pid, so the watch set can never grow and the
+        // comparison below would pass for the wrong reason. `isChildProcessActive` is not
+        // exported, so this pins the same field it reads: the character after `") "` of
+        // the stat line, where `Z` is the kernel saying "this pid has exited". (This check
+        // registers one probe on the seam too; the reset just below discards it together
+        // with the acquisition-phase probes.)
+        const flockStatFromSeam = releaseWatchSeam(flockPid);
+        expect(
+          flockStatFromSeam
+            .slice(flockStatFromSeam.lastIndexOf(")") + 2)
+            .trim()
+            .charAt(0),
+        ).toBe("Z");
+        pidsWatchedByRelease.length = 0;
+        degraded?.release();
+        expect(new Set(pidsWatchedByRelease)).toEqual(new Set([flockPid]));
+
+        // Control: with a readable children file the very same call watches the
+        // fd-sharing child as well, so the single-entry watch set above is a real
+        // consequence of the degradation and not an artefact of the instrumentation.
+        fsInjection.failChildrenRead = false;
+        const healthy = acquireFlockHandle(lockPath, { readProcessStat: releaseWatchSeam });
+        expect(healthy).not.toBeNull();
+        const healthyFlockPid = flockPidOfLastChildrenRead();
+        const fdSharingPid = Number(fsInjection.childrenContent.at(-1)?.trim());
+        expect(Number.isInteger(fdSharingPid)).toBe(true);
+        expect(fdSharingPid).toBeGreaterThan(0);
+        expect(fdSharingPid).not.toBe(healthyFlockPid);
+        flockPid = healthyFlockPid;
+        pidsWatchedByRelease.length = 0;
+        healthy?.release();
+        expect(new Set(pidsWatchedByRelease)).toEqual(new Set([healthyFlockPid, fdSharingPid]));
+
+        await waitForCondition(() => !isFlockHeld(lockPath), {
+          description: "the flock to be observable as free after the watched releases",
+        });
+      } finally {
+        fsInjection.failChildrenRead = false;
+        warnSpy.mockRestore();
+      }
+    },
+  );
 
   test("stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters", async () => {
     const dir = tempDir();
