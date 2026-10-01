@@ -31,6 +31,8 @@ herdsman help
 
 ### Install from source
 
+This path is for local development only; it is not a production install channel.
+
 Source builds also require pnpm >= 11.9.0.
 
 ```bash
@@ -46,7 +48,7 @@ herdsman help
 
 Herdsman agent commands and Pi notifications require the daemon. The daemon watches all running Herdr sessions reported by `herdr session list --json`, rescans them every 60 seconds, and does not index stopped Herdr sessions. Runtime files live in `~/.herdsman` by default. Set `HERDSMAN_HOME` to use another directory.
 
-On the production host the daemon is managed by the systemd unit `herdsman.service`, which keeps it running: use `systemctl restart herdsman.service` to restart it. There are no CLI start/stop/restart commands. `herdsman daemon status` reports the daemon state in either case.
+On the production host the package is installed from the npm registry (`npm install --global @dorokuma/herdsman@<version>`), and the daemon is managed by the systemd unit `herdsman.service`, which keeps it running: use `systemctl restart herdsman.service` to restart it. Install it with the same Node.js toolchain the unit uses, and prefix the command with that toolchain's `bin` on `PATH`, e.g. `PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" npm install --global @dorokuma/herdsman@<version>`, so the global prefix matches the unit's (the production unit pins nvm v22.23.1). On a host that mixes `nvm` and `mise`, omitting the prefix can install into a different global prefix. There are no CLI start/stop/restart commands. `herdsman daemon status` reports the daemon state in either case.
 
 For development or verification, run the entrypoint in the foreground with an explicit temporary data directory, so the production data directory is not used as scratch space:
 
