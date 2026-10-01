@@ -129,15 +129,26 @@ describe("periodic reconcile scheduling", () => {
     tick?.();
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(runs).toEqual(["started"]);
-    // Settle the in-flight run and let its promise chain (catch + finally that
-    // clears the in-flight guard) fully drain before the next tick.
+    // Settle the in-flight run; its promise chain (catch + finally that clears the
+    // in-flight guard) drains on a later turn, so poll instead of assuming a single
+    // settle turn was long enough. Each attempt ticks once and then yields a
+    // macrotask so the ticked run can start before the assertion is evaluated; the
+    // assertion itself is unchanged.
     resolveRun?.();
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    tick?.();
-    await vi.waitFor(() => expect(runs).toEqual(["started", "started"]));
+    await vi.waitFor(
+      async () => {
+        tick?.();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(runs).toEqual(["started", "started"]);
+      },
+      { interval: 10, timeout: 5_000 },
+    );
     resolveRun?.();
     await instance.stop();
-  });
+    // The poll above owns a 5s budget; the test-level deadline is kept longer so
+    // a stalled poll reports its own predicate error instead of being masked by
+    // `Test timed out in 5000ms`.
+  }, 10_000);
 
   test("stop clears the interval and awaits the in-flight run", async () => {
     let tick: (() => void) | undefined;
@@ -186,13 +197,23 @@ describe("periodic reconcile scheduling", () => {
     tick?.();
     await vi.waitFor(() => expect(runs).toEqual(["attempt"]));
     expect(warning).toHaveBeenCalledWith("Herdsman periodic reconcile failed", expect.any(Error));
-    // Let the catch/finally chain clear the in-flight guard before ticking again.
-    await new Promise((resolve) => setTimeout(resolve, 0));
-    tick?.();
-    await vi.waitFor(() => expect(runs).toEqual(["attempt", "attempt"]));
+    // The catch/finally chain clears the in-flight guard on a later turn, so poll
+    // instead of assuming a single settle turn was long enough. Each attempt ticks
+    // once and then yields a macrotask so the ticked run can start before the
+    // assertion is evaluated; the assertion itself is unchanged.
+    await vi.waitFor(
+      async () => {
+        tick?.();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        expect(runs).toEqual(["attempt", "attempt"]);
+      },
+      { interval: 10, timeout: 5_000 },
+    );
     warning.mockRestore();
     await instance.stop();
-  });
+    // Same reason as the sibling poll above: the 5s poll budget must expire
+    // before the test-level deadline so its predicate error is reported.
+  }, 10_000);
 });
 
 describe("shutdown budget", () => {
@@ -609,10 +630,13 @@ describe("daemon service lifecycle and socket guard", () => {
     }
     // The default 5s budget only measures scaffolding here, not a product SLA:
     // this case spawns a real `node --import tsx` daemon (process boot + tsx
-    // transpile + whole module graph + migrations), and its own internal
-    // vi.waitFor budget above is 20s -- longer than the enclosing test deadline.
-    // Parallel-replay evidence: .agents/notes/20260930-terminal-event-delivery-open-items.md D9.
-  }, 30_000);
+    // transpile + whole module graph + migrations). Its two internal waits are
+    // serial and each capped at 20s, so the worst case that can still pass is
+    // just under 40s -- 45s keeps the enclosing deadline above it and closes the
+    // (30s, 40s] window where a passing run was reported as a timeout.
+    // Owner decision 2026-10-02; parallel-replay evidence:
+    // .agents/notes/20260930-terminal-event-delivery-open-items.md D9 / D14②.
+  }, 45_000);
 
   test("a daemon rejected by the instance lock never opens or migrates the database", async () => {
     const root = mkdtempSync(join(tmpdir(), "herdsman-lock-nodb-"));

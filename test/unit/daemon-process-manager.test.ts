@@ -724,8 +724,12 @@ describe("daemon process manager", () => {
     } catch {}
     await new Promise((resolve) => child.on("exit", resolve));
 
-    // Brief settling delay for kernel cleanup
-    await new Promise((resolve) => setTimeout(resolve, 50));
+    // Kernel cleanup after the SIGKILL is not observable at a fixed offset, so
+    // poll until the flock is really released instead of assuming 50ms is enough
+    // on a loaded machine. The release is bounded by the poll's own timeout.
+    await waitForCondition(() => !isFlockHeld(lockPath), {
+      description: "the killed holder's flock to be observable as free",
+    });
 
     // Lock is released in kernel
     expect(isFlockHeld(lockPath)).toBe(false);
@@ -735,7 +739,10 @@ describe("daemon process manager", () => {
     expect(existsSync(lockPath)).toBe(true);
     release();
     expect(existsSync(lockPath)).toBe(true);
-  });
+    // `waitForCondition` owns a 5s budget; the test-level deadline is kept longer
+    // so a stalled barrier reports its own timeout instead of being masked by
+    // `Test timed out in 5000ms`.
+  }, 10_000);
 
   test("stale owner.json pointing to unrelated live PID (e.g. init PID 1) does not block lock acquisition", () => {
     const dir = tempDir();
