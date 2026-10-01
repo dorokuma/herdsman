@@ -331,10 +331,33 @@ function readChildPids(pid: number): number[] {
   }
 }
 
+/**
+ * Which protocol phase is asking, because `T` (SIGSTOP/SIGTSTP) does not mean the
+ * same thing in both:
+ *
+ * - `"ready"` (the default, post-READY): the helper published READY, so it is the
+ *   lock holder the caller is waiting on or protecting. A paused holder still
+ *   holds its flock, so T counts as alive — SIGKILLing it would drop a live lock
+ *   and open the double-holder window (this is the D6 fix point).
+ * - `"pre-ready"`: no READY yet as observed by this attempt, so the helper never became the protocol's legal
+ *   holder — it is a half-built child we spawned ourselves. Killing it therefore
+ *   frees only the flock *we* were trying to take (nothing else can be holding it
+ *   through that helper, so no second master can appear), so T counts as
+ *   abandonable and the acquisition stays on its fast kill-and-retry path instead
+ *   of spending its whole window on a paused helper.
+ *
+ * "Alive" below only ever means "this pid has not exited and dropped its own fds",
+ * never "the flock is free": per D1/D2 an inherited child fd (e.g. the
+ * `setsid`-escaped kind) keeps the kernel's open file description -- and with it
+ * the flock -- alive after this pid is judged dead.
+ */
+type ChildLivenessPhase = "ready" | "pre-ready";
+
 function isChildProcessActive(
   pid: number,
   readProcessStat: (pid: number) => string = (targetPid) =>
     readFileSync(`/proc/${targetPid}/stat`, "utf8"),
+  phase: ChildLivenessPhase = "ready",
 ): boolean {
   if (existsSync("/proc")) {
     try {
@@ -346,11 +369,23 @@ function isChildProcessActive(
       if (lastParen === -1) return true;
       const rest = stat.slice(lastParen + 2).trim();
       const state = rest.charAt(0);
-      // Z/X are exited (the kernel already dropped their flock) while T is only
-      // stopped but still holds it. T stays grouped with Z/X on purpose: this batch
-      // splits the errno cases only. See A7 in
+      // Liveness here means "this process has not exited and closed its own fds
+      // yet", never "the flock is free": a Z/X state says this pid has exited and
+      // dropped its own fds -- note D1/D2: an inherited child fd (e.g. a
+      // `setsid`-escaped descendant) may still hold the flock, since `flock` lives
+      // on the kernel's open file description and any surviving fd keeps it held.
+      // T (SIGSTOP/SIGTSTP) is only paused and still holds it (`flock -x -n`
+      // against a stopped holder exits 1). Whether that paused holder is alive or
+      // abandonable is what the phase above decides: T counts as alive once READY
+      // made the helper a holder, and as abandonable while it is still our
+      // half-built pre-READY child.
+      // Lowercase t (stopped while being traced) already counted as alive and is
+      // unchanged. Consistent with the other two liveness surfaces in this file
+      // (hasLiveLockOwner -> kill(pid, 0), isFlockHeld -> a real `flock -n`), both
+      // of which treat T as alive. See D6 in
       // .agents/notes/20260930-terminal-event-delivery-open-items.md.
-      return state !== "Z" && state !== "X" && state !== "T";
+      const pausedCountsAsActive = phase === "ready";
+      return state !== "Z" && state !== "X" && (pausedCountsAsActive || state !== "T");
     } catch (error) {
       // Only the kernel proving the pid is gone counts as dead: ENOENT (no
       // /proc/<pid>/stat entry) or ESRCH. Any other failure (EACCES, EPERM, EIO,
@@ -470,7 +505,12 @@ function spawnFlockHelper(
       } catch {}
     }
     // Check if child exited (e.g. flock returned 1 because lock is held by another process)
-    if (!isChildProcessActive(child.pid, deps?.readProcessStat)) {
+    // Pre-READY, so a paused (T) helper is abandonable: it never published the
+    // handshake and is therefore not the protocol's holder — just our own
+    // half-built child. Killing it (below) frees only the flock we were trying to
+    // take, so no second master can result, and the attempt loop retries on the
+    // fast path instead of burning the window (D6 refined).
+    if (!isChildProcessActive(child.pid, deps?.readProcessStat, "pre-ready")) {
       break;
     }
     const until = Date.now() + 1;

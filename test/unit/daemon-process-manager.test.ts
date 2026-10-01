@@ -3,6 +3,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -907,6 +908,125 @@ exit 0
 
     // Empty/truncated stat content (procfs reports `st_size` 0) parses to nothing.
     await expectSurvivingHolder(() => "");
+  });
+
+  test("a simulated T-state (SIGSTOP-paused seam) lock-holding child counts as alive and keeps its handle", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+
+    // Simulated here through the seam (no real signal is sent): `T` (SIGSTOP/SIGTSTP)
+    // only pauses the child, but the kernel still holds its flock,
+    // so the acquisition must survive it. Before the D6 fix this read as dead, so
+    // the just-acquired lock-holding helper was SIGKILLed and acquireFlockHandle
+    // returned null. The seam rewrites only the state field of the real stat line,
+    // so nothing else about the read differs from a healthy procfs.
+    //
+    // Only the post-READY phase is rewritten: once READY is out, the helper is the
+    // paused *holder* this case is about, whereas a T read before the handshake is
+    // (correctly) abandonable — rewriting that one too would make this case exercise
+    // the pre-READY path below instead of the holder-survives-T path.
+    const readyPublished = () => {
+      try {
+        return readdirSync(dir).some(
+          (name) =>
+            name.includes(".ack.") && readFileSync(join(dir, name), "utf8").startsWith("READY"),
+        );
+      } catch {
+        return false;
+      }
+    };
+
+    const pausedStat = (pid: number) => {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      const lastParen = stat.lastIndexOf(")");
+      const paused = `${stat.slice(0, lastParen + 2)}T${stat.slice(lastParen + 3)}`;
+      return readyPublished() ? paused : stat;
+    };
+
+    const handle = acquireFlockHandle(lockPath, { readProcessStat: pausedStat });
+    expect(handle).not.toBeNull();
+    // The handle must really own the flock: a second acquisition without the seam
+    // has to be refused, otherwise this case would not pin the double-master surface.
+    expect(acquireFlockHandle(lockPath)).toBeNull();
+    handle?.release();
+    await waitForCondition(() => !isFlockHeld(lockPath), {
+      description: "the released flock to be observable as free",
+    });
+    expect(isFlockHeld(lockPath)).toBe(false);
+  });
+
+  test("a pre-READY paused (T) helper is abandoned: the acquisition kills it and retries", async () => {
+    const dir = tempDir();
+    const lockPath = join(dir, "herdsman.pid.lock");
+    const binDir = join(dir, "bin");
+    const fakeSh = join(binDir, "sh");
+
+    // The helper's READY handshake runs through the `sh` it finds on PATH, so a slow
+    // `sh` parks the first helper in the pre-READY phase for 50ms — orders of
+    // magnitude longer than the parent's first liveness read (microseconds after
+    // spawn). "The first helper never published READY" is therefore a fact of this
+    // case rather than a race: the state read really does land in the pre-READY
+    // phase, before the ack file can exist.
+    mkdirSync(binDir, { mode: 0o700, recursive: true });
+    writeFileSync(
+      fakeSh,
+      `#!/bin/sh
+sleep 0.05
+exec /bin/sh "$@"
+`,
+      { mode: 0o755 },
+    );
+
+    // Semantics under test (D6 refined): before READY the helper is not a legal
+    // holder, so a paused (T) helper is abandonable — the acquisition must SIGKILL
+    // it and retry on the fast path instead of spending its whole window on it.
+    // Only the first helper is reported as T: it is the attempt whose READY never
+    // lands, and T is exactly the state a SIGSTOPped pre-READY helper has in
+    // production.
+    const helperPids: number[] = [];
+    const preReadyPausedStat = (pid: number) => {
+      const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+      if (!helperPids.includes(pid)) {
+        helperPids.push(pid);
+      }
+      if (helperPids[0] !== pid) {
+        return stat;
+      }
+      // Rewrite only the state field of the real stat line, like the post-READY T
+      // case above, so nothing else about the read differs from a healthy procfs.
+      const lastParen = stat.lastIndexOf(")");
+      return `${stat.slice(0, lastParen + 2)}T${stat.slice(lastParen + 3)}`;
+    };
+
+    const origPath = process.env.PATH;
+    process.env.PATH = `${binDir}:${origPath}`;
+    let handle: ReturnType<typeof acquireFlockHandle> = null;
+    let elapsed = 0;
+    try {
+      const start = Date.now();
+      handle = acquireFlockHandle(lockPath, { readProcessStat: preReadyPausedStat });
+      elapsed = Date.now() - start;
+    } finally {
+      process.env.PATH = origPath;
+    }
+
+    expect(handle).not.toBeNull();
+    // Fast path: the paused helper was killed and a retry took the lock. The bound
+    // is loose on purpose (the fake `sh` alone holds READY back ~50ms); what it pins
+    // is that this case stays far below the 1000ms acquisition window it spends when
+    // a pre-READY T is read as alive, as the version it replaces did.
+    expect(elapsed).toBeLessThan(500);
+    // The kill-and-retry really happened: a second helper was spawned.
+    expect(helperPids.length).toBeGreaterThanOrEqual(2);
+    // The surviving handle must really own the flock: a second acquisition without
+    // the seam is refused, so this case pins the double-master surface too.
+    expect(isFlockHeld(lockPath)).toBe(true);
+    expect(acquireFlockHandle(lockPath)).toBeNull();
+    handle?.release();
+    await waitForCondition(() => !isFlockHeld(lockPath), {
+      description: "the released flock to be observable as free",
+    });
+    expect(isFlockHeld(lockPath)).toBe(false);
   });
 
   test("stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters", async () => {

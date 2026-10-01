@@ -37,7 +37,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 | A4 | H1 hunk 内不插行的可分离性约束 | R5/双审（摘要） | **已解除**（H1 已提交） | 见 A4 正文 |
 | A5 | `process-manager` 并发 fork 误判登记 | R5 / oracle 定死为既有 flake（**3–7% 与「50ms 重试 100% 成功」两个数字引自该轮复核，本批未独立复现**） | 登记；立项与否待 owner（建议 Phase 2 之后）→ **本批已在分支 `fix/daemon-lock-liveness-errno` 修复（errno 分流，见 A5「更新」段）** | `src/daemon/process-manager.ts:296-398`（旧行号；新行号见「更新」段）；精确点 `:345-347`（`break`）、`:357`（SIGKILL 判定）、`:426`（抛错） |
 | A6 | 台账 / 口径说明 | R5（摘要） | 已落地（即本笔记口径） | 见 A6 正文 |
-| A7 | `isChildProcessActive` 把 `state === "T"`（SIGSTOP 等停止态、内核仍持 lock）判死，属 A5 同类误杀 | 本批（lock 存活判定 errno 分流修复） | **挂账**（本批未改，待 owner 拍板等待语义） | `src/daemon/process-manager.ts:293-328`（判活行 `:312` 的 `state !== "Z" && state !== "X" && state !== "T"`）；见 A7 正文 |
+| A7 | `isChildProcessActive` 把 `state === "T"`（SIGSTOP 等停止态、内核仍持 lock）判死，属 A5 同类误杀 | 本批（lock 存活判定 errno 分流修复） | **挂账**（本批未改，待 owner 拍板等待语义）→ **已修（2026-10-01，`fix/child-process-active-t-state`；owner 两次拍板：一次 S1（`T` 恒算活）→ 同日二次改为「精细版」：pre-READY 的 `T` 可放弃 / READY 之后 `T` 算活，详见 D6）**；正文两处前提（ptrace / cgroup freezer）已订正，见本条「更新」段 | `src/daemon/process-manager.ts:293-328`（判活行 `:312` 的 `state !== "Z" && state !== "X" && state !== "T"`）；见 A7 正文 |
 | A8 | **fail-open 存活判定决策记录**（只认 `ENOENT`/`ESRCH` 为死亡证明；残留「失效 handle」面；不加重试；`lastParen === -1` 属防御分支） | 本批 + oracle 窄复审实测 | **已决策**（fail-open；本批不加 errno 观测、不加重试） | `src/daemon/process-manager.ts:313-320`（catch 分流）；见 A8 正文 |
 
 #### A1｜措辞过强需收敛（含 oracle **R5** 复核的修正：其中 2 处同栈即可拿到 reason）
@@ -179,7 +179,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 - 位置：`src/daemon/process-manager.ts:293-324` 的 `isChildProcessActive`，判活表达式
   （`:312`；上方 `:308-311` 已加指向本条目的注释）`return state !== "Z" && state !== "X" && state !== "T";`——**`T` 与 `Z`/`X` 被同样判死**。
 - 机理：`T`（`SIGSTOP` / ptrace 停止 / cgroup freezer）只是**被暂停**，内核**仍持有其 flock**；而 `Z`/`X` 是
-  已退出、内核已释放 flock。因此判死 `T` 与判死 `Z` 后果不同：前者会让 `acquireFlockHandle` 把**正持锁**的
+  该进程已退出、**它自己**的 fd 已关闭（**订正 2026-10-01**：这不等于锁一定空闲——`flock` 挂在**内核 open file description** 上，**继承该 fd 的子孙**〔如 `setsid` 逃逸者〕仍可能持锁，见 D6 段的 **D1/D2 例外**）。因此判死 `T` 与判死 `Z` 后果不同：前者会让 `acquireFlockHandle` 把**正持锁**的
   停止态子进程 SIGKILL 掉并返回 `null` ⇒ 上层 `acquireDaemonLock` 误报 `operation lock is held`（同一类误杀，
   与 A5 同源，只是触发条件从「瞬时读失败」换成「持锁进程被暂停」）。
 - **本批未改（有意；理由是「范围控制 + 缺证据 + 属 owner 决策」，不是等待预算）**：
@@ -194,6 +194,12 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 - 处置建议：**单独立项评估**（与 A5 一起），候选做法是先区分「自己 spawn 的子进程」与「外部持锁者」再决定
   `T` 的处理，不在 errno 分流这一批里顺带改。
 - 核对：`grep -n 'state !== "Z"' src/daemon/process-manager.ts`。
+- **更新（2026-10-01，`fix/child-process-active-t-state`；owner 定稿）**：本条的 `T` 误杀**已修**——owner 一次拍板 **S1（`T` 恒算活）**、同日**二次改为「精细版」（pre-READY 的 `T` 可放弃 / READY 之后 `T` 算活）**，原 S1 被其 pre-READY 代价面推翻（修法、机理、三形状实测、FAIL→PASS 取证、未修/残留面全部落在 D6 详情段，本条不重复；表格行状态由「挂账」改「已修」）。
+  - **订正①（重要，如实写）：ptrace 不是 `T`**。**本批执行者一手复核**（`bash /tmp/scout-d6/ptrace.sh`，本机 `ptrace_scope=0`）实测：`before: S` → `strace -p` 附着后 tracee 仍是 **`S`**（脚本那行 echo 标作「`t` = tracing stop」，**该标注不准确**，实测不是 `T` 也不是 `t`）→ **在被 trace 的状态下**再 `kill -STOP` 得到 **小写 `t`**（`tracing+SIGSTOP: state=t`）。而原表达式（只排除 `Z`/`X`/`T`）下小写 `t` **本来就已算活**。⇒ 本条正文把「ptrace 停止」列为 `T` 的触发来源**不成立**；ptrace 这条路径**从来不在误杀面上**。
+  - **订正②（重要，如实写）：cgroup freezer 很可能不是 `T`，且本机不可验证**。本机 `/sys/fs/cgroup` 下**无 `cgroup.freeze`**（`cgroup.controllers` = `cpuset cpu io memory hugetlb pids rdma misc`，**无 `freezer`**，无 v2 freezer 可写面）⇒ **无法在本机复现或验证**「freezer 会让进程呈 `T`」。⇒ 记为**证据缺口**：正文把「cgroup freezer」列为 `T` 的来源**未经验证**，不得据此下结论。（本行 `ls /sys/fs/cgroup` 为本批一手核对。）
+  - ⇒ 本条**唯一被本轮一手证实的 `T` 来源是 `SIGSTOP`/`SIGTSTP`**（探针：对停止态持锁者跑 `flock -x -n` ⇒ `exit=1`，即内核仍持锁）。
+  - **本条处置建议③（「自身子进程 vs 外部持锁者」的等待语义）已由 owner 二次拍板的「精细版」收敛**：`T` 算活仍对**外部持锁者面全量生效**（`isFlockHeld` / `hasLiveLockOwner` 不受 phase 影响），而本工具 spawn 的 helper 仅**在 READY 之后**按「`T` 算活」处理，**pre-READY 阶段显式豁免为「可放弃」**（理由与实测见 D6 详情段「更新②」）；残余面见 D6 详情段「新增残留面」与 D1/D2。
+  - **核对**：`bash /tmp/scout-d6/ptrace.sh`（形状；`/tmp` 会被清理）；`ls /sys/fs/cgroup`（应无 `cgroup.freeze`、`cgroup.controllers` 无 `freezer`）；`grep -n 'SIGSTOP-paused' test/unit/daemon-process-manager.test.ts`。
 
 #### A8｜决策记录：存活判定采取 **fail-open**（只认 `ENOENT`/`ESRCH` 为死亡证明）
 
@@ -206,7 +212,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
   误判死 ⇒ SIGKILL 掉刚拿到 flock 的子进程 ⇒ 上层误报 `operation lock is held`（A5 的现场）；误判活 ⇒ 最多多等一个窗口。
   故非 `ENOENT`/`ESRCH` 一律 fail-open（按活）；同理 `lastParen === -1`（内容读空/截断、无法解析）也按活。
 - **② 残留「失效 handle」面的可达条件与后果**：fail-open 是**保守**而非正确，因此存在一个已知残留面。
-  **可达条件（需同时叠加）**：`READY` 已写出（子进程已成功 `flock`）**且**子进程在父进程下一次判定前已**真的死亡**（内核已释放 flock）
+  **可达条件（需同时叠加）**：`READY` 已写出（子进程已成功 `flock`）**且**子进程在父进程下一次判定前已**真的死亡**（该进程自己的 fd 已关闭；**订正 2026-10-01**：若存在继承该 fd 的子孙，锁不会被释放、本条件不成立，见 D6 段的 **D1/D2 例外**）
   **且**该次 `/proc` 读取返回**非 `ENOENT`/`ESRCH`** 的失败、或读空/截断（或 pid 恰好被复用）。
   此时父进程会把「已死」当「活」，返回一个**不持锁的 handle**（失效 handle）。
   **后果**：① **双主控风险**——上层以为已独占实例锁，但内核锁实际已释放，另一个进程可以同时拿到 ⇒「两个实例同时跑」（与 A5 同一类后果，方向相反）；
@@ -260,6 +266,14 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 > **追加（2026-10-01，`fix/parallel-flake-timing` 批）**：**D9 / D10 已修**（两条状态行已改写，机理与修法写在各条详情段的「本批」块）；D7 的「CI 单进程」表述**已订正**（见 D7 详情段「订正」条）；新增 **D13–D15** 三条挂账（反向用法整组 / 本批未修暂留项 / 未实测项）。本批**只动 `test/**` 与本节台账**，`src/**` 零改动、未提交；D11/D12 状态不变。
 > **追加（2026-10-01，`fix/parallel-flake-timing` 批 · 第二关 oracle 的 should-fix 项收口）**：D13 清单改为**全量 33 处四类分列**（含反方向例外 `test/unit/daemon-process-manager.test.ts:518`）；D14① 的「无活 socket / `isTerminalConnected` 恒 false」理由**订正**（该用例第一阶段就有活 socket）；D10「核对」改为修后**两种残余签名**的观察口径（屏障卡住 ⇒ 外层 5s 超时或谓词错误；屏障被绕过 ⇒ 回到原 owner `AssertionError`）；删去形状 A 的不可复算耗时数字、补入**高载档一手实测**（来源＝oracle 本轮）；新增 **D16｜抬预算判据 + 占用率清单**；**D10/D14 注明 `#stopping` 前提与「插入 `await` ⇒ 假失败报警」的耦合**（派发件写作 D8/D14，实际落点在 D10 段 + D14⑤，理由见 D14⑤：D8 讲的是 `readChildPids` 告警分支无覆盖，与屏障无耦合）；D15 的 CI 口径改为**决定**（不主动追样本）。按 D16 判据给两条用例加显式 30s（`test/integration/agent-index-service.test.ts:4889`、`test/unit/herdsman-pi-extension.test.ts:4758`，各 1 行注释 + 第三参）。本批仍**只动 `test/**` 与本节台账**，`src/**` 零改动、未提交。
 
+> **追加（2026-10-01，`fix/child-process-active-t-state` 批）**：**D6 已修**——owner 定稿等待语义 **S1：`T`（`SIGSTOP`/`SIGTSTP`）算活**（判活表达式删 `&& state !== "T"` + 注释改写），并给 `T` 态补 1 条回归用例（`test/unit/daemon-process-manager.test.ts:912-937`，FAIL→PASS 已取证）；**A7 正文的两处前提已订正**（ptrace 得到的是 `S`/小写 `t`、cgroup freezer 未验证＝证据缺口，见 A7「更新」段）。本批**只动 `src/daemon/process-manager.ts` 的一行判活 + 注释、该测试文件追加 1 条用例、本节台账**，未提交；D1/D2/D3/D4/D5/D7–D16 状态不变。
+
+> **追加（2026-10-01 同日二次拍板，同分支 `fix/child-process-active-t-state`）**：owner **推翻 S1，定稿「精细版」语义**——**pre-READY 的 `T` 可放弃（杀 + 重试）/ READY 之后的 `T` 恒算活**（保住 D6 的修点）；改判理由＝ S1 的 pre-READY 代价面（真 `SIGSTOP` 形状 B：S1 打满 1000ms 后失败 3/3，旧代码 7–8ms 自愈成功 3/3）。同分支上把判活函数改为**显式 phase 参数**（`type ChildLivenessPhase`）并追加 1 条 pre-READY 用例（全量 823 条）；**三形状实测对照表与 3 处口径修订全部落在 D6 详情段**。D1–D16 其余状态不变。
+
+> **追加（2026-10-01，`fix/child-process-active-t-state` 批 · reviewer 收口：措辞订正 + 观察项）**：D6 段（并同步 A7 机理正文、A8② 的同源句）把判活语义统一改为「**该进程尚未退出（未关闭自身 fd）才算活**」并补 **D1/D2 继承 fd 例外**（判死 ≠ 锁一定空闲；来源＝reviewer **必须项**）；D15 段新增 1 条**未复现 / 未定位**观察项（`pnpm check` 首跑末步的 `Bad substitution` 瞬时噪声：单步 `pnpm herdr-plugin:check` 与整链复跑均 `EXIT=0`、日志无该字样）；产品注释（判活函数的 JSDoc 与函数内注释）同步订正；回归用例 post-READY 名字改为「模拟」表述（reviewer 建议项，三条断言与缝形状未动）。本批**只动产品注释、测试用例名/注释与本台账**，**未改判活逻辑 / `phase` 语义 / 任何断言**，未提交。
+
+> **追加（2026-10-01，`fix/child-process-active-t-state` 批 · oracle 提交前第二意见的应修项收口：2 应修 + 2 措辞收敛）**：① **错引用订正**——D6 段把 pre-READY 用例的 `elapsed < 500` 写成「实测 ~7ms」，实为 **racy 探针 (B) 臂**的数（该臂不可复现）；该用例实测 **≈58–60ms（空载）/ 墙钟 74–77ms**，且该粗断言 **0 区分力**（oracle 复核：精细版 58/59/60ms、S1 55/56/55ms、HEAD 58/59/58ms），真区分力在 **`helperPids.length >= 2`（重试计数）**；② **(B) 配方前置**——形状 (B) 须用**确定性配方**（fake 慢 `sh` + 真 `SIGSTOP`）才能复现（不带 fake sh 的 racy 触发器 **6/6** 落在 post-READY 侧），确定性配方下 oracle 独立复算（每臂 3 次）：HEAD **60/61/66ms** / S1 **1000/1000/1000ms** / 精细版 **62/62/64ms**；③ **措辞收敛①**——pre-READY 判定的**绝对口气**「尚未宣告 READY ⇒ 协议上不视为合法持有者」收敛为**快照级**「**本 attempt 尚未观测到 READY**」，并新增 **I-1** 登记（形状 (A) **6/9** 命中、有界/无害、HEAD 逐字节同形）；同步给产品注释加 1 处限定词 `as observed by this attempt`；④ **措辞收敛②**——「新增残留面」收敛为**既有外部 `kill` 面的一个子集**（形状 (D) 实测 HEAD 与精细版逐项相同 **2/2 vs 2/2** ⇒ 与 `phase` 无关）；⑤ **D15 补半句**（`Bad substitution`：emitter＝harness 包装层 `package-manager-cli.js`、`/bin/sh`＝`dash`、检查链无 bash-ism、整链独立复跑 `EXIT=0` ⇒ 环境/包装层噪声）。本批**只动本台账 + `src/daemon/process-manager.ts` 判活注释 1 处限定词**，**未改逻辑 / `phase` 语义 / 断言 / 用例 / 窗口常量 / attempt 结构**，未提交。
+
 | # | 残余项 | 来源轮次 | 状态 | 核对锚点 |
 | --- | --- | --- | --- | --- |
 | D1 | `children` 文件不可用 → release 屏障降级为只盯 flock 进程，可能带锁返回 | 收口轮（本批）；残余率引自收口轮测量 | **接受**（已加每进程一次告警；残余由 acquire 重试兜底） | `src/daemon/process-manager.ts:312-333`（读 `:312`、告警 `:326`） |
@@ -267,7 +281,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 | D3 | acquire 硬上界 ≈**1000ms+ε**；deadline 耗尽后即使锁已空闲也返回失败 | 本批（B｜有界重试）＋收口轮实测 | **接受**（预算语义＝设计取舍） | `src/daemon/process-manager.ts:371`、`:452`、`:515` |
 | D4 | 无 `owner.json` 的外来持锁最多 4 次 spawn 后报 held；失败延迟 p50 ~2ms → ~11ms（有界） | 本批（B）；本轮一手重测 | **接受**（有界） | `src/daemon/process-manager.ts:391`；harness `/tmp/lockrace-docs/measure.ts` |
 | D5 | owner 闸门依赖 `isProcessRunning`（`kill(pid,0)`，EPERM 也算活）→ 僵尸 / pid 复用的 `owner.json` 会闸掉重试 | 本批（B｜重试闸门） | **接受**（退化为旧行为，不产生新错误） | `src/daemon/process-manager.ts:401-413`、`:216-223` |
-| D6 | `isChildProcessActive` 把 `T/Z/X` 都视为已退出 → helper 被 `SIGSTOP` 时 release 提前返回 | 既有（A7 同源） | **挂账**（待 owner 拍板等待语义；本批只做 errno 分流） | `src/daemon/process-manager.ts:353`；见 A7 |
+| D6 | `isChildProcessActive` 把 `T/Z/X` 都视为已退出 → helper 被 `SIGSTOP` 时 release 提前返回（**且一次拍板的 S1「`T` 恒算活」会把 pre-READY 被停住的半成品也算成要等待的持有者，白耗满 1000ms 窗口**） | 既有（A7 同源）；owner 2026-10-01 一次拍板 S1 → **同日二次拍板：精细版**（原 S1 被其 pre-READY 代价面推翻） | **已修（owner 二次拍板语义＝精细版：pre-READY 的 `T` 可放弃 / READY 之后的 `T` 恒算活）**：判活函数加显式 `phase`（`type ChildLivenessPhase`＝`:349`、签名＝`:351-355`），判活行＝`:378-379`；**只有 pre-READY 调用点**（`:504`）传 `"pre-ready"`。回归用例 **2 条**（post-READY `test/unit/daemon-process-manager.test.ts:913-956` 保留并核定、pre-READY `:958-1030` 本批新增），全量 **823 条**。三形状实测对照、3 处口径修订、S1 代价面见 D6 详情段 | `src/daemon/process-manager.ts:349`（`ChildLivenessPhase`）、`:378-379`（判活行）、`:504`（pre-READY 调用点；原 **`:478`**）；见 A7 |
 | D7 | 200 轮压测在**并行复跑**下逼近 5s vitest 超时（CI **结构上同样并行、并不免疫**——订正见详情段「订正」条） | 收口轮 + 本条 chore 重测 | **已修（本条 chore，仅该用例）**：`test/unit/daemon-process-manager.test.ts:1011` 给该用例加显式超时 `30_000`（依据：3 路并发全量**一手实测 6.3–6.7s** >5s）；**只抬了这一条用例**，同类 D9/D10 已由 `fix/parallel-flake-timing` 批收口（D7 与 D9 的机制不同：本条是耗时逼近阈值，D9 是脚手架预算错配） | 可复跑形状见下方 D7「核对」段（`pnpm vitest run --reporter=verbose`，单进程 / 2 路 / 3 路并发）；本批笔记第 51 行 |
 | D8 | D1 的告警分支**无自动化用例**（覆盖靠实验验证 + 审计） | 收口轮（本批） | **挂账**（要钉需新增缝或 `vi.mock("node:fs")`） | `src/daemon/process-manager.ts:326`；`test/unit/daemon-process-manager.test.ts` 内无 `readChildPids` 引用 |
 | D9 | `test/unit/daemon-service.test.ts:523`（真 spawn daemon 的重测试）在 **3 路并发 + 高负载（load 21–34）**下 **3/3** 超时；同形状 **load 12–17** 的 3 路运行 **0/6**——与 D7 **同类** | 本条 chore 文档轮（取证引自 oracle 文档轮）；本批实现 | **已修（2026-10-01，`fix/parallel-flake-timing`）**：该用例补第三参 `}, 30_000);`（落点 `test/unit/daemon-service.test.ts:615`）。机理＝真 spawn `node --import tsx` + **整模块图 + migrations** 的脚手架开销跑在默认 5s 上，而该用例内部的 `vi.waitFor` 自己就等 **20s**（内部预算反比外层预算长）；30s ≥ 20s 消除错配 | `test/unit/daemon-service.test.ts:523`（`}, 30_000);` 在 `:615`）；复跑形状同 D7「核对」段 |
@@ -276,7 +290,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 | D12 | 台账引用数字**不可复算** + `/tmp` 锚点**全部失效**（全台账通病，非本条引入） | 本条 chore 文档轮 | **挂账（台账卫生）** | `grep -rn "/tmp/" .agents/notes/`；本轮只处理了 D7 一条 |
 | D13 | `setTimeout(resolve,` 的**全量 33 处四类分列**：其中「断言某事没发生 / 没增长」的反向用法整组＝负载下**检出力下降**（**仅该批**会假通过、不会假失败）；另有 **3 处固定窗口等一个必然发生的结果（2 处沉降错位 + 1 处固定窗口等结果 `:518`；会假失败）**与 **20 处无风险** | 本批（`fix/parallel-flake-timing`）；清单与口径在第二轮补全 | **挂账**（反向整组本批不动：调 sleep 只白加墙钟，不改结构性；**`test/unit/daemon-process-manager.test.ts:518` 是③里的固定窗口等结果**，不在②「不会假失败」的限定内） | 见 D13 段（逐条 `file:line`；四类计数 **10+3+20=33**） |
 | D14 | 本批**未修 / 暂留**的点（startup-grace 无屏障、D9 内部 20s 与实际等待上限、新引入轮询的 5s 取值〔第二轮已改为「高载档实测占用 2–4%」〕、D13 组） | 本批 | **挂账**（逐条理由见 D14 段） | 见 D14 段 |
-| D15 | 前序取证 + 本批的**未实测项**（证据边界：D9 未打穿 5s、4 处 spawn 未负载实测、`waitForNotification` 峰值未测、CI 无失败样本〔本批改为**决定**，见 D15 段〕、`:39`/`:119` 两点未在探针下失败） | 前序 scout + 本批 | **挂账（证据边界）** | 见 D15 段 |
+| D15 | 前序取证 + 本批的**未实测项**（证据边界：D9 未打穿 5s、4 处 spawn 未负载实测、`waitForNotification` 峰值未测、CI 无失败样本〔本批改为**决定**，见 D15 段〕、`:39`/`:119` 两点未在探针下失败、**`pnpm check` 末步的 `Bad substitution` 瞬时噪声未复现 / 未定位根因（`fix/child-process-active-t-state` 批，见 D15 段）**） | 前序 scout + 本批 | **挂账（证据边界）** | 见 D15 段 |
 | D16 | **抬预算判据** + 逐用例占用率清单（谁该抬、谁不抬；判据 vs 个例；偏离判据的个例必须自带独立理由） | 本批（第二关 oracle should-fix 项） | **已落地**（判据 + 清单齐全；据此本批新增 2 处 30s，其余按判据不动，1 处个例保留原状并写明理由） | 见 D16 段；落点 `test/integration/agent-index-service.test.ts:4889`、`test/unit/herdsman-pi-extension.test.ts:4758` |
 
 #### D1｜`children` 文件不可用 → release 屏障降级为只盯 flock 进程
@@ -326,12 +340,56 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 
 #### D6｜`isChildProcessActive` 把 `T` 与 `Z/X` 同样判死
 
-- **现象**：判活表达式是 `state !== "Z" && state !== "X" && state !== "T"`；`T`（`SIGSTOP` / ptrace / cgroup freezer）**内核仍持锁**，却被判死。
+- **现象**：判活表达式是 `state !== "Z" && state !== "X" && state !== "T"`；`T`（`SIGSTOP`/`SIGTSTP`；**本条原列的 ptrace / cgroup freezer 两项前提已被订正为不成立 / 未验证，见 A7「更新」段**）**内核仍持锁**，却被判死。
 - **触发条件**：helper（或外部持锁者）在 release / acquire 判定窗口内被停止。
 - **影响**：release 侧提前放行 → 同 D1 形状（可能带锁返回）；acquire 侧同一判活也会把停止态 helper 判死（可 `SIGKILL` 掉正在持锁的子进程并返回 null）→ 上层误报 `operation lock is held`（与 A7 同源）。
 - **现有兜底**：本批只做 errno 分流，`T` 语义未动；acquire 有界重试部分兜底。
 - **状态**：**挂账**（＝ A7，待 owner 拍板「等待语义」；不属本批范围）。
 - **核对**：`grep -n 'state !== "Z"' src/daemon/process-manager.ts`；A7。
+- **更新①（2026-10-01，`fix/child-process-active-t-state`；owner 一次拍板等待语义 S1＝`T` 恒算活）**：`T` 判死**已修**（本条原「挂账」判断被 owner 拍板取代）；**但 S1 当日即被自身 pre-READY 代价面推翻，最终落地的是「更新②」的精细版**。
+  - **修法（S1，一次拍板的中间态；最终锚点见「更新②」）**：判活表达式删掉 `&& state !== "T"`——语义一句话＝**「该进程尚未退出（未关闭自身 fd）才算活」**（`Z`/`X` 仍判死），并改写上方注释写明 `T` 为何必须算活（含：小写 `t` 本来就已算活、与同文件另两个存活面口径一致）。
+    - **锚点位移（S1 中间态）**：判活行 `:353` → `:358`。**只动这一行 + 注释**：`A8` 的 errno 分流、release/acquire 的窗口预算（`ACQUIRE_WINDOW_MS` / `ACQUIRE_MAX_ATTEMPTS` / release 的 100ms）、`Z`/`ENOENT` 判死路径**零改动**（这条边界在**精细版里同样成立**，见「更新②」）。
+  - **机理（S1 保留的部分）**：`T`（`SIGSTOP`/`SIGTSTP`）只是**被暂停**，**内核仍持 flock**（scout 一手探针：对停止态持锁者跑 `flock -x -n` ⇒ **`exit=1`**）。判死的后果有两类：
+    ① **release 侧提前放行**——自旋屏障看到「无活 fd 持有者」立即返回，锁仍在自己一侧多持几 ms（与 D1 同形状）。**（口径修订 1：已收窄为理论/极窄面，见下「口径修订」条。）**
+    ② **acquire 侧杀掉持锁 helper 并返回 `null`**——放弃分支的破坏性响应（现 `:515-523`，原文锚点 `:484`）把**正持锁**的子进程 `SIGKILL` 掉，上层 `acquireDaemonLock` 抛 `operation lock is held` ⇒ daemon 启动失败。**（口径修订 2：「+ systemd 约 5s 重启循环」已收窄为「需多个 attempt 均被停住 / 窗口耗尽才失败」，见下「口径修订」条。）**
+  - **OS 事实（本批执行者已一手独立复核，不依赖 scout 转述）**：`flock -x -n fl.lock sh -c '…; exec cat'` 起 helper → `kill -STOP` 后 **flock 父进程与其 `children` 均呈 `T`** → 此时 `flock -x -n fl.lock true` **`exit=1`（锁仍被持）**、`kill -0` 两个 pid **均成功（进程仍在）**；再 `kill -KILL` 两个 pid 后探针才 **`exit=0`（锁释放）**。即「`T` 判死」与「该进程已退出（关掉自己的 fd）」不等价，S1 的语义就是「**该进程尚未退出（未关闭自身 fd）才算活**」。
+  - **一致性（S1 是对齐既有口径，不是新造语义）**：同文件另两个存活面本来就按「`T` 活」处理——`hasLiveLockOwner` → `isProcessRunning` → `kill(pid, 0)`（停止态进程的 `kill(pid,0)` 照样成功，`EPERM` 也算活）；`isFlockHeld` → 真 `flock -n` 探针（内核仍持锁 ⇒ 返回 held）。改动后三面口径一致。
+- **更新②（2026-10-01 二次拍板，同分支；owner 推翻 S1，定稿「精细版」语义）**：
+  - **语义（按协议阶段分流）**：**pre-READY**（helper 还没写 READY／ack 未出现）的 `T` **可放弃** ⇒ 进入既有「杀 + 重试」快路径（＝保持旧代码行为）；**READY 建立之后**的 `T` **恒算活** ⇒ 保住 D6 的修点（不误杀内核仍持锁的存活持有者）。
+  - **为什么 pre-READY 可以放弃**：**本 attempt 尚未观测到 READY**（**快照级**表述——原写「helper 尚未宣告 READY ⇒ 协议上不视为合法持有者」属**绝对口气**，采样缝隙见下 **I-1** 条）⇒ 本次判定**按「它不是本 attempt 的合法持有者」处理**；此时杀的是**我们自己 spawn 的半成品**，释放的只是**我们想要的那把锁**（本 attempt 的 ack 是它**私有的随机路径**、除本 attempt 无人读，故无外部进程会经由一个「本 attempt 未观测到 READY」的 helper 持锁）⇒ **不会引入双 master**。**为什么 READY 后 `T` 必须算活**：内核仍持 flock（见上「OS 事实」），判死会造成**误杀 / 双重持有面 = D6 本身**。
+  - **I-1（新增登记，如实）｜「刚写出 READY」的采样缝隙**：**刚写出 READY 的 helper**，若父进程的 ack 采样早于该写入落地，就会走到 **pre-READY 判定**；若此时它已被（外部）`SIGSTOP` 成 `T`，精细版判「可放弃」⇒ **`SIGKILL`**。**实测：形状 (A) 下 6/9 命中**（`helpersSeen=2`，多杀 1 个、**+4–6ms**）。判定**有界 / 无害**：① 被杀者**从未被本 attempt 采纳、从未写 `owner.json`**；② ack 是**每次 attempt 私有的随机路径**（除本 attempt 无人读）⇒ 杀的只是「**本 attempt 想要的那把锁**」，重试随即接手（`lockHeldAfterAcquire=true`）；③ **HEAD 在此路径逐字节同形** ⇒ **非本批引入**。
+  - **修法（本批落码，≈5 行代码 + 注释；注释锚点）**：给判活函数加**显式 phase 参数**，语义由调用点表达——`type ChildLivenessPhase = "ready" | "pre-ready"`（`src/daemon/process-manager.ts:349`，其上方 JSDoc `:334-348` 写清两个 phase 的理由并引 D6）；签名 `isChildProcessActive(pid, readProcessStat?, phase = "ready")`（`:351-355`）；判活行 `const pausedCountsAsActive = phase === "ready";` + `return state !== "Z" && state !== "X" && (pausedCountsAsActive || state !== "T");`（`:378-379`；函数内注释 `:367-376` 说明「该进程尚未退出（未关闭自身 fd）才算活」与 phase 的关系）；**只有 pre-READY 那一个调用点**（`:504`，等待循环里「child exited before READY」的 `break` 判定）传 `"pre-ready"`，READY 分支（`:486`）、放弃判定（`:515`）、release 屏障（`:607`）都用默认 `"ready"`。**`Z`/`X`/`ENOENT` 判死、`A8` errno 分流、`ACQUIRE_WINDOW_MS`（`:397`）/`ACQUIRE_MAX_ATTEMPTS`/release 100ms 预算、attempt 结构零改动**；**没有**在两个调用点各写一份裸 `state !== "T"` 判断。
+  - **措辞订正（2026-10-01，`fix/child-process-active-t-state` 批 · reviewer 必须项）**：本条此前把判活语义写成「内核已丢 fd 才算死」，属**过度承诺**——`flock` 挂在**内核 open file description** 上，进程进 `Z`/`X` 只说明**它自己**的 fd 关了；**若它派生的子孙继承了该 fd**（`setsid` 逃逸那类，**正是 D1/D2 的现实**），OFD 引用计数不为 0，**锁不会被释放** ⇒ 不该读成「判死 ⇒ 锁一定空闲」。⇒ 本段（并同步 A7 机理正文、A8② 的同源句）统一改为「**该进程尚未退出（未关闭自身 fd）才算活**」，并补 **D1/D2 继承 fd 例外：判死 ≠ 锁一定空闲**。产品注释（`src/daemon/process-manager.ts` 判活函数上方 JSDoc 与函数内注释）已同步订正，二者同源。
+  - **注释行位移（本批一手）**：措辞订正使注释净增 **9 行**（JSDoc **+5**、函数内注释 **+4**），D6 段此前引用的行号整体位移：`type ChildLivenessPhase` `:349` → **`:354`**、JSDoc `:334-348` → **`:334-353`**、签名 `:351-355` → **`:356-361`**、函数内注释 `:367-376` → **`:372-381`**、判活行 `:378-379` → **`:387-388`**、`ACQUIRE_WINDOW_MS` `:397` → **`:406`**、READY 分支 `:486` → **`:495`**、pre-READY 调用点 `:504` → **`:513`**、放弃判定 `:515` → **`:524`**、release 屏障 `:607` → **`:616`**（**只位移行号，未改任何逻辑**；标识符型 `grep -n 'ChildLivenessPhase\|pausedCountsAsActive'` 核对不受影响）。
+  - **回归用例（2 条，均在既有注入缝家族内，未新开文件）**：
+    - **post-READY（保留并核定）**：`test/unit/daemon-process-manager.test.ts:913-956`（`a simulated T-state (SIGSTOP-paused seam) lock-holding child counts as alive and keeps its handle`；**reviewer 建议项**：名字点明「模拟、注入缝」而非真信号）——缝改为**只在 READY 已发布时**改写 state 字段（`readyPublished()` 看锁目录里的 `.ack.*` 内容是否以 `READY` 开头；否则那次读会被（正确地）当成可放弃的 pre-READY 读，用例就会跑到另一条路径上），其余读法与健康 procfs 一致；三条断言不变（`handle !== null` / **不带该缝再取一次锁必须被拒**（钉「这个 handle 确实持锁」的双主控回归面）/ `release()` 后 `waitForCondition(() => !isFlockHeld(lockPath))`）。
+    - **pre-READY（本批新增 1 条）**：`test/unit/daemon-process-manager.test.ts:958-1030`（`a pre-READY paused (T) helper is abandoned: the acquisition kills it and retries`）——**PATH 缝**放一个「慢 `sh`」（`sleep 0.05` + `exec /bin/sh "$@"`）把第一个 helper 钉在 pre-READY 相 50ms（把「第一个 helper 从未写 READY」变成**事实**而非竞态），`readProcessStat` 缝只把**第一个** helper 的 state 报成 `T`；断言：`handle !== null`、`elapsed < 500`（**实测 ≈58–60ms（空载）**、用例墙钟 **74–77ms**；**此处原写的「实测 ~7ms」是错引用**——`7ms` 属 D6 表里 **racy 探针 (B) 臂**的数，且**该臂不可复现**，见下「(B) 配方前置」条。**该用例的真区分力在 `helperPids.length >= 2`（重试计数）**；`elapsed < 500` 只是**保底粗断言**（oracle 复核：精细版 58/59/60ms、S1 55/56/55ms、HEAD 58/59/58ms ⇒ **该粗断言 0 区分力**；S1 语义下本条也**不打满窗口**，而是在 `helperPids.length >= 2` 上失败，见下「反证」条）、**`helperPids.length >= 2`（杀+重试真发生）**、`isFlockHeld === true` + 不带缝再取被拒、release 后锁空闲。
+    - **反证（本批一手，非空跑凑绿）**：把 `pausedCountsAsActive` 临时改成恒 `true`（＝S1 语义）后该用例 **FAIL**：`AssertionError: expected 1 to be greater than or equal to 2`（`test/unit/daemon-process-manager.test.ts:1020`）⇒ 这条用例真的钉住了 pre-READY 语义。
+  - **用例计数**：`fix/child-process-active-t-state` 批 **821 → 822**（post-READY 1 条），本批 **822 → 823**（pre-READY 1 条；`pnpm test` 53 文件 / 823 条）。
+  - **本批未修 / 不动**：release 侧「带锁返回」残余属 **D1 / D2**（成立要有一个 `kill(-pgid)` 够不着的 fd 持有者，如 `setsid` 出去的进程；仓库自带用例 `test/unit/daemon-process-manager.test.ts:624-688` 本身就断言 `elapsed >= 90` 且 `isFlockHeld === true`），属已接受项、由 acquire 有界重试兜底，**精细版同样不修**。
+  - **三形状实测对照（本轮一手，真 `SIGSTOP`；每格 3 次；探针 `/tmp/scout-d6/probe2.ts`，源码三版副本 `current.ts`＝HEAD / `s1.ts`＝S1 / `refined.ts`＝本批精细版；缝只当「何时有 helper」的触发点，`readProcessStat` 返回的始终是**真实** `/proc/<pid>/stat`）**：
+
+    | 形状 | HEAD | S1 | 精细版（本批） |
+    |---|---|---|---|
+    | (A) READY 之后真 `SIGSTOP`（每个 attempt 都停） | `handle=null`，22–24ms，4 个 helper **全被 `SIGKILL`**（`Z`） | `handle` ✓ 5–7ms，1 个 helper，持锁者保持 `T` | `handle` ✓ 5–8ms，1 个 helper，持锁者保持 `T`（**同 S1**） |
+    | (B) pre-READY 真 `SIGSTOP`（停住的那个已持锁、从未写 READY）——**须确定性配方才能复现**（旧探针的 racy 触发器 6/6 落在 post-READY 侧；本行是**赢了竞态的样本、不是稳定量**，见下「(B) 配方前置」条） | `handle` ✓ **7–8ms**（旧探针样本；确定性配方 **60/61/66ms**），2 个 helper（停住的被杀成 `Z`，新的接手） | `handle=null`，**1000/1000/1001ms**（旧探针样本；确定性配方 **1000/1000/1000ms**），1 个 helper | `handle` ✓ **7ms**（旧探针样本；确定性配方 **62/62/64ms**），2 个 helper（**回到 HEAD 快路径**） |
+    | (C) release 侧真 `T`（持锁者全组停在 `T` 后 `release()`） | `releaseMs` 0/1/0 | `releaseMs` 0/1/0 | `releaseMs` 1/1/0（**三版无差异**） |
+
+    - (B) 的实测事实：`preReadyAtFreeze=true`、停住者 `stateAfter=T`、**`lockHeldWhileFrozen=true`**（被放弃的那个 helper **确实已持锁**，且 `readyEverAtEnd=false`＝从未写出 READY）；放弃后锁由**新 helper** 接手（`lockHeldAfterAcquire=true`、`helpersSeen=2`）⇒「只释放我们想要的锁、不引入双 master」在实测上成立。
+    - **(B) 配方前置（重要；oracle 提交前第二意见的应修②）**：形状 (B) **必须用确定性配方**——**fake 慢 `sh`**（`sleep 0.05` 把 READY 钉在 50ms 之后）＋ **真 `SIGSTOP`**——**才能复现**；**不带 fake sh 的 racy 触发器实测 6/6 落在 post-READY 侧**（`readyAfterStop=true`——READY 在「快照→停止」的 ~200µs 间隙里落地）⇒ 上表 (B) 行的旧探针数字（含 S1 的 `null`/1000/1000/1001ms）是**赢了竞态的样本、不是稳定量**：**结论成立**（S1 打满窗口、精细版回到 HEAD 快路径），**但复现必须用确定性配方**。确定性配方下 oracle 的独立复算（每臂各 3 次）：
+      - **HEAD**：`handle` ✓ **60/61/66ms**，`seen=2`，`readyAfterStop=false`，`heldWhileFrozen=true` ⇒ 冻结者成 `Z`、锁交新 helper；
+      - **S1**：`null`，**1000/1000/1000ms**，`seen=1` ⇒ 窗口耗尽、锁最终自由（`false`）；
+      - **精细版**：`handle` ✓ **62/62/64ms**，`seen=2`（「**回到 HEAD 快路径**」的结论不变）。
+    - (A) 的实测事实：HEAD 下每次 attempt 的持锁 helper 都在**写完 READY 之后**被停住 → 判死 → `SIGKILL` → 4 个 attempt 全废 → `handle=null`（**这就是 D6 的原始害**）；精细版与 S1 一样**保留 handle、不杀持锁者**。
+  - **口径修订（三条，均为本轮实测）**：
+    - **口径修订 1（把「机理①：release 侧提前放行」收窄为理论/极窄面）**：(C) 三版 `releaseMs` **0–1ms、无差异**。原因：`release()` 是 **`SIGKILL` 先行**（`:586-592` 先杀组、再进屏障），而 **`SIGKILL` 对 `T` 进程立即生效** ⇒ 屏障随后看到的已经是 `Z`/消失，`T` 判死与判活的差异**测不出来**。要真落到「带锁返回」上还需一个 `kill(-pgid)` 够不着的 fd 持有者（如 `setsid` 出去的进程），那属既有 **D1 / D2** 面。
+    - **口径修订 2（把「daemon 启动失败 + systemd 约 5s 重启循环」收窄）**：改为「**需多个 attempt 均被停住 / 窗口耗尽**才失败」。单次 `SIGSTOP` 形状下**旧代码（HEAD）会杀+重试并成功**——(B) 实测 **3/3 成功**（旧探针 7–8ms；确定性配方 60/61/66ms，见上「(B) 配方前置」条）；即「停一次 ⇒ daemon 起不来」**不成立**，只有停止在窗口内持续生效（如 (A) 每个 attempt 都被停）才走到「返回 `null` ⇒ 抛 `operation lock is held`」。
+    - **口径修订 3（如实记入 S1 的代价面）**：(B) 实测 **S1 3/3 打满 1000ms 后失败**（`handle=null`），而**旧代码 3/3 在 7–8ms 自愈成功**（旧探针样本；确定性配方 60/61/66ms）。即 S1 的「`T` 恒算活」把「我们自己 spawn 的、尚未宣告 READY 的半成品被停住」也当成需要等待的持有者，**白耗满整个 acquire 窗口**——这是 S1 被推翻的直接原因。触发需**外部 `SIGSTOP` 自家启动中的 helper**，现实**极窄**；且本仓 detached helper **只对 `SIGSTOP` 可达**（本批一手复核：对 `spawn(..., { detached: true })` 起的孤儿进程组连发两次 `SIGTSTP`，state 恒为 `S`、无变化；改发 `SIGSTOP` 才变 `T`——helper 在 `setsid` 后的**孤儿进程组**里，`SIGTSTP` 被内核丢弃）。**该代价已由精细版消除**（(B) 精细版 3/3 为 7ms（旧探针样本；确定性配方 62/62/64ms，仍与 HEAD 的 60/61/66ms 同水平，见上「(B) 配方前置」条），＝ HEAD 水平）。
+  - **新增残留面**（**2026-10-01 收敛**：不是「新增」，而是**既有外部 `kill` 面的一个子集**；owner 已知情并接受）：我们 handle 里的**停止态持锁者若被外部 `kill -9`** ⇒ 该 fd 持有者死亡、内核释放 flock，**锁静默消失，而 daemon 仍以为自己持有**（可达条件需要**外部动作**，不是本工具自己的路径；有 **SQLite 自身文件锁兜底**，不会静默损坏 DB——**但这不等于「不会双实例」：双实例仍可能出现，兜底只保证 DB 不被静默损坏**——表现为重复投递 / 写争用）。它与 A8② 的「失效 handle」面同源（都是「我们以为持有、内核已释放」），只换触发源。**收敛依据（oracle 提交前第二意见；形状 (D) 实测）**：该场景在 **HEAD 与精细版下逐项相同（2/2 vs 2/2）** ⇒ 与 **`phase` 语义无关**，是**既有外部 `kill` 面**的一个子集，**不是本批新增**的残留面（原先按「新增」登记属**措辞过强**）。
+  - **未采纳的相邻方案**（owner 只取精细版）：**S2**（给停止态持锁者加限频告警）**未采纳**；**S4**（不动放弃分支的破坏性响应）**未采纳**——放弃分支的 `SIGKILL` 组 + `return null`（现 `:515-523`；原文锚点 `:484`）**在两个 phase 下都保持原样**（这是精细版的改动边界：只改「什么时候算需要等待」，不改放弃时怎么杀）。
+  - **覆盖现状**：`T` 态的自动化覆盖**原为 0**（本文件既有用例只覆盖 `EIO` / 无 `code` / 空读三种读失败，**没有任何用例注入过 state 字母**）；`fix/child-process-active-t-state` 批共补 **2 条**，**正好覆盖精细版的两个 phase**（post-READY 1 条 + pre-READY 1 条）。
+  - **可选未实现（形状已记，未落码）**：① **release 侧 characterization**——release 前对 helper 全组 `SIGSTOP`，断言释放后锁可见空闲（本轮已按形状 (C) 实测三版 × 3 次、无差异，但**仍未落成用例**）；② **OS 事实用例**——直接断言「停止态持锁者仍被判 held」（`flock -x -n` ⇒ `exit=1`、`kill(pid,0)` 成功），形状见 `/tmp/scout-d6/tstate.sh`。两者**有意未实现**（最小测试；形状记在本条即可）。
+  - **核对**：`grep -n 'ChildLivenessPhase\|pausedCountsAsActive' src/daemon/process-manager.ts`；`grep -n 'pre-READY paused\|simulated T-state' test/unit/daemon-process-manager.test.ts`；三形状复跑形状：`pnpm exec tsx /tmp/scout-d6/probe2.ts /tmp/scout-d6/<current|s1|refined>.ts <A|B|C> <1|2|3>`（`/tmp` 会被清理，届时按 D6 本段描述重建：真 `SIGSTOP` 三种形状 + 三版源码副本）。
 
 #### D7｜200 轮压测在并行复跑下逼近 5s vitest 超时
 
@@ -463,6 +521,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 - **`waitForNotification` 真实峰值未测**：本批只把预算从 ~200ms 抬到 ~2s（`test/integration/rpc-test-client.ts:71`），**没有**在负载下测出「实际需要多长」——抬预算是按「负载下检出力」而非实测峰值的保守选择。
 - **`:39` / `:119` 两个屏障点未在饿死探针下失败**（见 D10 段末尾）：旧形状在这两点「也会假失败」**未被实测**，只能给代码层蕴含证明（高载档下这两点的实耗占用率见 D14③）。
 - **CI 无失败样本（本批改为**决定**，不是遗漏）**：`.github/workflows/ci.yml` **结构上并行**（订正见 D7 段），但本台账与本批都**没有** CI 上的失败样本 ⇒「CI 会不会真被打穿」**未实测**。**本批的决定**：**不主动追** CI 失败样本——CI 的暴露面低于本地并行复跑（只单套、没有我们自叠的 3 路并发，runner 的核数 / 负载档也不由我们控制），追样本的成本不抵收益；若将来真出现，**按 D9/D10 的机理口径归因**（先看是 `Test timed out in 5000ms` 还是 owner 断言 / 屏障签名，再对号 D7/D9/D10/ D13），**不新建兜底机制**。
+- **`pnpm check` 首跑末步的 `Bad substitution` 瞬时噪声（2026-10-01，`fix/child-process-active-t-state` 批；**未复现 / 未定位根因**）**：该批首跑 `pnpm check` 的末步 `pnpm herdr-plugin:check` 打印过 `/bin/sh: 1: Bad substitution (exited with code 2)`；**同一环境下单步 `pnpm herdr-plugin:check` 与整链 `pnpm check` 复跑均 `EXIT=0`、日志中无该字样** ⇒ 判为**瞬时环境噪声**，**未定位根因**、**未复现**。**它不属本批任何已修条目**（登记口径同本段的证据边界）。**半句补记（2026-10-01，oracle 提交前第二意见）**：**emitter＝agent harness 包装层**（`(exited with code N)` 后缀出自 harness 的 `package-manager-cli.js`）、**`/bin/sh`＝`dash`**、**检查链无 bash-ism**（`${…//…}` / `${…^^}` 类**全库无命中**）、**整链独立复跑 `EXIT=0`** ⇒ **环境 / 包装层噪声，非潜藏缺陷**，**便于后人免复查**。**本批一手补强（机制复现，2026-10-01）**：该文案在**本 harness 自身**即可逐字产生——本批一条收尾命令用 `${PIPESTATUS[0]}`（bash-ism）在 harness 的固定 `/bin/sh -c`（`dash`）下运行时，打印出**逐字相同**的 `/bin/sh: 1: Bad substitution`，并由 harness 包装层追加 `(exited with code 2)` ⇒ **发射器在仓库检查链之上**（本次观测的发射器是 harness 命令包装层；oracle 指出的包装层 `package-manager-cli.js` 属同一层）。但**原观测点那条命令未落盘**，故原判「**未复现 / 未定位根因**」**保持不变**（本条只把“环境/包装层”**从推测变为已演示的一类机制**）。
 
 #### D16｜抬预算判据 + 逐用例占用率清单（判据 vs 个例）
 
