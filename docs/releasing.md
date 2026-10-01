@@ -15,7 +15,7 @@ Do not run `npm publish` from `packages/herdsman-herdr-plugin`. Its private pack
 Run releases from the repository root on `main`. Replace the version below with the version being released.
 
 ```bash
-export VERSION=0.13.1
+export VERSION=0.13.2
 export TAG="v$VERSION"
 export PATH="$HOME/.local/share/mise/installs/node/26.7.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0:$PATH"
 
