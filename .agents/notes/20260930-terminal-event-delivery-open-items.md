@@ -256,6 +256,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 > **追加小节**（2026-10-01，`fix/daemon-lock-release-barrier` 批次提交前收口轮；来源轮次＝「实现轮 → 双审 → 收口轮」）。
 > 主体决策、机理与实测见 [`20260930-daemon-lock-release-barrier.md`](20260930-daemon-lock-release-barrier.md)——该笔记第 51 行那段已由本轮的收口重写（去掉证据不足的定量归因、补上本轮一手延迟数据）。
 > 口径：只登记**本批未消除**的残余项；「现有兜底」＝本批已落地的机制，不是未来计划；数字凡属**本轮一手实测**均标 harness 与 n/臂，凡引自他轮的写明来源。**只增不改**，不与 A/B/C 各节重复（A7/A8 只留指针）。
+> **追加（2026-10-01，`chore/stress-test-timeout` 文档轮）**：D7 在本轮收口——「已修」限定为**「仅该用例」**、取值依据改用**本条 chore 一手实测**（并删去一处悬空引用），`/tmp` 锚点改为**可复跑形状**；同时追加 **D9–D12** 四条同类观察项（来源＝oracle 文档轮指出）。**D9–D12 均未修：D9/D10 已立项、D11 已决定不保留、D12 挂账（台账卫生）。**
 
 | # | 残余项 | 来源轮次 | 状态 | 核对锚点 |
 | --- | --- | --- | --- | --- |
@@ -265,8 +266,12 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 | D4 | 无 `owner.json` 的外来持锁最多 4 次 spawn 后报 held；失败延迟 p50 ~2ms → ~11ms（有界） | 本批（B）；本轮一手重测 | **接受**（有界） | `src/daemon/process-manager.ts:391`；harness `/tmp/lockrace-docs/measure.ts` |
 | D5 | owner 闸门依赖 `isProcessRunning`（`kill(pid,0)`，EPERM 也算活）→ 僵尸 / pid 复用的 `owner.json` 会闸掉重试 | 本批（B｜重试闸门） | **接受**（退化为旧行为，不产生新错误） | `src/daemon/process-manager.ts:401-413`、`:216-223` |
 | D6 | `isChildProcessActive` 把 `T/Z/X` 都视为已退出 → helper 被 `SIGSTOP` 时 release 提前返回 | 既有（A7 同源） | **挂账**（待 owner 拍板等待语义；本批只做 errno 分流） | `src/daemon/process-manager.ts:353`；见 A7 |
-| D7 | 200 轮压测在**并行复跑**下逼近 5s vitest 超时（CI 单进程无风险） | 收口轮 + 本轮重测 | **挂账 → 另开独立 chore** | `/tmp/lockrace-final/concurrent3way/summary.txt`；本批笔记第 51 行 |
+| D7 | 200 轮压测在**并行复跑**下逼近 5s vitest 超时（CI 单进程无风险） | 收口轮 + 本条 chore 重测 | **已修（本条 chore，仅该用例）**：`test/unit/daemon-process-manager.test.ts:1011` 给该用例加显式超时 `30_000`（依据：3 路并发全量**一手实测 6.3–6.7s** >5s）；**只抬了这一条用例**，同类未解见 D9/D10 | 可复跑形状见下方 D7「核对」段（`pnpm vitest run --reporter=verbose`，单进程 / 2 路 / 3 路并发）；本批笔记第 51 行 |
 | D8 | D1 的告警分支**无自动化用例**（覆盖靠实验验证 + 审计） | 收口轮（本批） | **挂账**（要钉需新增缝或 `vi.mock("node:fs")`） | `src/daemon/process-manager.ts:326`；`test/unit/daemon-process-manager.test.ts` 内无 `readChildPids` 引用 |
+| D9 | `test/unit/daemon-service.test.ts:523`（真 spawn daemon 的重测试）在 **3 路并发 + 高负载（load 21–34）**下 **3/3** 超时；同形状 **load 12–17** 的 3 路运行 **0/6**——与 D7 **同类** | 本条 chore 文档轮（取证引自 oracle 文档轮） | **已立项**（owner 2026-10-01 决定：把“本地并行复跑假失败”这一类一起收拾；D7 已修，D9/D10 与其同类，另开批次处理） | `test/unit/daemon-service.test.ts:523`；复跑形状同 D7「核对」段 |
+| D10 | `test/integration/orchestrator-disconnect-grace.test.ts:306` 高载 3 路并发下 **1/3** 断言失败（**非超时**） | 本条 chore 文档轮（取证引自 oracle 文档轮） | **已立项**（owner 2026-10-01 决定：把“本地并行复跑假失败”这一类一起收拾；D7 已修，D9/D10 与其同类，另开批次处理） | `test/integration/orchestrator-disconnect-grace.test.ts:303-307`；复跑形状同 D7「核对」段 |
+| D11 | 该压测用例**已无性能探测力**（`30_000` ≈ 单跑耗时的 21×） | 本条 chore 文档轮（取证引自 oracle 文档轮） | **已决定：不保留**（owner 2026-10-01：该用例只做并发正确性，不设性能门限；若将来要性能信号，另开不受并行负载影响的形状） | `test/unit/daemon-process-manager.test.ts:1011` |
+| D12 | 台账引用数字**不可复算** + `/tmp` 锚点**全部失效**（全台账通病，非本条引入） | 本条 chore 文档轮 | **挂账（台账卫生）** | `grep -rn "/tmp/" .agents/notes/`；本轮只处理了 D7 一条 |
 
 #### D1｜`children` 文件不可用 → release 屏障降级为只盯 flock 进程
 
@@ -324,12 +329,20 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 
 #### D7｜200 轮压测在并行复跑下逼近 5s vitest 超时
 
-- **现象**：`stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters` 单跑中位约 1.39s（本轮：`/tmp/lockrace-final/single/summary.txt`），但并行复跑时逼近 vitest 默认 5s。
+- **现象**：`stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters` 单跑约 **1.33s**（**本条 chore 一手热跑 1316/1325/1351ms**），但并行复跑会越过 vitest 默认 5s（3 路并发全量一手实测 6.3–6.7s）。
 - **触发条件**：同一机器同时跑多份全量测试（本机复核 / 本地复跑场景）；**CI 单进程不触发**。
 - **影响**：本地并行复跑时该用例假失败（`Test timed out in 5000ms`），非产品缺陷；本批使它变慢约 +320~350ms（本轮交错实测，见本批笔记第 51 行）。
 - **现有兜底**：无（测试侧）。
-- **状态**：**挂账 → 另开独立 chore**（提高该用例超时或改 `vi.waitFor`）；不阻塞本批。
-- **核对**：`/tmp/lockrace-final/concurrent3way/summary.txt`、`/tmp/lockrace-final/concurrent-default5s/summary.txt`；本批笔记第 51 行。
+- **状态**：**已修（本条 chore，仅该用例）**——`test/unit/daemon-process-manager.test.ts:1011` 给该用例加显式超时 `30_000`（`}, 30_000)` 第三参形态，与本仓重测试既有写法一致）。
+  - **范围限定（重要）**：本条 chore **只抬了这一条用例**的超时，**并未**让「并行复跑全绿」成立——本地并行复跑的假失败**不止这一条**（同类未解项见 **D9 / D10**，D7 只是第一个被收口的）。
+  - **取值依据（均为本条 chore 一手实测）**：单跑 ~**1.33s**（热跑 1316/1325/1351ms）；**2 路**并发全量 **4.0–4.4s**（另一轮负载更重时曾到 **10.8–11.2s**，负载档划分见 D9）；**3 路**并发全量 **6.3–6.7s**（>5s ⇒ 默认 5s 超时下**必撞** `Test timed out in 5000ms`）。故取 30s，给最坏形状（3 路 6.7s）约 **4.5×** 余量；`vi.waitFor` 版不再需要。不阻塞本批。
+- **核对（可复跑形状；原 `/tmp/lockrace-final/**` 取证已随 `/tmp` 清理失效——`/tmp/lockrace-final` 现不存在），命令形状与对齐口径源自本批笔记第 51 行**：
+  - **命令**：`pnpm vitest run --reporter=verbose`；**看该用例那一行的耗时字段**（用例名 `stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters`，**行尾裸耗时（如 `1415ms`）**）；**失败只认** `Test timed out in 5000ms`（默认超时被打穿的签名）。
+  - **单进程**：**1 个进程**只跑该文件——`pnpm vitest run test/unit/daemon-process-manager.test.ts --reporter=verbose`。
+  - **2 路并发**：**2 个进程**同时**各跑全量**（`pnpm vitest run --reporter=verbose`；为免先被 5s 打断可加 `--testTimeout=60000`）。
+  - **3 路并发**：**3 个进程**同时**各跑全量**，同上（保持默认 5s，才看得到 `Test timed out in 5000ms`；**但当前树上有前提**：该用例已在 `test/unit/daemon-process-manager.test.ts:1011` 带了第三参超时 `30_000`（本 chore 所加），要复现上面这个签名**须先移除这条显式超时**——不移除的话，该签名不会再从这条用例冒出来（其它未收口的同类用例见 D9））。
+  - **负载档**：跑前**记下当时的 1 分钟 loadavg**（`uptime`）再判定；本批观察到的有意义分档是 load **12–17**（中）与 **21–34**（高，见 D9），**同档才横向可比**（跨档绝对值会被后台负载污染）。
+- **原始取证（已失效，仅留出处）**：`/tmp/lockrace-final/concurrent3way/summary.txt`、`/tmp/lockrace-final/concurrent-default5s/summary.txt`、`/tmp/lockrace-final/single/summary.txt`——`/tmp` 会被清理，故本条目一律以**可复跑形状**（上）为准。
 
 #### D8｜D1 的告警分支无自动化用例
 
@@ -339,6 +352,42 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 - **现有兜底**：收口轮的实验验证（`/tmp/lockrace-close2/warnprobe/` 注入缝副本）+ 审计复核。
 - **状态**：**挂账**（可选；要钉需新增注入缝或 `vi.mock("node:fs")`，本批未做）。
 - **核对**：`grep -n "console.warn" src/daemon/process-manager.ts`；`grep -n "readChildPids" test/unit/daemon-process-manager.test.ts`（应为空）。
+
+#### D9｜真 spawn daemon 的重测试在高负载并行复跑下同样超时（与 D7 同类）
+
+- **现象**：`test/unit/daemon-service.test.ts:523`（`a second daemon on the same HERDSMAN_HOME fails on the instance lock; SIGTERM releases it and allows restart`，**会真 spawn daemon** 的重测试）在 **3 路并发 + 高负载**下 **3/3** 记到 `Test timed out in 5000ms`。
+- **触发条件**：同一机器上 3 个进程各跑全量，且后台负载处于高挡（实测 **load 21–34**）；同形状在 **load 12–17** 的 3 路运行 **0/6**——即「多进程 + 高负载」同时满足才触发。
+- **影响**：本地并行复跑时该用例假失败（`Test timed out in 5000ms`），**非产品缺陷**。与 D7 **同类**：本地并行复跑的假失败**不止 D7 这一条用例**，D7 只是第一个被抬超时收口的。
+- **现有兜底**：无（本条 chore 只给 D7 那一条用例抬了超时，**未覆盖本条**）。
+- **状态**：**已立项**（owner 2026-10-01 决定：把“本地并行复跑假失败”这一类一起收拾；D7 已修，D9/D10 与其同类，另开批次处理）。
+- **核对**：`sed -n '523p' test/unit/daemon-service.test.ts`；复跑形状同 **D7「核对」段**（高负载、3 路并发全量、`--reporter=verbose`，看 `Test timed out in 5000ms`）。
+
+#### D10｜断连宽限集成用例在高负载并行复跑下断言被打穿（非超时）
+
+- **现象**：`test/integration/orchestrator-disconnect-grace.test.ts:306` 在高载 3 路并发下 **1/3** 出现 `AssertionError: expected { paneId: 'wB:p-owner', … } to be null`——**非超时**，失败点是 `:304-306` 的 `expect(orchestrator.status({…})?.owner).toBeNull()`。
+- **触发条件**：高负载 + 3 路并发全量复跑；该断言依赖 `scheduler.advance(60)` 之后的 tick/时序假设。
+- **影响**：断言对 tick/时序的假设被负载打穿 ⇒ 本地并行复跑出现**假失败**（同类噪声，非产品缺陷）；因**不是超时**，抬高该用例超时**解决不了**，须改断言形状（如把对 tick/时序的假设改成可等待条件）。
+- **现有兜底**：无。
+- **状态**：**已立项**（owner 2026-10-01 决定：把“本地并行复跑假失败”这一类一起收拾；D7 已修，D9/D10 与其同类，另开批次处理）。
+- **核对**：`sed -n '303,307p' test/integration/orchestrator-disconnect-grace.test.ts`；复跑形状同 **D7「核对」段**（高负载、3 路并发全量，看该行的 `AssertionError`）。
+
+#### D11｜该压测用例已不再有性能探测力
+
+- **现象**：`test/unit/daemon-process-manager.test.ts:1011` 的显式超时 `30_000` ≈ **单跑耗时的 21×**（单跑 ~1.3–1.4s）——这个阈值实际只兜「不挂死」，**探测不到** D7 记录的 +320~350ms 级变慢。
+- **触发条件**：任何想靠本用例回看性能回归的时刻。
+- **影响**：本用例**不再是性能信号**。**不能**简单下调阈值换探测力：`10_000` 这一档已被 oracle 实测证伪（在该档下并行复跑仍会假失败）。
+- **现有兜底**：无（本用例现在只保「200 轮无双主控」的**正确性**语义）。
+- **状态**：**已决定：不保留**（owner 2026-10-01：该用例只做并发正确性，不设性能门限；若将来要性能信号，另开不受并行负载影响的形状）。
+- **核对**：`sed -n '1010,1011p' test/unit/daemon-process-manager.test.ts`（`}, 30_000);`）。
+
+#### D12｜台账卫生：引用数字不可复算、`/tmp` 锚点全部失效（全台账通病）
+
+- **现象**：本条台账（A/B/C/D 各节）大量引用 `/tmp/**` 取证路径与其内数字，但 `/tmp` 会被清理（**本会话已发生一次 `/tmp` 目录整体消失**，`/tmp/lockrace-final` 现已不存在，见 D7 核对段）；且**部分引用数字在台账内查无对应记录、不可复算**——本文件历史里出现过引用「只存在于**未提交版本**中的数字」的例子（写作时点那个数字不在任何已提交版本里，本轮已删除），后来的读者无从核对。**通则**：引用台账数字前，先确认它在**已提交内容**里可查（如 `git log -S<数字>` / `git show <rev>:<文件>`），查不到就不得拿来当核对锚点。
+- **触发条件**：任何后来的核对者想按锚点复核时。
+- **影响**：锚点失效 ⇒ 台账条目**无法自证**。**属全台账通病，非本条 chore 引入**（本轮只把 D7 一条换成了可复跑形状）。
+- **现有兜底**：无（只能靠形状复跑，不能靠路径取证）。
+- **状态**：**挂账（台账卫生）**——待统一整改：把 `/tmp` 路径锚点改为**「可复跑形状」**（命令 + 进程数 + 负载档 + 判定字段）与**仓库内**路径/命令。
+- **核对**：`grep -rn "/tmp/" .agents/notes/`（列出全部待整改锚点；本轮只处理了 D7）。
 
 ## 被放弃的方案（必填）
 

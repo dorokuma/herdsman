@@ -1006,7 +1006,9 @@ exit 0
     expect(doubleMasterCount, countsMsg).toBe(0);
     expect(bothLostCount, countsMsg).toBeLessThanOrEqual(10);
     expect(singleMasterCount + bothLostCount + doubleMasterCount, countsMsg).toBe(200);
-  });
+    // 单跑约 1.4s，但并行复跑会升到 4～6.5s（3 路并发的全量复跑已越过 vitest 默认 5s），
+    // 故显式抬高本用例超时，避免并行复跑时的假失败。
+  }, 30_000);
 });
 
 function runtimeRecord(dir: string): DaemonRuntimeRecord {
