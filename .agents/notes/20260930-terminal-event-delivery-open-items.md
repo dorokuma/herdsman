@@ -281,6 +281,10 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 > **追加（2026-10-02，`fix/ledger-test-timing` 批 · 第二轮；`[MARK-FOLLOWUP-LEDGERTIMING2]`）**：① **D9 外层预算＝owner 拍板**——owner 2026-10-02 决定把 `test/unit/daemon-service.test.ts` 该用例的第三参由 `30_000` 抬到 **`45_000`**（落点现 **`:639`**、用例声明现 **`:544`**），**消掉 (30s, 40s] 这个「两段 20s 串联」造成的假失败窗口**（**不是** worker 判断）；详见 D9 段与 D14②。② **三处屏障用例加测试级第三参 `}, 10_000);`**（oracle should-fix S1，可诊断性）：`test/unit/daemon-service.test.ts:151` / `:216` 与 `test/unit/daemon-process-manager.test.ts:745`，**轮询预算仍为 `5_000`**（D16 口径不变）——独立理由＝**轮询到期必须早于测试级超时，谓词错误才报得出来**（否则只剩 `Test timed out in 5000ms`）；**未改** `vitest.config.ts`。③ **措辞收敛（oracle S2）**：D13③ 的「负载下可能假失败」订正为「**结构性假设：沉降必须在一个宏任务 turn 内完成**」（S2a，见 D13 段）；D14② 的「只改失败签名、不改失败面」订正为「**消掉 (30s, 40s] 的假失败窗口，不改真失败面**」（S2b）。④ reviewer / oracle 的 5 条遗留（参数形态不齐、D13 账目算式、锚点漂移、口径外同族、② 类附注）**逐条落进 D17｜遗留清单**。本批**仍只动 `test/**` 与本台账**，未提交。
 > **本轮锚点位移（本批自身造成，供后续批次）**：新增测试级第三参与注释使 `test/unit/daemon-service.test.ts` 在 `:145-216` 区间**净 +5 行** ⇒ D9 用例声明 `:539` → **`:544`**、第三参 `:631` → **`:639`**、内部两段 20s 上界 `:572-581` / `:601-604` → **`:577-586`** / **`:606-609`**；`test/unit/daemon-process-manager.test.ts` 在 `:739` 之后**净 +3 行**（该文件 `:739` 之后的既有锚点后移 3 行）。**D12 / 锚点卫生按派单仍由后续批次处理**，此处只登记。
 
+> **追加（2026-10-01，`chore/ledger-hygiene-d12-d15` 批；`[MARK-LEDGER-HYGIENE-D12D15]`；本机 `date` 实测 `2026-10-01`，批内前序条目记为 10-02 属时钟差异，本条按本机实测日期）**：**① 三处测试面小修**（`test/unit/daemon-process-manager.test.ts` 的 D1 降级用例把两个 handle 的 `release()` 移进 `finally`＝**D17(n) 收口**；同文件 SIGKILL 用例的无界 `child.on("exit")` 改为**有界轮询**＝**D17(f) 收口**，落点 `:793-795`，紧接的 flock 释放屏障 `:800-802`（**本轮 fix-round 后为 `:810-812` / `:817-819`**，映射见 D12.4）；`test/integration/herdr-socket-client.test.ts` 那条被丢弃的 `Promise.race` 改为**显式断言**＝**D17(d) 收口**），三处**断言一字未放宽**（`git diff -U0` 只增不删断言），每处都有**负控**（**修前 / 修后对照 + 注入必失败**；**原始输出不在 D15 段**——D15 段内 0 处命中，实际落点是 **D17 段 (d)/(f)/(n) 的「负控」块**，本轮另见下条 `[MARK-D12D15-FIXROUND]`）。**② D12 台账卫生**：`/tmp` 锚点与引用数字逐条处置、位移映射收进 **D12.4** 一处（本节内新增 D12.1–D12.5）。**③ D15 证据边界**：用台账配方（26 个 busy-loop；**订正**：原写「loadavg 24.6–28.0」的高值来自**只落 stdout、已随会话压缩不可复算**的首轮 ⇒ 可复算负载档以 **D15 段落盘记录**为准＝ 24.43 → 26.65 与 11.20 → 21.43）补测三处屏障占用率、D9 用例、`waitForNotification` 峰值、4 处 spawn 点；并把 `pnpm check` 的 `Bad substitution` 噪声**归因验证**（harness 固定 `/bin/sh -c`＝dash；本批一手复现逐字同一文案 `/bin/sh: 1: Bad substitution (exited with code 2)`）。**本批只动 `test/**` 两个文件与本台账**，`src/**` 零改动、`vitest.config.ts` 未动、**未提交**。
+>
+> **追加（同日第二轮，`chore/ledger-hygiene-d12-d15` fix-round；`[MARK-D12D15-FIXROUND]`）**：按双审结论落完 **oracle 3 条 should + 3 组同类补完 + 3 项登记**（工作树仍未提交，`HEAD` = `0a1d6b7`）。**① should#1（D12.4 轨迹格不可复算）**：逐 rev 按行内容实测订正为 `:62 @ 5433525`–`b6c3b87` → **`:63 @ 2555b2b`** → **`:64 @ 5b7181b`/`105286f`** → **`:127 @ 0a1d6b7`/本批**（与 oracle 实测一致）。**② should#2（指针错）**：顶部条原写「负控…见 **D15 段**「负控」行」，实测 **D15 段内 0 处命中** ⇒ 改指 **D17 段 (d)/(f)/(n)**，并复核该条其余指针（D12.4 / D15 ⑤ 均已落点）。**③ should#3（「都」过泛）**：「同文件其它真 spawn 用例**都**在 `finally` 里杀子进程」实测**只有 3/6**（见 D17(n) 订正），**台账与代码注释两处同口径改**。**④ 同类补完（3 处，各带负控）**：`two real concurrent processes…` 的两处**无界 `on("exit")`** 改**有界轮询**（`:758` / `:761`；负控＝SIGKILL 打空 ⇒ 修前只剩裸 `Test timed out in 5000ms`，修后报**具名** `Timed out after 5000ms waiting for the … after SIGKILL`）；该用例与 `stress test: 200 rounds` 的**杀子进程补进 `finally`**（负控＝让 kill 永不执行 ⇒ 修前残留 `holders=2` / `alive_tsx=2`，修后 `0/0`）；`herdr-socket-client` 那条断言**带上错误原因**（`stream-error: <err>`）且 **teardown 挪进 `finally`**（负控＝断言处必失败 ⇒ 修前 `10064ms` + `Hook timed out in 10000ms` 第二条报错，修后 `62ms` 单条报错）。**⑤ 一处预算新增（需 reviewer 追认）**：该用例按本文件既有口径加第三参 **`}, 10_000);`**——理由与 S1 同（**轮询 5s 到期必须早于测试级超时**，否则谓词错误报不出来；负控两态原文见 D17(r)）。**⑥ 登记（不修）**：D17 新增 **(r)** 假失败窗口（结构性：timer 相位先于 poll 相位；SIGSTOP 可确定性复现；高载实耗余量见条目）、**(s)** 高载测量的背景负载口径（多 agent 会话叠加）、**(t)** 本轮一手新发现的两处残留（SIGKILL 用例的 kill 仍 inline；两处 `readLine` / `nextLine` 是无界等待）。**本轮仍只动 `test/**` 两个文件 + 本节台账**，`src/**` 零改动、`vitest.config.ts` / `package.json` 未动、**未提交**。
+
 | # | 残余项 | 来源轮次 | 状态 | 核对锚点 |
 | --- | --- | --- | --- | --- |
 | D1 | `children` 文件不可用 → release 屏障降级为只盯 flock 进程，可能带锁返回 | 收口轮（本批）；残余率引自收口轮测量 | **接受**（已加每进程一次告警；残余由 acquire 重试兜底） | `src/daemon/process-manager.ts:312-333`（读 `:312`、告警 `:326`） |
@@ -294,8 +298,8 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 | D9 | `test/unit/daemon-service.test.ts:523`（真 spawn daemon 的重测试）在 **3 路并发 + 高负载（load 21–34）**下 **3/3** 超时；同形状 **load 12–17** 的 3 路运行 **0/6**——与 D7 **同类** | 本条 chore 文档轮（取证引自 oracle 文档轮）；本批实现 | **已修（2026-10-01，`fix/parallel-flake-timing`）**：该用例补第三参 `}, 30_000);`（落点 `test/unit/daemon-service.test.ts:615`）→ **2026-10-02 owner 拍板抬到 `45_000`**（消掉「两段 20s 串联」的 (30s, 40s] 假失败窗口；落点现 **`:639`**、用例声明现 **`:544`**，见 D14②）。机理＝真 spawn `node --import tsx` + **整模块图 + migrations** 的脚手架开销跑在默认 5s 上，而该用例内部的 `vi.waitFor` 自己就等 **20s**（内部预算反比外层预算长）；30s ≥ 20s 消除错配 | `test/unit/daemon-service.test.ts:544`（`}, 45_000);` 在 `:639`；原记 `:523` / `:615`，见 D14②）；复跑形状同 D7「核对」段 |
 | D10 | `test/integration/orchestrator-disconnect-grace.test.ts:306` 高载 3 路并发下 **1/3** 断言失败（**非超时**） | 本条 chore 文档轮（取证引自 oracle 文档轮）；本批实现 | **已修（2026-10-01，`fix/parallel-flake-timing`）**：依赖结果的 4 处固定 20ms 墙钟 → **轮询屏障** `waitForTerminalDisconnect()`（`test/integration/orchestrator-disconnect-grace.test.ts:447-486`；JSDoc 含本批第二轮补的两条前提 `:468-476`）。机理＝**单一 20ms 墙钟窗口 + 不重试**：事件循环被饿死 >20ms 时，`advance(...)` 跑在 `due=now+50` 宽限定时器**注册之前** ⇒ 定时器被**永久孤立**（虚拟时钟不再前进）⇒ owner 永不清 ⇒ 立刻断言失败 | `test/integration/orchestrator-disconnect-grace.test.ts:303-307`（屏障 `:447-486`）；复跑形状同 D7「核对」段 |
 | D11 | 该压测用例**已无性能探测力**（`30_000` ≈ 单跑耗时的 21×） | 本条 chore 文档轮（取证引自 oracle 文档轮） | **已决定：不保留**（owner 2026-10-01：该用例只做并发正确性，不设性能门限；若将来要性能信号，另开不受并行负载影响的形状） | `test/unit/daemon-process-manager.test.ts:1011` |
-| D12 | 台账引用数字**不可复算** + `/tmp` 锚点**全部失效**（全台账通病，非本条引入） | 本条 chore 文档轮 | **挂账（台账卫生）** | `grep -rn "/tmp/" .agents/notes/`；本轮只处理了 D7 一条 |
-| D13 | `setTimeout(resolve,` 的**全量 33 处四类分列**：其中「断言某事没发生 / 没增长」的反向用法整组＝负载下**检出力下降**（**仅该批**会假通过、不会假失败）；另有 **3 处固定窗口等一个必然发生的结果（2 处沉降错位 + 1 处固定窗口等结果 `:518`；会假失败）**与 **20 处无风险** | 本批（`fix/parallel-flake-timing`）；清单与口径在第二轮补全 | **挂账**（反向整组本批不动：调 sleep 只白加墙钟，不改结构性；**`test/unit/daemon-process-manager.test.ts:518` 是③里的固定窗口等结果**，不在②「不会假失败」的限定内）→ **③ 类 3 处已修（2026-10-01，`fix/ledger-test-timing`；锚点与改法见 D13 段「本批」块，`grep` 口径 33 → 32）**；② / ④ 仍不动；**③ 中两处「沉降错位」的动因已按 2026-10-02 订正为「结构性假设：沉降须在一个宏任务 turn 内完成」（原写「负载下可能假失败」偏强，见 D13 段「本批」块·第二轮）** | 见 D13 段（逐条 `file:line`；四类计数 **10+3+20=33**） |
+| D12 | 台账引用数字**不可复算** + `/tmp` 锚点**全部失效**（全台账通病，非本条引入） | 本条 chore 文档轮 | **部分已修（2026-10-01，`chore/ledger-hygiene-d12-d15`；原记「挂账（台账卫生）」；范围与残留见 **D12.1–D12.5**）**：本台账自身 **18 处 `/tmp` 命中（10 个锚点）** + 引用数字**逐条处置**（重定向到现树可复算锚点 或 标注「历史值@提交」）；散落的锚点位移映射收进 **D12.4** 一处；**残留**＝`.agents/notes/` 下**其它 8 篇**笔记的 **24 处** `/tmp` 锚点（按「不可变原则」+ 本批「只动台账文字」边界**未改写**） | **D12.1/D12.2/D12.3/D12.4/D12.5**（本文档内）；`grep -rn "/tmp/" .agents/notes/ \| wc -l` ＝ **42**（9 篇；本批开工时）→ **55**（本批后，**因新增本段对旧锚点的引用**）；本台账自身：**18**（开工）→ **31**（本批后）；**其它 8 篇 = 24**（两时点不变） |
+| D13 | `setTimeout(resolve,` 的**全量 33 处四类分列**：其中「断言某事没发生 / 没增长」的反向用法整组＝负载下**检出力下降**（**仅该批**会假通过、不会假失败）；另有 **3 处固定窗口等一个必然发生的结果（2 处沉降错位 + 1 处固定窗口等结果 `:518`；会假失败）**与 **20 处无风险** | 本批（`fix/parallel-flake-timing`）；清单与口径在第二轮补全 | **挂账**（反向整组本批不动：调 sleep 只白加墙钟，不改结构性；**`test/unit/daemon-process-manager.test.ts:518` 是③里的固定窗口等结果**，不在②「不会假失败」的限定内）→ **③ 类 3 处已修（2026-10-01，`fix/ledger-test-timing`；锚点与改法见 D13 段「本批」块，`grep` 口径 33 → 32 → **31**（后者见 D13 段「第三轮」，`chore/ledger-hygiene-d12-d15`））**；② / ④ 仍不动；**③ 中两处「沉降错位」的动因已按 2026-10-02 订正为「结构性假设：沉降须在一个宏任务 turn 内完成」（原写「负载下可能假失败」偏强，见 D13 段「本批」块·第二轮）** | 见 D13 段（逐条 `file:line`；四类计数 **10+3+20=33**；**本批后＝ 10+2+19 = 31**，见 D13 段「第三轮」） |
 | D14 | 本批**未修 / 暂留**的点（startup-grace 无屏障、D9 内部 20s 与实际等待上限、新引入轮询的 5s 取值〔第二轮已改为「高载档实测占用 2–4%」〕、D13 组） | 本批 | **挂账**（逐条理由见 D14 段）→ **2026-10-01 `fix/ledger-test-timing` 逐条判定：①/②/③ 保持不动（理由见 D14 段「本批判定」块），④ 的 ③ 子集已由本批修掉** → **2026-10-02：② 已由 owner 拍板修掉（D9 外层 `30_000`→`45_000`）；三处屏障用例加测试级 `}, 10_000);`（oracle S1）；本轮新遗留 5 条见 D17** | 见 D14 段 |
 | D15 | 前序取证 + 本批的**未实测项**（证据边界：D9 未打穿 5s、4 处 spawn 未负载实测、`waitForNotification` 峰值未测、CI 无失败样本〔本批改为**决定**，见 D15 段〕、`:39`/`:119` 两点未在探针下失败、**`pnpm check` 末步的 `Bad substitution` 瞬时噪声未复现 / 未定位根因（`fix/child-process-active-t-state` 批，见 D15 段）**） | 前序 scout + 本批 | **挂账（证据边界）** | 见 D15 段 |
 | D16 | **抬预算判据** + 逐用例占用率清单（谁该抬、谁不抬；判据 vs 个例；偏离判据的个例必须自带独立理由） | 本批（第二关 oracle should-fix 项） | **已落地**（判据 + 清单齐全；据此本批新增 2 处 30s，其余按判据不动，1 处个例保留原状并写明理由） | 见 D16 段；落点 `test/integration/agent-index-service.test.ts:4889`、`test/unit/herdsman-pi-extension.test.ts:4758` |
@@ -484,10 +488,183 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 - **触发条件**：任何后来的核对者想按锚点复核时。
 - **影响**：锚点失效 ⇒ 台账条目**无法自证**。**属全台账通病，非本条 chore 引入**（本轮只把 D7 一条换成了可复跑形状）。
 - **现有兜底**：无（只能靠形状复跑，不能靠路径取证）。
-- **状态**：**挂账（台账卫生）**——待统一整改：把 `/tmp` 路径锚点改为**「可复跑形状」**（命令 + 进程数 + 负载档 + 判定字段）与**仓库内**路径/命令。
-- **核对**：`grep -rn "/tmp/" .agents/notes/`（列出全部待整改锚点；本轮只处理了 D7）。
+- **状态（订正 2026-10-01，`chore/ledger-hygiene-d12-d15`；原记「挂账（台账卫生）」）**：**部分已修**。
+  - **范围（已处置）**＝**本台账自身**：① **18 处 `/tmp` 命中 → 10 个锚点，逐条处置**（D12.2）；② 本台账引用的**计数 / 耗时 / 行号 / 哈希 / 提交号**（D12.3）；③ 散落在 D17(c)/(g)/(g-1)/(i) 与各条正文里的**旧锚点**，**收成一处**（D12.4）。
+  - **残留（未处置）**＝`.agents/notes/` 下**其它 8 篇**笔记的 **24 处** `/tmp` 锚点（D12.5）：按项目 README「不可变原则」+ 本批边界（**只动台账文字**）**不改写**，仅在本台账登记清单与理由。
+  - **纪律**：本段**只动锚点/数字与其订正说明**——不改写历史判断、不覆盖既有结论、不重排表格；所有改变均以「订正」标出，原值保留在正文或本表「旧锚点」列内。
+- **订正前状态（原文保留，便于核对）**：「**挂账（台账卫生）**——待统一整改：把 `/tmp` 路径锚点改为**「可复跑形状」**（命令 + 进程数 + 负载档 + 判定字段）与**仓库内**路径/命令。」
+- **核对（本批两时点实测；格式＝开工时 → 本批后）**：`grep -rn "/tmp/" .agents/notes/ | wc -l` ＝ **42 → 55**（均为 **9 篇**；**增量全在本文档自身**）；`grep -c "/tmp/" .agents/notes/20260930-terminal-event-delivery-open-items.md` ＝ **18 → 31**；⇒ **其它 8 篇的 24 处两时点不变**（就是 D12.5 的残留）。本台账内 `file:line` 锚点共 **98 个**（去重），已按**现树行内容**逐一打印判读（口径见 D12.5）。**两时点差值的原因：本段为了处置旧锚点而大量引用 `/tmp` 路径（引用旧锚点、标注历史值），不新增任何依赖**——这也是 D17(q) 记下的同一件事：**引用即命中**，故 `wc -l` 只能当“卫生度计”，不能当“残留计”。
+
+##### D12.1｜处置判据（本批定死，二选一 + 两条补充）
+
+- **(a) 重定向到现树可复算锚点**：给 `file:line`（**按内容在现树重新定位**，不照抄旧行号）+ 一条可直接粘的复算命令。适用于**仓库内文件**的锚点。
+- **(b) 标注为历史值**：写明「该值在其提交/批次 X 时成立」并给**短哈希**；**值本身不改写**。适用于**测量值 / 已消失的 `/tmp` 取证 / 未提交中间态**。
+- **补充①（形状优先于路径）**：`/tmp` 上的**探针/脚本**（一次性实验器材）无法「重定向到仓库」，处置＝把其**可复跑形状**（命令 + 判定字段 + 负载档）内联到 D12.2 的「探针形状」块；其数字按 (b) 记为历史值。
+- **补充②（跨笔记边界）**：`.agents/notes/` 下**本台账以外**的笔记**不做改写**（不属「只动台账文字」），只在 D12.5 登记＝**残留**。
+
+##### D12.2｜`/tmp` 锚点处置表（本台账 18 处命中 → 10 个锚点，逐条）
+
+| # | 台账内锚点（行） | 处置 | 结果 |
+| --- | --- | --- | --- |
+| 1 | `/tmp/i-test.log`（`:117`、`:133`） | (b) 历史值 | 文件**已删**（前序批次收尾清理 `/tmp`）；值＝该处内联三行摘录，**适用时点＝2026-09-30 15:44、适用树＝`5433525` 之后 / `1136729` 之前**；值不改写 |
+| 2 | `/tmp/herdsman-clean-duplicates-2NEZvC/herdsman.pid.instance.lock`（`:119`） | (b) 历史值 | 是**报错原文**里的临时目录名（引用，不是取证锚点）；该 temp dir 已不存在；原文保留 |
+| 3 | `/tmp/scout-d6/ptrace.sh`（`:198`、`:202`） | (a) 形状内联 | 见下「探针形状」**P1** |
+| 4 | `/tmp/scout-d6/probe2.ts` + `current.ts`/`s1.ts`/`refined.ts`（`:377`、`:399`） | (a) + (b) | 形状见 **P2**；**三版源码副本改为用仓库内提交复算**（本批订正）：旧代码＝`git show b012ba6:src/daemon/process-manager.ts`、精细版＝`git show 2555b2b:src/daemon/process-manager.ts`；**S1 是未提交中间态 ⇒ 不可复算，按 (b) 记为历史值** |
+| 5 | `/tmp/scout-d6/tstate.sh`（`:398`） | (a) 形状内联 | 见 **P3** |
+| 6 | `/tmp/lockrace-docs/measure.ts`（`:289`、`:336`） | (b) 历史值 + 形状 | 值＝D4/D2 两表内数字；**适用树＝`b012ba6`（即台账所称「现行」；该批已提交）**；形状＝两臂各取 `git show <rev>:src/daemon/process-manager.ts` 副本、同轮交错（顺序对调）、n=25/臂/轮、判定字段 p50 / max |
+| 7 | `/tmp/lockrace-close2/item2/run.sh`（`:327`） | (b) 历史值 | 上界 1958/1959/1958ms（收紧前）→ 1000/1000/1000ms（收紧后）；**适用树＝`b012ba6`** |
+| 8 | `/tmp/lockrace-close2/warnprobe/`（`:426`） | (b) 历史值（**已被取代**） | D1 告警分支**现有自动化用例** ⇒ 现树锚点＝`test/unit/daemon-process-manager.test.ts:1322`（用例①）/ `:1365`（用例②），命令 `grep -n "children file warns exactly once\|leaves release watching" test/unit/daemon-process-manager.test.ts` |
+| 9 | `/tmp/lockrace-final/**`（`:413`、`:419`） | (b) 历史值 | 3 路并发 6/6 超时、HEAD 5009–5028ms、现行 5016–5029ms；**适用树＝`61f3295` 之前**（该 chore 已提交、超时已抬到 `30_000` ⇒ 复现该签名须先移除第三参，同段已注明） |
+| 10 | `/tmp/d10-fix-probe/**`（`:458`） | (b) 历史值 | 形状**已在该段内联为可复跑步骤**（`cp` 副本 + 替换 `socketTick()` 体）；数字为历史值 |
+
+- **探针形状（把 P1–P3 从 `/tmp` 脚本改成可直接重敲的形状；`/tmp` 被清后按此重建）**：
+  - **P1（A7「ptrace 不是 `T`」）**：`cat /proc/sys/kernel/yama/ptrace_scope` → 起一个长跑（或持锁）进程 → `strace -p <pid>` 附着 → 读 `/proc/<pid>/stat` 的 state（**实测仍是 `S`**）→ **在附着状态下**再 `kill -STOP <pid>` → 再读（**实测小写 `t`**；原表达式只排除 `Z`/`X`/`T` ⇒ 小写 `t` 本来就判活）。
+  - **P2（D6 三形状）**：`pnpm exec tsx <probe> <process-manager 副本> <A|B|C> <1|2|3>`；副本＝`git show b012ba6:…`（旧）/ `git show 2555b2b:…`（精细版）；形状 A＝READY 后真 `SIGSTOP`、B＝pre-READY 真 `SIGSTOP`（**须确定性配方**：fake 慢 `sh` + 真 `SIGSTOP`）、C＝release 侧真 `T`；判定字段＝`handle` / 耗时 / `helpersSeen` / `readyEverAtEnd` / `lockHeldWhileFrozen`。
+  - **P3（A7「OS 事实」）**：`flock -x -n f.lock sh -c 'exec cat' &` → `kill -STOP` 持锁者（父与子均呈 `T`）→ `flock -x -n f.lock true`（**预期 `exit=1`，锁仍被持**）+ `kill -0 <pid>`（成功）→ `kill -KILL` 后 `flock -x -n f.lock true`（预期 `exit=0`）。
+
+##### D12.3｜引用数字处置表
+
+**① 现树可复算（本批一手重算，命令可直接粘）**
+
+| 台账写法 | 现树值（2026-10-01） | 复算命令 / 现树锚点 |
+| --- | --- | --- |
+| `53 文件` | **53** | `git ls-files 'test/**/*.test.ts' \| wc -l`（口径同 `vitest.config.ts:18`） |
+| `840 用例`（现基线） | **840**（＝**53 文件 / 840 用例**，本批 `pnpm test` 实测，`EXIT=0`；本批**未增删用例**，±0） | `pnpm test` |
+| `33 处` / `32`（D13 口径） | **31**（本批再 −1：`herdr-socket-client` 那一处**换了写法**，不再命中该 grep 形状） | `grep -rn "setTimeout(resolve," test/ \| wc -l` |
+| `/tmp` 命中（全局 / 本台账） | 开工时 **42 / 18**（9 篇）→ 本批后 **55 / 31**；**其它 8 篇恒为 24** | `grep -rn "/tmp/" .agents/notes/ \| wc -l`；`grep -c "/tmp/" <本台账>` |
+| 显式逐用例预算（`30_000`/`45_000`/`120_000`/`10_000`） | **41 处命中**（含 `}, 10);` 这类**非** vitest 第三参，口径提示见 D16；**fix-round 新增 1 处**＝ `test/unit/daemon-process-manager.test.ts:775`，值 40 → 41） | `grep -rnE "\}, [0-9_]+\\);" test/` |
+| `1000ms`＝`ACQUIRE_WINDOW_MS` | `src/daemon/process-manager.ts:495` | `grep -n "ACQUIRE_WINDOW_MS = " src/daemon/process-manager.ts` |
+| `100ms`＝release best-effort 预算 | `:703` | `grep -n "Date.now() + 100" src/daemon/process-manager.ts` |
+| `4 次`＝`ACQUIRE_MAX_ATTEMPTS` | `:515`（重试间隔 `:516`） | `grep -n "ACQUIRE_MAX_ATTEMPTS\|ACQUIRE_RETRY_DELAY_MS" src/daemon/process-manager.ts` |
+| `200 轮`（压测规模） | 用例名内含；用例声明 `test/unit/daemon-process-manager.test.ts:1450` | `grep -n "200 rounds" test/unit/daemon-process-manager.test.ts` |
+| `26 个 busy-loop`（高载配方） | 沿用：`for i in $(seq 26); do ( while :; do :; done ) </dev/null >/dev/null 2>&1 & done`（本机 **12 核**，暖机 90s）；本批实测 1 分钟 loadavg **21.43** / **24.43 → 26.16 → 26.65**（两次同配方轮次，落在 D9 原始档 **21–34**） | `cat /proc/loadavg`；`uptime`；原始输**已就地内联**（见 D15 段；临时文件已在本批收尾清理） |
+| `2s`＝`waitForNotification` 总预算 | `test/integration/rpc-test-client.ts:71`（1000 × 2ms）+ 轮询 `:75`；本批高载实测峰值 **6ms**（D15） | `grep -n "attempts = 1_000\|setTimeout(resolve, 2)" test/integration/rpc-test-client.ts` |
+| `5s` 默认预算 / `20s` 内部上界 / `10_000` / `30_000` / `45_000` / `120_000` | 现树可复算（锚点见 D12.4） | `grep -n "timeout: 20_000\|}, 45_000);\|}, 10_000);" test/unit/daemon-service.test.ts` |
+| 提交号 `b59ac96` / `5433525` / `7c4a36b` / `ce17071` / `d03c3a5` / `0a1d6b7` / `1136729` / `b012ba6` / `2555b2b` / `61f3295` / `b6c3b87` / `105286f` / `5b7181b` | 全部存在且标题可查 | `git log -1 --format='%h %ad %s' --date=short <hash>` |
+| amend 前哈希 `233b106` / `34763e6` | **对象仍存在**（message 与 H1 / Phase 1 同标题，可 `git show`） | `git cat-file -t 233b106`；`git log -1 --oneline 233b106` |
+
+- **批次 → 提交映射（本批一手核对；台账多处写「未提交」，现已全部落在 `main`，是 D12 的主要订正依据）**：H1＝`b59ac96`、Phase 1＝`5433525`（共同基线 `7c4a36b`）；**A5/A8（errno 分流）＝`1136729`**（merge `ce17071`）；**D1–D5（release 屏障 + 有界重试）＝`b012ba6`**；**D7 + D9–D12 文档轮＝`61f3295`**；**D9/D10 修复 + D13–D16 + `[MARK-FIX-SHOULD2]`＝`b6c3b87`**；**D6（判活相位化）＝`2555b2b`**；**D13③/D14/D16/D17 两轮＝`105286f`**；**D8 覆盖＝`0a1d6b7`（本批 base）**；`5b7181b`＝daemon status 监督事实位（**本文件行号漂移的主因**，插在判活/锁函数之前）。核对：`git log --oneline -- .agents/notes/20260930-terminal-event-delivery-open-items.md`。**口径差订正（2026-10-01，同日第二轮 fix-round；来源＝oracle）**：`[MARK-FOLLOWUP-LEDGERTIMING2]` 那一批的**台账文字自称「未提交」**，但**其实体内容已随 `105286f` 落地**（本批一手核：`git show 105286f:test/unit/daemon-service.test.ts` ＝ `}, 45_000);` `:639`、`}, 10_000);` `:151`/`:216`；`git show 105286f:test/unit/daemon-process-manager.test.ts` ＝ `}, 10_000);` `:745`；该 commit 同时含整段 FOLLOWUP 台账文字）⇒ **后人不要按「未提交」去寻找中间态**（不存在「提交前的中间版本」）；批次名与 commit 的对应关系以本行及 D12.4 为准。
+
+**② 历史值 @ 提交（值不改写；给适用提交/批次）**
+
+| 数字（台账写法） | 适用批 / 提交 | 备注 |
+| --- | --- | --- |
+| 用例数 `818` / `820` / `821` / `822` / `823` / `838` / `840` 与各处 `53 文件` | 各批当值 | 本批仍为 **53 文件**；用例数见 D12.3① |
+| D3 上界 `1958/1959/1958ms` → `1000/1000/1000ms` | `b012ba6` | 病理构造实测；本批未重算 |
+| D4 失败延迟 `p50 1.99–2.13ms → 11.03–11.06ms`（max ≤2.78 / ≤11.70ms） | `b012ba6` | 同上 |
+| D1 残余率 `1/6000` | `b012ba6`（引自收口轮） | 本批未复现 |
+| D7 增量 `+349.5ms（+33.5%）` / `+319.5ms（+7.9%）` / `+320~350ms` | `b012ba6` | 同轮交错互比 |
+| 200 轮压测单跑 `1.33s`（`1316/1325/1351ms`）、2 路 `4.0–4.4s`、3 路 `6.3–6.7s`、高载 3 路 `10.7–11.5s` | `61f3295` | 本批高载单跑一手值（`5163ms` / `5418ms`）见 D15，以**追加**形式并存 |
+| D9 用例 3 路低载 `2560ms`；`51%（灰区上沿）` | `105286f` | 本批一手：低载单文件 **327ms**、高载单文件 **1736ms**（D15） |
+| `4014ms` / `3025ms`（隔离单跑）、`4084ms` / `3038ms`（低载 3 路，占用 82% / 61%） | `b6c3b87` | 未重算 |
+| 高载屏障实耗 `144/113/101/125ms`、重试循环 `198ms`（占用 2–4%） | `b6c3b87` 之前（引自 oracle 轮） | 本批高载一手新值见 D15 |
+| flock 调用计数 `400` / `433` / `485` / `463` / `511` | `b012ba6` | 两轮口径未统一（段内已如实登记） |
+| D6 三形状 `7–8ms` / `55–66ms` / `60–66ms` / `62/62/64ms` / `1000/1000/1000ms`、`releaseMs 0/1/0` | `2555b2b`（精细版）/ `b012ba6`（旧） | **S1 臂属未提交中间态 ⇒ 不可复算** |
+| A5 失败率 `3–7%`、`50ms 后重试 100% 成功` | 引自 oracle R5 复核 | 台账原已标「本批未独立复现」；现统一按 (b) 记 |
+| 锁 flake 复现率 `串行约 10%/轮`、`2 条并发约 20%/轮` | `b012ba6` 之前的侦察轮 | 同上 |
+| `55 文件 / 842 用例`（另一次独立复核） | 临时副本（含额外测试文件） | 台账已注明「已被第一手测量取代」 |
+
+**③ 不可复算 / 无落盘证据（残留，如实登记，不自行补值）**
+
+- **A5(a)** 的 18:13 / 18:26 那次失败：输出未落盘、用例名未捕获（台账已注明「已知缺口」）。
+- **errno 从未落盘**：A5(a)/(b) 两次观测都未捕获 `/proc` 读失败的具体 errno（A5「更新」段已注明）。
+- **`/tmp/i-test.log` 的三行摘录**：文件已删，值保留在正文（不可复算）。
+- **A8④ 的 `≈95 万次读 / 0 次空读`** 与 **oracle 各轮的全部数字**（高载 3 路 3/3 全绿、屏障点实耗等）：**引自他轮报告，本批无原文**，已在行内标注来源。
+- **S1 中间态的一切数字**：未提交 ⇒ 不可复算。
+
+##### D12.4｜锚点位移映射（唯一权威表；各条正文里只留指针）
+
+> 口径：`旧 file:line` @ 适用提交/批次 → **现 `file:line`（2026-10-01 工作树，按内容核对）**。核对手法＝脚本把台账里每个 `file:line` 的**现树行内容**打印出来逐一判读（口径见 D12.5），符号/引文匹配即算命中。
+
+**`src/daemon/process-manager.ts`**（漂移主因＝`5b7181b` 在本文件判活/锁函数**之前**插入 daemon status 监督事实位代码）
+
+| 旧锚点（台账原记） | 现锚点（按内容核对） |
+| --- | --- |
+| D1 行 `:312-333`（读 `:312`、告警 `:326`） | 读 `readChildPids` **`:401`**、catch **`:407`**、告警 **`:413-417`**（`console.warn` **`:415`**、文案 **`:416`**）；命令 `grep -n "readChildPids\|children is unavailable" src/daemon/process-manager.ts` |
+| A8 的 `sed -n '313,320p'` | **`:478-490`**（`const code` **`:483`**、`return code !== "ENOENT" && code !== "ESRCH"` **`:484`**） |
+| A7 位置 `:293-324` / `:293-328`；判活行 `:312` | `isChildProcessActive` **`:445-490`**；判活行 **`:476-477`**（`pausedCountsAsActive` `:476`） |
+| D6 `type ChildLivenessPhase` `:349`（后记 `:354`）、签名 `:351-355`/`:356-361`、JSDoc `:334-348`/`:334-353`、函数内注释 `:367-376`/`:372-381`、判活行 `:378-379`/`:387-388` | `type` **`:443`**、签名 **`:445-450`**、JSDoc **`:427-442`**、函数内注释 **`:461-475`**、判活行 **`:476-477`** |
+| D6 其余：`ACQUIRE_WINDOW_MS` `:397`/`:406`、READY 分支 `:486`/`:495`、pre-READY 调用点 `:504`/`:513`、放弃判定 `:515`/`:524`、release 屏障 `:607`/`:616` | `ACQUIRE_WINDOW_MS` **`:495`**、READY 分支 **`:584`**、pre-READY 调用点 **`:602`**、放弃判定 **`:613`**、release 屏障 **`:705`** |
+| A5 区段 `:296-398`；`if (!isChildProcessActive(child.pid)) break;` `:345-347`；SIGKILL 判定 `:357`（kill `:359`）；`throw` `:426`/`:451`/`:457` | `acquireFlockHandle` **`:635-733`**；break 判定 **`:602-604`**；SIGKILL 判定 **`:613-616`**（组 kill **`:615`**）；错误文案 **`:739`**、`throw` **`:745`** |
+| D3 `:371` / `:452` / `:515` | 窗口钳制 **`:576`**、attempt 循环 **`:647`**、窗口耗尽 `return null` **`:674`**、抛错 **`:745`** |
+| D4 `:391`（`ACQUIRE_MAX_ATTEMPTS`） | **`:515`** |
+| D2 `:574`（release 100ms） | **`:703`** |
+| D8 现树锚点 `:401` / `:408` / `:413-417` / `:388` / `:588` / `:705` / `:343` / `:352` | **仍命中**；**订正**：catch 是 **`:407`**（`:408` 是 catch 内注释首行，D8 段写 `:408` 属 off-by-one） |
+
+**`test/unit/daemon-process-manager.test.ts`**（漂移＝`0a1d6b7` 批 **+185 行**、本批 **+17 行**（`git diff --numstat`：`+20 −3`；1546 → **1563** 行）= `:788` 起 **+7**（SIGKILL 用例）/ `:1388` 起 **+8** + `:1442` 起 **+2**（D1 降级用例；另两处同行替换净 0），**同日第二轮 fix-round 再 +27 行**（1563 → **1590**；`:739` 起 **+17** / `:1396` 起 **+18** / `:1506` 起 **+27**）；下表已换成**最终（fix-round 后）**行号，旧值在括号里标注
+
+| 旧锚点（台账原记） | 现锚点（按内容核对） |
+| --- | --- |
+| D13③ 固定窗口 `:518`（＝pre-batch 实测 `:728`） | 该窗口已被轮询取代；等价锚点＝屏障 **`:817-819`**（批 3＝ `:800-802`）。**实测轨迹（本批一手，见下表）**：固定窗口 `:517` @ `5433525`–`b6c3b87` / **`:518` @ `2555b2b`** → **`:727-728` @ `5b7181b`** `b6c3b87`（`setTimeout(resolve, 50)` 在 `:728`）→ **本批（`105286f`）替换为屏障 `:730-732`** → `:793-795` @ `0a1d6b7` → `:800-802` @ 本批（批 3）→ **`:817-819` @ 本批 fix-round**（**注**：旧文一处把替换归因于 `61f3295`，实测应为 **`105286f`**；`61f3295` 只改了压测第三参） |
+| D17(a)/D13③ 屏障 `:730-732` | **`:817-819`**（批 3＝ `:800-802`） |
+| D13 ② 第三参 `:745` | **`:832`**（`}, 10_000);`；用例声明 **`:777`**）（批 3＝ `:815`/`:760`）；旧值 `:745` 属 **`105286f`** 树（实测）。**本批 fix-round 另新增一处 `}, 10_000);`＝ `:775`（`two real concurrent…`），理由见 D17(r) / D16** |
+| D17(f) 无界等待 `:725` | **本批已消除**，改为有界轮询 **`:810-812`**（`description: "the SIGKILLed flock holder to exit"`；批 3＝ `:793-795`） |
+| D13④ 轮询 helper 的 sleep `:62` | **分段轨迹（订正于同日第二轮 fix-round；见 D17(c)①）**：`:62 @ 5433525`–`b6c3b87` → **`:63 @ 2555b2b`** → **`:64 @ 5b7181b`/`105286f`** → **`:127 @ 0a1d6b7`/本批**（本批 `grep`：该文件内此形态**仅 1 处**，fix-round 未动它；**原写「`:64 @ 2555b2b`」错 1 行，已订正**） |
+| D7/D11/D16 的 `:1011`（旧树即已漂移） | 用例声明 **`:1468`**；第三参 `}, 30_000);` **`:1576`**（批 3＝ `:1450`/`:1549`） |
+| D6「反证」落点 `:1020` | **`:1323`**（`expect(helperPids.length).toBeGreaterThanOrEqual(2);`；批 3＝ `:1306`） |
+| A5「本批的回归用例 `:645-678`」 | **`:1181-1215`**（用例 `a failed or truncated /proc/<pid>/stat read…`，声明 **`:1181`**；`EIO` 注入 `:1202-1204`；批 3＝ `:1164-1198`，声明 `:1164`）；**旧值 `:645` 实测确属 `1136729` 树**（本批脚本核对） |
+| A5「200 轮压力用例顺移至 `:680`」 | **`:1468`**（旧值 `:680` 实测属 **`1136729`** 树；批 3＝ `:1450`） |
+| D8 用例① `:1315` / 用例② `:1358` | **`:1339`** / **`:1382`**（`test.skipIf` 行）、`:1383`（用例名）（批 3＝ `:1322` / `:1365` / `:1366`） |
+| D6 两条 T 态用例 `:912-937` / `:913-956` / `:958-1030`（D17(g-1) 已判旧树 `:1129`/`:1174`） | post-READY **`:1216`** / pre-READY **`:1261`**（批 3＝ `:1199` / `:1244`） |
+| D6 引的相邻用例体 `:624-688` | **`:928-992`**（**按用例标题核对**：＝ `flock handle release waits for every helper process that shares the lock fd`；旧区间起点是空行、±1 行；批 3＝ `:911-975`） |
+| mock 缝 `:47` / `:57`、`flockPidOfLastChildrenRead` `:87`、`waitForCondition` 定义 `:114` | **仍命中**；本批**新增调用点一处**＝ `:793`（其后既有的 flock 屏障 `:800-802` **方法未变**、只随行号位移）；**fix-round 后再 +2 处**＝ `:758` / `:761`（`two real concurrent…` 的两处 reap，并在**本档内首次**把测试级第三参从默认抬起，见 D16）⇒ `waitForCondition` **调用点现共 12 处**＝ `:657` / `:758` / `:761` / `:810` / `:817` / `:881` / `:897` / `:1196` / `:1255` / `:1329` / `:1377` / `:1456`（本批 `grep` 核对；批 3 的 10 处＝ `:657` / `:793` / `:800` / `:864` / `:880` / `:1179` / `:1238` / `:1312` / `:1360` / `:1438`；旧文里「4 处既有用法」是**部分列举**） |
+
+**跨提交位移轨迹（本批一手实测；口径＝按行内容在各 rev 的 `git show <rev>:<file>` 里定位行号，**脚本形状见 D12.5**）**——D17(c) 要求的「分段轨迹」即此表：
+
+| 标记（行内容） | `5433525` | `b012ba6`/`61f3295`/`b6c3b87` | `2555b2b` | `5b7181b` | `105286f` | `0a1d6b7` | 本批（含 fix-round） |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **文件总行数** | 756 | 1023 / 1025 / 1025 | 1145 | 1354 | 1361 | 1546 | **1563**（批 3）→ **1590**（fix-round） |
+| 本段位移量 | — | +267（@`b012ba6`） | **+1** | **+209** | **+7** | **+185**（头部 +63 / 末尾 +122） | **+17**（`:788` +7 / `:1388` +8 / `:1442` +2；批 3）+ **+27**（fix-round：`:739` +17 / `:1396` +18 / `:1506` +27） |
+| `flock held … SIGKILL`（用例名） | 487 | 487 | 488 | 697 | 697 | 760 | **777**（批 3＝ 760） |
+| `child.on("exit", resolve)`（无界等待） | 515 | 515 | 516 | 725 | 725 | 788 | **已消除**（批 3 `:793-795` → fix-round **`:810-812`**） |
+| `Brief settling delay for kernel cleanup`（D13③ 固定窗口） | 517 | 517 | 518 | 727 | **已消除**（→屏障 `:730-732`） | →`:793-795` | →`:800-802`（批 3）→ **`:817-819`** |
+| `}, 10_000);`（SIGKILL 用例第三参） | — | — | — | — | 745 | 808 | **832**（批 3＝ 815）；**另一处新增**：`:775`（`two real concurrent…`，同理由，见 D16/D17(r)） |
+| `}, 30_000);`（压测第三参） | — | 1011（`61f3295`/`b6c3b87` 时为 1011） | 1131 | 1340 | 1347 | 1532 | **1576**（批 3＝ 1549） |
+| `a failed or truncated /proc…`（A5 用例） | — | — | — | — | — | 1157 | **1181**（批 3＝ 1164） |
+| `a failed or truncated /proc…`（@`1136729` 首次出现） | — | **645 @ `1136729`** | — | — | — | — | — |
+| `stress test: 200 rounds`（压测用例名） | 645 | 912 | 1032 | 1241 | 1248 | 1433 | **1468**（批 3＝ 1450） |
+| `a simulated T-state…`（post-READY 用例） | — | — | 913 | 1122 | 1129 | 1192 | **1216**（批 3＝ 1199） |
+| `an unreadable children file…`（D8 用例①） | — | — | — | — | — | 1315 | **1339**（批 3＝ 1322） |
+| `async function waitForCondition(`（helper 定义） | 49 | 49 | 50 | 51 | 51 | 114 | **114**（fix-round 未动） |
+
+- **本表暴露的往事（供后续批次）**：① **`5b7181b`（daemon status）是 dpm 测试文件的第二个大位移源（+209）**，与 D8 批（+185）同量级——旧文普遍只记得 D8 批；② `105286f` 只 +7，`2555b2b` 只 +1（它把 +119 加在本表多数标记之后）；③' **本批在同一天对同一文件连加两轮位移**（批 3 **+17** + fix-round **+27**）是**本档首次由同一批次**在同一文件上连加两次 ⇒ 引用批 3 中间值时按 `:739` 起 +17 / `:1396` 起 +18 / `:1506` 起 +27 回推；herdr 文件按 `:254` 起 +3（断言行前）/ 文件尾 +8 回推；③ 两个「已知旧值」经实测各归各树：`}, 10_000);` 的 `:745` 属 **`105286f`**，A5 用例的 `:645` / 压测的 `:680` 属 **`1136729`**。⇒ 后续写锚点时**必须带树名/提交号**，否则差一个批次就差几十到几百行。
+
+**`test/unit/daemon-service.test.ts`**（`105286f` 之后行号；本批未动此文件）
+
+| 旧锚点（台账原记） | 现锚点（按内容核对） |
+| --- | --- |
+| D9 用例声明 `:523` / 第三参 `:615` | **`:544`** / **`:639`**（`}, 45_000);`） |
+| D13③ 沉降错位 `:135` / `:190` | 已改形状：屏障 **`:138-145`**（断言 **`:142`**）/ **`:204-211`**（断言 **`:208`**；用例声明 **`:182`**） |
+| `:197-209`（第二轮映射目标） | **`:200-211`** |
+| `:130` / `:132-146` / `:138-146` / `:141` / `:151` / `:216` | **仍命中**（`:151` / `:216`＝两条 `}, 10_000);`） |
+| 内部 `vi.waitFor` `:577-586`（`timeout: 20_000`）/ `Promise.race([childExit, 20s])` `:606-609` | **仍命中**（`childExit` 定义 `:570`、race 内引用 `:607`） |
+
+**其它文件**
+
+| 旧锚点（台账原记） | 现锚点（按内容核对） |
+| --- | --- |
+| `test/integration/herdr-socket-client.test.ts:257`（D13④「race 结果被丢弃」） | **本批改为显式断言**：**fix-round 后（最终）**块 **`:252-285`**（`try` `:254`、sentinel `:264`、`await Promise.race` `:265-276`、断言 **`:274`**、`finally` `:279-285` 内含 `controller.abort()` `:283` / `client.close()` `:284`）；批 3 值＝ sentinel `:261`、race `:262-269`、断言 `:271`、`close()` `:277`（**块内 `:257`–`:273` +3、之后 +8**，见本节末「新位移」条）；**该处已不再命中 `setTimeout(resolve,` 口径**（该文件内此形态＝ **0**） |
+| `src/daemon/observability-server.ts` `:198` / `:613` / `:613-622` / `:618` / `:621` / `:624-636` / `:702-709` / `:727-729` / `:201-213` | **仍命中**（`#stopping = true` `:202`） |
+| `orchestrator-disconnect-grace.test.ts` `:39` / `:119` / `:144` / `:149` / `:168` / `:179-210` / `:253` / `:300` / `:303-307` / `:306` / `:447-486` / `:478` / `:484` / `:494` | **仍命中** |
+| `observability-rpc.test.ts` `:422` / `:483-492` / `:491` / `:765` / `:1054` | **仍命中** |
+| `rpc-test-client.ts:71` / `:75`；`agent-index-service.test.ts` `:1035` / `:4809` / `:4889`；`herdsman-pi-extension.test.ts` `:4417` / `:4701` / `:4708` / `:4758`；`turn-completion-signal.test.ts` `:459` / `:485` / `:489`；`herdsman-pi-daemon-client.test.ts` `:160` / `:283` / `:375`；`herdr-session-watch-manager.test.ts` `:246` / `:929` / `:1237`；`final-audit-regressions.test.ts` `:37` / `:86`；`herdr-session-watch-idle-seam.test.ts` `:84` / `:282`；`herdsman-pi-turn-signal.test.ts` `:14` / `:42`；`event-dedup-pane-generation.test.ts:676`；`agent-history-discovery-regressions.test.ts:149`；`package-publication.test.ts:78`；`herdr-plugin-package.test.ts:72`；`orchestrator-pane-move.test.ts` `:139` / `:320` | **仍命中**（本批按行内容抽验；**未逐条判读的见 D12.5**） |
+| `src/daemon/service.ts:163-164`；`src/db/agent-orchestrator-scopes.ts:254-262`；`packages/herdsman-pi/src/index.ts` `:976-987` / `:997-999`；`src/observability/agent-index-service.ts` `:1074` / `:1735-1752`；`vitest.config.ts:18` | **仍命中** |
+| `.agents/notes/20260929-daemon-shutdown-budget.md:50`（引用未带目录前缀） | **仍命中**（本批解析到该文件并抽验＝「`daemon-process-manager` 偶发 flake」那条）；建议后续补全路径写法 |
+
+- **本批自身造成的新位移（供后续批次；行数均本批 `git diff --numstat` + 行数对比实测）**：`test/unit/daemon-process-manager.test.ts` 本批**净 +17 行**（1546 → **1563**；`+20 −3`），**三个位移点**＝`:788` 起 **+7**、`:1388` 起 **+8**、`:1442` 起 **+2**（`:1400` / `:1426` 两处为**同行替换**、净 0）⇒ 该文件 **「:788 之后」的既有锚点 +7**、**「:1388 之后」+15**、**「:1442 之后」+17**；`test/integration/herdr-socket-client.test.ts` 在 `:257` 处**净 +14 行**（379 → **393**；`+15 −1`）⇒ 该文件 **`:257` 之后**的既有锚点 +14。**完整链条示例（可直接复算）**：D13③/SIGKILL 用例的第三参 `:745` @ **`105286f`** → `:808` @ `0a1d6b7`（+63）→ **`:815` @ 本批**（+7）；屏障 `:730-732` → `:793-795` → **`:800-802`**。
+- **本批自身造成的新位移（**同日第二轮 fix-round**；行数均 `diff` 对比实测）**：`test/unit/daemon-process-manager.test.ts` **净 +27 行**（1563 → **1590**），**三个位移点**＝`:739` 起 **+17**、`:1396` 起 **+18**、`:1506` 起 **+27** ⇒ 该文件 **「:739 之后」+17**、**「:1396 之后」+18**、**「:1506 之后」+27**；`test/integration/herdr-socket-client.test.ts` 在 `:254` 起 **净 +8 行**（393 → **401**）——**块内不是均匀位移**：`:254` 的 `try {`（+1）与 `:260-261` 的诊断注释（+2）落在**断言行之前** ⇒ `:257`–`:273`（批 3）→ `:260`–`:276`（**+3**）；`finally` 与块尾在断言之后 ⇒ 断言行 `:271`（批 3）→ **`:274`**、文件尾 +8。**链条示例（可直接复算）**：D13② 第三参 `:745` @ `105286f` → `:808` @ `0a1d6b7` → `:815` @ 批 3（+7）→ **`:832` @ fix-round**（+17）；屏障 `:730-732` → `:793-795` → `:800-802` @ 批 3 → **`:817-819` @ fix-round**；本轮**新增**一个 `}, 10_000);`＝ `:775`（`two real concurrent…`，无同族旧值）。
+
+##### D12.5｜残留（本批未处置）与复算口径
+
+- **其它 8 篇笔记的 24 处 `/tmp` 锚点（未改写；本批两时点实测**恒定 24**）**：`20260930-daemon-lock-release-barrier.md`（5）、`20261001-release-0.13.2-post-release-docs.md`（7）、`20261001-production-install-channel-npm-registry.md`（4）、`20260930-phase1-delivery-latency.md`（3）、`20260930-terminal-event-delivery-h1.md`（2）、`20260929-remove-cli-daemon-lifecycle.md`（1）、`20261001-pi-confirmed-turn-frozen-baseline-empty-body.md`（1）、`wake-delivery-r4f1-remaining-risks.md`（1）。**理由**：项目 README「不可变原则」+ 本批边界「只动台账文字」。**特别注意**：`20261001-production-install-channel-npm-registry.md` 与 `20261001-release-0.13.2-post-release-docs.md` 里的 `/tmp/herdsman-global-backup-*.tgz` 是**有主回滚物**（清理时点另见该两篇），**不得**按「清理 `/tmp`」处置。命令：`grep -rc "/tmp/" .agents/notes/*.md`。
+- **未逐条判读的测试锚点**（行号仍命中，但描述未在上下文里逐条复核）：`observability-rpc.test.ts` `:459` / `:773` / `:775`；`herdr-session-watch-manager.test.ts` `:976` / `:1014` / `:1051` / `:280` / `:322` / `:362`；`orchestrator-disconnect-grace.test.ts` `:149` / `:253`；`orchestrator-pane-move.test.ts:162`；`herdsman-pi-extension.test.ts:1488`；`turn-completion-signal.test.ts:485`。**风险低**（都在 ②/④ 类同族清单里，行号未变）；要坐实需逐条读上下文（本批未做）。
+- **复算口径（本批用的锚点判读脚本）**：读本台账 → 正则抓出所有 `路径:行(-行)` → 对每条打印**现树该行内容**（多条以 `⏎` 连接、截断 110 字符）→ 人工判读是否仍是原文所述之物；不依赖旧行号、不写仓库文件。
+- **复算口径（轨迹表）**：对每个 rev 取 `git show <rev>:<file>`，按**行内容**（`line.includes(marker)`）定位行号；本批跑了 **8 个标记 × 9 个 rev**（脚本为一次性产物，已随临时目录清理，形状即本行所述）。
+- **本段引用的命令一律在仓库根执行**；标「本批一手」的为本批实测，其余标「适用提交」。
 
 #### D13｜`setTimeout(resolve,` 的**全量 33 处**四类分列（含反向用法整组）
+
+> **口径现状（2026-10-01）**：本段叙述与 33 处清单属**历史口径 @ `b6c3b87`**（可复算：`git grep -n "setTimeout(resolve," b6c3b87 -- test/ | wc -l`）；**现树＝ 31**，位移全在文末「**第三轮**」一条，逐处清单不再重排（不改写历史判断）。
 
 - **枚举口径（本批第二轮改写：不再是手挑清单）**：`grep -rn "setTimeout(resolve," test/` 在本分支工作树上**全量命中 33 处**（`grep -rn "setTimeout(resolve," test/ | wc -l` = 33，本批实测）；下面把 33 处**逐处**归入四类，**无一省略**，四类计数相加 = 33（10 + 3 + 20）。读者可直接用上面那条命令复算行号。
 - **四类定义（判定规则）**：
@@ -516,12 +693,13 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
   - **第二轮（2026-10-02，`[MARK-FOLLOWUP-LEDGERTIMING2]`）｜预算与锚点更新**：三处的**轮询预算仍为 `5_000`**（D16 口径不变），但**三处用例各加了测试级第三参 `}, 10_000);`**（oracle should-fix S1）——落点 `test/unit/daemon-service.test.ts:151`（`skips ticks…`）、`:216`（`start is idempotent…`）、`test/unit/daemon-process-manager.test.ts:745`（`flock held by child process…`）；**独立理由＝轮询到期必须早于测试级超时，谓词错误才报得出来**（否则只剩 `Test timed out in 5000ms`）。**未改** `vitest.config.ts`。
   - **第二轮锚点位移（本批自身造成）**：`test/unit/daemon-service.test.ts` 两处轮询块整体后移——`:132-145`（断言 `:142`，**未变**）与 **`:200-211`**（原 `:197-209`；断言 **`:208`**，原 `:205`；用例声明 **`:182`**，原 `:179`）；两处轮询内**宏任务让步**现为 **`:141`** / **`:207`**（原 `:141` / `:204`）。`daemon-process-manager` 的兄弟调用点因该文件净 **+3 行**位移为 **`:810`** / **`:1109`** / **`:1168`** / **`:1242`**（原 `:807` / `:1106` / `:1165` / `:1239`；`:594` 未变）。
   - **账目（可复算）**：见 **D17（b）**（`33 − 3 + 2 = 32`）。
+  - **第三轮（2026-10-01，`chore/ledger-hygiene-d12-d15`）｜口径 32 → 31**：本批把 **④** 里的 `test/integration/herdr-socket-client.test.ts:257`（「`Promise.race([iterator.next(), 50ms])` 结果被丢弃的 settle」）改为**显式断言**（超时即失败；sentinel 现树 `:264`、超时守卫 `:276`、断言在 **`:274`**（批 3 值＝ `:261` / `:268` / `:271`，fix-round 后块内 +3））⇒ 该处**退出 `setTimeout(resolve,` 口径**（现文件内该形态命中数＝ **0**）。**账目**：`32 − 1 = 31`（② 10 未动；③ 遗留 2 未动；④ 20 → 19）；复算＝ `git grep -n "setTimeout(resolve," HEAD -- test/ \| wc -l` ＝ **32** vs `grep -rn … test/ \| wc -l` ＝ **31**。**为什么这处不属于本批反例**：原写法下 race 结果被丢弃 ⇒ 断言实际从未生效，是 ④ 里**唯一**「既无风险又无用」的一条；改后**新增**一个真实断言，是**加强**而非放宽（负控见 D15 段）。
   - **S1 的取证（2026-10-02，本批一手；临时副本已删）**：把轮询内的 `tick?.()` 停掉（`daemon-service`）⇒ 两条用例 **2 failed，报 `AssertionError: expected [ 'started' ] to deeply equal [ 'started', 'started' ]` / `… [ 'attempt' ] …`**（5061ms / 5053ms）——**加第三参之前**同一形状报的是外层 `Test timed out in 5000ms`；把 `SIGKILL` 停掉并跳过 `child.on("exit")` 等待（`daemon-process-manager`，控制里让屏障带锁跑到）⇒ **`Error: Timed out after 5000ms waiting for the killed holder's flock to be observable as free`**（5214ms）⇒ **谓词/屏障错误确实抢在测试级超时之前报出来**（这正是加第三参的目的）。
 - **④ 其余无风险（20 处）**：
   - **轮询 helper（5）**：`test/unit/herdr-session-watch-manager.test.ts:1237`、`test/unit/daemon-process-manager.test.ts:62`、`test/unit/final-audit-regressions.test.ts:37`、`test/integration/herdr-session-watch-idle-seam.test.ts:282`、`test/integration/herdsman-pi-daemon-client.test.ts:375`（均为 `while (Date.now() < deadline)` + 断言/抛错；`daemon-process-manager` 那条还带 `Math.min(intervalMs, remaining)` 钳制）
   - **轮询式等待（1）**：`test/integration/rpc-test-client.ts:75`（`waitForNotification` 的 2ms 轮询；本批已把总预算从 ~200ms 抬到 ~2s，见 D15）
   - **夹具内部的流节奏（6）**：`test/unit/herdr-session-watch-manager.test.ts:246` / `:280` / `:322` / `:362`（假 `subscribeEvents` 异步生成器内部的 yield 节奏）、`test/unit/herdsman-pi-turn-signal.test.ts:14`（注入的 `sleep` 缝）、`test/integration/turn-completion-signal.test.ts:459`（假 `eventStream` 在 `pane.closed` 前插的 20ms）
-  - **不需要窗口的等待 / 结果被丢弃的 settle（3）**：`test/unit/herdsman-pi-turn-signal.test.ts:42`（15ms 后 grow，断言靠 `pending` 结局；两侧都是真实定时器，相对顺序不随负载变化）、`test/integration/herdr-socket-client.test.ts:257`（`Promise.race([iterator.next(), 50ms])`，**race 结果未被使用**）、`test/integration/herdsman-pi-daemon-client.test.ts:160`（10ms settle 后 `client.close()`，**纯 settle**）
+  - **不需要窗口的等待 / 结果被丢弃的 settle（3）**：`test/unit/herdsman-pi-turn-signal.test.ts:42`（15ms 后 grow，断言靠 `pending` 结局；两侧都是真实定时器，相对顺序不随负载变化）、`test/integration/herdr-socket-client.test.ts:257`（`Promise.race([iterator.next(), 50ms])`，**race 结果未被使用**）、`test/integration/herdsman-pi-daemon-client.test.ts:160`（10ms settle 后 `client.close()`，**纯 settle**）（**订正 2026-10-01，`chore/ledger-hygiene-d12-d15`**：`herdr-socket-client` 那处已改为**显式断言**（不再属「结果被丢弃」）⇒ 该小类现为 **2** 处，见本段「第三轮」）。
   - **轮询循环 + 自带上界（1）**：`test/integration/turn-completion-signal.test.ts:485`（`while (!closeProcessed && Date.now() - start < 1000)` 轮询 + 断言，随后才做 100ms 沉降）
   - **4 个 helper 定义本身（4）**：`test/integration/orchestrator-disconnect-grace.test.ts:494`（`socketTick` 定义）、`test/integration/orchestrator-pane-move.test.ts:320`（同前）、`test/integration/observability-rpc.test.ts:1054`（`tick` 定义）、`test/unit/herdsman-pi-extension.test.ts:4417`（`tick` 定义）——定义行本身无断言，其调用点的归属见下一条。
 - **★ helper 调用点分列（**不属于**上面 33 处命中，但属同族；本批一并交代，避免「重了定义、漏了调用点」）**：
@@ -529,7 +707,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
   - ③（沉降错位，低强度，未实测）：`test/unit/herdsman-pi-extension.test.ts:1650`（沉降后断言 `client.calls` 已含该调用——同向）、`:1488`（沉降后清空通知基线，最坏表现为滞后落地）。
   - ④：`test/integration/observability-rpc.test.ts:765`（清空通知基线前的沉降；后面的 `waitForNotification` 会把同方法的残留消息消费掉，故不致假失败）。
 - **为什么本批不动**：语义上必须「给窗口 + 断言窗口内无变化」；把 sleep 调大只是把墙钟加长，不改变「负载越重检出力越低」——那是**结构性**的，除非把负条件改写成可等待条件（多数没有这样的缝）。改动反而会削弱语义（旧写法在轻载下检出更强）。
-- **核对**：① 枚举与分类可逐条复算——`grep -rn "setTimeout(resolve," test/` 应输出 **33 行**，与上面 ①–④ 清单一一对应（行号按**当前**工作树）；② 单点上下文用 `awk 'NR==<行号>' <文件>`；③ **口径边界**：本段只覆盖 `setTimeout(resolve,`（Promise 化 sleep）这一形态，`setTimeout(cb, n)` 的非 Promise 用法**不在 33 处之内**、也不在本口径内。（**追加 2026-10-01，`fix/ledger-test-timing`**：该 `wc -l` 已由本批变为 **32**——③ 的 `daemon-process-manager` 那处改用 `waitForCondition` 后**不再命中**；上面的 **33** 属**本批前**口径，账目与逐处改法见本段「本批」块。）
+- **核对**：① 枚举与分类可逐条复算——`grep -rn "setTimeout(resolve," test/` 应输出 **33 行**，与上面 ①–④ 清单一一对应（行号按**当前**工作树）；② 单点上下文用 `awk 'NR==<行号>' <文件>`；③ **口径边界**：本段只覆盖 `setTimeout(resolve,`（Promise 化 sleep）这一形态，`setTimeout(cb, n)` 的非 Promise 用法**不在 33 处之内**、也不在本口径内。（**追加 2026-10-01，`fix/ledger-test-timing`**：该 `wc -l` 已由本批变为 **32**——③ 的 `daemon-process-manager` 那处改用 `waitForCondition` 后**不再命中**；上面的 **33** 属**本批前**口径，账目与逐处改法见本段「本批」块。）（**再追加 2026-10-01，`chore/ledger-hygiene-d12-d15`**：**现树 `wc -l` = 31**（`git grep -n "setTimeout(resolve," HEAD -- test/ \| wc -l` = **32**＝本批 base，`grep -rn … test/ \| wc -l` = **31**＝本批后，本批一手实测）；**−1 的唯一位移＝ ④ 的 `test/integration/herdr-socket-client.test.ts:257`**（原「race 结果被丢弃」）——本批把它换成**显式断言**，其 `Promise.race([iterator.next(), 50ms])` 写法被 `await` 超时守卫取代 ⇒ **退出该 grep 口径**。**四类计数现为：「② 检出力下降 10（一字未动）」+「③ 遗留 2（现降为「轮询内让步」，见下）」+「④ 19」= 31**；**② / ③ 的语义与不动理由不变**，仅 ④ 减 1。
 
 #### D14｜本批未修 / 暂留的点
 
@@ -542,7 +720,7 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 - **本批判定（2026-10-01，`fix/ledger-test-timing`；逐子项，回答「能否现在最小修」）**：
   - **① startup-grace 无屏障 → 保持不动（本批一手复核，D14① 订正后的理由成立）**：该用例（`test/integration/orchestrator-disconnect-grace.test.ts:179-210`）**根本不含固定 `sleep`**，三处 `advance` 全部落在**已 await 的工作之后**——`:186` `advance(99)` 在 `await startServer(...)` 之后、`:190` `advance(1)` 在 `await register(returning, "returning")`（RPC 往返）之后、`:205` `advance(100)` 属**从未 close 过 socket 的 absent server** ⇒ D10 的 close 竞态机理不作用于它，`waitForTerminalDisconnect` 的谓词在此处**没有可观测面**。要「加屏障」须**新增观测缝**（暴露 startup timer 是否 armed）或改用 orchestrator 侧可观测状态 ⇒ **不属最小修**（且本批边界禁止动 `src/**`）。
   - **② D9 内部 20s 与实际等待上限 → 已由 owner 拍板修复（2026-10-02）；此前 2026-10-01「保持不动 / 待 owner」的判定被 owner 决定取代**：内部等待是**串联两段**——`:577-586` 的 `vi.waitFor(..., { timeout: 20_000, interval: 100 })`（等子 daemon 的 pid 文件）与 `:606-609` 的 `Promise.race([childExit, 20s])`（等 `SIGTERM` 后的子进程退出）⇒ **病理性上界 40s**。**owner 2026-10-02 选择抬外层**：该用例第三参 `30_000` → **`45_000`**（落点现 **`:639`**、用例声明现 **`:544`**）＝ **消掉 (30s, 40s] 的假失败窗口，不改真失败面**——两段各自打满 20s 时该用例**仍然失败**（无假通过）；改掉的是「两段合计 ∈ (30s, 40s] 且各自 < 20s」这类**本可通过**的运行被外层截断成超时。**依据**：本机 3 路并发低载档实测该用例 **2560ms**（D16 表）⇒ 该窗口需约 **11×** 额外劣化才可达；owner 判断**值得消掉**。**本轮未动内部两段 20s**——「收敛成单一超时源 / 按阶段分配」仍是**最终设计**项。与 D16 判据的关系：本属其**第二条（内部上界 > 外层预算）的严格化**（按单次等待 30s ≥ 20s 已满足，按**串联上界 40s** 不满足），偏差自带本条独立理由。
-  - **③ 本批新引入轮询的 `timeout` 取值 → 沿用已落地口径（不改 5s），并登记本批新增 3 处屏障的预算形态**：`observability-rpc.test.ts:491` 与 `orchestrator-disconnect-grace.test.ts` 的 `timeout: 5_000` 按本条正文（高载档占用 **2–4%**）**不改**。本批新增：`test/unit/daemon-service.test.ts:138-146`、`:201-209` 用**显式** `{ interval: 10, timeout: 5_000 }`（与 D10 落地的 `observability-rpc` 同形）；`test/unit/daemon-process-manager.test.ts:730-732` 用 `waitForCondition` 的**默认** `intervalMs` 20 / `timeoutMs` 5000（与同文件 4 处既有用法一致）。**正常路径都是毫秒级**（本批一手：两个 `daemon-service` 用例 **65ms / 55ms**（含屏障）、`daemon-process-manager` 该用例 **227ms**）⇒ 5s 是**上界**而非墙钟；**高载档占用率本批未测**（同 D14③ 证据边界）。**第二轮（2026-10-02，oracle S1）追加**：这三处屏障所属的用例**各加了测试级第三参 `}, 10_000);`**（`daemon-service` 两条 + `daemon-process-manager` 一条，落点见 D13 段「本批」块·第二轮），独立理由＝**轮询到期（5s）必须早于测试级超时，谓词错误才报得出来**；**轮询预算仍为 `5_000`**（D16 口径不变），**未改** `vitest.config.ts`。
+  - **③ 本批新引入轮询的 `timeout` 取值 → 沿用已落地口径（不改 5s），并登记本批新增 3 处屏障的预算形态**：`observability-rpc.test.ts:491` 与 `orchestrator-disconnect-grace.test.ts` 的 `timeout: 5_000` 按本条正文（高载档占用 **2–4%**）**不改**。本批新增：`test/unit/daemon-service.test.ts:138-146`、`:201-209` 用**显式** `{ interval: 10, timeout: 5_000 }`（与 D10 落地的 `observability-rpc` 同形）；`test/unit/daemon-process-manager.test.ts:730-732` 用 `waitForCondition` 的**默认** `intervalMs` 20 / `timeoutMs` 5000（与同文件 4 处既有用法一致）。**正常路径都是毫秒级**（本批一手：两个 `daemon-service` 用例 **65ms / 55ms**（含屏障）、`daemon-process-manager` 该用例 **227ms**）⇒ 5s 是**上界**而非墙钟；**高载档占用率本批未测**（同 D14③ 证据边界）。**（订正 2026-10-01，`chore/ledger-hygiene-d12-d15`：高载档占用率已测）**：`daemon-service` 两条屏障用 **68ms / 65ms**（轮次 1）与 **76ms / 59ms**（轮次 2）⇒ 占 `5_000` 预算 **1.2–1.5%**；`daemon-process-manager` 那条所属用例 **748ms / 619ms** ⇒ **12–15%**（**用例整体**耗时，**不是**屏障实耗——实耗未插桩）。负载档（1 分钟 loadavg **24.43→26.65**，26 busy-loop / 12 核）与完整证据见 **D15** 段。**第二轮（2026-10-02，oracle S1）追加**：这三处屏障所属的用例**各加了测试级第三参 `}, 10_000);`**（`daemon-service` 两条 + `daemon-process-manager` 一条，落点见 D13 段「本批」块·第二轮），独立理由＝**轮询到期（5s）必须早于测试级超时，谓词错误才报得出来**；**轮询预算仍为 `5_000`**（D16 口径不变），**未改** `vitest.config.ts`。
   - **④ D13 组 → ③ 子集已修（本批），② / ④ 仍不动**：② 的理由（结构性、多数负条件无可用缝）与 ④ 的理由（无风险）均不变；③ 的三处改法见 D13 段「本批」块。**另注意**：D13 段「核对」条写的 `grep -rn "setTimeout(resolve," test/` **33 行**已因本批变为 **32**（口径与账目见本节表前追加条与 D13 段「本批」块）。
 
 #### D15｜未实测项（证据边界；沿用前序 scout 的标注 + 本批补充）
@@ -553,6 +731,55 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 - **`:39` / `:119` 两个屏障点未在饿死探针下失败**（见 D10 段末尾）：旧形状在这两点「也会假失败」**未被实测**，只能给代码层蕴含证明（高载档下这两点的实耗占用率见 D14③）。
 - **CI 无失败样本（本批改为**决定**，不是遗漏）**：`.github/workflows/ci.yml` **结构上并行**（订正见 D7 段），但本台账与本批都**没有** CI 上的失败样本 ⇒「CI 会不会真被打穿」**未实测**。**本批的决定**：**不主动追** CI 失败样本——CI 的暴露面低于本地并行复跑（只单套、没有我们自叠的 3 路并发，runner 的核数 / 负载档也不由我们控制），追样本的成本不抵收益；若将来真出现，**按 D9/D10 的机理口径归因**（先看是 `Test timed out in 5000ms` 还是 owner 断言 / 屏障签名，再对号 D7/D9/D10/ D13），**不新建兜底机制**。
 - **`pnpm check` 首跑末步的 `Bad substitution` 瞬时噪声（2026-10-01，`fix/child-process-active-t-state` 批；**未复现 / 未定位根因**）**：该批首跑 `pnpm check` 的末步 `pnpm herdr-plugin:check` 打印过 `/bin/sh: 1: Bad substitution (exited with code 2)`；**同一环境下单步 `pnpm herdr-plugin:check` 与整链 `pnpm check` 复跑均 `EXIT=0`、日志中无该字样** ⇒ 判为**瞬时环境噪声**，**未定位根因**、**未复现**。**它不属本批任何已修条目**（登记口径同本段的证据边界）。**半句补记（2026-10-01，oracle 提交前第二意见）**：**emitter＝agent harness 包装层**（`(exited with code N)` 后缀出自 harness 的 `package-manager-cli.js`）、**`/bin/sh`＝`dash`**、**检查链无 bash-ism**（`${…//…}` / `${…^^}` 类**全库无命中**）、**整链独立复跑 `EXIT=0`** ⇒ **环境 / 包装层噪声，非潜藏缺陷**，**便于后人免复查**。**本批一手补强（机制复现，2026-10-01）**：该文案在**本 harness 自身**即可逐字产生——本批一条收尾命令用 `${PIPESTATUS[0]}`（bash-ism）在 harness 的固定 `/bin/sh -c`（`dash`）下运行时，打印出**逐字相同**的 `/bin/sh: 1: Bad substitution`，并由 harness 包装层追加 `(exited with code 2)` ⇒ **发射器在仓库检查链之上**（本次观测的发射器是 harness 命令包装层；oracle 指出的包装层 `package-manager-cli.js` 属同一层）。但**原观测点那条命令未落盘**，故原判「**未复现 / 未定位根因**」**保持不变**（本条只把“环境/包装层”**从推测变为已演示的一类机制**）。
+
+- **本批高载档一手测量（2026-10-01，`chore/ledger-hygiene-d12-d15`；`[MARK-LEDGER-HYGIENE-D12D15]`；本节数字均为**本批一手**，除另注来源）**——**背景负载口径（oracle consider，fix-round 登记）**：本机是**多 agent 会话**环境（常驻 `pi` / `herdr server`，别的 session 可能同时在跑负担）⇒ 下列负载档与耗时**可能被别的 session 叠加**，不是单一来源的定值档；引用时按 **D17(s)** 注明：
+  - **负载档与配方（可复算）**：配方＝台账自己的高载配方 **26 个 busy-loop**，本机 **12 核**（`nproc`）；命令 `for i in $(seq 26); do ( while :; do :; done ) </dev/null >/dev/null 2>&1 & done`，**暖机 90s**。落盘证据（**已就地内联**；临时目录在本批收尾已清理，符合 D12(b)）——`loadavg-run2.txt` 原文：
+    ```
+    ambient (no loops): 17.23 10.03 14.58 3/997 208880
+    loops started: 26
+    loops alive: 26/26
+    before run1: 24.43 14.33 15.69 27/1018 209275
+    RUN1_EXIT=0
+    mid: 26.16 15.20 15.96 27/1018 209437
+    RUN2_EXIT=0
+    after run2: 26.65 15.84 16.15 27/1028 210581
+    CLEANUP alive=0 (want 0)
+    ```
+    ⇒ 1 分钟 loadavg **24.43 → 26.16 → 26.65**（落在 D9 原始档 **21–34** 中段）。另一次同配方轮次（同日 22:36）采样 30s/75s/90s ＝ **11.20 / 20.04 / 21.43**、`loops alive 26/26`、收尾 `alive=0`。**读档提醒**：上面的 `ambient` 行（17.23）是**上一轮 26 个 busy-loop 刚被杀**时的 1 分钟残值（同机真正空载时 1 分钟曾为 **0.68**；同一读数里 15 分钟 13.49–14.58 才是本机环境基线，来自常驻的 `pi` / `herdr server`）——**别把 17.23 当空载档**；本批的「低载档对照」用下表的定值轮（loadavg 峰值 5.4，引自 D16）。
+    **收尾证据**：`ps -o pid= -p $(cat busy3.pids) | wc -l` ＝ **0**（cleanup 行 `alive=0 (want 0)`）；`ps -eo pid,pcpu,etime,args --sort=-pcpu | head -5` 里只剩 `pi` / `herdr server`，**无 busy-loop 残留**。所有高载运行 **`EXIT=0`**、全绿（`daemon-service` **18/18**、`daemon-process-manager` **41/41**，两轮各一次）。
+  - **① 三处屏障用例的预算占用（高载档，两轮）**：`test/unit/daemon-service.test.ts` 两条（显式 `{ interval: 10, timeout: 5_000 }`）＝ **`skips ticks while a reconcile is in flight…` 68ms / 65ms**、**`start is idempotent and a rejected run does not break the cadence` 76ms / 59ms** ⇒ 占 `5_000` 预算 **1.2–1.5%**（低载档对照＝ **67ms / 58ms**）。`test/unit/daemon-process-manager.test.ts` 那条（`waitForCondition` 默认 `timeoutMs 5000`）所属用例 `flock held by child process…SIGKILL` ＝ **748ms / 619ms** ⇒ **12–15%**（**口径提醒**：这是**用例整体**耗时，**不是**屏障实耗；实耗未插桩，见下「未测」）。
+  - **② D9 用例高载档（`a second daemon on the same HERDSMAN_HOME fails on the instance lock; SIGTERM releases it and allows restart`）**：高载 **1736ms**（轮次 1）/ **1284ms**（轮次 2）；低载档 **327ms**。**按现预算重述口径**：占其**实际第三参 `45_000`** 的 **2.9–3.9%**、占**默认 5s** 的 **26–35%** ⇒ **本批高载档未打穿 5s**（与台账旧口径「最大观测 3184ms、未过 5000ms」**同向、同量级**；旧值未改写）。**未测**：仍无「3 路并发 × 高载」样本（本批高载只跑**单进程**）。
+  - **③ `waitForNotification` 峰值（插桩测量，单进程）**：临时给 `test/integration/rpc-test-client.ts` 的 `waitForNotification` 加一行探针（`appendFileSync` 记录每次调用耗时 + 方法名），跑 3 个调用方文件（`orchestrator-disconnect-grace` / `orchestrator-pane-move` / `observability-rpc`）：**低载档 18 次调用、峰值 3ms**；**高载档 18 次调用、峰值 6ms** ⇒ 占 **~2s 总预算的 0.3%**。**探针已还原**：`sha256sum test/integration/rpc-test-client.ts` ＝ **`ee8a68ca721175de5cfd51efe2b7c7c882d1b53a1e708e291de85e9b105048f1`**，与改前落盘值**逐字相同**；`git diff --stat -- test/integration/rpc-test-client.ts` **空**。**未测**：只覆盖这 3 个文件的 18 次调用（**不是**全仓分布），且是**单进程**档；峰值（而非分位数/长尾）。
+  - **④ 四处 spawn 点在高载档的表现（`test/unit/daemon-process-manager.test.ts`，同一文件内四条）**：
+
+    | 用例（标题） | 低载档（2 文件同跑，loadavg 峰值 5.4） | 高载轮次 1 | 高载轮次 2 | 高载占默认 5s | 该用例现有预算 |
+    | --- | --- | --- | --- | --- | --- |
+    | `two real concurrent processes competing for daemon lock: exactly one succeeds` | 154ms | 807ms | 748ms | **15–16%** | 默认 5s |
+    | `flock held by child process is released immediately upon SIGKILL` | 181ms | 748ms | 619ms | **12–15%** | 默认 5s（+测试级 `10_000`） |
+    | `a failed or truncated /proc/<pid>/stat read never counts as a dead lock-holding child` | 355ms | 480ms | 508ms | **9.6–10.2%** | 默认 5s |
+    | `stress test: 200 rounds of simultaneous sub-millisecond lock contention yields zero double-masters` | 1283ms | **5418ms** | **5163ms** | **103–108%（>100%）** | `30_000`（D7，既有） |
+    | （附）本批改过的 D1 两条：`an unreadable children file warns exactly once per process` | 10ms | 47ms | 52ms | ~1% | 默认 5s |
+    | （附）`an unreadable children file leaves release watching the flock process alone` | 10ms | 39ms | 52ms | ~1% | 默认 5s |
+  - **④的结论（本批关键新证据）**：**`stress test: 200 rounds` 在高载档单跑 = 5163ms / 5418ms，两次都突破默认 `5_000`** ⇒ **若没有 D7 的 `30_000` 第三参，这条用例在高载档下会稳定假失败**（此前 D7 只有 oracle 的「3 路并发 + 高载 6/6 超时」间接证据）；其余三处 **9.6–16%** ⇒ 低载档「<30% 不动」的判断在高载档**仍成立**（D16 分档口径：高载档 `>50%` 才补抬，**故本批不新增任何预算**）。
+  - **⑤ `Bad substitution` 噪声：机制归因（本批一手，可重复；与本节既有条目**同结论、新增一次独立复现**）**：`readlink -f /bin/sh` ＝ **`/usr/bin/dash`**；把一个 bash-ism（`${PIPESTATUS[0]}`）经 **harness 自己的固定 `/bin/sh -c`** 执行时，原样输出：
+    ```
+    harness shell = /usr/bin/dash
+    bash does not complain:
+      bash PIPESTATUS= (rc=0)
+    now the bash-ism under the harness's own /bin/sh -c:
+
+    /bin/sh: 1: Bad substitution
+
+    (exited with code 2)
+    ```
+    ⇒ **`/bin/sh: 1: Bad substitution` + `(exited with code 2)` 逐字复现**。反证两侧：同一脚本用 `bash -c` 跑**不报错**（`rc=0`）；写成**脚本文件**再跑时报的是 **`<脚本路径>: 2: Bad substitution`**（前缀是**脚本路径**、行号是 `2`）——即「**`/bin/sh` + 行号 1**」这个体裁本身就指认「经 `-c` 内联、第 1 行」的发射路径。⇒ t34 / oracle 的「**harness 包装层（固定 `/bin/sh -c`）+ dash**」归因**成立且可重放**；`(exited with code N)` 后缀由 harness 包装层追加。**边界（与原判一致，未放软）**：**原观测点那条 `pnpm herdr-plugin:check` 的命令未落盘**、仓库检查链内**仍无 bash-ism 命中** ⇒ 「那一次到底是哪条命令触发的」**仍未定位**，原判「**未复现 / 未定位根因**」**保持不变**；本条只把机制从「推测」升级为「**已演示、可重放**」。
+  - **⑥ 本批未测 / 测不了（如实登记；每项给「为何 / 要什么条件 / 风险」）**：
+    - **三处屏障的「实耗」未插桩**（只有**用例整体**耗时）：要测需在 `waitForCondition` 内部加探针（会在测量中改被测代码形状，**降证据等级**；且与「单次测量不扰动」冲突）⇒ 未做；风险：低——正常路径毫秒级已由用例整体耗时封顶（`≤76ms`）。
+    - **「3 路并发 × 高载」未叠加**：本批的「3 路并发」（改文件 ×3，用于门禁）与「高载」（26 busy-loop **单进程**）是**分开**跑的两个形状；叠加需要 26×3 个 busy-loop 或分批同步启动，本批时间/机器负载不允许⇒ 未做；风险：中（判据的最狠形状仍未完整复现；历史 oracle 轮报过 3 路高载 3/3 全绿）。
+    - **长尾 / 分布未测**：只有峰值与单次值，没有分位数（要就得多轮采样并插桩）⇒ 未做；风险：中（「平均够宽」不等于「长尾够宽」，但高载下 200 轮用例已**实测**突破默认线，说明长尾确实存在）。
+    - **`waitForNotification` 只测了 3 个文件的 18 次调用**：全仓其它调用点（如 `herdsman-pi-daemon-client` / `herdr-session-watch-*`）未覆盖⇒ 未做；风险：低（同一实现、同一预算常量，且峰值仅 6ms）。
+    - **CI 面、非 Linux / procfs 不暴露 children**：同上（D15 上文与 D17(h)①③），本批不变。
+  - **本批未改动 D7/D9/D10/D13 的任何历史结论**：上列新值均以**追加**形式并存，附测量日期（2026-10-01）与负载档；旧值一律保留在原文。
 
 #### D16｜抬预算判据 + 逐用例占用率清单（判据 vs 个例）
 
@@ -568,8 +795,8 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 | --- | --- | --- | --- | --- | --- |
 | `test/integration/agent-index-service.test.ts:4809`（`degraded done exhausting retries…`） | 4014ms | **4084ms** | **82%** | 本批新增 `30_000`（`:4889`） | **抬**（>50%） |
 | `test/unit/herdsman-pi-extension.test.ts:4708`（`omits expectedText from RPC…`） | 3025ms | **3038ms** | **61%** | 本批新增 `30_000`（`:4758`） | **抬**（>50%） |
-| `test/unit/daemon-process-manager.test.ts`（`two real concurrent processes competing…`） | 256ms | 758ms | 15% | 默认 5s | 低载档不动（<30%；高载未证） |
-| 同上（`flock held by child process is released immediately upon SIGKILL`） | 268ms | 976ms | 20% | 默认 5s | 低载档不动（<30%；高载未证） |
+| `test/unit/daemon-process-manager.test.ts`（`two real concurrent processes competing…`） | 256ms | 758ms | 15% | 默认 5s → **fix-round 改为 `10_000`** | 低载档不动（<30%）；**fix-round 的 `10_000` 不是占用率驱动**，而是**判据第二条的派生**——该用例本轮新引入两处 `waitForCondition`（内部等待上界 5s）⇒ **轮询到期必须早于测试级超时**，否则谓词错误被 `Test timed out in 5000ms` 掩盖（负控两态见 D17(r)；与 S1 同一独立理由） |
+| 同上（`flock held by child process is released immediately upon SIGKILL`） | 268ms | 976ms | 20% | 默认 5s（+测试级 `10_000`） | 低载档不动（<30%；高载未证）；其两处等待的**结构性假失败窗口**见 D17(r) |
 | 同上（`a failed or truncated /proc/<pid>/stat read…`） | 354ms | 517ms | 10% | 默认 5s | 低载档不动（<30%；高载未证） |
 | 同上（`:1011` `stress test: 200 rounds…`） | 1375ms | 6820ms | **136%** | `30_000`（既有，D7） | 已抬（本分支之前轮） |
 | `test/unit/herdr-plugin-package.test.ts:72`（`packages the runtime entrypoint…`） | 175ms | 1261ms | 25% | `30_000`（既有） | 低载档不动（<30%；保留既有预算；高载未证） |
@@ -580,26 +807,68 @@ H1（`b59ac96`）与 Phase 1（`5433525`）两批已提交之后，把双审（R
 
 - **判据 vs 个例的关系（本段存在的理由）**：上一轮的清单里出现过「42% 的修了、82% 的没修」的落差。本段把**判据**与**个例**分开写：判据是**默认线**（>50% 抬、<30% 不动、30–50% 观察），**偏离判据的个例必须自带独立理由**（本批仅 `test/unit/package-publication.test.ts` 一处属此类：前一轮按「与姊妹用例对齐」加 30s，本批实测 28% < 30% ⇒ **不构成新加理由，也不构成撤回理由**，保持原状）。
 - **偏差登记（本批一手实测 vs 派发件给的数字）**：派发件给的占用率（`daemon-process-manager` 两处 41–43%、`herdr-plugin-package` 2245ms≈45%、`package-publication` 42–54%）与本批实测（15%/20%/10%、25%、28%）**不同量级**——本机本轮是**低载档**（loadavg 峰值 5.4），而判据要求的最狠形状是**高载档 21–34**；差异方向（高载档只会更高）不影响「>50% 抬 / <30% 不动」的结论（分档执行口径见上方判据条）。
-- **核对**：`grep -rnE "\}, [0-9_]+\);" test/`（列出全部显式预算；本批新增 2 处：`test/integration/agent-index-service.test.ts:4889`、`test/unit/herdsman-pi-extension.test.ts:4758`）；占用率复跑形状＝**D7「核对」段** + `--reporter=verbose`（看逐用例行尾 `NNNms`）＋跑前后 `uptime` 记负载档。
+- **核对**：`grep -rnE "\}, [0-9_]+\);" test/`（列出全部显式预算；本批新增 2 处：`test/integration/agent-index-service.test.ts:4889`、`test/unit/herdsman-pi-extension.test.ts:4758`；**fix-round 再 +1 处** ＝ `test/unit/daemon-process-manager.test.ts:775`（`two real concurrent…`，理由＝判据第二条，见上表尾行）⇒ 现共 **41** 处命中）；- **高载档一手补测（2026-10-01，`chore/ledger-hygiene-d12-d15`；判据要求的最狠形状只补上了「高载」这一维，**3 路并发 × 高载仍未叠加**）**：形状＝**26 个 busy-loop / 12 核 / 暖机 90s**（1 分钟 loadavg **24.43 → 26.16 → 26.65**，落 D9 原始档 21–34）、**单进程**跑目标文件。结果：`test/unit/daemon-process-manager.test.ts` 四处 spawn 点 **748 / 619 / 508 / 5163ms**（轮次 2）与 **807 / 748 / 480 / 5418ms**（轮次 1）⇒ **`stress test: 200 rounds` 在高载档突破默认 5s（**103–108%**）**，直接坐实 D7 给它加的 `30_000` 第三参（此前只有 oracle 的「3 路并发 + 高载 6/6 超时」间接证据）；其余三处 **12–16%** ⇒ 低载档「<30% 不动」的结论在高载档**仍成立**（按分档执行口径「高载档只在有样本时复核、>50% 补抬」）。`test/unit/daemon-service.test.ts`：D9 用例高载 **1736ms / 1284ms**（占其 `45_000` 的 **2.9–3.9%**、占默认 5s 的 26–35%）、两处屏障 **68 / 65ms** 与 **76 / 59ms**（<2%）⇒ **无补抬**。**仍缺的形状**：3 路并发 × 高载（见 D15 段未测清单）；**长尾分布**未测。
+- 占用率复跑形状＝**D7「核对」段** + `--reporter=verbose`（看逐用例行尾 `NNNms`）＋跑前后 `uptime` 记负载档。
 
 #### D17｜遗留清单（2026-10-02，`fix/ledger-test-timing` 第二轮；来源＝reviewer / oracle，**本批只登记不动手**）
 
-- **（a）reviewer｜参数形态不齐**：`test/unit/daemon-process-manager.test.ts:730-732` 用 `waitForCondition` 的**默认** `intervalMs` 20 / `timeoutMs` 5000，而 `test/unit/daemon-service.test.ts:138-145` / `:204-211` 用**显式** `{ interval: 10, timeout: 5_000 }` ⇒ **后续统一重构时对齐**（**不阻断**：两条链路语义等价、当前逻辑正确）。**不动手**的理由：改 `waitForCondition` 默认值会牵动同文件 4 处既有调用点（`:594` / `:1109` / `:1168` / `:1242`），超出本批「只改三处屏障」的范围。
+- **（a）reviewer｜参数形态不齐**：`test/unit/daemon-process-manager.test.ts:730-732` 用 `waitForCondition` 的**默认** `intervalMs` 20 / `timeoutMs` 5000，而 `test/unit/daemon-service.test.ts:138-145` / `:204-211` 用**显式** `{ interval: 10, timeout: 5_000 }` ⇒ **后续统一重构时对齐**（**不阻断**：两条链路语义等价、当前逻辑正确）。**不动手**的理由：改 `waitForCondition` 默认值会牵动同文件**既有 4 处**调用点（`:594` / `:1109` / `:1168` / `:1242`），超出本批「只改三处屏障」的范围。（**fix-round 后这两个数字改正**：该文件 `waitForCondition` 调用点**现共 12 处**＝ `:657` / `:758` / `:761` / `:810` / `:817` / `:881` / `:897` / `:1196` / `:1255` / `:1329` / `:1377` / `:1456`；旧文的「4 处」是**部分列举**。）
 - **（b）D13 账目补算式（可复算）**：`grep -rn "setTimeout(resolve," test/ | wc -l` ＝ **33 − 3 + 2 = 32** —— **删 3**＝旧的三处固定窗口（`test/unit/daemon-process-manager.test.ts:728`、`test/unit/daemon-service.test.ts:135`、`:190`）；**增 2**＝两处轮询内的**宏任务让步**（现树 `test/unit/daemon-service.test.ts:141`、**`:207`**；派发件给的 `:204` 是**加测试级第三参之前**的行号）。**并注明**：`daemon-service.test.ts` 仍命中 **3 处**＝1 处**旧有** `:130`（② 类）+ 2 处**新增让步**（`:141` / `:207`）⇒ 该文件**净 0**。
-- **（c）锚点漂移（归 D12｜台账卫生，本批只登记）**：① 台账 D13 ④ 引用的 `test/unit/daemon-process-manager.test.ts:62` 在现树实为 **`:64`**（`:62` 是 `waitForCondition` 里的 `throw` 行，`:64` 才是 `setTimeout(resolve, …)`；**本批一手核对**）；② 台账 D13 ③ 引用的 `:518`，其 **pre-batch 实测为 `:728`**（本批一手核对），且属**跨提交累积**漂移（`:518→:519→:728`，中间步引自派发件、**本批未独立复核**）——**建议下次写成分段轨迹**（每段的提交/批次 + 位移量），便于后人复算。**本批未改写这些旧锚点。**
+- **（c）锚点漂移（归 D12｜台账卫生，本批只登记）**：① 台账 D13 ④ 引用的 `test/unit/daemon-process-manager.test.ts:62` 的**分段轨迹**（**订正于 2026-10-01 同日第二轮 fix-round，本批一手；oracle 实测同向**）：`:62 @ 5433525`–`b6c3b87` → **`:63 @ 2555b2b`** → **`:64 @ 5b7181b`/`105286f`** → **`:127 @ 0a1d6b7`/本批**。**原写「在现树实为 `:64`」在 `2555b2b` 那一格错 1 行**（`2555b2b` 树的 `:62` 是 `}`、`:63` 才是 `setTimeout(resolve, …)`；`throw` 行始终在 sleep 行 -2）——核对手法＝ `git show <rev>:<file> | sed -n '60,66p'`；同一 `rev` 的 `async function waitForCondition(` 定义行＝ 49 / 50 / 51 / 114（与 D12.4 轨迹表一致）；② 台账 D13 ③ 引用的 `:518`，其 **pre-batch 实测为 `:728`**（本批一手核对），且属**跨提交累积**漂移（`:518→:519→:728`，中间步引自派发件、**本批未独立复核**）——**建议下次写成分段轨迹**（每段的提交/批次 + 位移量），便于后人复算。**本批未改写这些旧锚点。** ⇒ **2026-10-01 由 `chore/ledger-hygiene-d12-d15` 收口：完整「旧→现」映射见 D12.4**（本档内唯一权威表）。
 - **（d）口径外同族（新挂账，待定）**：`test/integration/herdr-socket-client.test.ts:257` 的 `await Promise.race([iterator.next(), 50ms])`——**race 结果被丢弃**（D13 ④ 已按「无风险」登记），但它同时意味着**订阅竞态若真发生也不会报警**：**不会假失败、但会漏检**。**挂账待定**（要钉需把负条件改成「断言订阅确实生效」的可等待条件＝改测试语义，非机械替换）。
 - **（e）oracle 附注｜② 类的措辞同样偏强（**仅附注，不删原判断**）**：`test/unit/daemon-service.test.ts:130` 这类「断言**未重复启动**」的守卫判定是**同步**进行的——被跳过的 tick（`PeriodicReconcileScheduler` 里 `if (this.#inFlight) return;`）**根本不会在微任务里跑起来** ⇒ 这类检出力**不随负载下降**（**本批一手复核该同步性成立**；② 类其余条目**未逐条复核**）。因此 ② 类「**负载下**检出力下降」的措辞**同样偏强**，建议在 **D12 / 后续统一收敛**时一并对齐（本批**未改** ② 类条目正文）。
 - **（f）本批一手发现｜`daemon-process-manager` 那条用例在屏障之前还有一个无界等待（归后续）**：`test/unit/daemon-process-manager.test.ts:725` 的 `await new Promise((resolve) => child.on("exit", resolve));` **没有任何超时**——`SIGKILL` 失效（或杀错对象）时用例会卡在这里，**测试级预算就是该路径唯一的界**。因此 oracle S1 加的 `}, 10_000);` 在这条路径上只是把失败报告从 5s 推到 **10s**（本批负控实测：先看到 `Test timed out in 10000ms`，根本没走到屏障）；走到屏障的那半路径已由 S1 正确覆盖（屏障 `5_000` 先到期，报自己的错误）。**建议后续给该未界加轮询/超时**（属改测试结构，本批不做）。
-- **（g）本批（2026-10-01，`fix/d8-child-pids-warn-coverage`，D8 收口 + fix-round；`[MARK-D8-COVERAGE]` / `[MARK-D8-FIXROUND]`）自身造成的锚点位移（供后续批次；本批**不回写**任何旧行，D12 卫生批量处理）**：`test/unit/daemon-process-manager.test.ts` 本批**净 +185 行**（文件头 mock 缝 **+63**、末尾两条新用例 **+122**；含 fix-round 的注释 +1 行与承重自检 +5 行）⇒ 旧树 `:32-1247` 的锚点整体**后移 63 行**，旧树 `:1248` 起（压测用例及其后）整体**后移 185 行**。逐条映射（旧 → 新，fix-round 后一手 `grep`/`sed` 重测）：D17(c) 的 `:64` → **`:127`**；D17(f) 的 `:725` → **`:788`**；D17(a) / D13③ 的 `:730-732` → **`:793-795`**；D6 行引的两条 T 态用例区间 **订正见（g-1）**；D7 / D11 / D16 引的 `:1011`（兼称「压测用例声明」）→ 旧树 `:1011` 实为 `fakeFlock,`、压测用例声明在旧树 `:1248` ⇒ **新树声明行＝`:1433`**（`:1011` 属**旧树即已漂移**，本批未回写；数字同属 D12）。
-  - **（g-1）D6 行区间订正（按内容核实，本批一手；原写数字错，非本批造成）**：D6 行原引 `:913-956`（post-READY）/ `:958-1030`（pre-READY）**指向的是无关代码**——旧树 `:913` 实为 `const holderScript = join(binDir, "holder.sh");`、`:958` 落在一段 `holderScript` heredoc（`sleep 0.005` / `exec cat`）内（本批 `sed` 逐行核对）；本批写进 (g) 的「位移后值」`:975-1018`/`:1020-1092` 同样指向那段无关代码（同理作废）。**按用例标题定位**，两条 T 态用例的真实位置：旧树 **`:1129`**（`a simulated T-state (SIGSTOP-paused seam) …`）/ **`:1174`**（`a pre-READY paused (T) helper is abandoned…`）⇒ 本批改动后 **`:1192`** / **`:1237`**。oracle 给的 `:1191`/`:1236` 与实测**差 1 行**（本批 fix-round 在文件头注释净 +1 行所致），**以本批实测为准**。
+- **（g）本批（2026-10-01，`fix/d8-child-pids-warn-coverage`，D8 收口 + fix-round；`[MARK-D8-COVERAGE]` / `[MARK-D8-FIXROUND]`）自身造成的锚点位移（供后续批次；本批**不回写**任何旧行，D12 卫生批量处理）**：`test/unit/daemon-process-manager.test.ts` 本批**净 +185 行**（文件头 mock 缝 **+63**、末尾两条新用例 **+122**；含 fix-round 的注释 +1 行与承重自检 +5 行）⇒ 旧树 `:32-1247` 的锚点整体**后移 63 行**，旧树 `:1248` 起（压测用例及其后）整体**后移 185 行**。逐条映射（旧 → 新，fix-round 后一手 `grep`/`sed` 重测）：D17(c) 的 `:64` → **`:127`**；D17(f) 的 `:725` → **`:788`**；D17(a) / D13③ 的 `:730-732` → **`:793-795`**；D6 行引的两条 T 态用例区间 **订正见（g-1）**；D7 / D11 / D16 引的 `:1011`（兼称「压测用例声明」）→ 旧树 `:1011` 实为 `fakeFlock,`、压测用例声明在旧树 `:1248` ⇒ **新树声明行＝`:1433`**（`:1011` 属**旧树即已漂移**，本批未回写；数字同属 D12）。⇒ **本批（`chore/ledger-hygiene-d12-d15`）已把「旧→现」收成 D12.4 一处**，并按内容核实订正后值：两条 T 态用例现树 **`:1199`（post-READY）/ `:1244`（pre-READY）**（＝本条 `:1192`/`:1237` 再加本批 SIGKILL 用例的 **+7**）。
+  - **（g-1）D6 行区间订正（按内容核实，本批一手；原写数字错，非本批造成）**：D6 行原引 `:913-956`（post-READY）/ `:958-1030`（pre-READY）**指向的是无关代码**——旧树 `:913` 实为 `const holderScript = join(binDir, "holder.sh");`、`:958` 落在一段 `holderScript` heredoc（`sleep 0.005` / `exec cat`）内（本批 `sed` 逐行核对）；本批写进 (g) 的「位移后值」`:975-1018`/`:1020-1092` 同样指向那段无关代码（同理作废）。**按用例标题定位**，两条 T 态用例的真实位置：旧树 **`:1129`**（`a simulated T-state (SIGSTOP-paused seam) …`）/ **`:1174`**（`a pre-READY paused (T) helper is abandoned…`）⇒ 本批改动后 **`:1192`** / **`:1237`**。oracle 给的 `:1191`/`:1236` 与实测**差 1 行**（本批 fix-round 在文件头注释净 +1 行所致），**以本批实测为准**。⇒ **本批已将两者收进 D12.4**（现树 `:1199` / `:1244`）。
 - **（h）本批（2026-10-01，`fix/d8-child-pids-warn-coverage`）D8 收口后新增的证据边界（未做，待定）**：① **`existsSync("/proc")` 为假 ⇒ 不打告警**这条分支**仍无用例**（非 Linux / 无 procfs 场景）——本批只拦 `readFileSync` 的 children 路径，要钉得同时 mock `existsSync`（新挂账；**不动手**的理由：会扩大 mock 面到同文件其它用例共用的事件路径，超出本批“只让读 children 失败”的边界）。② 「每进程一次」是**模块作用域**状态，用例只钉到 **module instance 级**（靠 `vi.resetModules()` + 动态 import 取副本），**跨模块副本 / 跨进程的语义未实测**（代码上是模块作用域，属构造性事实，非实测）。③ 本机 procfs **有** children 文件（D1 已注明本机不可达）：失败是**注入**的，真实内核（`CONFIG_PROC_CHILDREN` 关 / 精简 procfs）**未实测**。④ **降级路径的真实墙钟残余未断言**：用例②只能看「release 等待集」的**成员**，看不了「flock 进程仍活时 release 是否提前返回」的实际时长。⑤ **平台口径（fix-round 订正）**：同文件邻例**有**守卫——`hasProcChildren = existsSync('/proc/<pid>/task/<pid>/children')`（fix-round 后 `:902`）＋ `test.skipIf(!hasProcChildren)`（`:904`/`:970`）；**用例② 本批已加同形守卫**（`:1358`）；**用例① 保持裸 `test(`**（理由：它注入读失败，在任何 Linux——含 procfs 不暴露 children 文件的内核——都成立，且在那样的内核上反而会**真触发**并通过；加守卫会漏掉该路径，与「把不可达分支钉住」的目标相反）。原写「与同文件邻例相同口径，未加平台守卫」**作废**（事实错误）。
-- **（i）本批（2026-10-01，`fix/d8-child-pids-warn-coverage`）一手核到的**旧锚点漂移**（源文件侧，归 D12；本批**不回写** D1 / D8 以外的行）**：D1 行（与 D8 原行）引 `src/daemon/process-manager.ts:312-333`（读 `:312`、告警 `:326`），现树实为 **`:401`（`readChildPids`）/ `:413-417`（告警，`console.warn`＝`:415`）**；`warnedChildPidsUnavailable`＝`:388`、`helperPids`＝`:588`、release 等待环＝`:705`（均为本批一手 `grep`）。D1 **状态未变**（仍为接受），只是锚点待下一批收口。
+- **（i）本批（2026-10-01，`fix/d8-child-pids-warn-coverage`）一手核到的**旧锚点漂移**（源文件侧，归 D12；本批**不回写** D1 / D8 以外的行）**：D1 行（与 D8 原行）引 `src/daemon/process-manager.ts:312-333`（读 `:312`、告警 `:326`），现树实为 **`:401`（`readChildPids`）/ `:413-417`（告警，`console.warn`＝`:415`）**；`warnedChildPidsUnavailable`＝`:388`、`helperPids`＝`:588`、release 等待环＝`:705`（均为本批一手 `grep`）。D1 **状态未变**（仍为接受），只是锚点待下一批收口。⇒ **本批已收口**：现树锚点见 **D12.4** 的 `src/daemon/process-manager.ts` 表（含读 `:401` / catch **`:407`**（`：408` 属 off-by-one）/ 告警 `:413-417` / `warnedChildPidsUnavailable` `:388` / `helperPids` `:588` / release 等待环 `:705`）；**D1 状态与结论未变**。
 - **（j）双审 consider｜「裸 catch + 一次性 latch」把任何**瞬时**失败都当成永久退化（本批登记，不动手）**：`src/daemon/process-manager.ts:408`（裸 `catch`）＋ `:413`（`!warnedChildPidsUnavailable` 一次性 latch）⇒ `EMFILE` / `EIO` / 「读时进程被杀」这类**瞬时**错误也会**永久消费唯一的告警预算**，此后再遇**真**退化（procfs 不再暴露 children 文件）就**永远静默降级**。属**已知设计**（模块级 flag 的既定语义，用例① 已把它钉成契约：「恰好一次」＋「第二次不再刷」），缺的是**登记**——(h) 边界清单原先没有这一条。**未做**：区分 errno（`ENOENT`＝结构性退化→latch；其余＝瞬时→不 latch 或按次数节流），属产品语义变更，待 owner / 后续批次。
 - **（k）双审 consider｜头注释措辞「exact … path」→ 实为「同形状路径」（本批已收敛措辞，未收紧正则）**：mock 的判据是 `/^\/proc\/(\d+)\/task\/(\d+)\/children$/`——`/proc/1/task/2/children` 这种**两个 pid 不相等**的路径也会被拦；生产恒相等（`readChildPids(pid)` 两侧同 pid），**无实害**。**本批 fix-round 已把注释改为「children-file path *shape*（两个 pid 不必相等）」**；**未**给正则加 `\1` 反向引用（不扩大改动面、也不缩小覆盖面）。
 - **（l）双审 consider｜注入面边界（失效方向是「响」的）**：该缝只拦**具名** `readFileSync` 导入路径。`import fs from "node:fs"`（**default** 导入）与 **`node:fs/promises`** 会**绕过**该缝——今天 `src/daemon/process-manager.ts` 只用具名 `readFileSync`（`:11` `} from "node:fs";`，文件内**无** `node:fs/promises`），故缝有效；将来若改成 default / promises，**用例会失败**（不是假绿）。**未做**：不为 default / promises 补拦（会扩大 mock 面）。
 - **（m）双审 consider｜跨进程语义未覆盖（设计使然）**：latch 是**模块作用域** ⇒ **每个进程各 warn 一次**（CLI 一次、daemon 一次）是**设计**；用例只钉 module instance 级（见 (h)②），**两个进程各自的告警预算未实测**。
-- **（n）oracle consider｜用例② 断言失败会**跳过 `release()`**（本批不动手；建议后续 3–5 行收口）**：句柄释放在 `try` 体内而非 `finally`——用例末尾 `finally`（fix-round 后 `:1426-1429`）只复位 `fsInjection.failChildrenRead` 与 spy（`:1427-1428`）⇒ 断言先炸时，未被 release 的 helper（flock + 其 fd 共享子进程）会把临时锁**把持到本进程退出**；同文件其它真 spawn 用例都在 `finally` 里杀子进程，**口径不一致**。**未做**：把 `degraded?.release()` / `healthy?.release()` 挪进 `finally`（或改用「已创建句柄」数组统一释放）。
+- **（n）oracle consider｜用例② 断言失败会**跳过 `release()`**（本批不动手；建议后续 3–5 行收口）**：句柄释放在 `try` 体内而非 `finally`——用例末尾 `finally`（D8 fix-round 后 `:1426-1429`；**同日第二轮再测：现树 `:1459-1462`**，两个 `release()` 落 `:1460` / `:1461`）只复位 `fsInjection.failChildrenRead` 与 spy（`:1427-1428`）⇒ 断言先炸时，未被 release 的 helper（flock + 其 fd 共享子进程）会把临时锁**把持到本进程退出**；同文件真 spawn 用例的**口径**（**订正 2026-10-01 同日第二轮 fix-round，本批一手；原写「都」过泛**）：该文件共 **6 个真 spawn 用例**，改动前**只有 3 个**在 `finally` 里杀子进程（`flock handle release does not busy wait…` 现树 `:901-910`、`flock handle release waits for every helper process…` `:983-990`、`release() returns only once the lock is observably free` `:1075-1082`）；另 3 个是 **inline 杀**（`two real concurrent processes…`＝ `killGroup` `:753-754`、`stress test: 200 rounds`＝ `:1559-1560`、`flock held … upon SIGKILL`＝ `:803`）。⇒ 本条的自证理由**不依赖邻例口径**，就是「**断言失败不该把锁留在手里**」；**本轮 fix-round 已给前两个 inline 用例补 `finally`**（`two real concurrent…` `:764-771`、`stress test` `:1566-1573`），**只剩 `flock held …SIGKILL` 仍是 inline**（已挂新 (t)①）。**未做**：把 `degraded?.release()` / `healthy?.release()` 挪进 `finally`（或改用「已创建句柄」数组统一释放）。
 - **（o）reviewer consider｜`flockPidOfLastChildrenRead`（fix-round 后 `:87`）只有用例② 一个调用点**，后续梳理可降为用例作用域。**本批不做**（与用例① 共用同一套注入态的取 pid 语义，先保持文件级可见性）。
+
+- **（本批状态续记：2026-10-01，`chore/ledger-hygiene-d12-d15`；`[MARK-LEDGER-HYGIENE-D12D15]`；**只追加状态与理由，不覆写原判断**）**：
+  - **（a）→ 维持挂账（本批不顺手对齐）**：本批新增的 `waitForCondition` 调用点（`:793`，见 (f) 收口）**沿用同文件既有写法＝默认 `intervalMs` 20 / `timeoutMs` 5000**，**未**改成 `daemon-service` 的显式形式；理由：① 改默认值会牵动该文件**既有 9 处调用点**（现树 `:657` / `:800` / `:864` / `:880` / `:1179` / `:1238` / `:1312` / `:1360` / `:1438`）；② 同文件内**先做到形状一致**优于跨文件对齐，跨文件对齐留待统一重构。
+  - **（b）→ 已记，追加第二步账目**：`33 − 3 + 2 = 32`（上批）⇒ 本批 **`32 − 1 = 31`**（`test/integration/herdr-socket-client.test.ts:257` 改写后退出该 grep 口径，见 (d) 与 D13 段「第三轮」）。复算：`git grep -n "setTimeout(resolve," HEAD -- test/ | wc -l` ＝ **32** vs `grep -rn "setTimeout(resolve," test/ | wc -l` ＝ **31**。
+  - **（d）→ 本批已收口（弱版）**：`test/integration/herdr-socket-client.test.ts:257`（现树木：sentinel `:261`、超时守卫 `:268`、断言 **`:271`**）把「race 结果被丢弃」改为**显式断言**。**负控**：让假服务器在 ack 后**立刻推一条 `pane.created`**（＝窗口内确有事件）⇒ **HEAD 版（race 丢弃）仍 `1 passed`（漏检）**、**worktree 版 `1 failed`**（`AssertionError: expected 'event' to be Symbol(no event within 50ms)`）。**`10009ms` 的归因（oracle 本轮指出；同日第二轮 fix-round 一手复现 + 修复）**：**不是**「临时副本自身开销」，而是——**失败路径跳过了 `client.close()` ⇒ `afterEach` 的 `server.close()` 等不到连接关闭、挂到 vitest 的 `hookTimeout`（`10000ms`）**，于是在真断言之外**追加第二条报错**（`Error: Hook timed out in 10000ms.`）。**fix-round 已把 teardown 挪进 `finally`**（现树 `:279-285` 的 `controller.abort(); client.close();`）⇒ 失败时不再产生第二条报错、也不再白等 10s。**负控（本轮一手，原始输出）**：注入「在 sentinel 断言处必失败（**不动流**）」——**修前**（批 3 版本）：用例 **10064ms**、`[1/2] Error: NC-INJECT…` + `[2/2] Error: Hook timed out in 10000ms.`（指 `test/integration/herdr-socket-client.test.ts:12`）；**修后**：用例 **62ms**、**只有 `[1/1]`**。**残留（＝强版仍挂账，见新增 (p)）**：改后的断言是**窗口内断言「没到」**＝ D13 **② 类**（负载下检出力下降、**不假失败**）。
+  - **（e）→ 本批未改 ② 类正文措辞（只加口径注）**：同意「措辞偏强」，但本批边界是「只动台账文字」，**改写 ② 类整组措辞属批量语义改写**、超出本次卫生轮；本轮只在 D13 段头加「口径现状」一行（33 → 现树 31，逐处清单**不重排**）。⇒ **仍挂账**。
+  - **（f）→ 本批已收口**：无界等待（旧树 `:725` → 修前现树 `:788`）改为：
+
+    ```ts
+    await waitForCondition(() => child.exitCode !== null || child.signalCode !== null, {
+      description: "the SIGKILLed flock holder to exit",
+    });
+    ```
+
+    （现树 `:793-795`，其后是 flock 释放屏障 `:800-802`。）**负控**：把 SIGKILL 指向**不存在的进程组**（`process.kill(-999999, "SIGKILL")` ⇒ 子进程**永不退出**）⇒ **HEAD 版**被**测试级预算**截断（`× … 10018ms`，**无具名错误**）；**worktree 版**在 **5149ms** 报**具名错误**：
+
+    ```
+    × test/unit/tmp-nc2-fixed.test.ts > daemon process manager > flock held by child process is released immediately upon SIGKILL 5149ms
+      → Timed out after 5000ms waiting for the SIGKILLed flock holder to exit
+    Error: Timed out after 5000ms waiting for the SIGKILLed flock holder to exit
+    ```
+
+    ⇒ 该路径不再只靠测试级预算兜底（从「裸 `Test timed out in 10000ms`」变成「5s 到期报屏障自己的具名错误」）；同时**缩短了失败反馈**——原状下先看到的是测试级超时（本批实测 10018ms），现为 **5s**。
+  - **（n）→ 本批已收口**：D1 降级用例：两个 handle 提到 `try` 外，`finally` 先 `degraded?.release(); healthy?.release();`（`release()` 幂等，双释放是 no-op）。**断言一字未改**（`git diff -U0 -- test/` 里本用例只增 `finally` 四行与变量声明）。**负控**：把 `expect(healthy).not.toBeNull()` 改成 `expect(healthy).toBeNull()` 强制在**两个 handle 都已获取之后**失败，两侧报**同一条** `AssertionError: expected { release: [Function release] } to be null`；差异只在残留（探针在用例自身 `finally` 末尾扫 `/proc`，列出仍打开锁文件的进程）：
+
+    ```
+    # HEAD 版（未修）
+    nc1 isFlockHeld=true holders=["124398/fd/3","124399/fd/3"]
+    # worktree 版（已修）
+    nc1 isFlockHeld=false holders=[]
+    ```
+
+    ⇒ 修前：断言失败时两个 helper（flock + fd 共享子进程）把临时锁**持到本进程退出**；修后：**当场释放、无残留持锁进程**。（NC1a＝第一处获取后即失败、NC1b＝健康对照获取后即失败，两变体结果同向。）
+  - **（j）/（k）/（l）/（m）/（o）→ 本批未动，维持挂账**：都属**产品语义 / 测试结构变更**（errno 分流、正则收紧、补 default / promises 注入面、跨进程语义实测、helper 作用域），与本批「台账卫生 + 三处小修」无关；本批只借 **D12.4** 收拢它们的**旧锚点**（如 (o) 的 `:87`、(k) 的注释行、(h)⑤ 的 `:902`/`:904`/`:970`）。
+  - **（p）（本批新增｜由 (d) 收口派生）**：`test/integration/herdr-socket-client.test.ts` 那条用例现在是**② 类负断言**（50ms 窗口内断言「没有事件到达」）⇒ ① 负载下**检出力下降**（**不假失败**，故**不属** flake 源）；② 它**仍**继承了 (d) 的未尽事项：「订阅竞态若真发生、但比窗口更晚」**仍不会**报警。**要钉死需**把负条件改成可等待的**正**条件（如「先等第一路 iterator 确实拿到订阅生效的证据，再断言第二路被拒」——需客户端暴露「已订阅」的可观测面）⇒ **挂账**（属测试语义 + 可能需 src 侧观测缝）。
+  - **（q）（本批新增｜方法学）**：本批发现「**只在 stdout 打印的一次性证据会被会话压缩吃掉**」（高载轮的首轮 `loadavg` 就只落在 stdout，轮次结束后已不可复算）⇒ **后续高载测量把 `loadavg` / 退出码 / 逐用例行写进落盘文件**（本批已按此重测一轮：`loadavg-run2.txt` + 两轮 `hl2-*.log`，且在**写台账时就地内联**、临时目录收尾清理）。与 **D12** 同源：证据要么落到**可复算**处，要么**当场标为历史值**。
+- **（r）（本轮新增｜oracle｜结构性假失败窗口：`flock held …SIGKILL` 的两处等待）**：现树 `:810-812`（有界轮询）与 `:817-819`（flock 释放屏障）两处，在**进程被整体去调度 ≥5s** 时会以**超时**收场。**机制（本批复核，与 oracle 一致）**：`waitForCondition` 是「**定时器相位先于谓词相位**」——每轮先 `setTimeout(20ms)` 让步、再查谓词，`deadline` 是**墙钟**；整体去调度期间两者都不推进，恢复后首轮即 `remaining <= 0` ⇒ 报自己的「Timed out after 5000ms」（**不是**被别的东西打穿，是**自己的界**到期）。**取证（oracle 本轮一手）**：用 `SIGSTOP` **确定性**做出「整体去调度」形状，**3 次 1 次命中**超时；**真实负载下从未出现**——高载档该屏障实耗 **max 26ms** ≈ `5_000` 预算的 **0.52%**（loadavg ≤ 34）。**结论（不修）**：「≥5s 完全去调度」在本机**任何可控负载下不可达**（26 busy-loop / 12 核档实耗仍在毫秒级）⇒ 与 D13 ② 同属**结构性**假设，登记不修；代价面＝偶发假失败、**无假通过**。
+- **（s）（本轮新增｜oracle consider｜高载测量的背景负载口径）**：本机是**多 agent 会话**环境（常驻 `pi` / `herdr server`，别的 session 可能同时在跑高载配方）⇒ 引用 **D15 段**任何 loadavg / 耗时数字时**必须注明「背景负载可能被别的 session 叠加」**，不得当单一来源的定值档；D15 段那个 `ambient` 行（17.23）就是这种叠加的实例（该段已给读档提醒）。
+- **（t）（本轮新增｜fix-round 一手新发现的两处残留；挂账不修）**：① `flock held …SIGKILL`（现树 `:777`）的**杀子进程仍在 inline**（`:803`；与 (n) 同族）——它在**屏障之前的那次断言 `expect(() => acquireDaemonLock(lockPath)).toThrow(…)`（现树 `:799`）失败时**，会把持锁子进程留到本进程退出；修法＝同 (n) 的 `try/finally`（本轮**未做**：不在派单范围，且该用例的 kill 处于「被测行为叙述」的位置，包 `finally` 要顺带改注释口径）。② 同文件仍有**两处无界等待**：`two real concurrent processes…` 的 `readLine`（`:737-740`，`p.stdout.once("data", …)`）与 `stress test` 工作进程的 `nextLine`（`waiters.push(resolve)`，无超时）——worker 若不打印任何一行，用例会挂到**测试级预算**（`10_000` / `30_000`）为止。**两者都属「改测试结构」，不在本轮派单内。**
+  - **（fix-round 行号换算（同日第二轮，`[MARK-D12D15-FIXROUND]`）**：本块（状态续记）内标「现树 / 批 3」的 dpm 行号按 **D12.4 末「新位移（第二轮）」** 的规则换算——`:739` 起 **+17**、`:1396` 起 **+18**、`:1506` 起 **+27**；`herdr-socket-client` 块内**断言行之前 +3**、文件尾 +8（例：续记 (d) 的 sentinel `:261` → **`:264`**、守卫 `:268` → **`:276`**、断言 `:271` → **`:274`**；续记 (f) 的轮询 `:793-795` → **`:810-812`**、屏障 `:800-802` → **`:817-819`**；续记 (n) 的 `finally` `:1426-1429`（D8 fix-round 值）→ 批 3 `:1441-1446` → fix-round **`:1459-1462`**（两个 `release()` 在 `:1460` / `:1461`））**。
+- **本批对 D17 的总结**：**新收口 3 条**＝(d) 弱版、(f)、(n)（**fix-round 均已加强**：(d) 补 teardown + `10009ms` 归因，(n) 订正过泛措辞并补 2 处 `finally`）；**状态更新 3 条**＝(a) 维持（调用点 9 → **12**）、(b) 第二步账目、(e) 维持；**未动**＝(h)(i)(j)(k)(l)(m)(o)；**新增**＝(p)(q)（第一轮）+ **(r)(s)(t)**（fix-round）。只有 (d)/(f)/(n) 因本批**被派单为小修**而收口，其余不变。
 
 ## 被放弃的方案（必填）
 

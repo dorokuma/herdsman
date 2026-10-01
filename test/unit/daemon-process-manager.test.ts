@@ -739,23 +739,40 @@ describe("daemon process manager", () => {
         p.stdout.once("data", (d) => resolve(d.toString().trim()));
       });
 
-    const results = await Promise.all([readLine(p1), readLine(p2)]);
-    expect(results.filter((r) => r === "ACQUIRED")).toHaveLength(1);
-    expect(results.filter((r) => r === "HELD")).toHaveLength(1);
-
     const killGroup = (p: typeof p1) => {
       try {
         if (p.pid) process.kill(-p.pid, "SIGKILL");
       } catch {}
     };
 
-    killGroup(p1);
-    killGroup(p2);
-    await Promise.all([
-      new Promise((res) => p1.on("exit", res)),
-      new Promise((res) => p2.on("exit", res)),
-    ]);
-  });
+    try {
+      const results = await Promise.all([readLine(p1), readLine(p2)]);
+      expect(results.filter((r) => r === "ACQUIRED")).toHaveLength(1);
+      expect(results.filter((r) => r === "HELD")).toHaveLength(1);
+
+      killGroup(p1);
+      killGroup(p2);
+      // Reap both workers under an explicit bound: they are detached and keep the
+      // lock until their stdin ends, so an unbounded `on("exit")` wait would hang
+      // until the test-level budget if the group SIGKILL never landed.
+      await waitForCondition(() => p1.exitCode !== null || p1.signalCode !== null, {
+        description: "the first lock contender to be reaped after SIGKILL",
+      });
+      await waitForCondition(() => p2.exitCode !== null || p2.signalCode !== null, {
+        description: "the second lock contender to be reaped after SIGKILL",
+      });
+    } finally {
+      // A failing assertion above must not leave two lock contenders behind: they
+      // keep their stdin (and the lock) until they are signalled. `killGroup`
+      // tolerates an already-dead pid, so the happy path's kills stay where they
+      // are and this is a no-op when the test already reaped both workers.
+      killGroup(p1);
+      killGroup(p2);
+    }
+    // The two `waitForCondition` reaps above own a 5s budget; the test-level
+    // deadline is kept longer so a stalled reap reports its own timeout instead of
+    // being masked by `Test timed out in 5000ms`.
+  }, 10_000);
 
   test("flock held by child process is released immediately upon SIGKILL", async () => {
     const dir = tempDir();
@@ -785,7 +802,14 @@ describe("daemon process manager", () => {
     try {
       if (child.pid) process.kill(-child.pid, "SIGKILL");
     } catch {}
-    await new Promise((resolve) => child.on("exit", resolve));
+    // Wait for the kill to land under an explicit bound instead of awaiting the
+    // `exit` event with no upper limit: a SIGKILL that reaches nothing (wrong pid,
+    // a process the caller may not signal) would otherwise hang here until the
+    // test-level budget reports a bare `Test timed out`. The poll fails with its
+    // own named error well inside that budget.
+    await waitForCondition(() => child.exitCode !== null || child.signalCode !== null, {
+      description: "the SIGKILLed flock holder to exit",
+    });
 
     // Kernel cleanup after the SIGKILL is not observable at a fixed offset, so
     // poll until the flock is really released instead of assuming 50ms is enough
@@ -1378,11 +1402,20 @@ exec /bin/sh "$@"
         return readFileSync(`/proc/${pid}/stat`, "utf8");
       };
 
+      // Both handles are held outside `try` so the `finally` below can release
+      // them: an assertion that fails before its own `release()` must not leave the
+      // helpers holding this temporary lock until the process exits. (Some sibling
+      // spawn cases clean up in `finally` the same way — the measured inventory is
+      // in the ledger's D17 (n); the two lock-contention cases kill inline.)
+      // `release()` is idempotent, so releasing twice is a no-op.
+      let degraded: ReturnType<typeof acquireFlockHandle> = null;
+      let healthy: ReturnType<typeof acquireFlockHandle> = null;
+
       try {
         // Degraded: the children file cannot be read, so `helperPids` holds the flock
         // process alone and release must not wait on anything else.
         fsInjection.failChildrenRead = true;
-        const degraded = acquireFlockHandle(lockPath, { readProcessStat: releaseWatchSeam });
+        degraded = acquireFlockHandle(lockPath, { readProcessStat: releaseWatchSeam });
         expect(degraded).not.toBeNull();
         flockPid = flockPidOfLastChildrenRead();
         // Load-bearing self-check: every assertion in this case rests on the seam
@@ -1408,7 +1441,7 @@ exec /bin/sh "$@"
         // fd-sharing child as well, so the single-entry watch set above is a real
         // consequence of the degradation and not an artefact of the instrumentation.
         fsInjection.failChildrenRead = false;
-        const healthy = acquireFlockHandle(lockPath, { readProcessStat: releaseWatchSeam });
+        healthy = acquireFlockHandle(lockPath, { readProcessStat: releaseWatchSeam });
         expect(healthy).not.toBeNull();
         const healthyFlockPid = flockPidOfLastChildrenRead();
         const fdSharingPid = Number(fsInjection.childrenContent.at(-1)?.trim());
@@ -1424,6 +1457,8 @@ exec /bin/sh "$@"
           description: "the flock to be observable as free after the watched releases",
         });
       } finally {
+        degraded?.release();
+        healthy?.release();
         fsInjection.failChildrenRead = false;
         warnSpy.mockRestore();
       }
@@ -1489,44 +1524,53 @@ exec /bin/sh "$@"
     const w1 = startWorker();
     const w2 = startWorker();
 
-    await Promise.all([w1.nextLine(), w2.nextLine()]);
+    try {
+      await Promise.all([w1.nextLine(), w2.nextLine()]);
 
-    const totalRounds = 200;
-    let singleMasterCount = 0;
-    let doubleMasterCount = 0;
-    let bothLostCount = 0;
+      const totalRounds = 200;
+      let singleMasterCount = 0;
+      let doubleMasterCount = 0;
+      let bothLostCount = 0;
 
-    for (let r = 0; r < totalRounds; r++) {
-      w1.child.stdin.write(`RACE ${r}\n`);
-      w2.child.stdin.write(`RACE ${r}\n`);
+      for (let r = 0; r < totalRounds; r++) {
+        w1.child.stdin.write(`RACE ${r}\n`);
+        w2.child.stdin.write(`RACE ${r}\n`);
 
-      const [res1, res2] = await Promise.all([w1.nextLine(), w2.nextLine()]);
-      const outcomes = [res1.split(" ")[0], res2.split(" ")[0]];
-      const wonCount = outcomes.filter((o) => o === "WON").length;
-      const lostCount = outcomes.filter((o) => o === "LOST").length;
+        const [res1, res2] = await Promise.all([w1.nextLine(), w2.nextLine()]);
+        const outcomes = [res1.split(" ")[0], res2.split(" ")[0]];
+        const wonCount = outcomes.filter((o) => o === "WON").length;
+        const lostCount = outcomes.filter((o) => o === "LOST").length;
 
-      if (wonCount === 1 && lostCount === 1) {
-        singleMasterCount++;
-        const winner = res1.startsWith("WON") ? w1 : w2;
-        winner.child.stdin.write(`RELEASE ${r}\n`);
-        const rel = await winner.nextLine();
-        expect(rel).toBe(`RELEASED ${r}`);
-      } else if (wonCount === 2) {
-        doubleMasterCount++;
-      } else if (lostCount === 2) {
-        bothLostCount++;
-      } else {
-        throw new Error(`unexpected race outcomes for round ${r}: ${res1}, ${res2}`);
+        if (wonCount === 1 && lostCount === 1) {
+          singleMasterCount++;
+          const winner = res1.startsWith("WON") ? w1 : w2;
+          winner.child.stdin.write(`RELEASE ${r}\n`);
+          const rel = await winner.nextLine();
+          expect(rel).toBe(`RELEASED ${r}`);
+        } else if (wonCount === 2) {
+          doubleMasterCount++;
+        } else if (lostCount === 2) {
+          bothLostCount++;
+        } else {
+          throw new Error(`unexpected race outcomes for round ${r}: ${res1}, ${res2}`);
+        }
       }
+
+      w1.child.kill("SIGKILL");
+      w2.child.kill("SIGKILL");
+
+      const countsMsg = `(WON,WON) double-master=${doubleMasterCount}; (LOST,LOST) both-lost=${bothLostCount}; (WON,LOST) single=${singleMasterCount}`;
+      expect(doubleMasterCount, countsMsg).toBe(0);
+      expect(bothLostCount, countsMsg).toBeLessThanOrEqual(10);
+      expect(singleMasterCount + bothLostCount + doubleMasterCount, countsMsg).toBe(200);
+    } finally {
+      // Both workers keep their stdin (and the lock) until they are signalled, so
+      // they must not outlive this test even when an assertion above fails; the
+      // inline kills stay as the happy path. `child.kill` on an exited child is a
+      // no-op rather than an error.
+      w1.child.kill("SIGKILL");
+      w2.child.kill("SIGKILL");
     }
-
-    w1.child.kill("SIGKILL");
-    w2.child.kill("SIGKILL");
-
-    const countsMsg = `(WON,WON) double-master=${doubleMasterCount}; (LOST,LOST) both-lost=${bothLostCount}; (WON,LOST) single=${singleMasterCount}`;
-    expect(doubleMasterCount, countsMsg).toBe(0);
-    expect(bothLostCount, countsMsg).toBeLessThanOrEqual(10);
-    expect(singleMasterCount + bothLostCount + doubleMasterCount, countsMsg).toBe(200);
     // 单跑约 1.4s，但并行复跑会升到 4～6.5s（3 路并发的全量复跑已越过 vitest 默认 5s），
     // 故显式抬高本用例超时，避免并行复跑时的假失败。
   }, 30_000);

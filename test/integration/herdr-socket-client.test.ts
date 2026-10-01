@@ -251,16 +251,38 @@ describe("HerdrSocketClient", () => {
 
     const client = new HerdrSocketClient({ socketPath });
     const controller = new AbortController();
-    const iterator = client
-      .subscribeEvents({ paneIds: ["w1:p1"] }, { signal: controller.signal })
-      [Symbol.asyncIterator]();
-    await Promise.race([iterator.next(), new Promise<void>((resolve) => setTimeout(resolve, 50))]);
-    const second = client
-      .subscribeEvents({}, { signal: controller.signal })
-      [Symbol.asyncIterator]();
-    await expect(second.next()).rejects.toThrow("already has an events.subscribe");
-    controller.abort();
-    client.close();
+    try {
+      const iterator = client
+        .subscribeEvents({ paneIds: ["w1:p1"] }, { signal: controller.signal })
+        [Symbol.asyncIterator]();
+      // The fake server answers `events.subscribe` and then pushes nothing, so no
+      // event may arrive on the first iterator inside this window. The race result
+      // used to be awaited and discarded, which left a stray event invisible; the
+      // timeout branch winning is now the assertion itself. A lost race names its
+      // non-sentinel outcome (which event, or which stream error) so a failure is
+      // diagnosable instead of a bare `"stream-error"`.
+      const noEventWithin50ms = Symbol("no event within 50ms");
+      const firstStreamOutcome = await Promise.race([
+        iterator.next().then(
+          () => "event" as const,
+          (error: unknown) => `stream-error: ${String(error)}`,
+        ),
+        new Promise<typeof noEventWithin50ms>((resolve) =>
+          setTimeout(() => resolve(noEventWithin50ms), 50),
+        ),
+      ]);
+      expect(firstStreamOutcome).toBe(noEventWithin50ms);
+      const second = client
+        .subscribeEvents({}, { signal: controller.signal })
+        [Symbol.asyncIterator]();
+      await expect(second.next()).rejects.toThrow("already has an events.subscribe");
+    } finally {
+      // Tear the connection down even when an assertion above failed: a client that
+      // stays connected makes `afterEach`'s `server.close()` wait for the hook
+      // timeout and report a second, unrelated failure next to the real one.
+      controller.abort();
+      client.close();
+    }
 
     expect(requests.filter((request) => request.method === "events.subscribe")).toHaveLength(1);
   });
