@@ -14,9 +14,9 @@
 - 子进程判活相位化：`isChildProcessActive` 增显式 `phase`（`"ready"` / `"pre-ready"`）参数——pre-READY 阶段（本 attempt 尚未观测到 READY）的 `T`（SIGSTOP/SIGTSTP）按「可放弃」处理，走既有「杀 + 重试」快路径；READY 建立之后 `T` 恒算活，不再杀掉仍持锁的 helper。只有 pre-READY 那一个调用点传 `"pre-ready"`，`Z` / `X` / `ENOENT` 判死路径、errno 分流、窗口预算与 attempt 结构零改动。
 - 测试（同版本收录）：并行复跑稳定性——`test/integration/orchestrator-disconnect-grace.test.ts` 4 处把真实 `sleep(20)` 当同步手段改为轮询屏障（事件循环被饿死时旧写法会让虚拟定时器被孤立、owner 永不清），`observability-rpc.test.ts` 的一处 `sleep(75)` 改为轮询到重新认领成功，`rpc-test-client.ts` 的 `waitForNotification` 预算约 200ms → 2s；`daemon-service.test.ts` / `package-publication.test.ts` / `agent-index-service.test.ts` / `herdsman-pi-extension.test.ts` 各补 30s 单例预算（不动全局 `vitest.config.ts`）；`daemon-process-manager.test.ts` 的 200 轮锁压测超时抬到 30s（单跑约 1.4s、3 路并发 4–6.5s，会撞穿 vitest 默认 5s）。断言一律未放宽。
 - 文档与笔记（同版本收录）：新增决策/取证笔记 7 篇（终态投递生命周期 H1、Phase 1 延迟、投递延迟观察、双审观察项与挂账台账、daemon 锁 release 屏障、`daemon status` 监督事实位、pi confirmed 基线空正文）；`0607eca` 为零代码改动的台账批次。
-- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.13.2；两个 README 的 Herdr 安装 tag 保持指向已存在的 `v0.12.1`（`v0.13.2` 的 tag 尚未创建），tag 替换在发布提交时执行。
+- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.13.2；两个 README 的 Herdr 安装 tag 随发布提交同步至本版本创建的 `v0.13.2`。
 - 范围：本版本包含 0.13.0、0.13.1 与 0.13.2 的全部内容（0.13.0 与 0.13.1 都未打 tag、未单独发布，内容随 0.13.2 一起发布；其中 0.13.1 只做了仓库内版本递增）。
-- **未发布**：仓库内版本号已递增到 0.13.2，但未打 tag、未发布到 npm；npm 上的 latest 仍是 0.12.1（`npm view @dorokuma/herdsman version` 实测）。本机生产用本地 tarball 安装本仓构建产物（不依赖 npm 发布），装后按部署流程重启，并用版本、PID、socket 逐条核对。
+- **已发布**：0.13.2 发布到 npm 的两个包（`@dorokuma/herdsman`、`@dorokuma/herdsman-pi`），并创建 tag `v0.13.2`；npm 上的 latest 由 0.12.1 变为 0.13.2。本机生产用本地 tarball 安装本仓构建产物（不依赖 npm 发布），装后按部署流程重启，并用版本、PID、socket 逐条核对。
 
 ## 0.13.1
 
