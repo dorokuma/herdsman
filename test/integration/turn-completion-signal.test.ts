@@ -1,9 +1,9 @@
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { HerdrSessionWatchManager } from "@/daemon/herdr-session-watch-manager.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
-import type { AgentEventRecord } from "@/observability/contracts.js";
+import type { AgentEventRecord, CompactAgentHistory } from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
@@ -1430,4 +1430,507 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     expect(validDones[0]?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
     harness.sqlite.close();
   }, 30_000);
+
+  test("W14: a confirmed pi turn keeps the answer when the plan baseline already holds it", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    // Production shape (worker event 48085 / scout event 48117): the plan row's
+    // compact_history_json is written once at plan creation and never updated,
+    // and that creation happened 131ms/308ms AFTER the final assistant message
+    // reached disk. The baseline therefore already carries the answer this round
+    // delivers, so the refreshed snapshot is byte-identical to it and
+    // `historyHasAdvanced(..., { requireAssistantChange: true })` reports "no
+    // advance" for a perfectly deliverable confirmed turn.
+    const terminalHistory: CompactAgentHistory = {
+      ...emptyCompactHistory("pi-jsonl"),
+      lastAssistantMessage: {
+        ref: "m2",
+        stopReason: "stop",
+        text: "final answer",
+        timestamp: null,
+      },
+    };
+    // The first read after the turn signal sees the same assistant message
+    // without its terminal stop reason (the message is readable before the tail
+    // settles); every later read is terminal, exactly like the frozen baseline.
+    const nonTerminalHistory: CompactAgentHistory = {
+      ...emptyCompactHistory("pi-jsonl"),
+      lastAssistantMessage: { ref: "m2", text: "final answer", timestamp: null },
+    };
+    let serveNonTerminalOnce = false;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          const compactHistory = serveNonTerminalOnce ? nonTerminalHistory : terminalHistory;
+          serveNonTerminalOnce = false;
+          return {
+            compactHistory: { ...compactHistory },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const plan = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: terminalHistory,
+      from: "working",
+      to: "done",
+    });
+
+    serveNonTerminalOnce = true;
+    registry.record({
+      confirmed: true,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+
+    const event = await index.executeStatusEventPlan({
+      agent,
+      compactHistory: terminalHistory,
+      from: "working",
+      to: "done",
+      planId: plan.id,
+    });
+
+    // A confirmed round whose refreshed snapshot equals the frozen plan baseline
+    // is still a deliverable round: the answer must not be blanked out as
+    // `no_advance_from_input`.
+    expect(event?.type).toBe("agent.done");
+    expect(event?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+    expect(event?.payload).toMatchObject({ staleSnapshot: false });
+    expect(event?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("W15: a confirmed pi turn with no deliverable text logs the release reason", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      const index = new AgentIndexService({
+        clientFactory: () => ({
+          close() {},
+          async sessionSnapshot() {
+            return piAgentSnapshot("working");
+          },
+        }),
+        history: {
+          async resolveCompactHistory() {
+            return {
+              compactHistory: { ...emptyHistory },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          },
+        } as unknown as AgentHistoryService,
+        sleep: async () => {},
+        stores: harness,
+        turnCompletions: registry,
+      });
+
+      await index.refreshHerdrSession(sessionInput());
+      const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+      if (!agent) throw new Error("expected agent");
+
+      const plan = harness.statusEventPlans.insertPending({
+        agent,
+        compactHistory: emptyHistory,
+        from: "working",
+        to: "done",
+      });
+
+      registry.record({
+        confirmed: true,
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        terminalId: "term_claude",
+        workspaceId: "wJ",
+      });
+
+      const event = await index.executeStatusEventPlan({
+        agent,
+        compactHistory: emptyHistory,
+        from: "working",
+        to: "done",
+        planId: plan.id,
+      });
+
+      // Nothing to deliver: the body stays empty and the round is still released
+      // non-degraded (a `degraded: true` row would be invalidated and re-run by
+      // #runPlanRow), but the release is no longer silent.
+      expect(event?.type).toBe("agent.done");
+      expect(event?.compactHistory?.lastAssistantMessage ?? null).toBeNull();
+      expect(event?.payload).toMatchObject({ staleSnapshot: false });
+      expect(event?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      const releaseLogs = warnCalls.filter(
+        (call) =>
+          call[0] === "Herdsman released a confirmed pi status event with no deliverable text" &&
+          call[1]?.degradedReason === "no_advance_from_input",
+      );
+      expect(releaseLogs).toHaveLength(1);
+      expect(releaseLogs[0]?.[1]).toMatchObject({
+        agentId: agent.id,
+        paneId: "wJ:p2",
+      });
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  // Shared fixture for the stale-baseline guard cases: the frozen plan baseline
+  // is handed in per round and the daemon always re-reads `disk()` from JSONL.
+  function staleGuardIndex(input: {
+    disk: () => CompactAgentHistory;
+    harness: ReturnType<typeof openObservabilityDbHarness>;
+    registry: TurnCompletionRegistry;
+  }): AgentIndexService {
+    return new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: { ...input.disk() },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: input.harness,
+      turnCompletions: input.registry,
+    });
+  }
+
+  // Drives one confirmed round through a persisted status event plan: the
+  // production shape, where `compact_history_json` is written once when the plan
+  // row is created and never updated afterwards. `eventKey` mirrors the Herdr
+  // event key every production plan carries.
+  async function runConfirmedPlanRound(input: {
+    baseline: CompactAgentHistory;
+    eventKey: string;
+    expectedText?: string;
+    harness: ReturnType<typeof openObservabilityDbHarness>;
+    index: AgentIndexService;
+    registry: TurnCompletionRegistry;
+  }): Promise<AgentEventRecord | undefined> {
+    const agent = input.harness.agents.findByPane({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+    });
+    if (!agent) throw new Error("expected agent");
+    const plan = input.harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: input.baseline,
+      from: "working",
+      herdrEventKey: input.eventKey,
+      to: "done",
+    });
+    input.registry.record({
+      confirmed: true,
+      ...(input.expectedText ? { expectedText: input.expectedText } : {}),
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      terminalId: "term_claude",
+      workspaceId: "wJ",
+    });
+    return input.index.executeStatusEventPlan({
+      agent,
+      compactHistory: input.baseline,
+      from: "working",
+      herdrEventKey: input.eventKey,
+      to: "done",
+      planId: plan.id,
+    });
+  }
+
+  test("W16: a confirmed pi turn whose frozen baseline is the last delivered body is released as a stale duplicate", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Round 1 delivers "round-1 answer"; that row is then the last terminal
+      // body on record for this pane.
+      const firstRound: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      let disk: CompactAgentHistory = firstRound;
+      const index = staleGuardIndex({ disk: () => disk, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      const first = await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-round-1",
+        harness,
+        index,
+        registry,
+      });
+      expect(first?.compactHistory?.lastAssistantMessage?.text).toBe("round-1 answer");
+
+      // Round 2 (production shape of the M1 sample): the plan baseline is the
+      // body already delivered in round 1, the pane writes no new message, and
+      // the extension's `expectedText` names a body that never reached disk —
+      // which is why these rounds take the `#waitForHistoryAdvance` path at all.
+      disk = { ...firstRound };
+      const stale = await runConfirmedPlanRound({
+        baseline: firstRound,
+        eventKey: "evt-round-2",
+        expectedText: "round-2 answer that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      // Delivering "round-1 answer" again would hand the orchestrator the
+      // previous round's result as if it were this one's: the body must be
+      // emptied, still released without a `degraded` marker (that would make
+      // #runPlanRow invalidate and re-run it), and logged with its own reason.
+      expect(stale?.type).toBe("agent.done");
+      expect(stale?.compactHistory?.lastAssistantMessage ?? null).toBeNull();
+      expect(stale?.payload).toMatchObject({ staleSnapshot: false });
+      expect(stale?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      const releaseLogs = warnCalls.filter(
+        (call) =>
+          call[0] === "Herdsman released a confirmed pi status event with no deliverable text" &&
+          call[1]?.degradedReason === "stale_baseline_duplicate",
+      );
+      expect(releaseLogs).toHaveLength(1);
+      expect(
+        warnCalls.filter((call) => call[1]?.degradedReason === "no_advance_from_input"),
+      ).toHaveLength(0);
+
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+        .all();
+      expect(invalidatedRows).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("W17: a confirmed pi turn whose baseline holds this round's answer is still delivered when the last delivered body differs", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Round 1 delivers "round-1 answer" (ref m1).
+      const firstRound: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      // Round 2's answer is a different message still on disk (ref m2).
+      const thisRound: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m2",
+          stopReason: "stop",
+          text: "round-2 answer",
+          timestamp: null,
+        },
+      };
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      let disk: CompactAgentHistory = firstRound;
+      const index = staleGuardIndex({ disk: () => disk, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-round-1",
+        harness,
+        index,
+        registry,
+      });
+
+      // The frozen baseline already carries this round's answer, so the refresh
+      // looks like "no advance" — but the content is neither new-round-verified
+      // duplicate nor previously delivered: it must reach the orchestrator.
+      disk = thisRound;
+      const delivered = await runConfirmedPlanRound({
+        baseline: thisRound,
+        eventKey: "evt-round-2",
+        expectedText: "answer that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(delivered?.type).toBe("agent.done");
+      expect(delivered?.compactHistory?.lastAssistantMessage?.text).toBe("round-2 answer");
+      expect(delivered?.payload).toMatchObject({ staleSnapshot: false });
+      expect(delivered?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      // The stale guard must not fire: the last delivered body (m1) differs from
+      // the content being released (m2).
+      expect(
+        warnCalls.filter((call) => call[1]?.degradedReason === "stale_baseline_duplicate"),
+      ).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("W18: a confirmed pi turn keeps never-delivered content even when expectedText does not match", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      const thisRound: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m9",
+          stopReason: "stop",
+          text: "round-2 answer",
+          timestamp: null,
+        },
+      };
+      let disk: CompactAgentHistory = emptyHistory;
+      const index = staleGuardIndex({ disk: () => disk, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      // Round 1 has nothing to deliver, so the last delivered row for this pane
+      // carries an empty body (its `lastAssistantMessage` is null).
+      await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-round-1",
+        harness,
+        index,
+        registry,
+      });
+      warn.mockClear();
+
+      // Reviewer's counterexample, pinned as the ruled semantics: `expectedText`
+      // disagrees with the text on disk and that text was never delivered. The
+      // `endsWith(expectedText)` mismatch is NOT a release blocker (the ruling:
+      // `expectedText` is systematically unreliable, which is a separate item —
+      // see .agents/notes/20261001-pi-confirmed-turn-frozen-baseline-empty-body.md
+      // "遗留 / 观察项" ①); the body is released as-is.
+      disk = thisRound;
+      const delivered = await runConfirmedPlanRound({
+        baseline: thisRound,
+        eventKey: "evt-round-2",
+        expectedText: "expected text that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(delivered?.type).toBe("agent.done");
+      expect(delivered?.compactHistory?.lastAssistantMessage?.text).toBe("round-2 answer");
+      expect(delivered?.compactHistory?.lastAssistantMessage?.ref).toBe("m9");
+      expect(delivered?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+      // No release with an empty body happened for this round either.
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] === "Herdsman released a confirmed pi status event with no deliverable text",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("W14b: a confirmed pi turn stays deliverable when every reread is terminal and identical to the frozen baseline", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // O5 gap of W14: there the first read after the signal was non-terminal
+      // (`serveNonTerminalOnce`). The measured production shape is that every
+      // read — the signal-time refresh included — is terminal and byte-identical
+      // to the frozen plan baseline. This is the first round for the pane, so the
+      // body was never delivered before either.
+      const terminalHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m2",
+          stopReason: "stop",
+          text: "final answer",
+          timestamp: null,
+        },
+      };
+      const index = staleGuardIndex({ disk: () => terminalHistory, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      const event = await runConfirmedPlanRound({
+        baseline: terminalHistory,
+        eventKey: "evt-round-1",
+        expectedText: "expected text that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(event?.type).toBe("agent.done");
+      expect(event?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+      expect(event?.payload).toMatchObject({ staleSnapshot: false });
+      expect(event?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] === "Herdsman released a confirmed pi status event with no deliverable text",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
 });

@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+- pi 终态事件不再把已就位的最终正文抹空：`turn completion` 已确认（`confirmed === true`）且磁盘上有非空终态 assistant 时，不再因为「计划行基线已含本轮答案」（计划行的 `compact_history_json` 只在创建时写一次、之后不更新）而把正文置空、发出渲染成 `(no assistant message)` 的空 `agent.done`；该放行路径不再静默——原因经 `console.warn("Herdsman released a confirmed pi status event with no deliverable text", { agentId, degradedReason, herdrSessionName, paneId, planId, terminalId })` 落日志（只含非敏感运行标识），仍**不置** `degraded`（置了会让 `#runPlanRow` 对已写事件 `invalidateById(..., "degraded_retry")` 再废一遍）。同时新增陈旧重复守卫：待交付正文恰好等于**最近一条终态行的正文**（通常是上一轮已交付的正文）时改为拦下（`degradedReason = stale_baseline_duplicate`，同样 log-only），不再把上一轮结果当本轮新结果重复投递。无 schema 变更、无迁移、无新 payload 键；非 confirmed 分支、`expected_text_mismatch` / `non_terminal_assistant` 的既有语义不变。遗留（本版本不改 pi 扩展）：pi 扩展侧用文件字节数变大做落盘确认，`expectedText` 与磁盘正文会系统性不一致，本版本只把它当分支判据、不再当放行条件；未覆盖的路径（工具阶段处理转换 + 信号 + `expectedText` 缺失）仍可能在极端条件下重发旧正文。
+- 测试：新增 W14 / W14b（基线已含答案时保留正文）、W15（放行理由进日志且仍非 degraded）、W16 / W17 / W18（陈旧重复守卫命中、不误伤、以及从未交付内容仍放行的既定语义）；`pnpm check` 绿（53 files / 838 tests）。
+
 - `daemon status` 增加只读监督事实：默认 JSON 多两个**可选**键 `managedBy`（pid 的 `/proc/<pid>/cgroup` 是否落在 herdsman.service 系统单元内 → `systemd:herdsman.service` / `unmanaged` / `unknown`）与 `restartCount`（`systemctl show herdsman.service -p NRestarts --value`，仅在 `managedBy` 为该单元时才探测，其它情况省略该键），并新增人类可读视图 `herdsman daemon status --text`（拿不到的 `restartCount` 显式写 `unavailable`）。默认 stdout 仍是 JSON，既有字段、`state` 取值与退出码语义零变化。口径：`unmanaged` 只表示"不归 herdsman.service 系统单元管"，不代表没人托管、也不代表可以杀；`restartCount` 是 systemd 的 `NRestarts`，`reset-failed`、`stop`+`start`、单元未加载都会把它清零，所以 `0` 不等于"从没崩过"。探针超时是硬上界：`spawnSync` 带 `killSignal: "SIGKILL"`，会无视 SIGTERM 的子进程也会被终止（默认 SIGTERM 时可被卡死 shim 拖住 8s）。
 
 ## 0.13.1

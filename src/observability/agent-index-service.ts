@@ -1934,7 +1934,26 @@ export class AgentIndexService {
           // invalidateById(..., "degraded_retry") on already-written content).
           const confirmedTerminal = turn.confirmed === true;
           const degradeOrRelease = (degradedReason: string): Record<string, unknown> => {
-            if (confirmedTerminal) return { staleSnapshot: false };
+            if (confirmedTerminal) {
+              // A confirmed round stays non-degraded (see above), but the reason
+              // is no longer swallowed: this path used to release silently with
+              // an emptied body, so an empty `agent.done` could only be
+              // diagnosed by reading the pane by hand. `degraded: true` must
+              // stay off here — #runPlanRow would `invalidateById(...,
+              // "degraded_retry")` the row it has already written.
+              console.warn(
+                "Herdsman released a confirmed pi status event with no deliverable text",
+                {
+                  agentId: input.agent.id,
+                  degradedReason,
+                  herdrSessionName: input.agent.herdrSessionName,
+                  paneId: input.agent.paneId,
+                  planId: input.planId ?? null,
+                  terminalId: input.agent.terminalId,
+                },
+              );
+              return { staleSnapshot: false };
+            }
             this.#logDegradedRelease(input, degradedReason);
             return { degraded: true, degradedReason, staleSnapshot: false };
           };
@@ -1970,12 +1989,46 @@ export class AgentIndexService {
             ) {
               throw new PlanWaitingHistoryError();
             }
+            // `historyHasAdvanced(..., { requireAssistantChange: true })` compares
+            // the assistant ref/text against the plan baseline. That baseline can
+            // hold this round's answer (a plan row's `compact_history_json` is
+            // written once at plan creation and never updated, and creation
+            // measured 131ms/308ms after the final assistant message reached
+            // disk). It can also hold the answer of a *previous* round — the same
+            // frozen baseline is exactly what the daemon last delivered — so a
+            // round that writes nothing new would otherwise re-release the
+            // previous round's body as if it were this one's. `latestTerminal` is
+            // the latest non-invalidated terminal row read before this round's row
+            // is written: usually the last delivery, possibly an undelivered idle.
+            const staleBaselineDuplicate = sameTerminalAssistantContent(
+              advanced,
+              latestTerminal?.compactHistory,
+              "pi",
+            );
+            // A confirmed turn carrying a non-empty terminal assistant message is
+            // trusted as-is, so `no_advance_from_input` stays reserved for rounds
+            // with genuinely no deliverable assistant text (empty or non-terminal
+            // tail).
+            const confirmedDeliverable =
+              confirmedTerminal &&
+              isTerminalAssistant(advanced) &&
+              hasNonEmptyAssistantMessage(advanced) &&
+              !staleBaselineDuplicate;
             if (
               !isRetry &&
               !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
             ) {
-              compactHistory = { ...advanced, lastAssistantMessage: null };
-              payloadExtra = degradeOrRelease("no_advance_from_input");
+              if (confirmedDeliverable) {
+                // Trust the already-in-place answer: release it as a non-stale
+                // snapshot and without a `degraded` marker.
+                compactHistory = advanced;
+                payloadExtra = { staleSnapshot: false };
+              } else {
+                compactHistory = { ...advanced, lastAssistantMessage: null };
+                payloadExtra = degradeOrRelease(
+                  staleBaselineDuplicate ? "stale_baseline_duplicate" : "no_advance_from_input",
+                );
+              }
             } else {
               const advancedText = advanced.lastAssistantMessage?.text?.trim() ?? "";
               const advancedMatchesExpected = !expectedText || advancedText.endsWith(expectedText);
