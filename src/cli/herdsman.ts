@@ -5,7 +5,12 @@ import { argv, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 import { resolveRuntime, runtimePathsFromRecordOrDefault } from "@/config/runtime.js";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
-import { getDaemonStatus, readDaemonRuntimeRecord } from "@/daemon/process-manager.js";
+import {
+  type DaemonStatus,
+  getDaemonStatus,
+  isSystemdHerdsmanManaged,
+  readDaemonRuntimeRecord,
+} from "@/daemon/process-manager.js";
 import type { AgentGetResult, AgentListItem, AgentReadResult } from "@/observability/contracts.js";
 
 const CURRENT_HERDR_WORKSPACE_ERROR =
@@ -20,7 +25,7 @@ type AgentScope = {
 };
 
 export type CliCommand =
-  | { action: DaemonAction; command: "daemon" }
+  | { action: DaemonAction; command: "daemon"; text: boolean }
   | ({ command: "agent-list"; json: boolean } & AgentScope)
   | ({ command: "agent-get"; json: boolean; target: string } & AgentScope)
   | ({ command: "agent-read"; json: boolean; limit?: number; target: string } & AgentScope)
@@ -46,8 +51,9 @@ export function parseCliArgs(
   if (command === "daemon") {
     const [action = "status", ...extra] = rest;
     if (!isDaemonAction(action)) throw new Error(`Unknown daemon action: ${action}`);
+    const text = takeFlag(extra, "--text");
     rejectExtra(extra);
-    return { action, command: "daemon" };
+    return { action, command: "daemon", text };
   }
 
   if (command === "agent") {
@@ -123,11 +129,20 @@ function scopedOrCurrent(scope: AgentScope, environment: NodeJS.ProcessEnv): Age
 
 export function helpText(): string {
   return `Usage:
-  herdsman daemon status
+  herdsman daemon status [--text]
   herdsman agent list [--all] [--workspace <id>] [--session <name>] [--json]
   herdsman agent get <target> [--workspace <id>] [--session <name>] [--json]
   herdsman agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]
   herdsman help
+
+Notes:
+  \`daemon status\` keeps printing JSON by default (the existing machine
+  contract); \`--text\` is the human view. Its two supervision facts are
+  read-only: \`managedBy\` only says whether the pid belongs to the
+  herdsman.service system unit — \`unmanaged\` does not mean unsupervised, and
+  it is not a licence to kill anything. \`restartCount\` is systemd's
+  NRestarts, which reset-failed, a stop+start pair or an unloaded unit all
+  reset to 0 — so 0 is not "never crashed".
 `;
 }
 
@@ -257,11 +272,39 @@ function oneLine(value: string): string {
   return value.replace(/\s+/g, " ").slice(0, 160);
 }
 
+/**
+ * Human-readable projection of `daemon status` for `--text`. The default output
+ * stays JSON, so scripts and the SKILL contract are unaffected; this view keeps
+ * only the fields a human reads at a glance and spells an unavailable restart
+ * count out instead of dropping it silently.
+ *
+ * `restartCount` is rendered only for the system unit that owns the pid. For
+ * `unmanaged`/`unknown` the JSON omits it too, and showing a number here would
+ * attribute another unit's restarts to this daemon.
+ */
+export function formatDaemonStatus(status: DaemonStatus): string {
+  const lines = [`state: ${status.state}`];
+  const pid = "pid" in status ? status.pid : undefined;
+  if (pid !== undefined) lines.push(`pid: ${pid}`);
+  if ("pidFileMissing" in status && status.pidFileMissing) lines.push("pidFileMissing: true");
+  if ("stalePid" in status && status.stalePid !== undefined) {
+    lines.push(`stalePid: ${status.stalePid}`);
+  }
+  if ("socketReachable" in status) lines.push(`socketReachable: ${status.socketReachable}`);
+  if (status.managedBy !== undefined) {
+    lines.push(`managedBy: ${status.managedBy}`);
+    if (isSystemdHerdsmanManaged(status.managedBy)) {
+      lines.push(`restartCount: ${status.restartCount ?? "unavailable"}`);
+    }
+  }
+  return lines.join("\n");
+}
+
 async function main(): Promise<void> {
   const command = parseCliArgs(argv.slice(2));
   const runtime = resolveRuntimeForCommand();
   if (command.command === "daemon") {
-    await runDaemonCommand(runtime);
+    await runDaemonCommand(command, runtime);
     return;
   }
   await runCliCommand(command, {
@@ -272,16 +315,14 @@ async function main(): Promise<void> {
 }
 
 async function runDaemonCommand(
+  command: Extract<CliCommand, { command: "daemon" }>,
   runtime: ReturnType<typeof resolveRuntimeForCommand>,
 ): Promise<void> {
-  console.log(
-    JSON.stringify(
-      await getDaemonStatus({
-        pidPath: runtime.paths.pidPath,
-        socketPath: runtime.paths.socketPath,
-      }),
-    ),
-  );
+  const status = await getDaemonStatus({
+    pidPath: runtime.paths.pidPath,
+    socketPath: runtime.paths.socketPath,
+  });
+  console.log(command.text ? formatDaemonStatus(status) : JSON.stringify(status));
 }
 
 export function resolveRuntimeForCommand() {

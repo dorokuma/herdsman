@@ -11,6 +11,13 @@ import {
 } from "node:fs";
 import { createConnection } from "node:net";
 import { basename, dirname } from "node:path";
+import {
+  type DaemonManagedBy,
+  HERDSMAN_SYSTEMD_UNIT,
+  managedByFromCgroup,
+  readProcessCgroup,
+  readSystemdRestartCount,
+} from "@/daemon/service-supervision.js";
 
 export type DaemonRuntimeRecord = {
   dbPath: string;
@@ -23,33 +30,61 @@ export type DaemonRuntimeRecord = {
   version: 1;
 };
 
-export type DaemonStatus =
-  | {
-      pid?: number;
-      pidPath: string;
-      pidFileMissing: true;
-      socketPath: string;
-      socketReachable: true;
-      state: "running";
-    }
-  | {
-      // Socket is reachable, so a daemon is running, but the pid file points to a
-      // dead or foreign PID. The daemon is managed outside this pid file (e.g.
-      // by systemd); stalePid is metadata only, not an orphan signal.
-      pidPath: string;
-      socketPath: string;
-      socketReachable: true;
-      stalePid: number;
-      state: "running";
-    }
-  | { pidPath: string; socketPath: string; state: "stopped"; stalePid?: number }
-  | {
-      pid: number;
-      pidPath: string;
-      socketPath: string;
-      socketReachable: boolean;
-      state: "running";
-    };
+/**
+ * Read-only facts about which supervisor owns the running daemon. Computed only
+ * on the branch where a daemon pid is known *and* its identity was confirmed;
+ * every other branch omits the keys entirely rather than guessing (the type
+ * makes them optional for exactly that reason). Both facts are best-effort and
+ * never affect `state`, the pid/socket verdicts, or the exit code.
+ *
+ * `managedBy` is present whenever that pid branch is taken, and falls back to
+ * `unknown` when its probe yields nothing. `restartCount` is present only when
+ * `managedBy` is `systemd:<HERDSMAN_SYSTEMD_UNIT>` *and* the probe succeeded:
+ * the value comes from `herdsman.service`, so it is meaningless for any other
+ * supervisor (see `isSystemdHerdsmanManaged`).
+ */
+export type DaemonStatusFacts = {
+  managedBy?: DaemonManagedBy;
+  restartCount?: number;
+};
+
+/**
+ * True when the daemon pid is supervised by the herdsman *system* unit — the
+ * only case in which the systemd `NRestarts` probe describes this pid.
+ */
+export function isSystemdHerdsmanManaged(managedBy: DaemonManagedBy | undefined): boolean {
+  return managedBy === `systemd:${HERDSMAN_SYSTEMD_UNIT}`;
+}
+
+export type DaemonStatus = DaemonStatusFacts &
+  (
+    | {
+        pid?: number;
+        pidPath: string;
+        pidFileMissing: true;
+        socketPath: string;
+        socketReachable: true;
+        state: "running";
+      }
+    | {
+        // Socket is reachable, so a daemon is running, but the pid file points to a
+        // dead or foreign PID. The daemon is managed outside this pid file (e.g.
+        // by systemd); stalePid is metadata only, not an orphan signal.
+        pidPath: string;
+        socketPath: string;
+        socketReachable: true;
+        stalePid: number;
+        state: "running";
+      }
+    | { pidPath: string; socketPath: string; state: "stopped"; stalePid?: number }
+    | {
+        pid: number;
+        pidPath: string;
+        socketPath: string;
+        socketReachable: boolean;
+        state: "running";
+      }
+  );
 
 export const DAEMON_ENTRYPOINT_NAMES = ["herdsman-daemon.js"] as const;
 
@@ -69,6 +104,13 @@ export type DaemonProcessDependencies = {
   isProcessRunning?: (pid: number) => boolean;
   identityProbe?: (pid: number, expectedNames?: readonly string[]) => boolean | undefined;
   pid?: number | undefined;
+  /** Overrides the `/proc/<pid>/cgroup` read used to name the supervisor. */
+  readCgroup?: (pid: number) => string | undefined;
+  /**
+   * Overrides the best-effort `systemctl show ... NRestarts` probe. Only called
+   * when the pid is supervised by the herdsman system unit.
+   */
+  readServiceRestartCount?: () => number | undefined;
 };
 export function readDaemonRuntimeRecord(path: string): DaemonRuntimeRecord | undefined {
   if (!existsSync(path)) {
@@ -121,6 +163,8 @@ export async function getDaemonStatus(input: {
   const processIsRunning = input.deps?.isProcessRunning ?? isProcessRunning;
   const identityProbe = input.deps?.identityProbe ?? readDaemonProcessIdentity;
   const connectSocket = input.deps?.connectSocket ?? defaultConnectSocket;
+  const probeCgroup = input.deps?.readCgroup ?? readProcessCgroup;
+  const probeRestartCount = input.deps?.readServiceRestartCount ?? readSystemdRestartCount;
 
   if (!existsSync(input.pidPath)) {
     if (await connectSocket(input.socketPath)) {
@@ -179,12 +223,57 @@ export async function getDaemonStatus(input: {
   }
 
   return {
+    ...supervisionFacts(pid, probeCgroup, probeRestartCount),
     pid,
     pidPath: input.pidPath,
     socketPath: input.socketPath,
     socketReachable: await connectSocket(input.socketPath),
     state: "running",
   };
+}
+
+/**
+ * Best-effort supervision facts for a known daemon pid. Never throws: a probe
+ * that rejects or throws only degrades its own field, so `daemon status` keeps
+ * its state and exit code no matter how broken `/proc` or `systemctl` is.
+ *
+ * Diagnostic path only: `probeRestartCount` spawns `systemctl` synchronously
+ * (see `service-supervision.ts`), so this must never be called from daemon
+ * lifecycle or hot paths.
+ */
+function supervisionFacts(
+  pid: number,
+  probeCgroup: (pid: number) => string | undefined,
+  probeRestartCount: () => number | undefined,
+): DaemonStatusFacts {
+  let managedBy: DaemonManagedBy = "unknown";
+  try {
+    const cgroup = probeCgroup(pid);
+    if (cgroup !== undefined) managedBy = managedByFromCgroup(cgroup);
+  } catch {
+    managedBy = "unknown";
+  }
+
+  // Only probe the restart count for a pid the herdsman system unit actually
+  // supervises. `NRestarts` is a property of `herdsman.service`, so for an
+  // `unmanaged` (or `unknown`) daemon it would be the count of a unit that does
+  // not own this pid — and `managedBy: unmanaged` + `restartCount: 3` reads
+  // like "this stray daemon restarted three times". Skipping the probe also
+  // keeps the diagnostic path from spawning `systemctl` for an answer that
+  // could not mean anything.
+  if (!isSystemdHerdsmanManaged(managedBy)) return { managedBy };
+
+  let restartCount: number | undefined;
+  try {
+    restartCount = probeRestartCount();
+  } catch {
+    restartCount = undefined;
+  }
+
+  // `0` here means "systemd has not restarted the unit since it loaded it"
+  // (reset-failed / stop+start / an unloaded unit all reset the counter), not
+  // "this daemon has never crashed".
+  return restartCount === undefined ? { managedBy } : { managedBy, restartCount };
 }
 
 type ProcessProbe = (pid: number, signal: 0) => unknown;

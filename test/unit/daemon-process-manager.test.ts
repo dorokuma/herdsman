@@ -27,6 +27,7 @@ import {
   removeDaemonPidFile,
   writeDaemonPidFile,
 } from "@/daemon/process-manager.js";
+import { managedByFromCgroup, readSystemdRestartCount } from "@/daemon/service-supervision.js";
 
 const tempDirs: string[] = [];
 
@@ -149,17 +150,220 @@ describe("daemon process manager", () => {
           connectSocket: async () => true,
           identityProbe: () => true,
           isProcessRunning: (pid) => pid === 1234,
+          readCgroup: () => undefined,
+          readServiceRestartCount: () => undefined,
         },
         pidPath,
         socketPath: "/tmp/herdsman.sock",
       }),
     ).resolves.toEqual({
+      managedBy: "unknown",
       pid: 1234,
       pidPath,
       socketPath: "/tmp/herdsman.sock",
       socketReachable: true,
       state: "running",
     });
+  });
+
+  test("reports the supervising systemd unit and restart count for a known daemon pid", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+
+    const status = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => true,
+        identityProbe: () => true,
+        isProcessRunning: (pid) => pid === 1234,
+        readCgroup: () => "0::/system.slice/herdsman.service\n",
+        readServiceRestartCount: () => 7,
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(status).toEqual({
+      managedBy: "systemd:herdsman.service",
+      pid: 1234,
+      pidPath,
+      restartCount: 7,
+      socketPath: "/tmp/herdsman.sock",
+      socketReachable: true,
+      state: "running",
+    });
+  });
+
+  test("omits the restart count when the daemon is not supervised by the herdsman unit", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+    let restartProbes = 0;
+
+    const status = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => true,
+        identityProbe: () => true,
+        isProcessRunning: (pid) => pid === 1234,
+        readCgroup: () => "0::/user.slice/user-0.slice/session-1.scope\n",
+        readServiceRestartCount: () => {
+          restartProbes += 1;
+          return 0;
+        },
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    // `NRestarts` belongs to `herdsman.service`, which does not own this pid:
+    // printing it next to `managedBy: unmanaged` would read like "this stray
+    // daemon restarted 0 times". The probe is not even run.
+    expect(status).toMatchObject({ managedBy: "unmanaged", state: "running" });
+    expect(status).not.toHaveProperty("restartCount");
+    expect(restartProbes).toBe(0);
+  });
+
+  test("degrades supervision facts to unknown/omitted without changing the rest of the status", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+    let restartProbes = 0;
+
+    const status = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => true,
+        identityProbe: () => true,
+        isProcessRunning: (pid) => pid === 1234,
+        readCgroup: () => undefined,
+        readServiceRestartCount: () => {
+          restartProbes += 1;
+          return undefined;
+        },
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(status).toMatchObject({
+      managedBy: "unknown",
+      pid: 1234,
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+      socketReachable: true,
+      state: "running",
+    });
+    expect(status).not.toHaveProperty("restartCount");
+    // `unknown` is not a systemd unit either, so no `systemctl` probe is spent.
+    expect(restartProbes).toBe(0);
+  });
+
+  test("a throwing supervision probe never fails daemon status or changes its state", async () => {
+    const dir = tempDir();
+    const pidPath = join(dir, "herdsman.pid");
+    writeFileSync(pidPath, "1234\n");
+
+    const status = await getDaemonStatus({
+      deps: {
+        connectSocket: async () => true,
+        identityProbe: () => true,
+        isProcessRunning: (pid) => pid === 1234,
+        readCgroup: () => {
+          throw new Error("cgroup read exploded");
+        },
+        readServiceRestartCount: () => {
+          throw new Error("systemctl exploded");
+        },
+      },
+      pidPath,
+      socketPath: "/tmp/herdsman.sock",
+    });
+
+    expect(status).toMatchObject({ managedBy: "unknown", pid: 1234, state: "running" });
+    expect(status).not.toHaveProperty("restartCount");
+  });
+
+  test("managedByFromCgroup requires the system slice and rejects lookalike units", () => {
+    // cgroup v2 and cgroup v1 system-manager layouts.
+    expect(managedByFromCgroup("0::/system.slice/herdsman.service\n")).toBe(
+      "systemd:herdsman.service",
+    );
+    expect(managedByFromCgroup("1:name=systemd:/system.slice/herdsman.service\n0::/\n")).toBe(
+      "systemd:herdsman.service",
+    );
+    // A nested cgroup inside the unit still belongs to that unit.
+    expect(managedByFromCgroup("0::/system.slice/herdsman.service/child.scope\n")).toBe(
+      "systemd:herdsman.service",
+    );
+    // Same unit name, but a *user* session unit: a different object that must
+    // not be reported as the system service (matching on the basename alone did).
+    expect(
+      managedByFromCgroup(
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/herdsman.service\n",
+      ),
+    ).toBe("unmanaged");
+    // A unit that merely starts with the same prefix must not be mistaken for it
+    expect(managedByFromCgroup("0::/system.slice/herdsman.service.dev\n")).toBe("unmanaged");
+    // Readable content that names no herdsman unit: genuinely unmanaged.
+    expect(managedByFromCgroup("0::/user.slice/user-0.slice/session-1.scope\n")).toBe("unmanaged");
+    expect(managedByFromCgroup("0::/\n")).toBe("unmanaged");
+    // Nothing was read: no fact available, which is `unknown`, not `unmanaged`.
+    expect(managedByFromCgroup("")).toBe("unknown");
+    expect(managedByFromCgroup("\n")).toBe("unknown");
+    expect(managedByFromCgroup("   \n\t\n")).toBe("unknown");
+  });
+
+  test("readSystemdRestartCount parses NRestarts and degrades on unusable output", () => {
+    const calls: Array<{ args: string[]; command: string; timeoutMs: number }> = [];
+    expect(
+      readSystemdRestartCount({
+        runner: (command, args, timeoutMs) => {
+          calls.push({ args, command, timeoutMs });
+          return "7\n";
+        },
+      }),
+    ).toBe(7);
+    expect(calls).toEqual([
+      {
+        args: ["show", "herdsman.service", "-p", "NRestarts", "--value"],
+        command: "systemctl",
+        timeoutMs: 1500,
+      },
+    ]);
+
+    expect(readSystemdRestartCount({ runner: () => "not-a-number" })).toBeUndefined();
+    expect(readSystemdRestartCount({ runner: () => "-1" })).toBeUndefined();
+    expect(readSystemdRestartCount({ runner: () => undefined })).toBeUndefined();
+    expect(
+      readSystemdRestartCount({
+        runner: () => {
+          throw new Error("systemctl exploded");
+        },
+      }),
+    ).toBeUndefined();
+  });
+
+  test("readSystemdRestartCount returns undefined when systemctl is missing", () => {
+    const dir = tempDir();
+    expect(
+      readSystemdRestartCount({ command: join(dir, "missing-systemctl"), timeoutMs: 500 }),
+    ).toBeUndefined();
+  });
+
+  test("readSystemdRestartCount returns within the timeout when the probe ignores SIGTERM", () => {
+    const dir = tempDir();
+    const stubborn = join(dir, "stubborn-systemctl");
+    // `trap '' TERM` + `exec`: the child ignores SIGTERM (SIG_IGN survives exec)
+    // and the sleeping image *is* the direct child, so only a hard kill can end
+    // it. A plain `sleep 5` would die on SIGTERM and give false confidence.
+    writeFileSync(stubborn, "#!/bin/sh\ntrap '' TERM\nexec sleep 8\n", { mode: 0o755 });
+
+    const start = Date.now();
+    expect(readSystemdRestartCount({ command: stubborn, timeoutMs: 300 })).toBeUndefined();
+    const elapsed = Date.now() - start;
+    // Without `killSignal: "SIGKILL"` this waited for the shim's full lifetime
+    // (8003ms measured on this machine), i.e. `daemon status` hung for 8s.
+    expect(elapsed).toBeLessThan(1000);
+    expect(elapsed).toBeGreaterThanOrEqual(250);
   });
 
   test("reports running with stalePid metadata when the pid is stale but the daemon socket is reachable", async () => {
@@ -281,12 +485,15 @@ describe("daemon process manager", () => {
         connectSocket: async () => true,
         identityProbe: () => undefined,
         isProcessRunning: () => true,
+        readCgroup: () => undefined,
+        readServiceRestartCount: () => undefined,
       },
       pidPath,
       socketPath: "/tmp/herdsman.sock",
     });
 
     expect(status1).toEqual({
+      managedBy: "unknown",
       pid: 1234,
       pidPath,
       socketPath: "/tmp/herdsman.sock",
@@ -301,6 +508,8 @@ describe("daemon process manager", () => {
         connectSocket: async () => true,
         identityProbe: () => undefined,
         isProcessRunning: () => true,
+        readCgroup: () => undefined,
+        readServiceRestartCount: () => undefined,
       },
       pidPath,
       socketPath: "/tmp/herdsman.sock",
