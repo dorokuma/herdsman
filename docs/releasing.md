@@ -180,6 +180,8 @@ git tag -a "$TAG" -m "$TAG"
 test "$(git rev-list -n 1 "$TAG")" = "$(git rev-parse HEAD)"
 ```
 
+The `HEAD` = `origin/main` check is evaluated at the point it runs — at the release start and again immediately after `git push origin main` — and holds there. Re-running the whole of `## Preconditions` *after* the release commit **and before it is pushed** makes it false by construction, because that commit has not yet been pushed; that is an artefact of the re-run, not a release failure, and is no reason to skip this gate. Read this check where it executes, not from a post-commit replay of the block.
+
 The staged set for the release commit is exactly four manifests plus both READMEs plus `CHANGELOG.md`; anything left unstaged fails the `git status --porcelain` check above and aborts the release.
 
 The tag must be created **after** the release commit — the commit that carries the README install tag and the CHANGELOG release section — has been pushed to `main`, which is why `git tag -a` follows `git push origin main` and the `HEAD` = `origin/main` check above. Verify the tag snapshot before publishing anything:
@@ -214,8 +216,12 @@ npm publish --access public
 If the command exits successfully but the registry returns E404 during
 subsequent verification, the CDN is still propagating: wait and retry
 `npm view` instead of republishing. Republishing a staged version
-returns E409; a successful publication that is not yet visible in
-`npm view` resolves within a minute.
+returns E409. A successful publication that is not yet visible in
+`npm view` normally appears within about a minute, and the second
+package has been observed to take longer: on 2026-10-02 the 0.13.3
+`@dorokuma/herdsman-pi` stayed at E404 across ten consecutive `npm view`
+retries before appearing (the first package appeared sooner). Keep
+retrying `npm view`; do not republish.
 
 Verify the exact version:
 
