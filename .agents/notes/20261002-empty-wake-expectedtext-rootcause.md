@@ -21,7 +21,10 @@ pi 终态回合出现「正文为空的 `agent.done`」有两条并存的根因�
 ## 根因
 
 **根因 ①（daemon 侧无条件抹空）。** `src/observability/agent-index-service.ts` 的 pi 终态分支在 `#waitForHistoryAdvance` 之后，对 `!advancedMatchesExpected`（`!expectedText || advancedText.endsWith(expectedText)` 不成立）走 `expected_text_mismatch`、对非终态/空末尾走 `non_terminal_assistant`，两臂都执行 `compactHistory = { ...advanced, lastAssistantMessage: null }` 再 `degradeOrRelease(...)` —— **无条件**把盘上已经落定的终态正文抹掉。
-- 实锤（第二意见 / oracle 观察，本批未独立复核原始行）：事件 **50549** 在事件写入**前 47ms**，盘上已有 `stopReason: "stop"` 的终态 assistant 正文（entry **`7ac7b132`**，**2555 字符**；先前写的 5374 是**字节**，被误记为「字」），快照 `updatedAt` 与判定所用快照**逐毫秒相同**，最终却写成空正文。即「文本明明在盘上、且就是本轮的，仍被抹成 null」。
+- 实锤（**本批独立复核**，2026-10-02T11:53Z 重测，可复算）：事件 **50549**（`created_at` = 1790927143153 = **2026-10-02T07:45:43.153Z**）投递出去的是**空正文** `agent.done`（`agent_events.compact_history_json.lastAssistantMessage = null`，payload 只有 `staleSnapshot: false`、无 `degradedReason`），而 journal 同刻（07:45:43.152828Z，planId 24233）的 warn 是 `Herdsman released a confirmed pi status event with no deliverable text { degradedReason: 'expected_text_mismatch' }`，紧随 `emitted pi agent.done after turn completion signal (confirmed=true)`。**事件前盘上最后一条终态 assistant 是 entry `dea4443d`**（`stopReason: "stop"`，ts 2026-10-02T07:45:42.953Z，**5374 字符 / 7678 字节**，正文首行 `## Completed`），距事件 `created_at` **200ms**（距 warn 199.8ms）。即「盘上已有非空终态正文、且就是事件时刻的盘况，投递出去却是空的」。
+- **订正（此前两处说法均错）**：① 此前引用的 entry **`7ac7b132`（2555 字符 / 3817 字节）不是事件前的正文**，而是事件**之后**下一轮的终态正文——其 ts = 07:46:57.355Z，在事件**之后 74.202s**，不可能「事件前就在盘上」；② 此前笔记写的「5374 是**字节**、被误记为字」是**反的**：**5374 是 `dea4443d` 的字符数，它的字节数是 7678**；2555 则是 `7ac7b132` 的字符数。③ 旧「47ms」的来源已查明：拿 journal 的**秒级**时间戳 07:45:43.000 减 07:45:42.953 = 47ms；对事件 `created_at`（…43.153）实为 **200ms**。复核结论与 oracle 一致（200ms / `dea4443d` / 7678 字节 / `7ac7b132` 在事件后 74.2s），与旧文本冲突的两处已按上文订正。
+- **并证否「那是计划行冻结基线」这一替代解释**：`status_event_plans` id=24233 的基线 `compact_history_json.updatedAt` = 2026-10-02T07:38:38.543Z（= 该轮之前最后一条 user message 的时间），而事件里 compact history 的 `updatedAt` = **07:45:42.953Z**（= `dea4443d`）⇒ 事件用的是事件时刻的**新读**，盘上末尾确为该条终态正文（旁证：同一 compact history 的 `lastToolResult.ref` = `…#entry=9d8b3048`、`lastUserMessage.ref` = `…#entry=86009140`，分别正是事件时刻文件里最后一条 toolResult（5806 字符）与最后一条 user message（「继续」，07:38:38.543Z））。
+- 复核方法（可复算）：`sqlite3 -readonly /root/.herdsman/state.db` 取该行 payload／compact history；`journalctl -u herdsman.service -o short-iso-precise --since 2026-10-02T07:45:41Z --until 2026-10-02T07:45:45Z` 取 warn；按 `historyRef.path` 逐行解析 pi 会话 JSONL（183 行），取事件 ts 之前最后一条 `stopReason: "stop"` 的 assistant 条目并算字符数（`len(text)`）与字节数（`len(text.encode("utf-8"))`）。
 
 **根因 ②（扩展侧 expectedText 被加工过，盘上原文才是权威）。** `packages/herdsman-pi/src/index.ts`（约 `:1299-1317`）里 `assistantMessageText(message)` 返回的是 `sanitizeText(text).text`，`signalTurnCompletion(expectedText)` 上报的就是这个 **sanitize 之后**的文本。而在 `message_end` **之后**，改写型扩展仍会继续改写落盘正文（例：`no-tables` 把 `### X` 改成粗体 `**X**`、把表格改成 bullet、以及链接处理）。于是：
 - 客户端上报的 `expectedText` 与磁盘原文**系统性不一致**（不是偶发抖动）；
@@ -63,6 +66,8 @@ pi 终态回合出现「正文为空的 `agent.done`」有两条并存的根因�
 
 **扩展的文本级确认必然 never-match（本批无法消除）。** 当 `expectedText` 的尾部窗口内被改写型扩展改写（或正文 ≤ 200 字符、任意位置被改写时整段即候选）时，文本级确认**必然失配** ⇒ 这类回合 `confirmed: false` → 走降级/重试。而 `confirmed` 是 `confirmedDeliverable` 的**硬合取项**，所以 **① 的救回对这类回合无效**。估算量级：约 **0.4%~1.5% 的回合**（按每天轮数折算为**每天个位数**）。
 
+**另一条 never-match 来源：凭据脱敏（本批新登记，独立于改写）。** `packages/herdsman-pi/src/index.ts:1300-1304` 的 `assistantMessageText` 返回的是 `sanitizeText(text).text`，而 `packages/herdsman-pi/src/sanitize-text.ts:26-42` 会把 `Authorization: Bearer …`、`Bearer …`、`token=` / `password=` / `secret=` / `api_key=` 的值以及 `sk-…` 一律换成 `[REDACTED]`（`redacted` 标志无人消费，`index.ts:1355` 直接把该文本喂给 `signalTurnCompletion`）。盘上 JSONL 存的是**原文**，而 `expectedText` 带的是 `[REDACTED]`；`turn-signal.ts:96-104` 的匹配是「文件尾部 8000 字符里是否 `includes` 候选」（候选 = 尾部 200 字符，正文 ≤200 字符时即全文，含其 JSONL 转义形态）⇒ 被脱敏的字面量一旦落在**候选窗口**内（尾部 200 字符内，或正文 ≤200 字符时的任意位置），文本级确认**必然 never-match**，与改写型扩展无关（脱敏发生在 sanitize 阶段，早于任何扩展改写）。**特别注意它未被上面 0.4%~1.5% 那个口径覆盖**：0.43%~1.5% 只统计「尾部窗口内的改写产物（表格等）」，凭据字面量不在该统计规则里 ⇒ 真实 never-match 率是「改写 + 脱敏」两类之和，会高于 1.5% 上界（本批未定量）。同样地，`confirmed` 是 `confirmedDeliverable` 的硬合取项，这一类也靠 ① 救不回，只能等 M2。
+
 **两个候选后续方案**
 - **M2（oracle 判为终局方向）**：daemon 侧把 mismatch 臂的 `confirmed` 闸门**降级为「信号已到」**——只要收到过 turn signal（不必是文本级 confirmed），就以**盘上正文为权威**采信，把 `confirmed` 从硬合取项里松绑。这样即使扩展 never-match 也不会丢正文。
 - **M1（仅在 ① 已部署上线后才可加）**：扩展侧在文本匹配失败时**退回尺寸增长判定**（旧行为作为兜底）。之所以必须**排在 ① 之后**：在 ① 上线前退回尺寸确认，等于恢复「mismatch 被确认然后被抹空」的老链路。
@@ -78,28 +83,29 @@ pi 终态回合出现「正文为空的 `agent.done`」有两条并存的根因�
 
 **回滚**
 - **daemon**：钉版本装回**上一个完整发布版本** + `systemctl restart herdsman.service`。
-- **扩展**：`git checkout -- packages/herdsman-pi/src/turn-signal.ts packages/herdsman-pi/src/wake.ts`。
+- **扩展**：`git checkout -- packages/herdsman-pi/src/turn-signal.ts packages/herdsman-pi/src/wake.ts` 在 0.13.5 之后是**空操作**（已证伪）：这两个文件当前 worktree hash == HEAD hash（`9ab8294f…` / `f7f5912b…`），HEAD 已含修复，该 checkout 只会把文件还原成同一份内容。要真正回滚必须**指名修复前的提交**：`git checkout 821fee5 -- packages/herdsman-pi/src/turn-signal.ts packages/herdsman-pi/src/wake.ts`（`821fee5` = `chore(release): 0.13.4`，即 0.13.4 的发布提交；其版本 hash 为 `4de06d4c…` / `dd951d00…`，与 HEAD 不同），或从 0.13.4 的发布物里取对应文件。**注意：该操作会在 main 上留下脏工作树**（两个文件相对 HEAD 处于已修改状态）——必须**显式提交或显式记录**这次回滚，否则 `git status --porcelain` 类门禁会挂、也没人知道运行时扩展已被回退。**回滚后必须重跑下面的 hash 断言**（否则你无法区分「回滚生效」与「什么都没发生」，后者正是 `git checkout --` 在 HEAD 含修复时给人的假安全感）。
 - **验收必须额外断言「worktree 里扩展文件 hash == 发布 tag 里对应文件的 hash」**。否则会出现「npm 包回滚了、行为没回滚」——因为扩展按工作树加载，包回滚并不会改变运行中的扩展行为。校验式（示意）：`git hash-object packages/herdsman-pi/src/turn-signal.ts` 与 `git show v<tag>:packages/herdsman-pi/src/turn-signal.ts | git hash-object --stdin` 必须相等（`wake.ts` 同理）。
+- **再加一条更硬的断言**：`git status --porcelain packages/herdsman-pi` **必须为空**——发布之后只要有人动过扩展源，发布物与运行时行为就脱钩（扩展按工作树加载，且**不会**随 npm 包回滚），这条能把「回滚 / 热修留下脏工作树」直接暴露出来。两条一起看：第一条管「内容对不对」，第二条管「发布后有没有人动过」。
 
 ## canary 判据（四个信号 + 阈值）
 
 观察窗口：**至少 24 小时或 50 个完成轮次**（取先到者后再看一次）。
 
-**分母与基线（实测时间 2026-10-02 11:09Z）**：分母 = **近 24h 终态轮次 327**（`agent.done` + `blocked`）。四条信号及其基线：
+**分母与基线（实测时间 2026-10-02T11:53Z；上一轮记的是 2026-10-02 11:09Z）**：分母 = **近 24h pi 终态轮次 318**（口径 = `agent_events.type='agent.done'` ∧ `json_extract(payload_json,'$.agent')='pi'`；上一轮记的 327 就是同一口径在 11:09Z 的读数）；同一窗口全部 `agent.done` = **350**（48h：pi 613 / 全部 689）。**`blocked` 实测为 0 行**（`agent_events` 里 `type='blocked'` 与 `payload.to='blocked'` 都不存在，`status_event_plans.to_status` 也没有 `blocked`）⇒ 「`agent.done` + `blocked`」这个分母在本库实际就等于 `agent.done`。四条信号及其基线：
 
-1. **① 救回量**：journal 计数 `accepted a confirmed pi status event despite an expectedText mismatch`。**基线不可测**（① 未上线）。预期上线后**不是小数**：mismatch/adopt 路径的**轮级占比实测 ≈ 29%~43%**，所以 warn 会接近「每几轮一条」，**别当异常告警**。
-2. **② mismatch 降级量**：`agent_events` 里 `degradedReason=expected_text_mismatch` 的条数，**基线 0/24h**。① 上线后预期 = 改写产物率 **0.43%~1.5%** × 轮数（折合每天个位数）。
-3. **③ 重试压力**：**② 的条数（`degradedReason=expected_text_mismatch`）+ `degraded_retry` 相对基线的变化**，以及「重试→补投」时延 **P95**。**基线 `degraded_retry` 12/24h**（≈3.7% 轮次）。
-4. **④ 空正文签名（按 journal 分组，不按字段）**：对 journal 分组 `Herdsman released a confirmed pi status event with no deliverable text`，**按其 `degradedReason` 字段分组**，**目标 = `expected_text_mismatch` 组趋 0**；`stale_baseline_duplicate` / `no_advance_from_input` 组是**既有地板，不算回归**。该签名（不分组合计）基线 **23/24h**（全时段 358）。
+1. **① 救回量**：journal 计数 `accepted a confirmed pi status event despite an expectedText mismatch`。**基线 0 条**（① 未上线，该计数在 ① 发布前按构造恒为 0；本次实测 journal 全时段 = 0 条）。预期上线后**不是小数**：mismatch/adopt 路径的**轮级占比实测 ≈ 29%~43%**，所以 warn 会接近「每几轮一条」，**别当异常告警**。
+2. **② mismatch 降级量**：`agent_events` 里 `payload.degradedReason=expected_text_mismatch` 的条数，**基线 0/24h、0/48h**（全时段 4）。① 上线后预期 = 改写产物率 **0.43%~1.5%** × 轮数（折合每天个位数）；**注意该上界未计入凭据脱敏类 never-match**（见「已知残余」）。
+3. **③ 重试压力**：**② 的条数（`degradedReason=expected_text_mismatch`）+ `degraded_retry` 相对基线的变化**，以及「重试→补投」时延 **P95**。**基线 `degraded_retry` 17/24h**（≈5.3% 轮次；全时段也是 17，且 17 条全落在近 24h 内——上一轮记的 12/24h 已随事件累积上升）。
+4. **④ 空正文签名（按 journal 分组，不按字段）**：对 journal 分组 `Herdsman released a confirmed pi status event with no deliverable text`，**按其 `degradedReason` 字段分组**，**目标 = `expected_text_mismatch` 组趋 0**；`stale_baseline_duplicate` / `no_advance_from_input` 组是**既有地板，不算回归**。该签名（不分组合计）基线 **23/24h = 23/48h = journal 全时段 23**（最早一条 2026-10-01T15:01:16.722Z，全部落在近 24h 内；journal 覆盖起点 = 2026-09-29T01:50:07Z，daemon 启动）；**构成 = `no_advance_from_input` 20 / `stale_baseline_duplicate` 2 / `expected_text_mismatch` 1**。DB 侧同口径（`type='agent.done'` ∧ `compact_history_json.lastAssistantMessage IS NULL` ∧ payload 无 `degradedReason`）在近 24h 也是 **23 条**，与 journal 的 23 条**逐条对上**（时间戳差 ≤2ms，如 event 50549 的 07:45:43.153Z vs warn 07:45:43.152828Z）；DB 全时段 358，其中 **266 条早于 journal 覆盖起点**（DB 最早一条在 2026-09-25T13:25:28Z）。
 
 **④ 为何不能沿用「旧空正文签名趋 0」**：`staleSnapshot=false` + 空 body + 无 `degradedReason` 这一签名**也被保留分支产出**——confirmed + `staleBaselineDuplicate`、confirmed + 空终态末尾，而这些分支的 payload **不落 `degradedReason`**。所以整体签名**不可达 0**，原写法会长期误报；只能分组后只盯 `expected_text_mismatch` 组。
 
-**③ 为何废弃绝对阈值**：③ 的既有构成（全时段）= `no_advance_from_input` 98、`non_terminal_assistant` 53、`expected_text_mismatch` **仅 2**。地板 12/24h（≈3.7%）本身即远高于任何「小比例」阈值 ⇒ **绝对阈值必须废弃**，只能看**相对基线的变化**。
+**③ 为何废弃绝对阈值**：③ 的既有构成（全时段，实测 2026-10-02T11:53Z）按 `payload.degradedReason` 分组 = `no_advance_from_input` **286**、`non_terminal_assistant` **128**、`expected_text_mismatch` **4**；若只取空正文 `agent.done`（`compact_history_json.lastAssistantMessage IS NULL`）则为 `no_advance_from_input` **101**、`non_terminal_assistant` **55**、`expected_text_mismatch` **2**（上一轮记的 98/53/2 就是后一个口径）。地板 17/24h（≈5.3%）本身即远高于任何「小比例」阈值 ⇒ **绝对阈值必须废弃**，只能看**相对基线的变化**。
 
 **升级条件（按 (a) 口径）**：
 
 - **(a) 本文采用**：**把 M2 改述为「计划内终局」**——M2 本就在计划内，canary 只决定**紧急度**（提前 / 推迟），不是「超阈值才启动」。触发**提前**的观察：② 从 0 抬头、④ 的 `expected_text_mismatch` 组连续不为 0，或出现「重试耗尽 → `agent.failed reason=degraded`」且可归因于 mismatch。
-- **(b) 备选硬阈值**：若要数值门槛，写 **> 2%**（显著超出上界 1.5%），且只对 ②/④ 生效。**原「② 或 ③ 的比例 > 0.5% 轮次」已删除**：它低于 ③ 的既有地板（12/24h ≈ 3.7%），按字面执行会**自触发误判**。
+- **(b) 备选硬阈值**：若要数值门槛，写 **> 2%**（显著超出上界 1.5%），且只对 ②/④ 生效。**原「② 或 ③ 的比例 > 0.5% 轮次」已删除**：它低于 ③ 的既有地板（17/24h ≈ 5.3%），按字面执行会**自触发误判**。
 
 **度量陷阱**：
 - `confirmed: true` **且文本匹配**的正常路径**不写** `staleSnapshot: false`（只有「mismatch 被采信」这一支才写）⇒ **不要**拿 `staleSnapshot` 字段当度量标尺，否则会把正常轮次误算成异常或反之。度量 ① 请直接数 journal 的 warn 文案。
@@ -133,9 +139,9 @@ pi 终态回合出现「正文为空的 `agent.done`」有两条并存的根因�
 
 - 本批任务：`[MARK-IMPL2-EMPTY-WAKE]`（第二实现批：注释措辞 / `failed` 标注 / 两条语义钉死测试 / 本篇笔记）；第一实现批（同一未提交分支 `fix/empty-wake-delivery`，9 个文件）落地 ①②③④ 的源码与回归测试。
 - 本篇 canary 段的阈值 / 口径修正：`[MARK-NOTE-CANARY-FIX]`（第三批，**仅改本篇笔记**，未动任何源码/测试）：④ 改按 journal `degradedReason` 分组、③ 改相对基线、废弃「> 0.5%」自触发阈值、补登 3 条新观察。
-- 根因 ① 的实锤（事件 50549 前 47ms、entry `7ac7b132`、**2555 字符** `stopReason:"stop"` 正文、快照 `updatedAt` 逐毫秒相同、却写成空）：来自**第二意见 / oracle 的独立观察**，本批**未独立复核**原始行。
+- 根因 ① 的实锤：**本批已独立复核并订正**（事件 50549 `created_at` = 2026-10-02T07:45:43.153Z；事件前最后一条盘上终态正文 = entry `dea4443d`（`stopReason:"stop"`、07:45:42.953Z、5374 字符 / 7678 字节）；事件后 74.202s 才落盘的 `7ac7b132`（2555 字符 / 3817 字节）不属事件前盘况，旧文本的「前 47ms / 2555 字符」已按上文订正）。复核方法、命令与两条口径对照（journal + DB）均写入本篇「根因」「canary 判据」两节。
 - oracle 旧观察「45/48 命中 `textMatches=false`」：**分子/分母/样本集未复现**（怀疑分母是「空正文事件集」），已在上文标注为**不可直接引用**，并给出可复现替代数（轮级 mismatch/adopt 占比 ≈29%~43%、尾部窗口改写产物率 0.43%~1.5%、末条消息全文含改写产物 12.7%~35.3%）。
-- canary 基线（分母 327 / ② 0 / ③ 12 / ④ 23 / 该签名全时段 358 / ③ 构成 98+53+2 / `deliverable=1` 终态行 2 行、全表 45 行（口径见遗留 9），测量时间 **2026-10-02 11:09Z**）与 3 条新观察：由 **oracle / 第二意见实测**提供，本批**仅转录口径**。
+- canary 基线：**本批重测刷新**（测量时间 **2026-10-02T11:53Z**；分母 pi 318 / 全部 `agent.done` 350，`blocked` 0 行 / ① 0 / ② 0（全时段 4）/ ③ `degraded_retry` 17 / ④ 23（= 48h = journal 全时段；构成 20+2+1）/ DB 全时段空正文 358 / ③ 构成按 `payload.degradedReason` 为 286+128+4、按空正文为 101+55+2 / `deliverable=1` 终态行 2 行、全表 45 行（口径见遗留 9））；上一轮记的 2026-10-02 11:09Z 版本（327 / 0 / 12 / 23 / 358 / 98+53+2）已被上文取代，此处仅作对照。
 - 根因 ② 的源码位置：`packages/herdsman-pi/src/index.ts` 约 `:1299-1317`（`assistantMessageText` → `sanitizeText`）；`packages/herdsman-pi/src/turn-signal.ts`（旧 `new_content` 尺寸确认，本批已删）。
 - 相关笔记：`.agents/notes/20261001-pi-confirmed-turn-frozen-baseline-empty-body.md`（冻结基线空正文、判据一/二/三）、`.agents/notes/20261001-production-install-channel-npm-registry.md`（生产安装渠道、wrapper 过时条目）、`.agents/notes/20260930-terminal-event-delivery-open-items.md`（投递时延与空正文观察）。
 - 部署渠道依据：项目 AGENTS.md「生产部署渠道（唯一，registry）」，daemon 装 `@dorokuma/herdsman@<version>` + `systemctl restart herdsman.service`。
