@@ -2032,11 +2032,11 @@ export class AgentIndexService {
             // that M2 accepts unconfirmed rounds, be re-released as this round's
             // answer; (ii) it only counts rows in `delivered`/`acked`, because a
             // never-deliverable row (`agent.idle` from a non-`working` status, per
-            // `isDeliverableAgentEvent`) can carry the same ref as a `done` row
-            // (~47% of ref-bearing idles in production) and must not be able to
-            // blank an otherwise deliverable round. So the tightened guard is
-            // deliberately NOT a strict superset of the old one for never-delivered
-            // rows.
+            // `isDeliverableAgentEvent`; ~50% of ref-bearing `agent.idle` rows for a
+            // given agent (47/94 in a 7-day sample) carry the same ref as a `done` row
+            // of that agent; they are never deliverable) can sit in the window and must
+            // not blank a deliverable round; the tightened guard is not a strict
+            // superset of the old one (it fires only in the mismatch arm).
             const staleBaselineDuplicate = (
               this.#stores.sqlite
                 .prepare(
