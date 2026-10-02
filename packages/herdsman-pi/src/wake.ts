@@ -117,7 +117,20 @@ export function formatAgentOutcomeUpdates(outcomes: AgentOutcome[]): string {
     const pane = outcome.paneId ?? "unknown";
     if (outcome.kind === "failed") {
       const reason = outcome.reason && outcome.reason.length > 0 ? outcome.reason : "(unknown)";
-      return `- failed ${identity} ${pane}\n  reason: ${reason}`;
+      // A failed round can still have produced assistant text before it failed; a
+      // reason-only line left that body invisible to the orchestrator. But the
+      // body of a `failed` / `discarded` outcome is not this round's output:
+      // `#appendPlanFailedEvent` / `#appendPlanDiscardedEvent` pass the plan
+      // baseline snapshot (`plan.compactHistory`, written once at plan creation),
+      // which may hold an earlier round's answer (see the plan-baseline notes).
+      // Rendering it as `last assistant:` read as "this round produced this", so
+      // the label says pre-round. The wire record carries no assistant `ref`, so
+      // same-source cannot be decided here without widening the daemon payload;
+      // the label is therefore always explicit (and only dropped when the body is
+      // empty, keeping the reason-only line byte-for-byte unchanged).
+      const body =
+        outcome.text.length > 0 ? `\n  last assistant (pre-round): ${outcome.text}` : "";
+      return `- failed ${identity} ${pane}\n  reason: ${reason}${body}`;
     }
     const excerpt = outcome.text.length > 0 ? outcome.text : "(no assistant message)";
     return `- ${outcome.kind} ${identity} ${pane}\n  last assistant: ${excerpt}\n  event: ${outcome.eventId}`;

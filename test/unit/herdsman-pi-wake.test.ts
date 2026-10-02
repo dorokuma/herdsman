@@ -1,5 +1,6 @@
 import { describe, expect, test } from "vitest";
 import type { AgentEventWireRecord } from "../../packages/herdsman-pi/src/daemon-client.js";
+import type { AgentOutcome } from "../../packages/herdsman-pi/src/wake.js";
 import {
   createAgentOutcomeProjector,
   formatAgentOutcomeUpdates,
@@ -94,7 +95,34 @@ describe("Pi agent wake projection", () => {
     expect(formatted).toContain("[HERDSMAN WAKE POLICY]");
     expect(formatted).toContain("- failed reviewer · Claude wB:p2");
     expect(formatted).toContain("reason: PROCESS_CRASH");
-    expect(formatted).not.toContain("last assistant:");
+    // The failed body comes from the plan baseline snapshot, not this round, so
+    // the label is explicit about it instead of reading as this round's output.
+    expect(formatted).toContain("last assistant (pre-round): assistant result 20");
+  });
+
+  test("carries a failed outcome's existing assistant body and omits the line without one", () => {
+    const withBody: AgentOutcome = {
+      agent: "claude",
+      eventId: 25,
+      kind: "failed",
+      name: "worker",
+      paneId: "wB:p2",
+      reason: "degraded",
+      terminalId: "term_agent",
+      text: "Partial output",
+    };
+    const formatted = formatAgentOutcomeUpdates([withBody]);
+    expect(formatted).toContain("- failed worker · Claude wB:p2");
+    expect(formatted).toContain("reason: degraded");
+    // A failed round that already produced assistant text must not reach the
+    // orchestrator as a reason-only line; the body is labelled `(pre-round)`
+    // because it is the plan baseline snapshot, not this round's output.
+    expect(formatted).toContain("last assistant (pre-round): Partial output");
+
+    const withoutBody = formatAgentOutcomeUpdates([{ ...withBody, text: "" }]);
+    expect(withoutBody).toContain("reason: degraded");
+    // 无正文时的输出与改前逐字一致：只保留 reason 行。
+    expect(withoutBody).not.toContain("last assistant");
   });
 
   test("projects agent.discarded as a wakeable failed outcome even with PLAN_WAITING_HISTORY reason", () => {

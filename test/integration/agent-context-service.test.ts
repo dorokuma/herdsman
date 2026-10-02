@@ -1,7 +1,7 @@
 import { chmod, mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import { DISCOVERY_RECENCY_GRACE_MS } from "@/agent-history/discovery.js";
 import type { AgentHistoryService, ResolvedCompactAgentHistory } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
@@ -369,6 +369,35 @@ describe("AgentContextService refresh", () => {
     expect(refreshed.snapshot.paneRevision).toBe(2);
     expect(refreshed.snapshot.updatedAt).toBeInstanceOf(Date);
     expect(refreshed.snapshot.updatedAt.getTime()).toBeGreaterThan(stored.updatedAt.getTime());
+  });
+
+  test("degrades to an in-memory snapshot when the agent row is deleted before the write", async () => {
+    const harness = openAgent();
+    const current = await source("deleted-agent.jsonl");
+    const fake = fakeHistory(resolved(current.ref, current.fingerprint));
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // The pane/agent row can be physically deleted while the daemon is still
+    // draining a status event plan (journal 18:17:10 `status event plan drain
+    // rejected rows { rejected: 1, errors: [...] }`). `agent_context_snapshots`
+    // references `agents(id)`, so the insert used to fail the whole drain with
+    // `FOREIGN KEY constraint failed`.
+    harness.sqlite.prepare("delete from agents where id = ?").run(harness.agent.id);
+
+    const result = await context(harness, fake.service).refreshAgent({
+      agent: harness.agent,
+      identityChanged: false,
+    });
+
+    expect(result.changed).toBe(true);
+    expect(result.snapshot.compactHistory.lastAssistantMessage?.text).toBe("done");
+    expect(result.snapshot.updatedAt).toBeInstanceOf(Date);
+    // Nothing is persisted for a deleted agent; the caller only needs the body of
+    // the round it is delivering.
+    expect(harness.agentContextSnapshots.get(harness.agent.id)).toBeUndefined();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("deleted agent"),
+      expect.objectContaining({ agentId: harness.agent.id }),
+    );
   });
 
   test("prefers a recent discovered_file when occupied is unchanged", async () => {
