@@ -136,6 +136,21 @@ const FLOCK_SYSCALL_NUMBERS: Partial<Record<NodeJS.Architecture, string>> = {
 };
 
 /**
+ * Best-effort read of the pid the fake `flock` wrappers below publish into their
+ * `holderPidFile`. Used on the failure path: when the handshake wait times out,
+ * the cleanup must still be able to reach the holder, and an absent/garbled file
+ * must leave the caller with `undefined` rather than a bogus pid.
+ */
+function readPublishedHolderPid(holderPidFile: string): number | undefined {
+  try {
+    const parsed = Number(readFileSync(holderPidFile, "utf8").trim());
+    return Number.isInteger(parsed) && parsed > 0 ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * True once `pid` is parked inside the kernel acquiring the flock. A process
  * that already owns a lock waits somewhere else (for `flock -x f <cmd>`: in
  * `do_wait` for its `<cmd>` child), so this identifies a contending process
@@ -927,7 +942,7 @@ describe("daemon process manager", () => {
 
   test.skipIf(!hasProcChildren)(
     "flock handle release waits for every helper process that shares the lock fd",
-    () => {
+    async () => {
       const dir = tempDir();
       const lockPath = join(dir, "herdsman.pid.lock");
       const binDir = join(dir, "bin");
@@ -969,6 +984,21 @@ exec cat
       try {
         const handle = acquireFlockHandle(lockPath);
         expect(handle).not.toBeNull();
+        // READY proves the *lock holder* is up, not that this wrapper published its
+        // pid: the fake flock backgrounds the holder first and writes
+        // `holderPidFile` afterwards, so on a loaded full-suite run that write can
+        // land after the handshake the acquisition above returned on. Wait for the
+        // pid file to be observable instead of blind-reading it — the blind read
+        // raised ENOENT roughly once per full parallel run (the single-file run
+        // never lost the race, which is why it read as flaky).
+        await waitForCondition(
+          () => existsSync(holderPidFile) && readFileSync(holderPidFile, "utf8").trim() !== "",
+          {
+            description: `the fake flock wrapper to publish the helper pid into ${holderPidFile}`,
+            intervalMs: 5,
+            timeoutMs: 2000,
+          },
+        );
         holderPid = Number(readFileSync(holderPidFile, "utf8"));
 
         const start = Date.now();
@@ -982,6 +1012,11 @@ exec cat
         expect(isFlockHeld(lockPath)).toBe(true);
       } finally {
         process.env.PATH = origPath;
+        // A wait that timed out leaves `holderPid` unassigned even though the
+        // wrapper may already have published it by then — re-probe once, so a
+        // failed wait cannot leak a lock-holding holder (it lives in its own
+        // session, so only its pid lets us reach it).
+        holderPid ??= readPublishedHolderPid(holderPidFile);
         if (holderPid !== undefined) {
           try {
             process.kill(-holderPid, "SIGKILL");
@@ -993,7 +1028,7 @@ exec cat
 
   test.skipIf(!hasProcChildren)(
     "flock handle release() returns only once the lock is observably free",
-    () => {
+    async () => {
       const dir = tempDir();
       const lockPath = join(dir, "herdsman.pid.lock");
       const binDir = join(dir, "bin");
@@ -1052,6 +1087,18 @@ exec cat
       try {
         const handle = acquireFlockHandle(lockPath);
         expect(handle).not.toBeNull();
+        // Same handshake-order race as the sibling test above: the fake flock
+        // backgrounds the holder and publishes `holderPidFile` only afterwards, so
+        // READY (which the acquisition above already waited for) can be observable
+        // before the pid file is. Wait for the pid file rather than blind-reading it.
+        await waitForCondition(
+          () => existsSync(holderPidFile) && readFileSync(holderPidFile, "utf8").trim() !== "",
+          {
+            description: `the fake flock wrapper to publish the holder pid into ${holderPidFile}`,
+            intervalMs: 5,
+            timeoutMs: 2000,
+          },
+        );
         holderPid = Number(readFileSync(holderPidFile, "utf8"));
         expect(Number.isInteger(holderPid) && holderPid > 0).toBe(true);
         // The holder is parked before its short hold, so the lock really is held
@@ -1074,6 +1121,9 @@ exec cat
         expect(elapsed).toBeLessThan(90);
       } finally {
         process.env.PATH = origPath;
+        // Same failure-path cleanup as the sibling test above: a timed-out wait
+        // must not leak the holder just because `holderPid` was never assigned.
+        holderPid ??= readPublishedHolderPid(holderPidFile);
         if (holderPid !== undefined) {
           try {
             process.kill(-holderPid, "SIGKILL");
