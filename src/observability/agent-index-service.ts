@@ -2032,10 +2032,43 @@ export class AgentIndexService {
             } else {
               const advancedText = advanced.lastAssistantMessage?.text?.trim() ?? "";
               const advancedMatchesExpected = !expectedText || advancedText.endsWith(expectedText);
-              if (!advancedMatchesExpected) {
+              if (confirmedDeliverable) {
+                // Event 50549: the extension confirmed the write, but its
+                // `expectedText` is the extension's own guess at the final tail and
+                // can disagree with the transcript that actually landed on disk
+                // (the old extension treated "the file grew" as confirmation, so a
+                // stale/escaped tail was reported as written). The disk tail is the
+                // authoritative evidence, and it already is a terminal assistant
+                // message with a body, so it is this round's answer: release it
+                // as-is (see :2012-2026 for the same judgement) and keep
+                // `degraded` off, because `degraded: true` makes #runPlanRow call
+                // invalidateById(..., "degraded_retry") on content that is already
+                // written. The mismatch is still recorded as a warning so the
+                // disagreement stays diagnosable instead of being swallowed.
+                if (!advancedMatchesExpected) {
+                  console.warn(
+                    "Herdsman accepted a confirmed pi status event despite an expectedText mismatch",
+                    {
+                      agentId: input.agent.id,
+                      degradedReason: "expected_text_mismatch",
+                      herdrSessionName: input.agent.herdrSessionName,
+                      paneId: input.agent.paneId,
+                      planId: input.planId ?? null,
+                      terminalId: input.agent.terminalId,
+                    },
+                  );
+                  payloadExtra = { staleSnapshot: false };
+                }
+                compactHistory = advanced;
+              } else if (!advancedMatchesExpected) {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease("expected_text_mismatch");
               } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
+                // `confirmedDeliverable` is false in this arm by construction (its
+                // terminal/non-empty conjuncts are exactly this condition's
+                // negation), so a confirmed round never reaches it and
+                // `non_terminal_assistant` keeps its pre-existing meaning: only a
+                // non-terminal or empty tail is degraded.
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease("non_terminal_assistant");
               } else {

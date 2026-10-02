@@ -430,6 +430,17 @@ export class AgentStore {
     return this.#record(row);
   }
 
+  /**
+   * Non-throwing existence probe for callers that must decide whether dependent
+   * rows (e.g. `agent_context_snapshots`, which references `agents(id)`) can
+   * still be written for this agent.
+   */
+  exists(id: string): boolean {
+    return (
+      this.#sqlite.prepare("select 1 as present from agents where id = ?").get(id) !== undefined
+    );
+  }
+
   resolveTarget(scope: AgentQueryScope, target: string): AgentIndexRecord {
     const agents = this.list(scope);
     const candidateGroups = [

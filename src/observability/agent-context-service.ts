@@ -135,7 +135,35 @@ export class AgentContextService {
     if (previous && sameSnapshotPayload(previous, next)) {
       return { changed: false, snapshot: previous };
     }
-    return { changed: true, snapshot: this.#stores.agentContextSnapshots.put(next) };
+    // `agent_context_snapshots.agent_id` references `agents(id)` (drizzle/
+    // 0003_opposite_tarantula.sql), and a pane can be physically deleted while the
+    // daemon is still draining a persisted status event plan (journal 18:17:10
+    // `status event plan drain rejected rows { rejected: 1, errors: [...] }`).
+    // The write then fails with `FOREIGN KEY constraint failed` and takes the
+    // whole drain batch (every other row in it) down with it. A deleted agent can
+    // never be read back from this store anyway, so degrade to an in-memory
+    // snapshot that still carries the round's compact history to its caller.
+    if (!this.#stores.agents.exists(input.agent.id)) {
+      this.#logDeletedAgentSkip(input.agent);
+      return { changed: true, snapshot: inMemorySnapshot(next) };
+    }
+    try {
+      return { changed: true, snapshot: this.#stores.agentContextSnapshots.put(next) };
+    } catch (error) {
+      // The row can still be deleted between the check above and the insert; the
+      // foreign-key failure must stay contained to this one snapshot.
+      if (!isForeignKeyConstraintError(error)) throw error;
+      this.#logDeletedAgentSkip(input.agent);
+      return { changed: true, snapshot: inMemorySnapshot(next) };
+    }
+  }
+
+  #logDeletedAgentSkip(agent: AgentIndexRecord): void {
+    console.warn("Herdsman skipped agent context snapshot write for a deleted agent", {
+      agentId: agent.id,
+      herdrSessionName: agent.herdrSessionName,
+      paneId: agent.paneId,
+    });
   }
 
   getAgentSnapshot(agentId: string): AgentContextSnapshotRecord | undefined {
@@ -176,6 +204,30 @@ export class AgentContextService {
       workspaceId: input.workspaceId,
     };
   }
+}
+
+/**
+ * SQLite's `SQLITE_CONSTRAINT_FOREIGNKEY` (19 | (3 << 8)) result code, which
+ * `node:sqlite` exposes as `errcode` on the thrown `Error`.
+ */
+const SQLITE_CONSTRAINT_FOREIGNKEY = 787;
+
+function isForeignKeyConstraintError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    (error as { errcode?: unknown }).errcode === SQLITE_CONSTRAINT_FOREIGNKEY
+  );
+}
+
+/**
+ * The snapshot a deleted agent would have received: identical payload, stamped
+ * with the current time instead of the monotonic store timestamp.
+ */
+function inMemorySnapshot(
+  next: Omit<AgentContextSnapshotRecord, "updatedAt">,
+): AgentContextSnapshotRecord {
+  return { ...next, updatedAt: new Date() };
 }
 
 async function shouldForceDiscovery(input: {

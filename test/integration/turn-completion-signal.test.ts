@@ -1205,6 +1205,92 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   }, 10_000);
 
+  test("50549: a confirmed turn keeps the disk body when the signal expectedText mismatches", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    let calls = 0;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return piAgentSnapshot("working");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          calls += 1;
+          // Round baseline (m1) is the previous delivered answer; the disk the
+          // daemon re-reads after the signal holds this round's real answer (m2).
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: calls === 1 ? "m1" : "m2",
+                text: calls === 1 ? "previous round answer" : "assembled final body",
+                timestamp: null,
+                stopReason: "stop",
+              },
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+      turnCompletions: registry,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    calls = 0;
+    const pending = index.handleHerdrEvent(doneEvent);
+    // Production shape (event 50549): the extension confirmed the write but its
+    // expectedText is a stale/escaped tail that the on-disk body does not end
+    // with. The disk body is still this round's answer and must be delivered.
+    setTimeout(() => {
+      registry.record({
+        confirmed: true,
+        expectedText: "expected tail that never reached disk",
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        terminalId: "term_claude",
+        workspaceId: "wJ",
+      });
+    }, 10);
+
+    const result = await pending;
+    expect(result.events).toContainEqual(
+      expect.objectContaining({
+        compactHistory: expect.objectContaining({
+          lastAssistantMessage: expect.objectContaining({
+            ref: "m2",
+            text: "assembled final body",
+          }),
+        }),
+        type: "agent.done",
+      }),
+    );
+    // The mismatch stays diagnosable through a warning, but it must not blank the
+    // body nor degrade the (already written) row.
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("expectedText mismatch"),
+      expect.objectContaining({ degradedReason: "expected_text_mismatch" }),
+    );
+    const doneRows = harness.sqlite
+      .prepare("select * from agent_events where type = 'agent.done'")
+      .all() as Array<Record<string, unknown>>;
+    expect(doneRows).toHaveLength(1);
+    expect(doneRows[0]).toMatchObject({ deliverable: 1, status: "pending" });
+    expect(JSON.parse(String(doneRows[0]?.payload_json))).not.toEqual(
+      expect.objectContaining({ degraded: true }),
+    );
+    expect(JSON.parse(String(doneRows[0]?.compact_history_json))).toMatchObject({
+      lastAssistantMessage: { ref: "m2", text: "assembled final body" },
+    });
+    harness.sqlite.close();
+  }, 10_000);
+
   test("pi timeout with terminal but empty assistant emits degraded non_terminal_assistant", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 0 });
