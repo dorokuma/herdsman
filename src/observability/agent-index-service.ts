@@ -102,6 +102,25 @@ export type StatusEventPlan = {
 
 export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
 
+/**
+ * How many prior terminal rows the stale-baseline duplicate guard compares
+ * against, newest first. The guard used to compare only the single latest
+ * terminal row; M2 widens the accepted body set to unconfirmed rounds, so a body
+ * that was already delivered as an earlier terminal row must be recognised too.
+ * The window keeps that comparison bounded instead of scanning every terminal row
+ * the agent ever emitted (those live up to the 7-day settled TTL).
+ *
+ * Why 200: within that 7-day TTL a single agent's delivered/acked terminal rows
+ * in production top out around 250, and the body the guard cares about is always
+ * one of the most recent deliveries, so 200 covers it with margin while keeping
+ * the read to a few hundred KB of JSON.
+ *
+ * Above the window the guard stops recognising a duplicate, so an older body that
+ * resurfaces at the tail could be re-released as this round's answer once more.
+ * That is the accepted cost of bounding the scan instead of walking every row.
+ */
+const STALE_DUPLICATE_GUARD_SCAN_LIMIT = 200;
+
 export class PlanWaitingHistoryError extends Error {
   constructor() {
     super(PLAN_WAITING_HISTORY);
@@ -1933,6 +1952,13 @@ export class AgentIndexService {
           // degraded (which is what made #runPlanRow run
           // invalidateById(..., "degraded_retry") on already-written content).
           const confirmedTerminal = turn.confirmed === true;
+          // M2: the "trust the on-disk body" judgement is decoupled from
+          // `confirmed`. That the turn-end signal arrived is already guaranteed by
+          // the enclosing `if (turn?.received)`, so the deliverability judgement
+          // below only has to decide whether the disk carries a deliverable body —
+          // a round no longer needs a (systematically unreliable) client-side
+          // `confirmed` to be released. `confirmedTerminal` keeps its own meaning
+          // for the released/degraded logging and payload.
           const degradeOrRelease = (degradedReason: string): Record<string, unknown> => {
             if (confirmedTerminal) {
               // A confirmed round stays non-degraded (see above), but the reason
@@ -1997,13 +2023,40 @@ export class AgentIndexService {
             // disk). It can also hold the answer of a *previous* round — the same
             // frozen baseline is exactly what the daemon last delivered — so a
             // round that writes nothing new would otherwise re-release the
-            // previous round's body as if it were this one's. `latestTerminal` is
-            // the latest non-invalidated terminal row read before this round's row
-            // is written: usually the last delivery, possibly an undelivered idle.
-            const staleBaselineDuplicate = sameTerminalAssistantContent(
-              advanced,
-              latestTerminal?.compactHistory,
-              "pi",
+            // previous round's body as if it were this one's. The guard compares
+            // `advanced` against the prior terminal rows for this agent that can
+            // have reached the orchestrator — a bounded window, newest first (the
+            // `agent_events` query below). Two things changed from the single-row
+            // guard: (i) it now looks at a window, because a body delivered before
+            // the current latest terminal row would otherwise slip through and, now
+            // that M2 accepts unconfirmed rounds, be re-released as this round's
+            // answer; (ii) it only counts rows in `delivered`/`acked`, because a
+            // never-deliverable row (`agent.idle` from a non-`working` status, per
+            // `isDeliverableAgentEvent`) can carry the same ref as a `done` row
+            // (~47% of ref-bearing idles in production) and must not be able to
+            // blank an otherwise deliverable round. So the tightened guard is
+            // deliberately NOT a strict superset of the old one for never-delivered
+            // rows.
+            const staleBaselineDuplicate = (
+              this.#stores.sqlite
+                .prepare(
+                  `select compact_history_json from agent_events
+                   where agent_id = ? and herdr_session_name = ?
+                     and type in ('agent.idle', 'agent.done', 'agent.blocked')
+                     and status in ('delivered', 'acked')
+                   order by id desc limit ?`,
+                )
+                .all(
+                  input.agent.id,
+                  input.agent.herdrSessionName,
+                  STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+                ) as Array<{ compact_history_json: string | null }>
+            ).some((row) =>
+              sameTerminalAssistantContent(
+                advanced,
+                parseCompactHistoryJson(row.compact_history_json),
+                "pi",
+              ),
             );
             // A confirmed turn carrying a non-empty terminal assistant message is
             // trusted as-is, so `no_advance_from_input` stays reserved for rounds
@@ -2032,24 +2085,33 @@ export class AgentIndexService {
             } else {
               const advancedText = advanced.lastAssistantMessage?.text?.trim() ?? "";
               const advancedMatchesExpected = !expectedText || advancedText.endsWith(expectedText);
-              if (confirmedDeliverable) {
-                // Event 50549: the extension confirmed the write, but its
-                // `expectedText` is the extension's own guess at the final tail and
-                // can disagree with the transcript that actually landed on disk
-                // (the old extension treated "the file grew" as confirmation, so a
-                // stale/escaped tail was reported as written). The disk tail is the
-                // authoritative evidence, and it already is a terminal assistant
-                // message with a body, so it is this round's answer: release it
-                // as-is (see :2012-2026 for the same judgement) and keep
-                // `degraded` off, because `degraded: true` makes #runPlanRow call
-                // invalidateById(..., "degraded_retry") on content that is already
-                // written. The mismatch is still recorded as a warning so the
-                // disagreement stays diagnosable instead of being swallowed.
+              // M2 deliverability judgement: the turn-end signal already arrived
+              // (the enclosing `if (turn?.received)`), so only the disk matters — a
+              // non-empty terminal assistant message that was not already delivered
+              // (`diskDeliverable`) is this round's answer. The
+              // client's `confirmed` flag is deliberately not a conjunct here: its
+              // `expectedText` is only the extension's own guess at the final tail
+              // and can systematically disagree with the transcript that landed on
+              // disk (rewrite-type extensions and credential redaction both make
+              // the text-level confirmation never match), while the disk tail is
+              // the authoritative evidence. When the guess disagrees the body is
+              // still released as-is — `degraded` stays off, because `degraded:
+              // true` makes #runPlanRow call invalidateById(..., "degraded_retry")
+              // on content that is already written — and the mismatch is recorded
+              // as a warning (split by `confirmed`) so it stays diagnosable.
+              const diskDeliverable =
+                isTerminalAssistant(advanced) &&
+                hasNonEmptyAssistantMessage(advanced) &&
+                !staleBaselineDuplicate;
+              if (diskDeliverable) {
                 if (!advancedMatchesExpected) {
                   console.warn(
-                    "Herdsman accepted a confirmed pi status event despite an expectedText mismatch",
+                    confirmedTerminal
+                      ? "Herdsman accepted a confirmed pi status event despite an expectedText mismatch"
+                      : "Herdsman accepted an unconfirmed pi status event despite an expectedText mismatch",
                     {
                       agentId: input.agent.id,
+                      confirmed: confirmedTerminal,
                       degradedReason: "expected_text_mismatch",
                       herdrSessionName: input.agent.herdrSessionName,
                       paneId: input.agent.paneId,
@@ -2064,11 +2126,11 @@ export class AgentIndexService {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease("expected_text_mismatch");
               } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
-                // `confirmedDeliverable` is false in this arm by construction (its
+                // `diskDeliverable` is false in this arm by construction (its
                 // terminal/non-empty conjuncts are exactly this condition's
-                // negation), so a confirmed round never reaches it and
-                // `non_terminal_assistant` keeps its pre-existing meaning: only a
-                // non-terminal or empty tail is degraded.
+                // negation), so a round with a deliverable disk body never reaches
+                // it and `non_terminal_assistant` keeps its pre-existing meaning:
+                // only a non-terminal or empty tail is degraded.
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease("non_terminal_assistant");
               } else {
@@ -2705,6 +2767,15 @@ function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     }, ms);
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+}
+
+function parseCompactHistoryJson(value: string | null): CompactAgentHistory | null {
+  if (!value) return null;
+  try {
+    return JSON.parse(value) as CompactAgentHistory;
+  } catch {
+    return null;
+  }
 }
 
 function sameTerminalAssistantContent(
