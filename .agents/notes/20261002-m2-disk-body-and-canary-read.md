@@ -84,6 +84,7 @@ journalctl -u herdsman.service --since <重启时刻> -o cat \
 journalctl -u herdsman.service --since <重启时刻> -o cat \
   | grep -oE "turn completion signal \(confirmed=(true|false)\)" | sort | uniq -c
 ```
+**正向对照指纹（目标格命中时新旧行为如何区分）**：`unconfirmed` + mismatch 命中时，新码表现为 unconfirmed 的 ① warn + **采信非空正文**（放行），旧码表现为**空正文** + ②/④ 的 `expected_text_mismatch`。
 
 ### 伤害读数（必须与**部署后自身基线**比）
 
