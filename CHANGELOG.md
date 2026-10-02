@@ -1,5 +1,12 @@
 ## [Unreleased]
 
+## 0.13.4
+
+- 0.13.3 发布落地记录（`3f08e12`）：新增笔记 `.agents/notes/20261002-release-0.13.3.md`，登记 0.13.3 的发布落地事实（registry / git / Release 三面），并把两处待登记事项留在同一份记录里——`## Preconditions` 的 `HEAD = origin/main` 一条在 push 之前按构造不成立（属重跑产物，不是发布失败），以及 npm 账号页级检查（verified email / write 2FA）0.13.3 轮未做、记为用户决策。
+- 发布流程文档缺口修补（`306ced6`，`docs/releasing.md`）：补 registry 传播时长口径——新版本在 `npm view` 上可见的时长不恒定，0.13.3 的 `@dorokuma/herdsman-pi` 曾在连续十次重试内保持 E404 才出现，按文档只重试 `npm view`、不 republish（重发会 E409）；并写明 `HEAD = origin/main` 检查的时点说明——该检查就地成立（发布开始时与 `git push origin main` 之后各一次），在发布提交之后、push 之前重跑整段 `## Preconditions` 会让它按构造为假，那是重跑的产物，不是跳过该门禁的理由。这两处即 0.13.3 笔记遗留清单里的两条。
+- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.13.4；`README.md` 与 `packages/herdsman-herdr-plugin/README.md` 的 Herdr 安装 tag 指向 `v0.13.4`。
+- 范围：本版本包含 0.13.3 之后的全部内容（0.13.3 发布落地记录 + 发布流程文档缺口修补）；`src/**` 零改动——无产品行为改动、无 schema 变更、无迁移。
+
 ## 0.13.3
 
 - 测试稳定化（`105286f`）：把三处「固定 sleep 窗口当同步手段」改为轮询到条件真正落定——`test/unit/daemon-service.test.ts` 里两处「沉降须在一个宏任务 turn 内完成」的结构性假设改为 `vi.waitFor` 轮询（`interval: 10` / `timeout: 5_000`，每次尝试先 tick 再让出一个宏任务），`test/unit/daemon-process-manager.test.ts` 里 SIGKILL 之后那处固定 50ms「内核清理」延迟改为 `waitForCondition(() => !isFlockHeld(lockPath))`。三处屏障用例补 10s 用例级预算，使轮询自身的 5s 超时先报出谓词错误，而不是被默认 `Test timed out in 5000ms` 掩盖；`daemon-service` 的 D9 用例外层预算 30s → 45s（其两个内部等待串行、各上限 20s）。既有断言的 `expect` 行一字未改，只是移进轮询体。本版本 `pnpm check` 绿（53 files / 840 tests）。
