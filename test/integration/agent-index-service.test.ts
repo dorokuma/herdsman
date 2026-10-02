@@ -4480,7 +4480,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     harness.sqlite.close();
   });
 
-  test("S7: degraded emission on expectedText mismatch after wait", async () => {
+  test("S7: an unconfirmed expectedText mismatch with a terminal body on disk is delivered", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ sleep: async () => {}, timeoutMs: 3_000 });
     let callCount = 0;
@@ -4543,26 +4543,21 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     const pending = index.handleHerdrEvent(doneEvent);
 
     const _result = await pending;
-    // Degraded event is invalidated in-DB and not delivered to callers.
-    expect(_result.events.filter((e) => e.type === "agent.done")).toHaveLength(0);
-    const listAfterEvents = harness.agentEvents.listAfter({
-      herdrSessionName: "default",
-      workspaceId: "wJ",
-    });
-    expect(listAfterEvents.filter((e) => e.type === "agent.done")).toHaveLength(0);
-    // Verify the degraded record in DB.
+    // M2: the disk tail the wait settled on ("intermediate text") is a non-empty
+    // terminal assistant message and the turn signal arrived, so the disk body is
+    // authoritative and delivered as-is. `confirmed: false` no longer blanks it.
+    const dones = _result.events.filter((e) => e.type === "agent.done");
+    expect(dones).toHaveLength(1);
+    expect(dones[0]?.compactHistory?.lastAssistantMessage?.text).toBe("intermediate text");
+    expect(dones[0]?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
     const invalidatedRows = harness.sqlite
       .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
       .all();
-    expect(invalidatedRows).toHaveLength(1);
-    const degraded = invalidatedRows[0];
-    if (!degraded) throw new Error("expected degraded event row");
-    const payload = JSON.parse(degraded.payload_json as string);
-    expect(payload.degradedReason).toBe("expected_text_mismatch");
+    expect(invalidatedRows).toHaveLength(0);
     harness.sqlite.close();
   }, 10_000);
 
-  test("S8: degraded event retries until history matches expectedText then completes", async () => {
+  test("S8: a degraded event retries until a terminal body arrives then completes", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ sleep: async () => {}, timeoutMs: 3_000 });
     let callCount = 0;
@@ -4576,13 +4571,16 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       history: {
         async resolveCompactHistory() {
           callCount += 1;
+          // call 1/2 = the baseline reads; call 3 = the first drain's reread, still
+          // a non-terminal (tool-use) turn so there is no deliverable body (M2 keeps
+          // degrading it); call 4+ = the terminal answer that matches expectedText.
           if (callCount <= 2) {
             return {
               compactHistory: {
                 ...emptyCompactHistory("pi-jsonl"),
                 lastAssistantMessage: {
-                  ref: callCount === 1 ? "old-ref" : "intermediate-ref",
-                  text: callCount === 1 ? "old" : "intermediate text",
+                  ref: "old-ref",
+                  text: "old",
                   timestamp: null,
                   stopReason: "stop",
                 },
@@ -4599,7 +4597,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
                   ref: "mismatch-ref",
                   text: "still not final",
                   timestamp: null,
-                  stopReason: "stop",
+                  stopReason: null,
                 },
               },
               historyRef: null,
@@ -4655,10 +4653,12 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     });
 
     await index.drainPendingPlans();
-    // First drain emitted a degraded event (expected_text_mismatch) and called
-    // markRetry, which invalidated the event in DB and set plan to pending.
-    // Only an UNconfirmed turn may still be degraded: a client-confirmed turn is
-    // delivered directly (see the confirmed-turn regression tests below).
+    // First drain emitted a degraded event and called markRetry, which invalidated
+    // the row in DB and set the plan to pending. The
+    // `expected_text_mismatch` label is an arm-order artefact — the mismatch arm is
+    // checked before the non-terminal one — NOT a consequence of the tail being
+    // non-terminal. The round is degraded at all because M2 finds no deliverable
+    // terminal body on disk: an unconfirmed turn is blanked only then.
     const firstInvalidatedRows = harness.sqlite
       .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
       .all();
@@ -4683,8 +4683,9 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       workspaceId: "wJ",
     });
 
-    // Second drain: reset running→pending and drain again; history now matches
-    // expectedText, so the complete event is emitted and plan is completed.
+    // Second drain: reset running→pending and drain again; the terminal body has
+    // landed and matches expectedText, so the complete event is emitted and the
+    // plan completes.
     await index.drainPendingPlans();
     const completed = harness.statusEventPlans.get(plan.id);
     expect(completed.status).toBe("completed");
