@@ -267,6 +267,8 @@ test -f "$REGISTRY_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts
 
 Write release notes to `/tmp/herdsman-$VERSION-release-notes.md`. Include both npm install commands, package-content changes, validation, and the fact that Herdr still installs its plugin from GitHub.
 
+This section is not finished until the note commit from the Record step below has landed on `origin/main`.
+
 The Release body also carries the registry-side facts, which are true and checkable by this point: `dist-tags.latest` advanced from the previous version to `$VERSION` in both packages, both `@dorokuma/herdsman@$VERSION` and `@dorokuma/herdsman-pi@$VERSION` are visible in the registry, and the pushed tag `$TAG` points at the release commit.
 
 ```bash
@@ -291,11 +293,24 @@ test -z "$(git status --porcelain)"
 
 **Record the release in `.agents/notes/`.** The release is not finished until its release note exists under `.agents/notes/`. Name it after the directory's convention — `YYYYMMDD-slug.md`, release date plus a short slug, as in `.agents/notes/README.md` — and reuse the front matter of the neighbouring notes (`status`, `supersedes`, `superseded_by`, `模块`; see `.agents/notes/_template.md`).
 
+The note lands as its own commit on `main` — `docs(release): record $VERSION` — pushed on its own; after that push, re-verify `git status --porcelain` is empty and `HEAD` equals `origin/main`, and the release is not finished until the note lands. Do not fold it into the release commit: the staged set for that commit is pinned to the four manifests plus both READMEs plus `CHANGELOG.md`, and the registry, Release, and deployment facts do not exist at the moment the release commit is written. A note that lands after the release still lands as that same separate commit and must not alter the frozen tag or Release snapshot. The `git status --porcelain` gate above covers the release commit only; the note file is expected to be the sole content of its own commit.
+
 The note records at least:
 
 - the registry-side facts: `dist-tags.latest` moved from the previous version to `$VERSION` in both `@dorokuma/herdsman` and `@dorokuma/herdsman-pi`; both `@dorokuma/herdsman@$VERSION` and `@dorokuma/herdsman-pi@$VERSION` are visible in the registry; and `git rev-list -n 1 "$TAG"` peels the pushed tag to the release commit;
 - the `sha256sum` of both tarballs packed in `$RELEASE_TMP`, plus the conclusion that each matches the published `dist.integrity` (`npm view "<pkg>@$VERSION" dist.integrity`). `sha256sum` and `dist.integrity` cannot be compared directly — the integrity hash is base64 `sha512` with a `sha512-` prefix — so recompute the whole string, prefix included, in one copy-pasteable command: `printf 'sha512-%s' "$(openssl dgst -sha512 -binary <tgz> | openssl base64 -A)"`, then compare its output with `dist.integrity`; the two must agree;
-- the Release URL, for example from `gh release view "$TAG" --json url --jq .url`.
+- the Release URL, for example from `gh release view "$TAG" --json url --jq .url`;
+- both packages' published `dist.tarball` URLs;
+- the deployment facts and their acceptance outcome, when the release was deployed: the pinned install command and prefix, the restart (`MainPID` before and after, exit code), the three complete-release checks (`npm view … version` for both packages and `git ls-remote --tags --exit-code`), and any post-deployment baseline numbers — every measured number carries its UTC timestamp and the copy-pasteable command that produced it. A release that was not deployed records that fact instead.
+
+```bash
+# Completion check: run after the note commit has been pushed.
+test -z "$(git status --porcelain)"
+test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
+git log -1 --format=%s origin/main | grep -F "docs(release): record $VERSION"
+```
+
+These three commands are the completion criterion for the release, and they run after this step so that anyone can re-run them after the fact rather than trusting the releaser's self-check; no earlier step in this section may carry the assertion, because it must fail before the note commit exists. This check applies to a completed release; a long-term abort writes its note with a different subject and is covered by the relevant abort section instead.
 
 An aborted release writes this note too whenever the abort touched the registry, a tag, or a Release — a clean abort that touched none of those has no account to keep and may skip it (see `## Recover from a partial publication`).
 
