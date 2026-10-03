@@ -264,7 +264,7 @@ describe("AgentOrchestratorService", () => {
   test("filters idle events unless they transition from working", () => {
     const { harness, service } = openService();
     const compactHistory = {
-      ...emptyCompactHistory("codex-jsonl"),
+      ...emptyCompactHistory("pi-jsonl"),
       lastAssistantMessage: { ref: "history", text: "codex completed task", timestamp: null },
     };
     service.claim({ ...scope, paneId: "wB:p-owner", terminalId: "term_owner" });
@@ -1065,7 +1065,7 @@ describe("Non-Pi agent completed delivery conditions", () => {
     const failedMissing = appendEvent(harness, {
       agent: "claude",
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: null,
       },
       terminalId: "term_claude_failed",

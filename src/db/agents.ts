@@ -1,6 +1,4 @@
 import { randomUUID } from "node:crypto";
-import { lstatSync, readFileSync, realpathSync } from "node:fs";
-import { relative } from "node:path";
 import type { DatabaseSync } from "node:sqlite";
 import type { AgentEventStore } from "@/db/agent-events.js";
 import {
@@ -56,15 +54,19 @@ export class AgentStore {
     herdrSessionName: string;
   }): AgentIndexRecord[] {
     const now = Date.now();
+    // `agent.list` / `session.snapshot` are the base metadata source, and Herdr
+    // (0.9.3, "herdr api schema --json" -> `AgentInfo`) emits snake_case only.
+    // Fields Herdr does not report (e.g. `pane_generation`, `env`, `pid`) keep
+    // their local fallbacks below.
     const snapshots = input.agents.flatMap((agent) => {
-      const paneId = stringValue(agent.pane_id) ?? stringValue(agent.paneId);
-      const workspaceId = stringValue(agent.workspace_id) ?? stringValue(agent.workspaceId);
+      const paneId = stringValue(agent.pane_id);
+      const workspaceId = stringValue(agent.workspace_id);
       if (!paneId || !workspaceId) return [];
       return [
         {
           agent,
           paneId,
-          terminalId: stringValue(agent.terminal_id) ?? stringValue(agent.terminalId),
+          terminalId: stringValue(agent.terminal_id),
           workspaceId,
         },
       ];
@@ -114,19 +116,17 @@ export class AgentStore {
         retainedIds.push(id);
         const agent = stringValue(snapshot.agent.agent);
         const name = stringValue(snapshot.agent.name);
-        const terminalTitle =
-          stringValue(snapshot.agent.terminal_title) ?? stringValue(snapshot.agent.terminalTitle);
+        const terminalTitle = stringValue(snapshot.agent.terminal_title);
         if (terminalTitle) this.#terminalTitleById.set(id, terminalTitle);
         else this.#terminalTitleById.delete(id);
         const sessionHint = current?.agent === agent ? current.agent_session_hint_json : null;
-        const grokHome =
-          stringValue(snapshot.agent.agent)?.toLowerCase() === "grok"
-            ? grokHomeForAgent(snapshot.agent)
-            : null;
+        // `grok_home` is a legacy column kept so the schema does not need a
+        // migration; no reader and no discovery path reads it any more (grok is
+        // not a supported history agent), so it is written as a constant null.
         const values = [
           snapshot.paneId,
           snapshot.terminalId,
-          stringValue(snapshot.agent.tab_id) ?? stringValue(snapshot.agent.tabId),
+          stringValue(snapshot.agent.tab_id),
           snapshot.workspaceId,
           agent,
           name,
@@ -135,9 +135,9 @@ export class AgentStore {
           sessionHint,
           integerValue(snapshot.agent.revision),
           paneGeneration(snapshot.agent) ?? current?.pane_generation ?? null,
-          grokHome ?? current?.grok_home ?? null,
+          null,
           stringValue(snapshot.agent.cwd),
-          stringValue(snapshot.agent.foreground_cwd) ?? stringValue(snapshot.agent.foregroundCwd),
+          stringValue(snapshot.agent.foreground_cwd),
           snapshot.agent.focused === true ? 1 : 0,
           now,
         ];
@@ -493,55 +493,7 @@ function mapAgent(row: AgentRow): AgentIndexRecord {
     tabId: row.tab_id,
     terminalId: row.terminal_id,
     workspaceId: row.workspace_id,
-    grokHome: row.grok_home,
   };
-}
-
-export function grokHomeForAgent(agent: HerdrAgentLike): string | null {
-  const env = agent.env;
-  const explicit =
-    typeof env === "object" && env !== null
-      ? stringValue((env as Record<string, unknown>).GROK_HOME)
-      : null;
-  // Proc fallback cannot prove the pid is the pane's agent; prefer explicit metadata.
-  const raw =
-    explicit ??
-    (() => {
-      const pid = agent.pid;
-      if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return null;
-      try {
-        return (
-          readFileSync(`/proc/${pid}/environ`)
-            .toString("utf8")
-            .split("\0")
-            .find((item) => item.startsWith("GROK_HOME="))
-            ?.slice(10) ?? null
-        );
-      } catch {
-        return null;
-      }
-    })();
-  return raw ? validateGrokHome(raw) : null;
-}
-
-export function validateGrokHome(value: string): string | null {
-  if (!value.startsWith("/") || value.includes("..")) return null;
-  try {
-    const link = lstatSync(value);
-    if (
-      !link.isDirectory() ||
-      link.isSymbolicLink() ||
-      (link.mode & 0o022) !== 0 ||
-      link.uid !== (process.geteuid?.() ?? -1)
-    )
-      return null;
-    const real = realpathSync(value);
-    const relativeRoot = relative(value, real);
-    if (relativeRoot.startsWith("..") || relativeRoot.includes("/")) return null;
-    return real;
-  } catch {
-    return null;
-  }
 }
 
 function paneGeneration(agent: HerdrAgentLike): string | null {

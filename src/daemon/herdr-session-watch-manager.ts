@@ -467,9 +467,9 @@ function closedHitsLivePane(
   event: Record<string, unknown>,
   agents: ReadonlyArray<{ paneId: string; paneGeneration?: string | null }>,
 ): boolean {
-  const paneId = stringValue(event.pane_id) ?? stringValue(event.paneId);
+  const paneId = stringValue(event.pane_id);
   if (!paneId) return false;
-  const generation = stringValue(event.pane_generation) ?? stringValue(event.paneGeneration);
+  const generation = stringValue(event.pane_generation);
   return agents.some(
     (agent) =>
       agent.paneId === paneId && (generation == null || agent.paneGeneration === generation),

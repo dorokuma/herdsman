@@ -378,12 +378,13 @@ export class ObservabilityRpcServer {
         const input = params as AgentQueryScope & { target: string };
         const scope = this.#resolveScope(input);
         const agent = this.#stores.agents.resolveTarget(scope, input.target);
-        const preferredRef = await this.#context.preferredHistoryRef(agent);
+        // An explicit read is an operator action, not the daemon's background
+        // cadence: it re-resolves from the official values so a lookup that just
+        // failed (and is therefore memoized for the background rounds) cannot
+        // answer this call with an empty history.
         const history = await this.#history.resolveCompactHistory(
           this.#context.historyLookupInput(agent),
-          {
-            ...(preferredRef ? { preferredRef } : {}),
-          },
+          { forceDiscovery: true },
         );
         return { agent: { ...agent, history: history.compactHistory } };
       }
@@ -392,10 +393,9 @@ export class ObservabilityRpcServer {
         const input = params as AgentQueryScope & { limit?: number; target: string };
         const scope = this.#resolveScope(input);
         const agent = this.#stores.agents.resolveTarget(scope, input.target);
-        const preferredRef = await this.#context.preferredHistoryRef(agent);
         const read = await this.#history.read(this.#context.historyLookupInput(agent), {
+          forceDiscovery: true,
           limit: input.limit ?? 20,
-          ...(preferredRef ? { preferredRef } : {}),
         });
         return { agent: { ...agent, historyRef: read.historyRef, messages: read.messages } };
       }

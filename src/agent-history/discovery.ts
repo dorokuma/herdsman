@@ -1,236 +1,316 @@
-import { createReadStream, existsSync, lstatSync, realpathSync } from "node:fs";
-import { lstat, readdir, readFile, stat } from "node:fs/promises";
+import { lstatSync, realpathSync } from "node:fs";
 import { isAbsolute, join, normalize, relative } from "node:path";
-import { createInterface } from "node:readline";
-import { DatabaseSync } from "node:sqlite";
 import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts.js";
 
-// A pane agent's authoritative session ref (herdr detection or herdsman-pi
-// registration) may not have landed when the agent is first observed, so
-// discovery falls back to cwd-based guessing. A session file untouched since
-// before the agent was first seen cannot be that agent's live session.
-// Herdr observation delay is on the second scale. Pi and role-hinted lookups
-// use a 30-second grace window to absorb detection lag; other executor
-// fallbacks (claude/codex/gemini/grok) keep 10 minutes so idle sessions are
-// not dropped. Antigravity already short-circuits before recency ranking.
-// Dispatched Pi role sessions live under /tmp/herdr-role-sessions/<herdr-session>/.
-// Exact-path registration may resolve any file under this root; fallback/id scans
-// must be scoped to the agent's own herdr session subdirectory, and when the pane
-// terminal title contains a complete role-<id> segment, to that role directory only
-// (no cross-role adopt, and ~/.pi/agent/sessions is excluded while the hint is set).
+/**
+ * Herdsman supports session history for exactly two agents, by decision:
+ *
+ * 1. `pi` — Herdr's own integration reports the session file itself, so the
+ *    official `agent_session.kind == "path"` value is used as-is after the
+ *    file-safety gate (this is the generic path channel, not a pi-only branch).
+ * 2. `agy` — Herdr reports only `kind == "id"`, and an agy conversation id is
+ *    the name of its own conversation database, so the id resolves to exactly
+ *    one candidate:
+ *      - `agy` -> `<home>/.gemini/antigravity-cli/conversations/<id>.db`
+ *
+ * Every other agent — whether or not Herdr has an integration for it — is
+ * deliberately not resolved: herdsman does not walk agent directories, rank
+ * candidates by mtime/cwd, match role directories from the terminal title, or
+ * pick "the newest plausible file". An unresolvable pane is an explicit failure:
+ * one `console.warn` naming the official values plus the derived candidate path,
+ * then `null`.
+ */
 export const ALLOWED_SESSION_ROOTS = ["/tmp/herdr-role-sessions"] as const;
 
-export const DISCOVERY_RECENCY_GRACE_MS = 30_000;
-export const FALLBACK_DISCOVERY_RECENCY_GRACE_MS = 10 * 60_000;
 export type AgentHistoryLookupInput = {
   agent: string | null;
   agentSession: AgentSessionRef | null;
-  cwd: string | null;
-  foregroundCwd: string | null;
-  firstSeenAtMs?: number;
-  grokHome?: string;
   herdrSessionName?: string;
   homeDir?: string;
-  occupiedSessionPaths?: ReadonlySet<string>;
-  terminalTitle?: string | null;
+  paneId?: string | null;
 };
 
-type Candidate = {
-  cwd: string | null;
-  mtimeMs: number;
-  path: string;
-  source: AgentHistoryRef["source"];
-};
+/**
+ * A pane whose official value cannot be resolved must not be re-resolved — nor
+ * re-warned — on every refresh round. The failure is remembered per official
+ * input (agent, kind, source, value, store root) for
+ * `DISCOVERY_RETRY_AFTER_FAILURE_MS`: within that window the lookup is skipped
+ * entirely, and only the first failure for a key logs a warning. Any change in
+ * the official values (or in the store root) is a new key and is attempted
+ * immediately, and the window is deliberately bounded so a session file that
+ * appears a few seconds after the pane reports its id is still picked up.
+ *
+ * The memory only decelerates the ordinary cadence — the background refresh the
+ * daemon runs every round. It never answers a caller that is asking right now: an
+ * explicit read (`agent.get` / `agent.read`) and an external forced refresh pass
+ * `options.force` and resolve for real. The warning stays deduplicated per key,
+ * so forcing does not produce extra noise.
+ */
+const DISCOVERY_RETRY_AFTER_FAILURE_MS = 60_000;
+const DISCOVERY_FAILURE_CACHE_LIMIT = 512;
+const failedDiscoveryAt = new Map<string, number>();
+const warnedDiscoveryKeys = new Set<string>();
+
+export function discoveryLookupKey(input: AgentHistoryLookupInput): string {
+  return [
+    input.agent ?? "",
+    input.agentSession?.kind ?? "",
+    input.agentSession?.source ?? "",
+    input.agentSession?.value ?? "",
+    input.homeDir ?? process.env.HOME ?? "",
+  ].join("\u0000");
+}
+
+/**
+ * True while the very same official values are still inside their retry window,
+ * so callers can skip the lookup the pane would otherwise repeat every round.
+ */
+export function discoveryFailureFresh(input: AgentHistoryLookupInput, now = Date.now()): boolean {
+  const at = failedDiscoveryAt.get(discoveryLookupKey(input));
+  return at !== undefined && now - at < DISCOVERY_RETRY_AFTER_FAILURE_MS;
+}
+
+function rememberDiscoveryFailure(
+  key: string,
+  input: AgentHistoryLookupInput,
+  detail: string,
+): void {
+  failedDiscoveryAt.delete(key);
+  failedDiscoveryAt.set(key, Date.now());
+  if (failedDiscoveryAt.size > DISCOVERY_FAILURE_CACHE_LIMIT) {
+    const oldest = failedDiscoveryAt.keys().next();
+    if (!oldest.done) failedDiscoveryAt.delete(oldest.value);
+  }
+  if (warnedDiscoveryKeys.has(key)) return;
+  warnedDiscoveryKeys.add(key);
+  if (warnedDiscoveryKeys.size > DISCOVERY_FAILURE_CACHE_LIMIT) {
+    const oldest = warnedDiscoveryKeys.values().next();
+    if (!oldest.done) warnedDiscoveryKeys.delete(oldest.value);
+  }
+  reportMissingOfficialSession(input, detail);
+}
 
 export async function discoverAgentHistory(
   input: AgentHistoryLookupInput,
+  options: { force?: boolean } = {},
 ): Promise<AgentHistoryRef | null> {
-  if (input.agentSession?.kind === "path") {
-    const resolved = safeAllowedSessionPath(input.agentSession.value, input.homeDir);
-    if (resolved && existsSync(resolved)) {
-      const source = historySourceFromSessionRef(input.agentSession);
-      return { kind: "agent_session", path: resolved, source, value: resolved };
+  const key = discoveryLookupKey(input);
+  if (!options.force) {
+    const failureAt = failedDiscoveryAt.get(key);
+    if (failureAt !== undefined && Date.now() - failureAt < DISCOVERY_RETRY_AFTER_FAILURE_MS) {
+      return null;
     }
   }
-
-  const cwd = input.cwd ?? input.foregroundCwd;
-  const normalizedCwd = normalizeCwd(cwd);
-  const homeDir = input.homeDir ?? process.env.HOME ?? "";
-
-  if (input.agentSession?.kind === "id") {
-    const source = historySourceFromSessionRef(input.agentSession);
-    if (source === "grok-jsonl") {
-      const matches = await discoverGrokSessions({
-        homeDir,
-        cwd,
-        sessionId: input.agentSession.value,
-        ...(input.grokHome === undefined ? {} : { grokHome: input.grokHome }),
-      });
-      const candidate = selectUniqueCandidate(matches, normalizedCwd, input.occupiedSessionPaths);
-      if (candidate)
-        return {
-          kind: "agent_session",
-          path: candidate.path,
-          source,
-          value: input.agentSession.value,
-        };
-    }
-    if (source === "antigravity-sqlite") {
-      const ref = discoverAntigravitySession(homeDir, input.agentSession.value);
-      if (ref) return { ...ref, kind: "agent_session" };
-    }
-    if (source === "pi-jsonl") {
-      const roots = new Set(
-        piJsonlScanRoots(homeDir, input.herdrSessionName, roleDirectoryHint(input)),
+  const fail = (detail: string): null => {
+    rememberDiscoveryFailure(key, input, detail);
+    return null;
+  };
+  const session = input.agentSession;
+  if (!session) {
+    return fail("Herdr reported no agent_session for this pane; herdsman does not guess one");
+  }
+  if (session.kind === "path") {
+    const resolved = safeOfficialSessionPath(session.value);
+    if (!resolved) {
+      return fail(
+        `Herdr agent_session path is not a readable session file owned by herdsman: ${session.value}`,
       );
-      for (const root of roots) {
-        const matches = await scanRootById(root, input.agentSession.value, source);
-        const candidate = matches.find((item) => !input.occupiedSessionPaths?.has(item.path));
-        if (candidate) {
-          return {
-            kind: "agent_session",
-            path: candidate.path,
-            source,
-            value: input.agentSession.value,
-          };
-        }
-      }
     }
-    if (source === "opencode-sqlite") {
-      const ref = discoverOpenCodeSession({ cwd, homeDir, sessionId: input.agentSession.value });
-      if (ref) return { ...ref, kind: "agent_session" };
-    }
+    return {
+      kind: "agent_session",
+      path: resolved,
+      source: historySourceFromSessionRef(session),
+      value: resolved,
+    };
   }
-
-  const agent = input.agent?.toLowerCase() ?? input.agentSession?.agent.toLowerCase() ?? "";
-  const candidates: Candidate[] = [];
-  const roleHint = roleDirectoryHint(input);
-  if (agent === "pi") {
-    const roots = new Set(piJsonlScanRoots(homeDir, input.herdrSessionName, roleHint));
-    for (const root of roots) {
-      candidates.push(...(await scanRoot(root, "pi-jsonl")));
-    }
-  }
-  if (agent === "claude") {
-    candidates.push(...(await scanRoot(join(homeDir, ".claude", "projects"), "claude-jsonl")));
-  }
-  if (agent === "codex") {
-    candidates.push(...(await scanRoot(join(homeDir, ".codex", "sessions"), "codex-jsonl")));
-  }
-  if (agent === "gemini") {
-    candidates.push(...(await scanGeminiRoot(join(homeDir, ".gemini", "tmp"))));
-  }
-  if (agent === "opencode") {
-    const ref = discoverOpenCodeSession({ cwd, homeDir, sessionId: null });
-    if (ref) return ref;
-  }
-  if (agent === "grok") {
-    const matches = await discoverGrokSessions({
-      homeDir,
-      cwd,
-      sessionId: null,
-      ...(input.grokHome === undefined ? {} : { grokHome: input.grokHome }),
-    });
-    candidates.push(...matches);
-  }
-  if (agent === "agy" || agent === "antigravity" || agent === "antigravity_cli") {
-    const ref = discoverAntigravitySession(homeDir, null);
-    if (ref) return ref;
-  }
-  const ranked = candidates
-    .filter((candidate) => normalizedCwd !== null && normalizeCwd(candidate.cwd) === normalizedCwd)
-    .filter((candidate) => !input.occupiedSessionPaths?.has(candidate.path))
-    .filter((candidate) => matchesRoleDirectory(candidate.path, roleHint))
-    .filter(
-      (candidate) =>
-        input.firstSeenAtMs === undefined ||
-        candidate.mtimeMs >= input.firstSeenAtMs - discoveryRecencyGraceMs(input),
-    )
-    .sort((a, b) => {
-      if (a.mtimeMs !== b.mtimeMs) return b.mtimeMs - a.mtimeMs;
-      return a.path.localeCompare(b.path);
-    });
-  const best = ranked[0];
-  return best
-    ? { kind: "discovered_file", path: best.path, source: best.source, value: best.path }
-    : null;
+  const resolvedById = resolveSessionFileById({
+    ...(input.homeDir === undefined ? {} : { homeDir: input.homeDir }),
+    session,
+  });
+  if (resolvedById.ref) return resolvedById.ref;
+  return fail(resolvedById.detail);
 }
 
+/**
+ * Deterministic id -> session file resolution for `agy`. It derives at most one
+ * candidate path from the official id alone and then verifies it: the candidate
+ * must be a regular file owned by herdsman inside the agent's own store root.
+ * Nothing is ranked, filtered by cwd, or picked from candidates.
+ *
+ * An agent without a template here is not guessed. That splits in two, and the
+ * warning has to say which one it is:
+ * - a supported agent whose official value arrived as an id (pi): herdsman has no
+ *   id-based derivation for it, so this pane reports no history;
+ * - an agent herdsman does not support at all.
+ */
+function resolveSessionFileById(input: {
+  homeDir?: string;
+  session: AgentSessionRef;
+}): SessionFileResolution {
+  const homeDir = input.homeDir ?? process.env.HOME ?? "";
+  const source = historySourceFromSessionRef(input.session);
+  const id = input.session.value;
+  const miss = (detail: string): SessionFileResolution => ({ detail, ref: null });
+  if (source === "antigravity-sqlite") {
+    // agy conversation ids are uuids; anything else cannot name a conversation
+    // file, and a non-uuid must never be joined into the conversations path.
+    if (!isUuidLike(id)) return miss(`agy conversation id is not a uuid: ${id}`);
+    const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
+    return containedFileRef({
+      candidate: join(dir, `${id}.db`),
+      id,
+      label: "agy",
+      root: dir,
+      source,
+    });
+  }
+  if (source !== "unknown") {
+    return miss(
+      `${input.session.agent} reported an id; herdsman has no id-based session-file derivation for it (only agy does)`,
+    );
+  }
+  return miss(
+    `${input.session.agent} is not a supported herdsman history agent (only pi and agy are)`,
+  );
+}
+
+type SessionFileResolution = { detail: string; ref: AgentHistoryRef | null };
+
+/**
+ * One candidate path, verified: regular file, not a symlink, owned by herdsman,
+ * not writable by other principals, and really inside the agent's store root.
+ * Any failure is a miss (the caller reports it), never a fallback search.
+ */
+function containedFileRef(input: {
+  candidate: string;
+  id: string;
+  label: string;
+  root: string;
+  source: AgentHistoryRef["source"];
+}): SessionFileResolution {
+  const real = safeOfficialSessionPath(input.candidate);
+  if (!real) {
+    return {
+      detail: `${input.label}: ${input.candidate} is not a readable session file`,
+      ref: null,
+    };
+  }
+  if (!isInside(input.root, real)) {
+    return { detail: `${input.label}: ${real} escapes ${input.root}`, ref: null };
+  }
+  return {
+    detail: `${input.label}: resolved ${real}`,
+    ref: { kind: "agent_session", path: real, source: input.source, value: input.id },
+  };
+}
+
+function isInside(root: string, path: string): boolean {
+  const realRoot = realpathOrNormalize(root);
+  const rest = relative(realRoot, path);
+  return rest !== "" && !rest.startsWith("..") && !isAbsolute(rest);
+}
+
+function realpathOrNormalize(value: string): string {
+  try {
+    return realpathSync(value);
+  } catch {
+    return normalize(value);
+  }
+}
+
+function isUuidLike(value: string): boolean {
+  // Version-agnostic on purpose: agy conversation ids are uuids, and a uuid must
+  // stay pure hex+dashes so it can never act as a path.
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
+}
+
+function reportMissingOfficialSession(input: AgentHistoryLookupInput, detail: string): void {
+  console.warn("Herdsman has no usable official Herdr agent session", {
+    agent: input.agent,
+    agentSession: input.agentSession,
+    detail,
+    herdrSessionName: input.herdrSessionName ?? null,
+    paneId: input.paneId ?? null,
+  });
+}
+
+/**
+ * Maps an official `agent_session` to the reader that can read it. Only the two
+ * supported agents have a reader; everything else is `unknown`, which every
+ * reader rejects. `source` looks like `herdr:<agent>`, so segments are matched
+ * whole — `herdr:copilot` contains "pi" and must never be read as a pi session.
+ */
 export function historySourceFromSessionRef(ref: AgentSessionRef): AgentHistoryRef["source"] {
   const agent = ref.agent.toLowerCase();
-  const source = ref.source.toLowerCase();
-  if (
-    agent === "agy" ||
-    agent === "antigravity" ||
-    agent === "antigravity_cli" ||
-    source.includes("antigravity")
-  )
-    return "antigravity-sqlite";
-  if (agent === "grok" || source.includes("grok")) return "grok-jsonl";
-  if (agent === "pi" || source.includes("pi")) return "pi-jsonl";
-  if (agent === "claude" || source.includes("claude")) return "claude-jsonl";
-  if (agent === "codex" || source.includes("codex")) return "codex-jsonl";
-  if (agent === "opencode" || source.includes("opencode")) return "opencode-sqlite";
-  if (agent === "gemini" || source.includes("gemini")) return "gemini-json";
+  const segments = [agent, ...ref.source.toLowerCase().split(/[^a-z0-9_]+/)].filter(Boolean);
+  const is = (...names: string[]) => names.some((name) => segments.includes(name));
+  if (is("agy", "antigravity", "antigravity_cli", "antigravity-cli")) return "antigravity-sqlite";
+  if (is("pi")) return "pi-jsonl";
   return "unknown";
 }
 
 export function safeAllowedSessionPath(value: string, homeDir?: string): string | null {
+  const real = safeRegularFile(value);
+  if (!real) return null;
+  const homeSessionRoot = join(homeDir ?? process.env.HOME ?? "/root", ".pi/agent/sessions");
+  const roots = [homeSessionRoot, ...ALLOWED_SESSION_ROOTS];
+  return roots.some((root) => {
+    const rest = relative(root, real);
+    return rest === "" || (!rest.startsWith("..") && !isAbsolute(rest));
+  })
+    ? real
+    : null;
+}
+
+/**
+ * File-safety gate shared by `safeOfficialSessionPath` and
+ * `safeAllowedSessionPath`.
+ *
+ * The raw path is checked with `lstatSync` **before** it is resolved: after
+ * `realpathSync` the symlink itself is gone, so an `isSymbolicLink()` check on
+ * the resolved path could never fire. A symlink (or anything that is not a
+ * regular file) at the reported path is rejected outright; the resolved target
+ * is then checked again, so a hard-link/symlink swap behind a directory cannot
+ * smuggle in a file herdsman does not own.
+ */
+function safeRegularFile(value: string): string | null {
   if (!isAbsolute(value) || value.includes("..")) return null;
-  const resolved = normalize(value);
+  const reported = normalize(value);
   try {
-    const real = realpathSync(resolved);
+    const raw = lstatSync(reported);
+    if (raw.isSymbolicLink() || !raw.isFile()) return null;
+    const real = realpathSync(reported);
     const target = lstatSync(real);
     if (
-      !target.isFile() ||
       target.isSymbolicLink() ||
+      !target.isFile() ||
       target.uid !== CURRENT_EUID ||
       (target.mode & 0o022) !== 0
     )
       return null;
-    const homeSessionRoot = join(homeDir ?? process.env.HOME ?? "/root", ".pi/agent/sessions");
-    const roots = [homeSessionRoot, ...ALLOWED_SESSION_ROOTS];
-    return roots.some((root) => {
-      const rest = relative(root, real);
-      return rest === "" || (!rest.startsWith("..") && !isAbsolute(rest));
-    })
-      ? real
-      : null;
+    return real;
   } catch {
     return null;
   }
 }
+
+/**
+ * File-safety gate for an official session path reported by Herdr.
+ *
+ * Herdr only reports back the value an installed agent integration handed it
+ * (`pane.report_agent_session`), so the *root* of an official path is not
+ * guessed any more and is deliberately not whitelisted: pi keeps its sessions
+ * under its own agent home, and a fixed root list would silently reject those
+ * official values. What is still enforced is that herdsman only reads a regular,
+ * non-symlink file it owns and that no other principal can rewrite behind it.
+ * `safeAllowedSessionPath` keeps the root whitelist for the herdsman-pi
+ * registration protocol, where a pane claims a path itself.
+ */
+export function safeOfficialSessionPath(value: string): string | null {
+  return safeRegularFile(value);
+}
+
 const CURRENT_EUID = process.geteuid?.() ?? -1;
-
-function isSafeHerdrSessionSegment(name: string): boolean {
-  return name.length > 0 && name !== "." && name !== ".." && !/[\\/\0]/.test(name);
-}
-
-const ROLE_DIRECTORY_SEGMENT = /^role-[a-z0-9][\w-]*$/i;
-
-function roleDirectoryHint(input: Pick<AgentHistoryLookupInput, "terminalTitle">): string | null {
-  if (!input.terminalTitle) return null;
-  for (const segment of input.terminalTitle.split(" - ")) {
-    const trimmed = segment.trim();
-    if (ROLE_DIRECTORY_SEGMENT.test(trimmed)) return trimmed;
-  }
-  return null;
-}
-
-export function usesShortDiscoveryRecency(
-  input: Pick<AgentHistoryLookupInput, "agent" | "agentSession" | "terminalTitle">,
-): boolean {
-  const agent = input.agent?.toLowerCase() ?? input.agentSession?.agent.toLowerCase() ?? "";
-  return agent === "pi" || roleDirectoryHint(input) !== null;
-}
-
-export function discoveryRecencyGraceMs(
-  input: Pick<AgentHistoryLookupInput, "agent" | "agentSession" | "terminalTitle">,
-): number {
-  return usesShortDiscoveryRecency(input)
-    ? DISCOVERY_RECENCY_GRACE_MS
-    : FALLBACK_DISCOVERY_RECENCY_GRACE_MS;
-}
 
 export function sessionPathAllowedByShape(value: string, homeDir?: string): boolean {
   if (!isAbsolute(value) || value.includes("..")) return false;
@@ -241,325 +321,4 @@ export function sessionPathAllowedByShape(value: string, homeDir?: string): bool
     const rest = relative(root, resolved);
     return rest !== "" && !rest.startsWith("..") && !isAbsolute(rest);
   });
-}
-
-function pathIsUnderAllowedSessionRoot(path: string): boolean {
-  return ALLOWED_SESSION_ROOTS.some((root) => {
-    const rest = relative(root, path);
-    return rest !== "" && !rest.startsWith("..") && !isAbsolute(rest);
-  });
-}
-
-function matchesRoleDirectory(path: string, roleHint: string | null): boolean {
-  if (!roleHint || !pathIsUnderAllowedSessionRoot(path)) return true;
-  return path.split("/").includes(roleHint);
-}
-
-function piJsonlScanRoots(
-  homeDir: string,
-  herdrSessionName: string | undefined,
-  roleDirectory?: string | null,
-): string[] {
-  const roots: string[] = [];
-  if (!roleDirectory) {
-    roots.push(join(homeDir, ".pi", "agent", "sessions"));
-  }
-  if (herdrSessionName === undefined || !isSafeHerdrSessionSegment(herdrSessionName)) {
-    return roots;
-  }
-  for (const allowed of ALLOWED_SESSION_ROOTS) {
-    const scoped = normalize(join(allowed, herdrSessionName));
-    const rest = relative(allowed, scoped);
-    if (rest === "" || rest.startsWith("..") || isAbsolute(rest)) continue;
-    if (roleDirectory && isSafeHerdrSessionSegment(roleDirectory)) {
-      const roleScoped = normalize(join(scoped, roleDirectory));
-      const roleRest = relative(scoped, roleScoped);
-      if (roleRest === "" || roleRest.startsWith("..") || isAbsolute(roleRest)) continue;
-      roots.push(roleScoped);
-    } else {
-      roots.push(scoped);
-    }
-  }
-  return roots;
-}
-
-async function scanRootById(
-  root: string,
-  id: string,
-  source: AgentHistoryRef["source"],
-): Promise<Candidate[]> {
-  if (!existsSync(root)) return [];
-  const rootStats = await stat(root).catch(() => null);
-  if (!rootStats || rootStats.uid !== CURRENT_EUID || (rootStats.mode & 0o022) !== 0) {
-    console.warn(`Skipping unsafe discovery root: ${root}`);
-    return [];
-  }
-  const files = (await listJsonlFiles(root)).filter((path) => path.split("/").pop()?.includes(id));
-  const candidates: Candidate[] = [];
-  for (const path of files) {
-    const stats = await stat(path).catch(() => null);
-    const linkStats = await lstat(path).catch(() => null);
-    if (!stats?.isFile() || !linkStats?.isFile() || stats.uid !== CURRENT_EUID) continue;
-    candidates.push({ cwd: null, mtimeMs: stats.mtimeMs, path, source });
-  }
-  return candidates;
-}
-
-function normalizeCwd(value: string | null): string | null {
-  if (value === null) return null;
-  const compact = value.replace(/\/{2,}/g, "/");
-  if (compact === "/") return compact;
-  return compact.replace(/\/+$/, "");
-}
-
-async function scanRoot(root: string, source: AgentHistoryRef["source"]): Promise<Candidate[]> {
-  if (!existsSync(root)) return [];
-  const rootStats = await stat(root).catch(() => null);
-  if (!rootStats || rootStats.uid !== CURRENT_EUID || (rootStats.mode & 0o022) !== 0) {
-    console.warn(`Skipping unsafe discovery root: ${root}`);
-    return [];
-  }
-  const files = await listJsonlFiles(root);
-  const candidates: Candidate[] = [];
-  for (const path of files) {
-    const stats = await stat(path).catch(() => null);
-    const linkStats = await lstat(path).catch(() => null);
-    if (!stats?.isFile() || !linkStats?.isFile() || stats.uid !== CURRENT_EUID) continue;
-    candidates.push({ cwd: await readCandidateCwd(path), mtimeMs: stats.mtimeMs, path, source });
-  }
-  return candidates;
-}
-
-const MAX_DISCOVERY_DEPTH = 4;
-const MAX_DISCOVERY_FILES = 2000;
-
-async function listJsonlFiles(root: string, depth = 0, state = { count: 0 }): Promise<string[]> {
-  if (depth > MAX_DISCOVERY_DEPTH || state.count >= MAX_DISCOVERY_FILES) return [];
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-  const files: string[] = [];
-  for (const entry of entries) {
-    if (state.count >= MAX_DISCOVERY_FILES) break;
-    const path = join(root, entry.name);
-    if (entry.isDirectory()) files.push(...(await listJsonlFiles(path, depth + 1, state)));
-    if (entry.isFile() && entry.name.endsWith(".jsonl")) {
-      const candidate = join(root, entry.name);
-      if (!lstatSync(candidate, { throwIfNoEntry: false })?.isFile()) continue;
-      files.push(candidate);
-      state.count += 1;
-    }
-  }
-  return files;
-}
-
-async function readCandidateCwd(path: string): Promise<string | null> {
-  const input = createReadStream(path, { encoding: "utf8", start: 0, end: 256 * 1024 - 1 });
-  input.on("error", () => {});
-  const lines = createInterface({ input, crlfDelay: Infinity });
-  let inspected = 0;
-  try {
-    for await (const line of lines) {
-      if (line.trim().length === 0) continue;
-      inspected += 1;
-      try {
-        const parsed = JSON.parse(line) as unknown;
-        const record = recordValue(parsed);
-        const cwd = stringValue(record.cwd) ?? stringValue(record.foreground_cwd);
-        if (cwd) return cwd;
-        const payload = recordValue(record.payload);
-        const payloadCwd = stringValue(payload.cwd) ?? stringValue(payload.foreground_cwd);
-        if (payloadCwd) return payloadCwd;
-        const message = recordValue(record.message);
-        const nestedCwd = stringValue(message.cwd) ?? stringValue(message.foreground_cwd);
-        if (nestedCwd) return nestedCwd;
-      } catch {
-        // Ignore malformed candidate records, preserving existing matching semantics.
-      }
-      if (inspected >= 100) break;
-    }
-  } finally {
-    lines.close();
-    input.destroy();
-  }
-  return null;
-}
-
-async function scanGeminiRoot(root: string): Promise<Candidate[]> {
-  if (!existsSync(root)) return [];
-  const projectDirs = await listGeminiProjectDirs(root);
-  const candidates: Candidate[] = [];
-  for (const projectDir of projectDirs) {
-    const cwd =
-      (await readFile(join(projectDir, ".project_root"), "utf8").catch(() => "")).trim() || null;
-    const sessions = await listGeminiSessionFiles(join(projectDir, "chats"));
-    for (const path of sessions) {
-      const stats = await stat(path).catch(() => null);
-      if (!stats?.isFile()) continue;
-      candidates.push({ cwd, mtimeMs: stats.mtimeMs, path, source: "gemini-json" });
-    }
-  }
-  return candidates;
-}
-
-async function listGeminiProjectDirs(root: string): Promise<string[]> {
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-  const dirs: string[] = [];
-  for (const entry of entries) {
-    const path = join(root, entry.name);
-    if (!entry.isDirectory()) continue;
-    if (existsSync(join(path, ".project_root"))) dirs.push(path);
-  }
-  return dirs;
-}
-
-async function listGeminiSessionFiles(chatsDir: string): Promise<string[]> {
-  const entries = await readdir(chatsDir, { withFileTypes: true }).catch(() => []);
-  return entries
-    .filter(
-      (entry) =>
-        entry.isFile() && entry.name.startsWith("session-") && entry.name.endsWith(".json"),
-    )
-    .map((entry) => join(chatsDir, entry.name));
-}
-
-function discoverGrokSessions(input: {
-  homeDir: string;
-  cwd: string | null;
-  grokHome?: string;
-  sessionId?: string | null;
-}): Promise<Candidate[]> {
-  const root = join(
-    input.grokHome ?? process.env.GROK_HOME ?? join(input.homeDir, ".grok"),
-    "sessions",
-  );
-  return listGrokCandidates(root, input.cwd, input.sessionId);
-}
-
-async function listGrokCandidates(
-  root: string,
-  cwd: string | null,
-  sessionId?: string | null,
-): Promise<Candidate[]> {
-  if (!existsSync(root)) return [];
-  const rootStats = await stat(root).catch(() => null);
-  if (!rootStats || rootStats.uid !== CURRENT_EUID || (rootStats.mode & 0o022) !== 0) return [];
-  const entries = await readdir(root, { withFileTypes: true }).catch(() => []);
-  const result: Candidate[] = [];
-  for (const encoded of entries) {
-    if (!encoded.isDirectory()) continue;
-    let decodedCwd: string;
-    try {
-      decodedCwd = decodeURIComponent(encoded.name);
-    } catch {
-      continue;
-    }
-    if (cwd && normalizeCwd(decodedCwd) !== normalizeCwd(cwd)) continue;
-    const sessions = await readdir(join(root, encoded.name), { withFileTypes: true }).catch(
-      () => [],
-    );
-    for (const session of sessions) {
-      if (
-        !session.isDirectory() ||
-        !isUuid(session.name) ||
-        (sessionId && session.name !== sessionId)
-      )
-        continue;
-      const path = join(root, encoded.name, session.name, "chat_history.jsonl");
-      const link = await lstat(path).catch(() => null);
-      const stats = await stat(path).catch(() => null);
-      if (!link?.isFile() || !stats?.isFile() || stats.uid !== CURRENT_EUID) continue;
-      result.push({ cwd: decodedCwd, mtimeMs: stats.mtimeMs, path, source: "grok-jsonl" });
-    }
-  }
-  return result;
-}
-
-function selectUniqueCandidate(
-  candidates: Candidate[],
-  cwd: string | null,
-  occupied?: ReadonlySet<string>,
-): Candidate | null {
-  const filtered = candidates.filter((item) => !occupied?.has(item.path));
-  if (cwd) {
-    const matching = filtered.filter((item) => normalizeCwd(item.cwd) === normalizeCwd(cwd));
-    return matching.length === 1 ? (matching[0] ?? null) : null;
-  }
-  return filtered.length === 1 ? (filtered[0] ?? null) : null;
-}
-
-function isUuid(value: string): boolean {
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value);
-}
-
-function discoverAntigravitySession(
-  homeDir: string,
-  sessionId: string | null,
-): AgentHistoryRef | null {
-  if (sessionId && !isUuid(sessionId)) return null;
-  const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
-  if (sessionId) {
-    const path = join(dir, `${sessionId}.db`);
-    return safeConversationDb(path, sessionId)
-      ? { kind: "discovered_file", path, source: "antigravity-sqlite", value: sessionId }
-      : null;
-  }
-  return null;
-}
-
-function safeConversationDb(path: string, sessionId: string): boolean {
-  if (!isUuid(sessionId) || !existsSync(path)) return false;
-  try {
-    const stats = lstatSync(path);
-    return stats.isFile() && (stats.mode & 0o022) === 0;
-  } catch {
-    return false;
-  }
-}
-function discoverOpenCodeSession(input: {
-  cwd: string | null;
-  homeDir: string;
-  sessionId: string | null;
-}): AgentHistoryRef | null {
-  const dbPath = resolveOpenCodeDbPath(input.homeDir);
-  if (!existsSync(dbPath)) return null;
-  let sqlite: DatabaseSync | null = null;
-  try {
-    sqlite = new DatabaseSync(dbPath, { readOnly: true });
-    if (input.sessionId) {
-      const row = sqlite
-        .prepare("select id from session where id = ? limit 1")
-        .get(input.sessionId) as { id: string } | undefined;
-      return row
-        ? { kind: "discovered_file", path: dbPath, source: "opencode-sqlite", value: row.id }
-        : null;
-    }
-    if (!input.cwd) return null;
-    const row = sqlite
-      .prepare("select id from session where directory = ? order by time_updated desc limit 1")
-      .get(input.cwd) as { id: string } | undefined;
-    return row
-      ? { kind: "discovered_file", path: dbPath, source: "opencode-sqlite", value: row.id }
-      : null;
-  } catch {
-    return null;
-  } finally {
-    sqlite?.close();
-  }
-}
-
-function resolveOpenCodeDbPath(homeDir: string): string {
-  const override = process.env.OPENCODE_DB;
-  if (override && override !== ":memory:") {
-    return override.startsWith("/")
-      ? override
-      : join(homeDir, ".local", "share", "opencode", override);
-  }
-  return join(homeDir, ".local", "share", "opencode", "opencode.db");
-}
-
-function recordValue(value: unknown): Record<string, unknown> {
-  return typeof value === "object" && value !== null ? (value as Record<string, unknown>) : {};
-}
-
-function stringValue(value: unknown): string | null {
-  return typeof value === "string" && value.length > 0 ? value : null;
 }

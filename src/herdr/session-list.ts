@@ -55,9 +55,11 @@ export function normalizeHerdrSessionList(value: string | unknown): HerdrSession
   return sessions.map((session) => {
     const item =
       typeof session === "object" && session !== null ? (session as Record<string, unknown>) : {};
+    // `herdr session list --json` emits snake_case (`session_dir`, `socket_path`)
+    // and that is the only shape herdsman consumes.
     const name = stringValue(item.name);
-    const sessionDir = stringValue(item.session_dir) ?? stringValue(item.sessionDir);
-    const socketPath = stringValue(item.socket_path) ?? stringValue(item.socketPath);
+    const sessionDir = stringValue(item.session_dir);
+    const socketPath = stringValue(item.socket_path);
     if (!name || !sessionDir || !socketPath) {
       throw new Error("Invalid herdr session list entry");
     }

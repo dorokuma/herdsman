@@ -1,9 +1,8 @@
-import { existsSync, mkdirSync, mkdtempSync, unlinkSync, utimesSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { DISCOVERY_RECENCY_GRACE_MS } from "@/agent-history/discovery.js";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { createAgentHistoryService, emptyCompactHistory } from "@/agent-history/service.js";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
@@ -329,14 +328,39 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
-  test("reads additional runtime histories through agent.read", async () => {
+  test("reads supported histories through agent.read and refuses every other agent", async () => {
     const { client, dir, harness } = await openServer();
-    seedAdditionalRuntimeAgents(harness);
-    const codexDir = join(dir, ".codex", "sessions", "2026", "07", "09");
-    mkdirSync(codexDir, { recursive: true });
+    // Disk bait for the agents herdsman deliberately does not support: their own
+    // session stores are populated exactly as their real layouts look. None of
+    // them may be read, and the files must not be walked to find a session.
+    const codexSessionDir = join(dir, ".codex", "sessions", "2026", "07", "09");
+    mkdirSync(codexSessionDir, { recursive: true });
+    const codexSessionPath = join(
+      codexSessionDir,
+      "rollout-2026-07-09T12-00-00-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee.jsonl",
+    );
     writeFileSync(
-      join(codexDir, "rollout-2026-07-09T12-00-00-eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee.jsonl"),
+      codexSessionPath,
       `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo-codex" } })}\n${JSON.stringify({ type: "event_msg", payload: { type: "user_message", message: "codex user" } })}\n`,
+    );
+
+    const geminiProjectDir = join(dir, ".gemini", "tmp", "repo-gemini");
+    const geminiChatsDir = join(geminiProjectDir, "chats");
+    mkdirSync(geminiChatsDir, { recursive: true });
+    writeFileSync(join(geminiProjectDir, ".project_root"), "/repo-gemini\n");
+    const geminiSessionPath = join(geminiChatsDir, "session-2026-07-09T12-00-00abcdef.json");
+    writeFileSync(
+      geminiSessionPath,
+      JSON.stringify({ messages: [{ id: "g1", type: "user", content: "gemini user" }] }),
+    );
+
+    const claudeProjectDir = join(dir, ".claude", "projects", "-repo-claude");
+    mkdirSync(claudeProjectDir, { recursive: true });
+    const claudeId = "11111111-1111-4111-8111-111111111111";
+    const claudeSessionPath = join(claudeProjectDir, `${claudeId}.jsonl`);
+    writeFileSync(
+      claudeSessionPath,
+      `${JSON.stringify({ type: "user", uuid: "u1", message: { role: "user", content: "claude user" } })}\n`,
     );
 
     const openCodeDir = join(dir, ".local", "share", "opencode");
@@ -363,39 +387,60 @@ describe("ObservabilityRpcServer", () => {
       .run("p1", "m1", "oc_1", 2, 2, JSON.stringify({ type: "text", text: "opencode user" }));
     sqlite.close();
 
-    const geminiProjectDir = join(dir, ".gemini", "tmp", "repo-gemini");
-    const geminiChatsDir = join(geminiProjectDir, "chats");
-    mkdirSync(geminiChatsDir, { recursive: true });
-    writeFileSync(join(geminiProjectDir, ".project_root"), "/repo-gemini\n");
+    // The two supported agents: agy resolves its official conversation id to the
+    // conversation database, pi hands over its session file path directly.
+    const agyId = "22222222-2222-4222-8222-222222222222";
+    const conversationsDir = join(dir, ".gemini", "antigravity-cli", "conversations");
+    mkdirSync(conversationsDir, { recursive: true });
+    const agyDbPath = join(conversationsDir, `${agyId}.db`);
+    const agyDb = new DatabaseSync(agyDbPath);
+    agyDb.exec("create table unrelated (id text primary key)");
+    agyDb.close();
+    const piSessionDir = join(dir, ".pi", "agent", "sessions");
+    mkdirSync(piSessionDir, { recursive: true });
+    const piSessionPath = join(piSessionDir, "ses-rpc.jsonl");
     writeFileSync(
-      join(geminiChatsDir, "session-2026-07-09T12-00-00abcdef.json"),
-      JSON.stringify({ messages: [{ id: "g1", type: "user", content: "gemini user" }] }),
+      piSessionPath,
+      `${JSON.stringify({ type: "message", id: "u1", message: { role: "user", content: "pi user" } })}\n`,
     );
 
+    seedAdditionalRuntimeAgents(harness, {
+      agyId,
+      claudeId,
+      codexSessionPath,
+      geminiSessionPath,
+      piSessionPath,
+    });
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+
     await expect(
-      client.request("agent.read", { limit: 10, target: "codex", workspaceId: "wB" }),
+      client.request("agent.read", { limit: 10, target: "agy", workspaceId: "wB" }),
     ).resolves.toMatchObject({
       agent: {
-        historyRef: { source: "codex-jsonl" },
-        messages: [expect.objectContaining({ role: "user" })],
+        historyRef: { source: "antigravity-sqlite", value: agyId },
+        messages: [],
       },
     });
     await expect(
-      client.request("agent.read", { limit: 10, target: "opencode", workspaceId: "wB" }),
+      client.request("agent.read", { limit: 10, target: "pi", workspaceId: "wB" }),
     ).resolves.toMatchObject({
       agent: {
-        historyRef: { source: "opencode-sqlite", value: "oc_1" },
-        messages: [expect.objectContaining({ role: "user" })],
+        historyRef: { source: "pi-jsonl", value: piSessionPath },
+        messages: [expect.objectContaining({ role: "user", text: "pi user" })],
       },
     });
-    await expect(
-      client.request("agent.read", { limit: 10, target: "gemini", workspaceId: "wB" }),
-    ).resolves.toMatchObject({
-      agent: {
-        historyRef: { source: "gemini-json" },
-        messages: [expect.objectContaining({ role: "user" })],
-      },
-    });
+    for (const target of ["claude", "codex", "gemini", "opencode"]) {
+      await expect(
+        client.request("agent.read", { limit: 10, target, workspaceId: "wB" }),
+      ).resolves.toMatchObject({
+        agent: { historyRef: null, messages: [] },
+      });
+      await expect(
+        client.request("agent.get", { target, workspaceId: "wB" }),
+      ).resolves.toMatchObject({
+        agent: { history: expect.objectContaining({ messageCount: 0 }) },
+      });
+    }
 
     client.close();
     harness.sqlite.close();
@@ -514,18 +559,15 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
-  test("serves cached lists and uses the persisted ref only for live detail reads", async () => {
+  test("serves cached lists and re-resolves live detail reads", async () => {
     const calls: string[] = [];
     const liveHistory = {
-      async read(_input: unknown, options: { preferredRef?: { value: string } | null }) {
-        calls.push(`read:${options.preferredRef?.value}`);
+      async read(_input: unknown, options: { forceDiscovery?: boolean }) {
+        calls.push(`read:${options.forceDiscovery === true ? "fresh" : "reuse"}`);
         return { historyRef: null, messages: [] };
       },
-      async resolveCompactHistory(
-        _input: unknown,
-        options: { preferredRef?: { value: string } | null },
-      ) {
-        calls.push(`get:${options.preferredRef?.value}`);
+      async resolveCompactHistory(_input: unknown, options: { forceDiscovery?: boolean } = {}) {
+        calls.push(`get:${options.forceDiscovery === true ? "fresh" : "reuse"}`);
         return {
           compactHistory: emptyCompactHistory("pi-jsonl"),
           historyRef: null,
@@ -558,37 +600,102 @@ describe("ObservabilityRpcServer", () => {
     expect(calls).toEqual([]);
     await client.request("agent.get", { target: "pi", workspaceId: "wB" });
     await client.request("agent.read", { target: "pi", workspaceId: "wB" });
-    expect(calls).toEqual(["get:/tmp/history.jsonl", "read:/tmp/history.jsonl"]);
+    // A list is served from the stored snapshots (no history read at all), while
+    // an explicit detail read re-resolves from the official values instead of
+    // reusing the persisted ref or a memoized failure.
+    expect(calls).toEqual(["get:fresh", "read:fresh"]);
     client.close();
     harness.sqlite.close();
   });
 
-  test("skips locking discovered_file refs and forwards terminalTitle on agent.get/read", async () => {
+  test("agent.read retries a lookup that failed moments ago instead of returning a memoized empty history", async () => {
+    const { client, dir, harness } = await openServer();
+    const agyId = "33333333-3333-4333-8333-333333333333";
+    harness.herdrSessions.upsertRunning({
+      name: "default",
+      sessionDir: "/tmp/herdr",
+      socketPath: "/tmp/herdr/herdr.sock",
+    });
+    harness.agents.replaceForSession({
+      agents: [
+        {
+          agent: "agy",
+          agent_session: {
+            agent: "agy",
+            kind: "id",
+            source: "herdr:antigravity_cli",
+            value: agyId,
+          },
+          agent_status: "idle",
+          pane_id: "wB:p-agy",
+          terminal_id: "term_agy",
+          workspace_id: "wB",
+        },
+      ],
+      herdrSessionName: "default",
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const discoveryWarnings = () =>
+      warn.mock.calls.filter(([message]) =>
+        String(message).includes("no usable official Herdr agent session"),
+      );
+
+    // Nothing resolves yet, so the lookup fails and is remembered for the
+    // daemon's background rounds.
+    await expect(
+      client.request("agent.read", { limit: 10, target: "agy", workspaceId: "wB" }),
+    ).resolves.toMatchObject({
+      agent: { historyRef: null, messages: [] },
+    });
+    expect(discoveryWarnings()).toHaveLength(1);
+
+    // The operator fixes the reported problem (the conversation database appears)
+    // inside the retry window: an explicit read resolves it now instead of
+    // answering from the remembered failure.
+    const conversations = join(dir, ".gemini", "antigravity-cli", "conversations");
+    mkdirSync(conversations, { recursive: true });
+    const dbPath = join(conversations, `${agyId}.db`);
+    const db = new DatabaseSync(dbPath);
+    db.exec("create table unrelated (id text primary key)");
+    db.close();
+
+    await expect(
+      client.request("agent.read", { limit: 10, target: "agy", workspaceId: "wB" }),
+    ).resolves.toMatchObject({
+      agent: { historyRef: { path: dbPath, source: "antigravity-sqlite", value: agyId } },
+    });
+    await expect(
+      client.request("agent.get", { target: "agy", workspaceId: "wB" }),
+    ).resolves.toMatchObject({
+      agent: { history: expect.objectContaining({ source: "antigravity-sqlite" }) },
+    });
+    // Forcing a retry never duplicates the per-key warning.
+    expect(discoveryWarnings()).toHaveLength(1);
+
+    client.close();
+    harness.sqlite.close();
+  });
+
+  test("skips a persisted discovered_file ref on agent.get/read", async () => {
     const calls: Array<{
       method: string;
       preferred?: string | undefined;
-      title?: string | null | undefined;
     }> = [];
     const liveHistory = {
-      async read(
-        input: { terminalTitle?: string | null },
-        options: { preferredRef?: { value: string } | null },
-      ) {
+      async read(_input: unknown, options: { preferredRef?: { value: string } | null }) {
         calls.push({
           method: "read",
           preferred: options.preferredRef?.value,
-          title: input.terminalTitle,
         });
         return { historyRef: null, messages: [] };
       },
       async resolveCompactHistory(
-        input: { terminalTitle?: string | null },
+        _input: unknown,
         options: { preferredRef?: { value: string } | null } = {},
       ) {
         calls.push({
           method: "get",
           preferred: options.preferredRef?.value,
-          title: input.terminalTitle,
         });
         return {
           compactHistory: emptyCompactHistory("pi-jsonl"),
@@ -630,14 +737,14 @@ describe("ObservabilityRpcServer", () => {
     await client.request("agent.get", { target: "pi", workspaceId: "wB" });
     await client.request("agent.read", { target: "pi", workspaceId: "wB" });
     expect(calls).toEqual([
-      { method: "get", preferred: undefined, title: "π - role-worker-53c500b2 - root" },
-      { method: "read", preferred: undefined, title: "π - role-worker-53c500b2 - root" },
+      { method: "get", preferred: undefined },
+      { method: "read", preferred: undefined },
     ]);
     client.close();
     harness.sqlite.close();
   });
 
-  test("keeps preferred discovered_file on agent.get/read when the file is recent and occupied is unchanged", async () => {
+  test("does not reuse a persisted discovered_file ref on agent.get/read", async () => {
     const calls: string[] = [];
     const liveHistory = {
       async read(_input: unknown, options: { preferredRef?: { value: string } | null }) {
@@ -676,52 +783,8 @@ describe("ObservabilityRpcServer", () => {
     });
     await client.request("agent.get", { target: "pi", workspaceId: "wB" });
     await client.request("agent.read", { target: "pi", workspaceId: "wB" });
-    expect(calls).toEqual([`get:${path}`, `read:${path}`]);
-    client.close();
-    harness.sqlite.close();
-  });
-
-  test("rediscovers on agent.get/read when the discovered_file recency has expired", async () => {
-    const calls: string[] = [];
-    const liveHistory = {
-      async read(_input: unknown, options: { preferredRef?: { value: string } | null }) {
-        calls.push(options.preferredRef ? `read:${options.preferredRef.value}` : "read:discover");
-        return { historyRef: null, messages: [] };
-      },
-      async resolveCompactHistory(
-        _input: unknown,
-        options: { preferredRef?: { value: string } | null } = {},
-      ) {
-        calls.push(options.preferredRef ? `get:${options.preferredRef.value}` : "get:discover");
-        return {
-          compactHistory: emptyCompactHistory("pi-jsonl"),
-          historyRef: null,
-          sourceFingerprint: null,
-        };
-      },
-    } as unknown as AgentHistoryService;
-    const { client, dir, harness } = await openServer({ history: liveHistory });
-    seedAgent(harness, dir);
-    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wB:p1" });
-    if (!agent) throw new Error("missing seeded agent");
-    const path = join(dir, "expired-discovered.jsonl");
-    writeFileSync(path, "history\n");
-    const expired = agent.firstSeenAt.getTime() - DISCOVERY_RECENCY_GRACE_MS - 1_000;
-    utimesSync(path, new Date(expired), new Date(expired));
-    harness.agentContextSnapshots.put({
-      agentId: agent.id,
-      compactHistory: emptyCompactHistory("pi-jsonl"),
-      historyRef: {
-        kind: "discovered_file",
-        path,
-        source: "pi-jsonl",
-        value: path,
-      },
-      paneRevision: null,
-      sourceFingerprint: { mtimeMs: expired, path, size: 1 },
-    });
-    await client.request("agent.get", { target: "pi", workspaceId: "wB" });
-    await client.request("agent.read", { target: "pi", workspaceId: "wB" });
+    // Herdsman no longer trusts a ref the deleted cwd/mtime scanner produced, even
+    // while the file is still recent: the official agent_session value decides.
     expect(calls).toEqual(["get:discover", "read:discover"]);
     client.close();
     harness.sqlite.close();
@@ -1054,7 +1117,16 @@ async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 20));
 }
 
-function seedAdditionalRuntimeAgents(harness: ReturnType<typeof openObservabilityDbHarness>) {
+function seedAdditionalRuntimeAgents(
+  harness: ReturnType<typeof openObservabilityDbHarness>,
+  sessions: {
+    agyId: string;
+    claudeId: string;
+    codexSessionPath: string;
+    geminiSessionPath: string;
+    piSessionPath: string;
+  },
+) {
   harness.herdrSessions.upsertRunning({
     name: "default",
     sessionDir: "/tmp/herdr",
@@ -1063,7 +1135,55 @@ function seedAdditionalRuntimeAgents(harness: ReturnType<typeof openObservabilit
   harness.agents.replaceForSession({
     agents: [
       {
+        agent: "agy",
+        agent_session: {
+          agent: "agy",
+          kind: "id",
+          source: "herdr:antigravity_cli",
+          value: sessions.agyId,
+        },
+        agent_status: "idle",
+        cwd: "/repo-agy",
+        pane_id: "wB:p-agy",
+        terminal_id: "term_agy",
+        workspace_id: "wB",
+      },
+      {
+        agent: "pi",
+        agent_session: {
+          agent: "pi",
+          kind: "path",
+          source: "herdr:pi",
+          value: sessions.piSessionPath,
+        },
+        agent_status: "idle",
+        cwd: "/repo-pi",
+        pane_id: "wB:p-pi",
+        terminal_id: "term_pi",
+        workspace_id: "wB",
+      },
+      {
+        agent: "claude",
+        agent_session: {
+          agent: "claude",
+          kind: "id",
+          source: "herdr:claude",
+          value: sessions.claudeId,
+        },
+        agent_status: "idle",
+        cwd: "/repo-claude",
+        pane_id: "wB:p-claude",
+        terminal_id: "term_claude",
+        workspace_id: "wB",
+      },
+      {
         agent: "codex",
+        agent_session: {
+          agent: "codex",
+          kind: "path",
+          source: "herdr:codex",
+          value: sessions.codexSessionPath,
+        },
         agent_status: "idle",
         cwd: "/repo-codex",
         pane_id: "wB:p-codex",
@@ -1072,6 +1192,12 @@ function seedAdditionalRuntimeAgents(harness: ReturnType<typeof openObservabilit
       },
       {
         agent: "opencode",
+        agent_session: {
+          agent: "opencode",
+          kind: "id",
+          source: "herdr:opencode",
+          value: "oc_1",
+        },
         agent_status: "idle",
         cwd: "/repo-opencode",
         pane_id: "wB:p-opencode",
@@ -1080,6 +1206,12 @@ function seedAdditionalRuntimeAgents(harness: ReturnType<typeof openObservabilit
       },
       {
         agent: "gemini",
+        agent_session: {
+          agent: "gemini",
+          kind: "path",
+          source: "herdr:gemini",
+          value: sessions.geminiSessionPath,
+        },
         agent_status: "idle",
         cwd: "/repo-gemini",
         pane_id: "wB:p-gemini",

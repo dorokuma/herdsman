@@ -1,6 +1,10 @@
 import { existsSync } from "node:fs";
 import type { DatabaseSync } from "node:sqlite";
-import { safeAllowedSessionPath, sessionPathAllowedByShape } from "@/agent-history/discovery.js";
+import {
+  safeAllowedSessionPath,
+  safeOfficialSessionPath,
+  sessionPathAllowedByShape,
+} from "@/agent-history/discovery.js";
 import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
 import { type AgentEventStore, hasNonEmptyAssistantMessage } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
@@ -1347,10 +1351,11 @@ export class AgentIndexService {
       const overlayByPane = new Map<string, PaneOverlay>();
       for (const pane of snapshot.panes) {
         const value = record(pane);
-        const paneId = stringValue(value.pane_id) ?? stringValue(value.paneId);
+        // `pane.list` panes are official `PaneInfo` records: snake_case only.
+        const paneId = stringValue(value.pane_id);
         if (!paneId) continue;
         const revision = integerValue(value.revision);
-        const terminalTitle = stringValue(value.terminal_title) ?? stringValue(value.terminalTitle);
+        const terminalTitle = stringValue(value.terminal_title);
         if (revision === undefined && !terminalTitle) continue;
         overlayByPane.set(paneId, {
           ...(revision === undefined ? {} : { revision }),
@@ -1424,7 +1429,7 @@ export class AgentIndexService {
         );
         const sessionReady =
           agent.agentSession?.kind === "path" &&
-          safeAllowedSessionPath(agent.agentSession.value) !== null;
+          safeOfficialSessionPath(agent.agentSession.value) !== null;
         const sessionUnbound =
           sessionReady &&
           (cached?.historyRef?.kind !== "agent_session" ||
@@ -1692,7 +1697,7 @@ export class AgentIndexService {
   }
 
   #isClosedPaneAgent(herdrSessionName: string, agent: HerdrAgentLike): boolean {
-    const paneId = stringValue(agent.pane_id) ?? stringValue(agent.paneId);
+    const paneId = stringValue(agent.pane_id);
     if (!paneId) return false;
     return this.#stores.agents.isPaneClosed({
       herdrSessionName,
@@ -2579,34 +2584,23 @@ type PaneOverlay = {
 
 function withPaneRevision(agent: unknown, overlayByPane: Map<string, PaneOverlay>): HerdrAgentLike {
   const raw = record(agent);
-  const paneId = stringValue(raw.pane_id) ?? stringValue(raw.paneId);
+  // Herdr payloads are snake_case only (`AgentInfo` / `PaneInfo`); no camelCase
+  // alias is accepted, so a Herdr rename surfaces as a missing field instead of
+  // a silent compatibility shim.
+  const paneId = stringValue(raw.pane_id);
   const overlay = paneId ? overlayByPane.get(paneId) : undefined;
   const revision = integerValue(raw.revision) ?? overlay?.revision;
-  const terminalTitle =
-    stringValue(raw.terminal_title) ?? stringValue(raw.terminalTitle) ?? overlay?.terminalTitle;
+  const terminalTitle = stringValue(raw.terminal_title) ?? overlay?.terminalTitle;
   if (revision === undefined && !terminalTitle) return raw;
-  // Collapse dual keys onto herdr-canonical snake_case `terminal_title`.
-  // Incoming snapshots may carry camelCase `terminalTitle`; spreading `raw`
-  // would otherwise leave both keys on the overlay object. Downstream
-  // HerdrAgentLike readers (AgentStore.replaceForSession) still accept
-  // camelCase as fallback, and AgentIndexRecord.terminalTitle is populated
-  // later from whichever key is present.
-  const rest = { ...raw };
-  delete rest.terminalTitle;
   return {
-    ...rest,
+    ...raw,
     ...(revision === undefined ? {} : { revision }),
     ...(terminalTitle ? { terminal_title: terminalTitle } : {}),
   };
 }
 
 function paneGenerationOf(agent: HerdrAgentLike): string | null {
-  return (
-    stringValue(agent.pane_generation) ??
-    stringValue(agent.paneGeneration) ??
-    stringValue(agent.creation_id) ??
-    stringValue(agent.creationId)
-  );
+  return stringValue(agent.pane_generation) ?? stringValue(agent.creation_id);
 }
 
 function matchingPrior(
@@ -2738,7 +2732,7 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function paneGenerationFromEvent(event: Record<string, unknown>): string | null {
-  return stringValue(event.pane_generation) ?? stringValue(event.paneGeneration);
+  return stringValue(event.pane_generation);
 }
 
 function paneIdentityKey(paneId: string, paneGeneration: string | null | undefined): string {
@@ -2794,7 +2788,7 @@ function sameTerminalAssistantContent(
     return Boolean(currentMsg.text && currentMsg.text === prevMsg.text);
   }
 
-  // Non-agy (pi, claude, codex, grok, opencode):
+  // Non-agy (pi):
   if (currentMsg.ref !== null && prevMsg.ref !== null) {
     return currentMsg.ref === prevMsg.ref;
   }

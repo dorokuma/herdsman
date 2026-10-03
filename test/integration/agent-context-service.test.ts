@@ -1,8 +1,7 @@
-import { chmod, mkdir, mkdtemp, rm, stat, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { DISCOVERY_RECENCY_GRACE_MS } from "@/agent-history/discovery.js";
 import type { AgentHistoryService, ResolvedCompactAgentHistory } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
@@ -31,7 +30,7 @@ async function source(
   const info = await stat(path);
   return {
     fingerprint: { mtimeMs: Math.trunc(info.mtimeMs), path, size: info.size },
-    ref: { kind: "discovered_file", path, source: "pi-jsonl", value: path },
+    ref: { kind: "agent_session", path, source: "pi-jsonl", value: path },
   };
 }
 
@@ -119,18 +118,10 @@ function refreshAgent(
 
 function fakeHistory(result: ResolvedCompactAgentHistory) {
   const calls: Array<{ forceDiscovery?: boolean; preferredRef?: AgentHistoryRef | null }> = [];
-  const occupied: Array<ReadonlySet<string> | undefined> = [];
-  const lookups: Array<{ terminalTitle?: string | null }> = [];
   return {
     calls,
-    lookups,
-    occupied,
     service: {
-      resolveCompactHistory: async (input, options) => {
-        occupied.push(
-          (input as { occupiedSessionPaths?: ReadonlySet<string> }).occupiedSessionPaths,
-        );
-        lookups.push(input as { terminalTitle?: string | null });
+      resolveCompactHistory: async (_input, options) => {
         calls.push(options ?? {});
         return result;
       },
@@ -159,7 +150,7 @@ function snapshotInput(agent: AgentIndexRecord, value: ResolvedCompactAgentHisto
 }
 
 describe("AgentContextService refresh", () => {
-  test("uses discovery for missing snapshots and retries snapshots with no resolved history", async () => {
+  test("uses discovery for missing snapshots without forcing the per-round lookup", async () => {
     const harness = openAgent();
     const current = await source("current.jsonl");
     const fake = fakeHistory(resolved(current.ref, current.fingerprint));
@@ -171,7 +162,11 @@ describe("AgentContextService refresh", () => {
       changed: true,
       snapshot: { historyRef: current.ref },
     });
-    expect(fake.calls).toEqual([{ forceDiscovery: true }]);
+    // Discovery still runs for this round (the fake was called at all), but it is
+    // not *forced*: an unresolved pane must not keep the failure memory in
+    // `discovery.ts` permanently fresh, otherwise its retry window could never
+    // expire and the background deceleration would never apply.
+    expect(fake.calls).toEqual([{ forceDiscovery: false }]);
 
     const empty = resolved(null, null);
     harness.agentContextSnapshots.put(snapshotInput(harness.agent, empty));
@@ -180,7 +175,7 @@ describe("AgentContextService refresh", () => {
       agent: harness.agent,
       identityChanged: false,
     });
-    expect(retry.calls).toEqual([{ forceDiscovery: true }]);
+    expect(retry.calls).toEqual([{ forceDiscovery: false }]);
   });
 
   test("reuses a stored ref only for upward revisions with a changed source or unchanged revisions", async () => {
@@ -234,13 +229,10 @@ describe("AgentContextService refresh", () => {
         identityChanged: item.identityChanged,
       });
       expect(fake.calls[0]?.forceDiscovery).toBe(true);
-      if (item.identityChanged) {
-        expect(fake.calls[0]).not.toHaveProperty("preferredRef");
-      }
     }
   });
 
-  test("does not prefer a path session until safeAllowedSessionPath succeeds", async () => {
+  test("does not prefer a path session until the official path is readable", async () => {
     const missing = join(
       "/tmp/herdr-role-sessions",
       `missing-pref-${Date.now()}-${Math.random().toString(16).slice(2)}.jsonl`,
@@ -252,7 +244,10 @@ describe("AgentContextService refresh", () => {
       agent: harness.agent,
       identityChanged: true,
     });
-    expect(fake.calls).toEqual([{ forceDiscovery: true }]);
+    // An unreadable official path is an unresolved pane: nothing to reuse, and no
+    // forced lookup either (the failure memory owns that cadence). What matters
+    // here is that no persisted ref is handed to discovery.
+    expect(fake.calls).toEqual([{ forceDiscovery: false }]);
     expect(fake.calls[0]).not.toHaveProperty("preferredRef");
   });
 
@@ -338,7 +333,10 @@ describe("AgentContextService refresh", () => {
       identityChanged: true,
     });
 
-    expect(changed.calls).toEqual([{ forceDiscovery: true }]);
+    // The official id changed, so no persisted ref matches it: discovery runs
+    // (new key, nothing memoized) but the round does not force, because an id
+    // pane is always resolved by the deterministic template anyway.
+    expect(changed.calls).toEqual([{ forceDiscovery: false }]);
     expect(result.snapshot.historyRef).toEqual({
       kind: "agent_session",
       path: secondSource.ref.path,
@@ -400,62 +398,27 @@ describe("AgentContextService refresh", () => {
     );
   });
 
-  test("prefers a recent discovered_file when occupied is unchanged", async () => {
+  test("no longer trusts a persisted discovered_file ref", async () => {
     const speculative = await source("speculative.jsonl");
     const harness = openAgent({ revision: 1 });
     harness.agentContextSnapshots.put(
-      snapshotInput(harness.agent, resolved(speculative.ref, speculative.fingerprint)),
-    );
-    const fake = fakeHistory(resolved(speculative.ref, speculative.fingerprint));
-
-    await context(harness, fake.service).refreshAgent({
-      agent: harness.agent,
-      identityChanged: false,
-    });
-    expect(fake.calls).toEqual([{ forceDiscovery: false, preferredRef: speculative.ref }]);
-  });
-
-  test("rediscovers a discovered_file after recency expires", async () => {
-    const speculative = await source("stale-speculative.jsonl");
-    const harness = openAgent({ revision: 1 });
-    const expired = harness.agent.firstSeenAt.getTime() - DISCOVERY_RECENCY_GRACE_MS - 1_000;
-    const path = speculative.ref.path;
-    if (!path) throw new Error("Expected speculative path");
-    await utimes(path, new Date(expired), new Date(expired));
-    const info = await stat(path);
-    harness.agentContextSnapshots.put(
       snapshotInput(
         harness.agent,
-        resolved(speculative.ref, {
-          mtimeMs: Math.trunc(info.mtimeMs),
-          path,
-          size: info.size,
-        }),
+        resolved({ ...speculative.ref, kind: "discovered_file" }, speculative.fingerprint),
       ),
     );
-    const fake = fakeHistory(resolved(speculative.ref, speculative.fingerprint));
+    const fake = fakeHistory(resolved(null, null));
 
     await context(harness, fake.service).refreshAgent({
       agent: harness.agent,
       identityChanged: false,
     });
+    // The scanner that produced discovered_file refs is gone, so a persisted one
+    // is dropped and discovery runs again against the official value only.
     expect(fake.calls).toEqual([{ forceDiscovery: false }]);
     expect(fake.calls[0]).not.toHaveProperty("preferredRef");
   });
-
-  test("passes terminalTitle into history lookup", async () => {
-    const harness = openAgent();
-    const titled = { ...harness.agent, terminalTitle: "π - role-worker - root" };
-    const current = await source("titled.jsonl");
-    const fake = fakeHistory(resolved(current.ref, current.fingerprint));
-    await context(harness, fake.service).refreshAgent({
-      agent: titled,
-      identityChanged: false,
-    });
-    expect(fake.lookups[0]).toMatchObject({ terminalTitle: "π - role-worker - root" });
-  });
-
-  test("rediscovers a discovered_file when occupied paths change", async () => {
+  test("rediscovers when the agent's occupied session paths change", async () => {
     const speculative = await source("occupied-change.jsonl");
     const path = speculative.ref.path;
     if (!path) throw new Error("Expected speculative path");
@@ -495,10 +458,12 @@ describe("AgentContextService refresh", () => {
     if (!self) throw new Error("Expected self agent");
     await service.refreshAgent({ agent: self, identityChanged: false });
     expect(fake.calls[1]?.forceDiscovery).toBe(true);
-    expect(fake.calls[1]).not.toHaveProperty("preferredRef");
+    // An official ref belongs to the agent that reported it, so occupancy no
+    // longer suppresses it the way it suppressed a guessed discovered_file.
+    expect(fake.calls[1]).toEqual({ forceDiscovery: true, preferredRef: speculative.ref });
   });
 
-  test("occupies other agents' snapshot historyRef paths during discovery", async () => {
+  test("reports other agents' live and snapshot historyRef paths as occupied", async () => {
     const harness = openAgent();
     const agents = harness.agents.replaceForSession({
       agents: [
@@ -553,11 +518,11 @@ describe("AgentContextService refresh", () => {
       paneRevision: 1,
       sourceFingerprint: { mtimeMs: 1, path: snapshotPath, size: 1 },
     });
-    const current = await source("occupied.jsonl");
-    const fake = fakeHistory(resolved(current.ref, current.fingerprint));
+    const service = context(harness, fakeHistory(resolved(null, null)).service);
 
-    await context(harness, fake.service).refreshAgent({ agent: self, identityChanged: false });
-    const occupied = [...(fake.occupied[0] ?? [])].sort();
+    // The set is computed from the other agents' live agentSession paths and
+    // their persisted snapshot refs, before any refresh writes one for `self`.
+    const occupied = [...service.occupiedSessionPathsFor(self)].sort();
     expect(occupied).toEqual([
       "/tmp/herdr-role-sessions/default/role-direct/session.jsonl",
       snapshotPath,
@@ -600,7 +565,7 @@ describe("AgentContextService cached reads", () => {
     const claudeRef: AgentHistoryRef = {
       kind: "discovered_file",
       path: "/tmp/claude.jsonl",
-      source: "claude-jsonl",
+      source: "pi-jsonl",
       value: "/tmp/claude.jsonl",
     };
     const piRef: AgentHistoryRef = {

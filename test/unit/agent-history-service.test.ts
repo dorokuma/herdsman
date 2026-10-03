@@ -1,14 +1,10 @@
-import { mkdtemp, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryLookupInput } from "@/agent-history/discovery.js";
 import type { AgentHistoryReader } from "@/agent-history/readers.js";
-import {
-  cacheSourcePathForRef,
-  createAgentHistoryService,
-  emptyCompactHistory,
-} from "@/agent-history/service.js";
+import { createAgentHistoryService, emptyCompactHistory } from "@/agent-history/service.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentHistoryRef } from "@/observability/contracts.js";
 
@@ -16,8 +12,6 @@ const tempDirs: string[] = [];
 const lookup: AgentHistoryLookupInput = {
   agent: "pi",
   agentSession: null,
-  cwd: "/repo",
-  foregroundCwd: null,
 };
 
 afterEach(async () => {
@@ -41,7 +35,7 @@ function reader(input: { failCompact?: boolean; failRead?: boolean; noAssistant?
   const readRefs: AgentHistoryRef[] = [];
   const fake: AgentHistoryReader = {
     canRead: (historyRef) =>
-      historyRef.source === "pi-jsonl" || historyRef.source === "opencode-sqlite",
+      historyRef.source === "pi-jsonl" || historyRef.source === "antigravity-sqlite",
     async read(historyRef) {
       readRefs.push(historyRef);
       if (input.failRead) throw new Error("read failed");
@@ -193,12 +187,12 @@ describe("agent history service", () => {
     );
     expect(fixture.reader.compactRefs).toHaveLength(1);
   });
-  test("uses the OpenCode DB path for fingerprints while preserving the session id", async () => {
-    const path = await sourceFile("opencode.db");
+  test("fingerprints the resolved file while preserving the official session id", async () => {
+    const path = await sourceFile("agy.db");
     const preferred: AgentHistoryRef = {
       kind: "discovered_file",
       path,
-      source: "opencode-sqlite",
+      source: "antigravity-sqlite",
       value: "session-a",
     };
     const fixture = service({ discovered: null });
@@ -288,7 +282,7 @@ describe("agent history service", () => {
     });
   });
 
-  test("forwards firstSeenAtMs through resolveCompactHistory to discovery", async () => {
+  test("forwards the pane identity through resolveCompactHistory to discovery", async () => {
     const discovered = ref(await sourceFile("discovered.jsonl"));
     const fakeReader = reader();
     let discoveryInput: AgentHistoryLookupInput | undefined;
@@ -300,22 +294,17 @@ describe("agent history service", () => {
       readers: [fakeReader.fake],
     });
 
-    await svc.resolveCompactHistory({ ...lookup, firstSeenAtMs: 123 }, { forceDiscovery: true });
+    await svc.resolveCompactHistory(
+      { ...lookup, herdrSessionName: "default", paneId: "wA:p1" },
+      { forceDiscovery: true },
+    );
 
-    expect(discoveryInput?.firstSeenAtMs).toBe(123);
-  });
-
-  test("uses session-specific cache keys for OpenCode DB refs", () => {
-    const first: AgentHistoryRef = {
-      kind: "discovered_file",
-      path: "/tmp/opencode.db",
-      source: "opencode-sqlite",
-      value: "session-a",
-    };
-    const second: AgentHistoryRef = { ...first, value: "session-b" };
-
-    expect(cacheSourcePathForRef(first)).toBe("/tmp/opencode.db#session=session-a");
-    expect(cacheSourcePathForRef(second)).toBe("/tmp/opencode.db#session=session-b");
+    expect(discoveryInput).toEqual({
+      agent: "pi",
+      agentSession: null,
+      herdrSessionName: "default",
+      paneId: "wA:p1",
+    });
   });
 
   test("forceRefresh bypasses getFresh cache lookup and updates cache with put", async () => {
@@ -383,6 +372,115 @@ describe("agent history service", () => {
         Math.trunc(shmStats.mtimeMs) * 7,
       path: mainPath,
       size: mainStats.size + walStats.size + shmStats.size,
+    });
+  });
+
+  describe("failed discovery is not repeated every round", () => {
+    test("warns once for the same unresolved official values and reads nothing twice", async () => {
+      const homeDir = await mkdtemp(join(tmpdir(), "herdsman-history-negative-cache-"));
+      tempDirs.push(homeDir);
+      // The real discovery (no injected one): this is what the daemon runs.
+      const service = createAgentHistoryService({ homeDir });
+      const input: AgentHistoryLookupInput = {
+        agent: "agy",
+        agentSession: {
+          agent: "agy",
+          kind: "id",
+          source: "herdr:antigravity_cli",
+          value: "99999999-9999-4999-8999-999999999999",
+        },
+      };
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      const first = await service.resolveCompactHistory(input);
+      const second = await service.resolveCompactHistory(input);
+      const read = await service.read(input, { limit: 10 });
+
+      expect(first.historyRef).toBeNull();
+      expect(second.historyRef).toBeNull();
+      expect(read).toEqual({ historyRef: null, messages: [] });
+      // Exactly one warning: the discovery one. The "discovery returned no
+      // reference" warning and the repeated lookup are both suppressed.
+      expect(warn).toHaveBeenCalledTimes(1);
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("no usable official Herdr agent session"),
+        expect.anything(),
+      );
+    });
+
+    test("resolves as soon as the official values change", async () => {
+      const homeDir = await mkdtemp(join(tmpdir(), "herdsman-history-retry-"));
+      tempDirs.push(homeDir);
+      const service = createAgentHistoryService({ homeDir });
+      const id = "12121212-1212-4121-8121-121212121212";
+      const otherId = "34343434-3434-4343-8343-343434343434";
+      const input: AgentHistoryLookupInput = {
+        agent: "agy",
+        agentSession: {
+          agent: "agy",
+          kind: "id",
+          source: "herdr:antigravity_cli",
+          value: id,
+        },
+      };
+      vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      expect((await service.resolveCompactHistory(input)).historyRef).toBeNull();
+      const conversations = join(homeDir, ".gemini", "antigravity-cli", "conversations");
+      await mkdir(conversations, { recursive: true });
+      await writeFile(join(conversations, `${id}.db`), "");
+
+      // A changed official id is a new lookup key, so the pane is attempted
+      // immediately instead of waiting out the previous failure's window.
+      const other: AgentHistoryLookupInput = {
+        ...input,
+        agentSession: { agent: "agy", kind: "id", source: "herdr:antigravity_cli", value: otherId },
+      };
+      await writeFile(join(conversations, `${otherId}.db`), "");
+      const resolved = await service.resolveCompactHistory(other);
+      expect(resolved.historyRef).toMatchObject({ source: "antigravity-sqlite", value: otherId });
+      expect(resolved.compactHistory.source).toBe("antigravity-sqlite");
+    });
+
+    test("a forced discovery bypasses the failure memory for unchanged official values", async () => {
+      const homeDir = await mkdtemp(join(tmpdir(), "herdsman-history-force-bypass-"));
+      tempDirs.push(homeDir);
+      const service = createAgentHistoryService({ homeDir });
+      const id = "56565656-5656-4565-8565-565656565656";
+      const input: AgentHistoryLookupInput = {
+        agent: "agy",
+        agentSession: {
+          agent: "agy",
+          kind: "id",
+          source: "herdr:antigravity_cli",
+          value: id,
+        },
+      };
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+      expect((await service.resolveCompactHistory(input)).historyRef).toBeNull();
+      expect(warn).toHaveBeenCalledTimes(1);
+
+      // The operator fixes the reported problem inside the 60s window and forces
+      // a refresh: the memory only decelerates the ordinary cadence, so the
+      // lookup happens for real. The warning stays deduplicated per key.
+      const conversations = join(homeDir, ".gemini", "antigravity-cli", "conversations");
+      await mkdir(conversations, { recursive: true });
+      await writeFile(join(conversations, `${id}.db`), "");
+      const stillSuppressed = await service.resolveCompactHistory(input);
+      expect(stillSuppressed.historyRef).toBeNull();
+
+      const forced = await service.resolveCompactHistory(input, { forceDiscovery: true });
+      expect(forced.historyRef).toMatchObject({ source: "antigravity-sqlite", value: id });
+      expect(forced.compactHistory.source).toBe("antigravity-sqlite");
+      // The forced lookup really ran, yet the discovery warning is still reported
+      // once per official value: forcing adds no warning noise. (The db written
+      // here is an empty file, so the reader's own “no assistant message” warning
+      // is counted separately.)
+      const discoveryWarnings = warn.mock.calls.filter(([message]) =>
+        String(message).includes("no usable official Herdr agent session"),
+      );
+      expect(discoveryWarnings).toHaveLength(1);
     });
   });
 });

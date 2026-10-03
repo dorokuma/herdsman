@@ -99,13 +99,13 @@ export class AgentEventReconciler {
           snapshot.panes.flatMap((pane) => {
             if (typeof pane !== "object" || pane === null) return [];
             const item = pane as Record<string, unknown>;
-            const paneId = stringValue(item.pane_id) ?? stringValue(item.paneId);
+            const paneId = stringValue(item.pane_id);
             if (!paneId) return [];
             return [
               {
                 paneId,
-                generation: stringValue(item.pane_generation) ?? stringValue(item.paneGeneration),
-                terminalId: stringValue(item.terminal_id) ?? stringValue(item.terminalId),
+                generation: stringValue(item.pane_generation),
+                terminalId: stringValue(item.terminal_id),
               },
             ];
           }),
@@ -245,14 +245,11 @@ function isRetainableTerminalFailure(event: AgentEventRecord): boolean {
 }
 
 /**
- * Cache keys for opencode-sqlite append `#session=...` onto the backing file
- * path. Existence is checked against the real path, not the synthetic key.
+ * Whether the history cache's backing file still exists. Cache keys are plain
+ * file paths now (agy's conversation database, pi's session jsonl).
  */
 function historyCacheSourceExists(sourcePath: string): boolean {
-  if (existsSync(sourcePath)) return true;
-  const marker = "#session=";
-  const index = sourcePath.indexOf(marker);
-  return index > 0 && existsSync(sourcePath.slice(0, index));
+  return existsSync(sourcePath);
 }
 
 /**

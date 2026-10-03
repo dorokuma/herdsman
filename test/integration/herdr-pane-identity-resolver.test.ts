@@ -34,22 +34,21 @@ describe("Herdr pane identity", () => {
     expect(harness.herdrSessions.findRunningBySocketPath("/tmp/herdr.sock.other")).toBeUndefined();
   });
 
-  test.each([
-    {
-      pane_id: "wB:p2",
-      terminal_id: "term_2",
-      workspace_id: "wB",
-    },
-    {
-      pane: {
-        paneId: "wB:p2",
-        terminalId: "term_2",
-        workspaceId: "wB",
-      },
-    },
-  ])("normalizes direct and wrapped pane results", async (result) => {
+  test("reads the official pane_info envelope and rejects non-official shapes", async () => {
     const close = vi.fn();
-    const getPane = vi.fn().mockResolvedValue(result);
+    const getPane = vi
+      .fn()
+      .mockResolvedValueOnce({
+        pane: { pane_id: "wB:p2", terminal_id: "term_2", workspace_id: "wB" },
+        type: "pane_info",
+      })
+      // Herdsman used to also accept camelCase aliases and an unwrapped result;
+      // Herdr 0.9.3 only ever answers with the snake_case pane_info envelope.
+      .mockResolvedValueOnce({
+        pane: { paneId: "wB:p2", terminalId: "term_2", workspaceId: "wB" },
+        type: "pane_info",
+      })
+      .mockResolvedValueOnce({ pane_id: "wB:p2", terminal_id: "term_2", workspace_id: "wB" });
 
     await expect(
       resolveHerdrPaneIdentity({
@@ -58,8 +57,22 @@ describe("Herdr pane identity", () => {
         socketPath: "/tmp/herdr.sock",
       }),
     ).resolves.toEqual({ paneId: "wB:p2", terminalId: "term_2", workspaceId: "wB" });
+    await expect(
+      resolveHerdrPaneIdentity({
+        clientFactory: () => ({ close, getPane }),
+        paneId: "wA:p1",
+        socketPath: "/tmp/herdr.sock",
+      }),
+    ).rejects.toThrow("Herdr pane response has no terminal identity");
+    await expect(
+      resolveHerdrPaneIdentity({
+        clientFactory: () => ({ close, getPane }),
+        paneId: "wA:p1",
+        socketPath: "/tmp/herdr.sock",
+      }),
+    ).rejects.toThrow("Invalid Herdr pane response");
     expect(getPane).toHaveBeenCalledWith({ pane_id: "wA:p1" });
-    expect(close).toHaveBeenCalledOnce();
+    expect(close).toHaveBeenCalledTimes(3);
   });
 
   test("locks the real Herdr pane.get shape and extracts cwd, not pid", async () => {
@@ -140,7 +153,10 @@ describe("Herdr pane identity", () => {
     const close = vi.fn();
     await expect(
       resolveHerdrPaneIdentity({
-        clientFactory: () => ({ close, getPane: vi.fn().mockResolvedValue({ pane_id: "wB:p2" }) }),
+        clientFactory: () => ({
+          close,
+          getPane: vi.fn().mockResolvedValue({ pane: { pane_id: "wB:p2" }, type: "pane_info" }),
+        }),
         paneId: "wB:p2",
         socketPath: "/tmp/herdr.sock",
       }),

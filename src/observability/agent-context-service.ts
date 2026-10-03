@@ -1,8 +1,4 @@
-import {
-  discoveryRecencyGraceMs,
-  historySourceFromSessionRef,
-  safeAllowedSessionPath,
-} from "@/agent-history/discovery.js";
+import { historySourceFromSessionRef, safeOfficialSessionPath } from "@/agent-history/discovery.js";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { statSourceFingerprint } from "@/agent-history/source-fingerprint.js";
@@ -55,36 +51,8 @@ export class AgentContextService {
     return occupiedForAgent(agent, this.#stores.agents, this.#stores.agentContextSnapshots);
   }
 
-  historyLookupInput(
-    agent: AgentIndexRecord,
-    occupiedSessionPaths?: ReadonlySet<string>,
-  ): ReturnType<typeof historyLookup> {
-    return historyLookup(
-      agent,
-      this.#stores.agents,
-      this.#stores.agentContextSnapshots,
-      occupiedSessionPaths,
-    );
-  }
-
-  async preferredHistoryRef(agent: AgentIndexRecord): Promise<AgentHistoryRef | null> {
-    const previous = this.#stores.agentContextSnapshots.get(agent.id);
-    const occupiedSessionPaths = occupiedForAgent(
-      agent,
-      this.#stores.agents,
-      this.#stores.agentContextSnapshots,
-    );
-    const occupiedFingerprint = fingerprintOccupied(occupiedSessionPaths);
-    const priorOccupiedFingerprint = this.#occupiedFingerprintByAgent.get(agent.id);
-    const occupiedChanged =
-      priorOccupiedFingerprint !== undefined && priorOccupiedFingerprint !== occupiedFingerprint;
-    return selectPreferredRef({
-      agent,
-      identityChanged: occupiedChanged,
-      occupiedChanged,
-      occupiedSessionPaths,
-      previous,
-    });
+  historyLookupInput(agent: AgentIndexRecord): ReturnType<typeof historyLookup> {
+    return historyLookup(agent);
   }
 
   async refreshAgent(input: RefreshAgentContextInput): Promise<RefreshAgentContextResult> {
@@ -98,32 +66,22 @@ export class AgentContextService {
     const occupiedChanged =
       priorOccupiedFingerprint !== undefined && priorOccupiedFingerprint !== occupiedFingerprint;
     this.#occupiedFingerprintByAgent.set(input.agent.id, occupiedFingerprint);
-    const preferredRef = await selectPreferredRef({
-      agent: input.agent,
-      identityChanged: input.identityChanged || occupiedChanged,
-      occupiedChanged,
-      occupiedSessionPaths,
-      previous,
-    });
+    const preferredRef = await selectPreferredRef({ agent: input.agent, previous });
     const forceDiscovery =
       input.forceRefresh ||
       (await shouldForceDiscovery({
         agent: input.agent,
         directAuthoritativeRef: pathHistoryRefFromAgent(input.agent),
         identityChanged: input.identityChanged || occupiedChanged,
-        preferredRef,
         previous,
       }));
     const resolved = bindAuthoritativeId(
       input.agent,
-      await this.#history.resolveCompactHistory(
-        this.historyLookupInput(input.agent, occupiedSessionPaths),
-        {
-          forceDiscovery,
-          ...(input.forceRefresh === undefined ? {} : { forceRefresh: input.forceRefresh }),
-          ...(preferredRef ? { preferredRef } : {}),
-        },
-      ),
+      await this.#history.resolveCompactHistory(this.historyLookupInput(input.agent), {
+        forceDiscovery,
+        ...(input.forceRefresh === undefined ? {} : { forceRefresh: input.forceRefresh }),
+        ...(preferredRef ? { preferredRef } : {}),
+      }),
     );
     const next = {
       agentId: input.agent.id,
@@ -230,16 +188,36 @@ function inMemorySnapshot(
   return { ...next, updatedAt: new Date() };
 }
 
+/**
+ * Whether this regular refresh round must ignore the persisted ref and resolve
+ * again from the official values.
+ *
+ * A pane herdsman cannot resolve does **not** force anything: discovery runs for
+ * it on the ordinary path anyway, and its remembered failure is what decelerates
+ * that cadence (`discovery.ts`). Forcing every round would keep the memory
+ * permanently fresh, so its retry window could never expire and the deceleration
+ * would never apply. Explicit reads (`agent.get` / `agent.read`) and an external
+ * forced refresh do not go through this function and retry regardless.
+ *
+ * What is left here is the resolved case: re-resolve instead of reusing the
+ * persisted ref when the pane's identity changed, its revision moved in a way
+ * the persisted ref cannot explain, or its source content moved under the same
+ * fingerprint.
+ */
 async function shouldForceDiscovery(input: {
   agent: AgentIndexRecord;
   directAuthoritativeRef: AgentHistoryRef | null;
   identityChanged: boolean;
-  preferredRef: AgentHistoryRef | null;
   previous: AgentContextSnapshotRecord | undefined;
 }): Promise<boolean> {
+  // The official path is readable, so the persisted ref is the current one.
   if (input.directAuthoritativeRef) return false;
-  if (input.agent.agentSession?.kind === "id") return input.preferredRef === null;
-  if (input.identityChanged || !input.previous?.historyRef) return true;
+  // An id pane has no official path: its lookup is always the deterministic id
+  // template, which discovery runs on the ordinary path anyway.
+  if (input.agent.agentSession?.kind === "id") return false;
+  // No resolved ref yet: nothing to reuse, and nothing to force.
+  if (!input.previous?.historyRef) return false;
+  if (input.identityChanged) return true;
   if (paneRevisionDecreased(input.agent.paneRevision, input.previous.paneRevision)) return true;
   if (!paneRevisionIncreased(input.agent.paneRevision, input.previous.paneRevision)) return false;
   const fingerprint = input.previous.sourceFingerprint;
@@ -250,7 +228,7 @@ async function shouldForceDiscovery(input: {
 
 function pathHistoryRefFromAgent(agent: AgentIndexRecord): AgentHistoryRef | null {
   if (agent.agentSession?.kind !== "path") return null;
-  const path = safeAllowedSessionPath(agent.agentSession.value);
+  const path = safeOfficialSessionPath(agent.agentSession.value);
   if (!path) return null;
   return {
     kind: "agent_session",
@@ -298,9 +276,6 @@ function bindAuthoritativeId(
 
 async function selectPreferredRef(input: {
   agent: AgentIndexRecord;
-  identityChanged: boolean;
-  occupiedChanged: boolean;
-  occupiedSessionPaths: ReadonlySet<string>;
   previous: AgentContextSnapshotRecord | undefined;
 }): Promise<AgentHistoryRef | null> {
   const previousRef = input.previous?.historyRef ?? null;
@@ -308,27 +283,12 @@ async function selectPreferredRef(input: {
   if (directAuthoritativeRef) return directAuthoritativeRef;
   const matchingId = matchingAuthoritativeIdRef(input.agent, previousRef);
   if (matchingId) return matchingId;
-  if (previousRef?.kind === "discovered_file") {
-    const path = previousRef.path ?? previousRef.value;
-    if (input.identityChanged || input.occupiedChanged || input.occupiedSessionPaths.has(path)) {
-      return null;
-    }
-    if (!(await discoveredFileStillRecent(input.agent, path))) return null;
-    return previousRef;
-  }
+  // A `discovered_file` ref came from the deleted cwd/mtime scanner. Herdsman no
+  // longer produces one and no longer trusts a persisted one: the official
+  // `agent_session` value (or its explicit absence) decides from now on.
+  if (previousRef?.kind === "discovered_file") return null;
   if (input.agent.agentSession) return null;
   return previousRef;
-}
-
-async function discoveredFileStillRecent(agent: AgentIndexRecord, path: string): Promise<boolean> {
-  const fingerprint = await statSourceFingerprint(path);
-  if (!fingerprint) return false;
-  const graceMs = discoveryRecencyGraceMs({
-    agent: agent.agent,
-    agentSession: agent.agentSession,
-    ...(agent.terminalTitle ? { terminalTitle: agent.terminalTitle } : {}),
-  });
-  return fingerprint.mtimeMs >= agent.firstSeenAt.getTime() - graceMs;
 }
 
 export function occupiedForAgent(
@@ -353,24 +313,12 @@ function fingerprintOccupied(paths: ReadonlySet<string>): string {
   return [...paths].sort().join("\0");
 }
 
-function historyLookup(
-  agent: AgentIndexRecord,
-  agents: AgentStore,
-  snapshots: AgentContextSnapshotStore,
-  occupiedSessionPaths?: ReadonlySet<string>,
-) {
+function historyLookup(agent: AgentIndexRecord) {
   return {
     agent: agent.agent,
     agentSession: agent.agentSession,
-    cwd: agent.cwd,
-    firstSeenAtMs: agent.firstSeenAt.getTime(),
-    foregroundCwd: agent.foregroundCwd,
     herdrSessionName: agent.herdrSessionName,
-    ...(agent.agent?.toLowerCase() === "grok" && agent.grokHome
-      ? { grokHome: agent.grokHome }
-      : {}),
-    ...(agent.terminalTitle ? { terminalTitle: agent.terminalTitle } : {}),
-    occupiedSessionPaths: occupiedSessionPaths ?? occupiedForAgent(agent, agents, snapshots),
+    paneId: agent.paneId,
   };
 }
 

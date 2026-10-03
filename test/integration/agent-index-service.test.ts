@@ -100,6 +100,36 @@ describe("AgentIndexService", () => {
     harness.sqlite.close();
   });
 
+  test("falls back to the local index when the official agent.list snapshot fails", async () => {
+    const harness = openObservabilityDbHarness();
+    let fail = false;
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          if (fail) throw new Error("Herdr session.snapshot request timed out after 2000ms");
+          return oneAgent("working", 10, "codex", "reviewer");
+        },
+      }),
+      history: history(() => undefined),
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const indexed = harness.agents.list({ herdrSessionName: "default" });
+    expect(indexed).toHaveLength(1);
+
+    fail = true;
+    await expect(index.refreshHerdrSession(sessionInput())).rejects.toThrow(
+      "Herdr session.snapshot request timed out after 2000ms",
+    );
+    // The failed official call must not empty the base list: the last indexed
+    // snapshot keeps serving `agent.list` until Herdr answers again.
+    expect(harness.agents.list({ herdrSessionName: "default" })).toEqual(indexed);
+    expect(harness.herdrSessions.list().filter((session) => session.running)).toHaveLength(1);
+    harness.sqlite.close();
+  });
+
   test("publishes name-only changes without reparsing history and snapshots names in events", async () => {
     const harness = openObservabilityDbHarness();
     const calls: string[] = [];
@@ -717,50 +747,6 @@ describe("AgentIndexService", () => {
     expect(calls).toContain("pi:none");
     harness.sqlite.close();
   });
-
-  test("forwards terminalTitle from the live snapshot into history lookup", async () => {
-    const harness = openObservabilityDbHarness();
-    const titles: Array<string | null | undefined> = [];
-    const index = new AgentIndexService({
-      clientFactory: () => ({
-        close() {},
-        async sessionSnapshot() {
-          return snapshot(
-            [
-              agent({
-                agent: "pi",
-                pane_id: "wJ:p2",
-                revision: undefined,
-                terminal_id: "term_claude",
-                workspace_id: "wJ",
-              }),
-            ],
-            [
-              {
-                pane_id: "wJ:p2",
-                revision: 10,
-                terminal_title: "π - role-worker-53c500b2 - root",
-              },
-            ],
-          );
-        },
-      }),
-      history: {
-        async resolveCompactHistory(input: { terminalTitle?: string | null }) {
-          titles.push(input.terminalTitle);
-          return {
-            compactHistory: emptyCompactHistory("pi-jsonl"),
-            historyRef: null,
-            sourceFingerprint: null,
-          };
-        },
-      } as unknown as AgentHistoryService,
-      stores: harness,
-    });
-    await index.refreshHerdrSession(sessionInput());
-    expect(titles).toEqual(["π - role-worker-53c500b2 - root"]);
-    harness.sqlite.close();
-  });
 });
 
 function history(onResolve: (agent: { agent: string | null }) => void, assistantText = "result") {
@@ -777,12 +763,12 @@ function history(onResolve: (agent: { agent: string | null }) => void, assistant
       const historyRef = {
         kind: "agent_session" as const,
         path,
-        source: "claude-jsonl" as const,
+        source: "pi-jsonl" as const,
         value: path,
       };
       return {
         compactHistory: {
-          ...emptyCompactHistory("claude-jsonl"),
+          ...emptyCompactHistory("pi-jsonl"),
           historyRef,
           lastAssistantMessage: { ref: "history", text: assistantText, timestamp: null },
         },
@@ -884,7 +870,7 @@ function snapshot(agents: Record<string, unknown>[], panes: Record<string, unkno
 }
 
 describe("AgentIndexService identity regressions (independent coverage)", () => {
-  test("agentSession 由空变为存在时 identityChanged 为真并强制 discovery", async () => {
+  test("agentSession 由空变为存在时 identityChanged 为真并重新解析（不强制 discovery）", async () => {
     const harness = openObservabilityDbHarness();
     const calls: Array<{ forceDiscovery?: boolean }> = [];
     let current = oneAgent("working", 10, "pi");
@@ -926,7 +912,10 @@ describe("AgentIndexService identity regressions (independent coverage)", () => 
       [{ pane_id: "wJ:p2", revision: 11 }],
     );
     await index.refreshHerdrSession(sessionInput());
-    expect(calls).toEqual([{ forceDiscovery: true }]);
+    // The pane is looked up again (the fake was called), because the new official
+    // value is a new lookup key. It is not a *forced* round: an unresolved pane
+    // must let the failure memory in `discovery.ts` age out normally.
+    expect(calls).toEqual([{ forceDiscovery: false }]);
     harness.sqlite.close();
   });
 });
@@ -1341,7 +1330,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: "ref-claude", text: "claude message", timestamp: null },
             },
             historyRef: null,
@@ -1360,7 +1349,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const plan: StatusEventPlan = {
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-claude", text: "claude message", timestamp: null },
       },
       from: "working",
@@ -1396,7 +1385,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: {
                 ref: "ref-claude",
                 text: "claude completed",
@@ -1832,7 +1821,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
             }
             return {
               compactHistory: {
-                ...emptyCompactHistory("claude-jsonl"),
+                ...emptyCompactHistory("pi-jsonl"),
                 lastAssistantMessage: { ref: "initial", text: "initial output", timestamp: null },
               },
               historyRef: null,
@@ -1852,7 +1841,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       const planRow = harness.statusEventPlans.insertPending({
         agent,
         compactHistory: {
-          ...emptyCompactHistory("claude-jsonl"),
+          ...emptyCompactHistory("pi-jsonl"),
           lastAssistantMessage: { ref: "initial", text: "initial output", timestamp: null },
         },
         from: "working",
@@ -1935,7 +1924,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: historyRef, text: historyText, timestamp: null },
             },
             historyRef: null,
@@ -1956,7 +1945,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const p1: StatusEventPlan = {
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "Claude turn 1", timestamp: null },
       },
       from: "working",
@@ -1969,7 +1958,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const p2Row = harness.statusEventPlans.insertPending({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "Claude turn 1", timestamp: null },
       },
       from: "working",
@@ -2022,7 +2011,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("codex-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: historyRef, text: historyText, timestamp: null },
             },
             historyRef: null,
@@ -2043,7 +2032,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const p1: StatusEventPlan = {
       agent,
       compactHistory: {
-        ...emptyCompactHistory("codex-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "Codex turn 1", timestamp: null },
       },
       from: "working",
@@ -2058,7 +2047,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const p2Row = harness.statusEventPlans.insertPending({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("codex-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "Codex turn 1", timestamp: null },
       },
       from: "working",
@@ -2085,7 +2074,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const p3: StatusEventPlan = {
       agent,
       compactHistory: {
-        ...emptyCompactHistory("codex-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-2", text: "Codex turn 2 new output", timestamp: null },
       },
       from: "working",
@@ -2445,7 +2434,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
             }
             return {
               compactHistory: {
-                ...emptyCompactHistory("claude-jsonl"),
+                ...emptyCompactHistory("pi-jsonl"),
                 lastAssistantMessage: { ref: "initial", text: "initial output", timestamp: null },
               },
               historyRef: null,
@@ -2466,7 +2455,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       const pRow = harness.statusEventPlans.insertPending({
         agent,
         compactHistory: {
-          ...emptyCompactHistory("claude-jsonl"),
+          ...emptyCompactHistory("pi-jsonl"),
           lastAssistantMessage: { ref: "initial", text: "initial output", timestamp: null },
         },
         from: "working",
@@ -2519,7 +2508,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
             }
             return {
               compactHistory: {
-                ...emptyCompactHistory("claude-jsonl"),
+                ...emptyCompactHistory("pi-jsonl"),
                 lastAssistantMessage: { ref: "ref-ok", text: "recovered output", timestamp: null },
               },
               historyRef: null,
@@ -2542,7 +2531,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       const pRow = harness.statusEventPlans.insertPending({
         agent,
         compactHistory: {
-          ...emptyCompactHistory("claude-jsonl"),
+          ...emptyCompactHistory("pi-jsonl"),
           lastAssistantMessage: { ref: "initial", text: "initial output", timestamp: null },
         },
         from: "working",
@@ -2593,7 +2582,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: {
                 ref: "fresh-disk-ref",
                 text: "fresh disk text",
@@ -2616,7 +2605,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     const pRow = harness.statusEventPlans.insertPending({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: {
           ref: "stale-insert-ref",
           text: "stale insert text",
@@ -2673,7 +2662,7 @@ describe("AgentIndexService status event plan drain resilience", () => {
     const healthy = harness.statusEventPlans.insertPending({
       agentId: agent.id,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
       },
       fromStatus: "working",
@@ -2715,7 +2704,7 @@ describe("AgentIndexService status event plan drain resilience", () => {
     const row = harness.statusEventPlans.insertPending({
       agentId: agent.id,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
       },
       fromStatus: "working",
@@ -2758,7 +2747,7 @@ describe("AgentIndexService status event plan drain resilience", () => {
     const plan: StatusEventPlan = {
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
       },
       from: "working",
@@ -2863,7 +2852,7 @@ describe("batch2 window regressions", () => {
     harness.agentEvents.append({
       agentId: agent.id,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "history", text: "result", timestamp: null },
       },
       herdrSessionName: "default",
@@ -2877,7 +2866,7 @@ describe("batch2 window regressions", () => {
     const plan: StatusEventPlan = {
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "history", text: "result", timestamp: null },
       },
       from: "working",
@@ -3499,7 +3488,7 @@ describe("batch2 window regressions", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: historyRef, text: historyText, timestamp: null },
             },
             historyRef: null,
@@ -3517,7 +3506,7 @@ describe("batch2 window regressions", () => {
     const first = await index.executeStatusEventPlan({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
       },
       from: "working",
@@ -3529,7 +3518,7 @@ describe("batch2 window regressions", () => {
     const k2 = await index.executeStatusEventPlan({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
       },
       from: "working",
@@ -3551,7 +3540,7 @@ describe("batch2 window regressions", () => {
     const k3 = await index.executeStatusEventPlan({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-2", text: "turn-2", timestamp: null },
       },
       from: "working",
@@ -3580,7 +3569,7 @@ describe("batch2 window regressions", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
             },
             historyRef: null,
@@ -3602,7 +3591,7 @@ describe("batch2 window regressions", () => {
       const row = harness.statusEventPlans.insertPending({
         agent,
         compactHistory: {
-          ...emptyCompactHistory("claude-jsonl"),
+          ...emptyCompactHistory("pi-jsonl"),
           lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
         },
         from: "working",
@@ -3679,7 +3668,7 @@ describe("batch2 window regressions", () => {
           }
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: "ref-1", text: "turn-1", timestamp: null },
             },
             historyRef: null,
@@ -3767,7 +3756,7 @@ describe("batch2 window regressions", () => {
         },
       }),
       history: history(() => ({
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
       })),
       stores: harness,
@@ -3779,7 +3768,7 @@ describe("batch2 window regressions", () => {
     const row = harness.statusEventPlans.insertPending({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
       },
       from: "working",
@@ -3806,7 +3795,7 @@ describe("batch2 window regressions", () => {
     const result = await index.executeStatusEventPlan({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
       },
       from: "working",
@@ -3844,7 +3833,7 @@ describe("batch2 window regressions", () => {
         },
       }),
       history: history(() => ({
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
       })),
       stores: harness,
@@ -3856,7 +3845,7 @@ describe("batch2 window regressions", () => {
     const row = harness.statusEventPlans.insertPending({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
       },
       from: "working",
@@ -3883,7 +3872,7 @@ describe("batch2 window regressions", () => {
     const result = await index.executeStatusEventPlan({
       agent,
       compactHistory: {
-        ...emptyCompactHistory("claude-jsonl"),
+        ...emptyCompactHistory("pi-jsonl"),
         lastAssistantMessage: { ref: "ref-1", text: "initial", timestamp: null },
       },
       from: "working",

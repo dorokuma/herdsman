@@ -32,7 +32,7 @@ function historyStub() {
     async resolveCompactHistory() {
       return {
         compactHistory: {
-          ...emptyCompactHistory("claude-jsonl"),
+          ...emptyCompactHistory("pi-jsonl"),
           lastAssistantMessage: { ref: "x", text: "result", timestamp: null },
         },
         historyRef: null,
@@ -64,7 +64,7 @@ describe("event deduplication and pane generations", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: "x", text: "result", timestamp: null },
             },
             historyRef: null,
@@ -536,7 +536,7 @@ describe("event deduplication and pane generations", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: "x", text: "result", timestamp: null },
             },
             historyRef: null,

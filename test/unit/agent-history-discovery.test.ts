@@ -1,20 +1,19 @@
-import { chmod, mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { chmodSync, symlinkSync } from "node:fs";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
-import { afterEach, describe, expect, test } from "vitest";
+import { afterEach, describe, expect, test, vi } from "vitest";
 import {
-  DISCOVERY_RECENCY_GRACE_MS,
   discoverAgentHistory,
-  discoveryRecencyGraceMs,
-  FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
   historySourceFromSessionRef,
-  usesShortDiscoveryRecency,
+  safeAllowedSessionPath,
+  safeOfficialSessionPath,
 } from "@/agent-history/discovery.js";
 
 const tempDirs: string[] = [];
 
 afterEach(async () => {
+  vi.restoreAllMocks();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
 });
 
@@ -24,412 +23,359 @@ async function tempHome(name: string) {
   return dir;
 }
 
+const AGY_ID = "01714b30-5613-49c9-b3a2-ce3f9e7406c1";
+
+async function agyConversations(homeDir: string) {
+  const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
+  await mkdir(dir, { recursive: true });
+  return dir;
+}
+
+function agyLookup(homeDir: string, value: string, extra: Record<string, unknown> = {}) {
+  return discoverAgentHistory({
+    agent: "agy",
+    agentSession: { agent: "agy", kind: "id", source: "herdr:antigravity_cli", value },
+    homeDir,
+    ...extra,
+  });
+}
+
 describe("agent history discovery", () => {
-  test("discovers Grok sessions under the isolated Grok HOME", async () => {
-    const homeDir = await tempHome("herdsman-grok-home-");
-    const grokHome = join(homeDir, "isolated-grok");
-    const sessionDir = join(
-      grokHome,
-      "sessions",
-      encodeURIComponent("/repo"),
-      "12345678-1234-4123-8123-123456789abc",
-    );
-    await mkdir(sessionDir, { recursive: true });
-    const path = join(sessionDir, "chat_history.jsonl");
-    await writeFile(path, `${JSON.stringify({ type: "assistant", content: "done" })}\n`);
-    await expect(
-      discoverAgentHistory({
-        agent: "grok",
-        agentSession: null,
-        cwd: "/repo",
-        foregroundCwd: null,
-        homeDir,
-        grokHome,
-      }),
-    ).resolves.toMatchObject({ source: "grok-jsonl", path });
-  });
-
-  test("resolves an existing Antigravity UUID to its database", async () => {
-    const homeDir = await tempHome("herdsman-agy-home-");
-    const id = "12345678-1234-4123-8123-123456789abc";
-    const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
-    const path = join(dir, `${id}.db`);
-    await mkdir(dir, { recursive: true });
-    await writeFile(path, "");
-    await chmod(path, 0o644);
-    await expect(
-      discoverAgentHistory({
-        agent: "agy",
-        agentSession: { agent: "agy", kind: "id", source: "agy", value: id },
-        cwd: null,
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({ source: "antigravity-sqlite", path, value: id });
-  });
-
-  test("returns empty for invalid Antigravity paths", async () => {
-    const homeDir = await tempHome("herdsman-agy-empty-home-");
-    await expect(
-      discoverAgentHistory({
-        agent: "agy",
-        agentSession: { agent: "agy", kind: "id", source: "agy", value: "not-a-uuid" },
-        cwd: null,
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toBeNull();
-  });
-
-  test("maps session refs for new runtime sources", () => {
-    expect(
-      historySourceFromSessionRef({
-        agent: "codex",
-        kind: "path",
-        source: "herdr:codex",
-        value: "/tmp/c.jsonl",
-      }),
-    ).toBe("codex-jsonl");
-    expect(
-      historySourceFromSessionRef({
-        agent: "opencode",
-        kind: "id",
-        source: "herdr:opencode",
-        value: "ses_1",
-      }),
-    ).toBe("opencode-sqlite");
-    expect(
-      historySourceFromSessionRef({
-        agent: "gemini",
-        kind: "path",
-        source: "herdr:gemini",
-        value: "/tmp/g.json",
-      }),
-    ).toBe("gemini-json");
-  });
-
-  test("discovers Codex JSONL by session_meta cwd", async () => {
-    const homeDir = await tempHome("herdsman-codex-home-");
-    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
-    await mkdir(dir, { recursive: true });
-    const older = join(
-      dir,
-      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
-    );
-    const newer = join(
-      dir,
-      "rollout-2026-07-09T11-00-00-bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb.jsonl",
-    );
-    await writeFile(
-      older,
-      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/other" } })}\n`,
-    );
-    await writeFile(
-      newer,
-      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
-    );
-
-    await expect(
-      discoverAgentHistory({
-        agent: "codex",
-        agentSession: null,
-        cwd: "/repo",
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({
-      kind: "discovered_file",
-      path: newer,
-      source: "codex-jsonl",
-      value: newer,
-    });
-  });
-
-  test("discovers OpenCode DB session by cwd", async () => {
-    const homeDir = await tempHome("herdsman-opencode-home-");
-    const dbPath = join(homeDir, ".local", "share", "opencode", "opencode.db");
-    await mkdir(join(homeDir, ".local", "share", "opencode"), { recursive: true });
-    const sqlite = new DatabaseSync(dbPath);
-    sqlite.exec(
-      "create table session (id text primary key, directory text not null, time_updated integer not null)",
-    );
-    sqlite
-      .prepare("insert into session (id, directory, time_updated) values (?, ?, ?)")
-      .run("s_old", "/repo", 1);
-    sqlite
-      .prepare("insert into session (id, directory, time_updated) values (?, ?, ?)")
-      .run("s_new", "/repo", 2);
-    sqlite.close();
-
-    await expect(
-      discoverAgentHistory({
-        agent: "opencode",
-        agentSession: null,
-        cwd: "/repo",
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({
-      kind: "discovered_file",
-      path: dbPath,
-      source: "opencode-sqlite",
-      value: "s_new",
-    });
-  });
-
-  test("discovers Gemini session JSON through .project_root", async () => {
-    const homeDir = await tempHome("herdsman-gemini-home-");
-    const projectDir = join(homeDir, ".gemini", "tmp", "repo-project");
-    const chatsDir = join(projectDir, "chats");
-    await mkdir(chatsDir, { recursive: true });
-    await writeFile(join(projectDir, ".project_root"), "/repo\n");
-    const sessionPath = join(chatsDir, "session-2026-07-09T12-00-00abcdef.json");
-    await writeFile(
-      sessionPath,
-      JSON.stringify({ messages: [{ type: "user", content: [{ text: "hello" }] }] }),
-    );
-
-    await expect(
-      discoverAgentHistory({
-        agent: "gemini",
-        agentSession: null,
-        cwd: "/repo",
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({
-      kind: "discovered_file",
-      path: sessionPath,
-      source: "gemini-json",
-      value: sessionPath,
-    });
-  });
-
-  test("uses a 30s recency window for pi and role-hinted lookups, 10min otherwise", () => {
-    expect(
-      usesShortDiscoveryRecency({ agent: "pi", agentSession: null, terminalTitle: null }),
-    ).toBe(true);
-    expect(discoveryRecencyGraceMs({ agent: "pi", agentSession: null })).toBe(
-      DISCOVERY_RECENCY_GRACE_MS,
-    );
-    expect(discoveryRecencyGraceMs({ agent: "claude", agentSession: null })).toBe(
-      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
-    );
-    expect(discoveryRecencyGraceMs({ agent: "codex", agentSession: null })).toBe(
-      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
-    );
-    expect(discoveryRecencyGraceMs({ agent: "gemini", agentSession: null })).toBe(
-      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
-    );
-    expect(discoveryRecencyGraceMs({ agent: "grok", agentSession: null })).toBe(
-      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
-    );
-    expect(discoveryRecencyGraceMs({ agent: "agy", agentSession: null })).toBe(
-      FALLBACK_DISCOVERY_RECENCY_GRACE_MS,
-    );
-    expect(
-      discoveryRecencyGraceMs({
-        agent: "claude",
-        agentSession: null,
-        terminalTitle: "π - role-worker-53c500b2 - root",
-      }),
-    ).toBe(DISCOVERY_RECENCY_GRACE_MS);
-  });
-
-  test("drops stale fallback candidates whose mtime predates firstSeenAtMs by more than 10 minutes", async () => {
-    const homeDir = await tempHome("herdsman-codex-stale-home-");
-    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
-    await mkdir(dir, { recursive: true });
-    const path = join(
-      dir,
-      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
-    );
-    await writeFile(
-      path,
-      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
-    );
-    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
-    const mtimeMs = firstSeenAtMs - FALLBACK_DISCOVERY_RECENCY_GRACE_MS - 1_000;
-    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
-
-    await expect(
-      discoverAgentHistory({
-        agent: "codex",
-        agentSession: null,
-        cwd: "/repo",
-        firstSeenAtMs,
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toBeNull();
-  });
-
-  test("keeps a candidate whose mtime is at or after firstSeenAtMs", async () => {
-    const homeDir = await tempHome("herdsman-codex-recent-home-");
-    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
-    await mkdir(dir, { recursive: true });
-    const path = join(
-      dir,
-      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
-    );
-    await writeFile(
-      path,
-      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
-    );
-    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
-    const mtimeMs = firstSeenAtMs + 60_000;
-    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
-
-    await expect(
-      discoverAgentHistory({
-        agent: "codex",
-        agentSession: null,
-        cwd: "/repo",
-        firstSeenAtMs,
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({
-      kind: "discovered_file",
-      path,
-      source: "codex-jsonl",
-      value: path,
-    });
-  });
-
-  test("keeps a fallback candidate whose mtime is before firstSeenAtMs but within 10 minutes", async () => {
-    const homeDir = await tempHome("herdsman-codex-grace-home-");
-    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
-    await mkdir(dir, { recursive: true });
-    const path = join(
-      dir,
-      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
-    );
-    await writeFile(
-      path,
-      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
-    );
-    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
-    const mtimeMs = firstSeenAtMs - FALLBACK_DISCOVERY_RECENCY_GRACE_MS + 1_000;
-    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
-
-    await expect(
-      discoverAgentHistory({
-        agent: "codex",
-        agentSession: null,
-        cwd: "/repo",
-        firstSeenAtMs,
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({
-      kind: "discovered_file",
-      path,
-      source: "codex-jsonl",
-      value: path,
-    });
-  });
-
-  test("drops a pi candidate whose mtime predates firstSeenAtMs by more than 30s", async () => {
-    const homeDir = await tempHome("herdsman-pi-stale-home-");
-    const dir = join(homeDir, ".pi", "agent", "sessions");
-    await mkdir(dir, { recursive: true });
-    const path = join(dir, "stale-session.jsonl");
-    await writeFile(path, `${JSON.stringify({ cwd: "/repo" })}\n`);
-    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
-    const mtimeMs = firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS - 1_000;
-    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
-
-    await expect(
-      discoverAgentHistory({
-        agent: "pi",
-        agentSession: null,
-        cwd: "/repo",
-        firstSeenAtMs,
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toBeNull();
-  });
-
-  test("keeps a pi candidate whose mtime is 29s before firstSeenAtMs", async () => {
-    const homeDir = await tempHome("herdsman-pi-grace-home-");
-    const dir = join(homeDir, ".pi", "agent", "sessions");
-    await mkdir(dir, { recursive: true });
-    const path = join(dir, "recent-session.jsonl");
-    await writeFile(path, `${JSON.stringify({ cwd: "/repo" })}\n`);
-    const firstSeenAtMs = Date.UTC(2026, 6, 9, 14, 0, 0);
-    const mtimeMs = firstSeenAtMs - DISCOVERY_RECENCY_GRACE_MS + 1_000; // 29s before firstSeen
-    await utimes(path, new Date(mtimeMs), new Date(mtimeMs));
-
-    await expect(
-      discoverAgentHistory({
-        agent: "pi",
-        agentSession: null,
-        cwd: "/repo",
-        firstSeenAtMs,
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({
-      kind: "discovered_file",
-      path,
-      source: "pi-jsonl",
-      value: path,
-    });
-  });
-
-  test("keeps old behavior when firstSeenAtMs is omitted", async () => {
-    const homeDir = await tempHome("herdsman-codex-noftime-home-");
-    const dir = join(homeDir, ".codex", "sessions", "2026", "07", "09");
-    await mkdir(dir, { recursive: true });
-    const path = join(
-      dir,
-      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa.jsonl",
-    );
-    await writeFile(
-      path,
-      `${JSON.stringify({ type: "session_meta", payload: { cwd: "/repo" } })}\n`,
-    );
-    await utimes(path, new Date(1000), new Date(1000));
-
-    await expect(
-      discoverAgentHistory({
-        agent: "codex",
-        agentSession: null,
-        cwd: "/repo",
-        foregroundCwd: null,
-        homeDir,
-      }),
-    ).resolves.toMatchObject({
-      kind: "discovered_file",
-      path,
-      source: "codex-jsonl",
-      value: path,
-    });
-  });
-
-  test("leaves the authoritative agentSession path resolve unaffected by firstSeenAtMs", async () => {
-    const homeDir = await tempHome("herdsman-path-home-");
+  test("takes the official Herdr agent_session path as the history reference", async () => {
+    const homeDir = await tempHome("herdsman-official-path-");
     const sessionPath = join(homeDir, ".pi", "agent", "sessions", "ses-1.jsonl");
     await mkdir(join(homeDir, ".pi", "agent", "sessions"), { recursive: true });
-    await writeFile(sessionPath, "{}");
-    await utimes(sessionPath, new Date(1000), new Date(1000));
+    await writeFile(sessionPath, "{}\n");
 
     await expect(
       discoverAgentHistory({
         agent: "pi",
         agentSession: { agent: "pi", kind: "path", source: "herdr:pi", value: sessionPath },
-        cwd: null,
-        firstSeenAtMs: Date.UTC(2026, 6, 9, 14, 0, 0),
-        foregroundCwd: null,
         homeDir,
+        herdrSessionName: "default",
+        paneId: "wA:p1",
       }),
-    ).resolves.toMatchObject({
+    ).resolves.toEqual({
       kind: "agent_session",
       path: sessionPath,
       source: "pi-jsonl",
       value: sessionPath,
     });
+  });
+
+  test("accepts an official path outside the herdsman-pi session roots", async () => {
+    // The path channel is generic: Herdr hands herdsman the value an installed
+    // agent integration reported, so the root of that value is not whitelisted
+    // (the whitelist only guards the herdsman-pi registration protocol). The
+    // reference is returned as-is; whether a reader supports the agent is a
+    // separate question, and the source is mapped honestly.
+    const homeDir = await tempHome("herdsman-official-omp-");
+    const dir = join(homeDir, ".omp", "sessions");
+    await mkdir(dir, { recursive: true });
+    const sessionPath = join(dir, "ses-2.jsonl");
+    await writeFile(sessionPath, "{}\n");
+
+    await expect(
+      discoverAgentHistory({
+        agent: "omp",
+        agentSession: { agent: "omp", kind: "path", source: "herdr:omp", value: sessionPath },
+        homeDir,
+      }),
+    ).resolves.toEqual({
+      kind: "agent_session",
+      path: sessionPath,
+      source: "unknown",
+      value: sessionPath,
+    });
+  });
+
+  test("reports and refuses a missing official agent_session instead of scanning", async () => {
+    // The pane's own conversation database exists under the temp home. Discovery
+    // must not fall back to it: with no official value on the pane, herdsman has
+    // nothing to read.
+    const homeDir = await tempHome("herdsman-no-official-value-");
+    const conversations = await agyConversations(homeDir);
+    await writeFile(join(conversations, `${AGY_ID}.db`), "");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(
+      discoverAgentHistory({
+        agent: "agy",
+        agentSession: null,
+        herdrSessionName: "default",
+        paneId: "wA:p2",
+      }),
+    ).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({
+        agent: "agy",
+        detail: expect.stringContaining("no agent_session"),
+        herdrSessionName: "default",
+        paneId: "wA:p2",
+      }),
+    );
+  });
+
+  test("resolves an official agy conversation id to its conversation database", async () => {
+    const homeDir = await tempHome("herdsman-agy-id-");
+    const conversations = await agyConversations(homeDir);
+    const dbPath = join(conversations, `${AGY_ID}.db`);
+    await writeFile(dbPath, "");
+
+    await expect(agyLookup(homeDir, AGY_ID)).resolves.toEqual({
+      kind: "agent_session",
+      path: dbPath,
+      source: "antigravity-sqlite",
+      value: AGY_ID,
+    });
+  });
+
+  test("reports and refuses an agy conversation id with no database", async () => {
+    const homeDir = await tempHome("herdsman-agy-miss-");
+    await agyConversations(homeDir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(agyLookup(homeDir, AGY_ID, { paneId: "wA:p3" })).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({
+        detail: expect.stringContaining("is not a readable session file"),
+        paneId: "wA:p3",
+      }),
+    );
+  });
+
+  test("never joins a non-uuid agy id into the conversations path", async () => {
+    const homeDir = await tempHome("herdsman-agy-nonuuid-");
+    // `conversations/../escape.db` normalises to this file, so only the uuid
+    // guard keeps the id from naming a conversation outside the store.
+    const root = join(homeDir, ".gemini", "antigravity-cli");
+    await mkdir(join(root, "conversations"), { recursive: true });
+    await writeFile(join(root, "escape.db"), "");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(agyLookup(homeDir, "../escape", { paneId: "wA:p7" })).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({
+        detail: expect.stringContaining("agy conversation id is not a uuid"),
+      }),
+    );
+  });
+
+  test("refuses a symlinked or group-writable agy conversation database", async () => {
+    const homeDir = await tempHome("herdsman-agy-gate-");
+    const conversations = await agyConversations(homeDir);
+    // One id per attempt: a repeated *failed* lookup for the same official
+    // values is deliberately suppressed by the failure memory.
+    const gateId = "0f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f";
+    const okId = "1f1f1f1f-1f1f-4f1f-8f1f-1f1f1f1f1f1f";
+    const linkId = "2f2f2f2f-2f2f-4f2f-8f2f-2f2f2f2f2f2f";
+    const gateDb = join(conversations, `${gateId}.db`);
+    await writeFile(gateDb, "");
+    await writeFile(join(conversations, `${okId}.db`), "");
+    const linkDb = join(conversations, `${linkId}.db`);
+    await writeFile(linkDb, "");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Group-writable: another principal could rewrite the conversation store.
+    chmodSync(gateDb, 0o664);
+    await expect(agyLookup(homeDir, gateId, { paneId: "wA:p12" })).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({
+        detail: expect.stringContaining("not a readable session file"),
+      }),
+    );
+
+    chmodSync(join(conversations, `${okId}.db`), 0o644);
+    await expect(agyLookup(homeDir, okId)).resolves.toMatchObject({
+      source: "antigravity-sqlite",
+    });
+
+    // Symlinked database: the gate must see the link, not its target.
+    const elsewhere = join(homeDir, "elsewhere.db");
+    await writeFile(elsewhere, "");
+    await rm(linkDb);
+    symlinkSync(elsewhere, linkDb);
+    await expect(agyLookup(homeDir, linkId)).resolves.toBeNull();
+  });
+
+  test("reports and refuses an official id for any other agent", async () => {
+    // Only pi (official path) and agy (official id) are supported agents. Every
+    // other agent is refused with the same fail-closed warning, whether or not
+    // Herdr has an integration for it — this is a deliberate, documented limit.
+    const homeDir = await tempHome("herdsman-unsupported-agent-");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    for (const agent of ["claude", "codex", "opencode", "grok", "gemini", "omp"]) {
+      await expect(
+        discoverAgentHistory({
+          agent,
+          agentSession: {
+            agent,
+            kind: "id",
+            source: `herdr:${agent}`,
+            value: "ses_1",
+          },
+          homeDir,
+          herdrSessionName: "default",
+          paneId: "wA:p4",
+        }),
+      ).resolves.toBeNull();
+    }
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({
+        detail: expect.stringContaining("is not a supported herdsman history agent"),
+        herdrSessionName: "default",
+        paneId: "wA:p4",
+      }),
+    );
+  });
+
+  test("reports and refuses an official path that is not a readable session file", async () => {
+    const homeDir = await tempHome("herdsman-missing-path-");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: {
+          agent: "pi",
+          kind: "path",
+          source: "herdr:pi",
+          value: join(homeDir, "gone.jsonl"),
+        },
+        homeDir,
+        paneId: "wA:p5",
+      }),
+    ).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({
+        detail: expect.stringContaining("not a readable session file"),
+        paneId: "wA:p5",
+      }),
+    );
+  });
+
+  test("maps session refs for the supported agents and nothing else", () => {
+    const source = (agent: string, kind: "id" | "path" = "path") =>
+      historySourceFromSessionRef({
+        agent,
+        kind,
+        source: `herdr:${agent}`,
+        value: "/tmp/x.jsonl",
+      });
+    expect(source("pi")).toBe("pi-jsonl");
+    expect(
+      historySourceFromSessionRef({
+        agent: "antigravity_cli",
+        kind: "id",
+        source: "herdr:antigravity_cli",
+        value: AGY_ID,
+      }),
+    ).toBe("antigravity-sqlite");
+    // Everything else is `unknown`, which no reader accepts.
+    for (const agent of ["claude", "codex", "gemini", "grok", "omp", "opencode"]) {
+      expect(source(agent)).toBe("unknown");
+    }
+  });
+
+  test("matches whole source segments, so a substring never picks the wrong reader", () => {
+    const source = (agent: string) =>
+      historySourceFromSessionRef({
+        agent,
+        kind: "path",
+        source: `herdr:${agent}`,
+        value: "/tmp/x.jsonl",
+      });
+    // `herdr:copilot` contains "pi" but is not a pi session: a substring match
+    // would hand a copilot path to the pi reader.
+    expect(source("copilot")).toBe("unknown");
+    expect(source("pi")).toBe("pi-jsonl");
+    // `herdr:omp` is a pi-family agent with no reader, so it must map to
+    // `unknown` rather than being silently read as pi (documented gap).
+    expect(source("omp")).toBe("unknown");
+    expect(
+      historySourceFromSessionRef({
+        agent: "antigravity",
+        kind: "id",
+        source: "herdr:antigravity",
+        value: AGY_ID,
+      }),
+    ).toBe("antigravity-sqlite");
+  });
+
+  test("rejects a session file that is itself a symlink, but not one behind a linked directory", async () => {
+    const homeDir = await tempHome("herdsman-symlink-gate-");
+    const sessions = join(homeDir, ".pi", "agent", "sessions");
+    await mkdir(sessions, { recursive: true });
+    const real = join(sessions, "real.jsonl");
+    await writeFile(real, "{}\n");
+    const link = join(sessions, "link.jsonl");
+    symlinkSync(real, link);
+
+    // The check has to happen before realpathSync, otherwise the resolved target
+    // is inspected and the symlink is invisible.
+    expect(safeOfficialSessionPath(link)).toBeNull();
+    expect(safeAllowedSessionPath(link, homeDir)).toBeNull();
+    expect(safeOfficialSessionPath(real)).toBe(real);
+    expect(safeAllowedSessionPath(real, homeDir)).toBe(real);
+
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: { agent: "pi", kind: "path", source: "herdr:pi", value: link },
+        homeDir,
+        paneId: "wA:p11",
+      }),
+    ).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({ detail: expect.stringContaining("not a readable session file") }),
+    );
+
+    // Only the file itself is checked: an official path reached through a
+    // symlinked *parent* directory is a normal file and stays readable.
+    const linkedRoot = join(homeDir, "linked-root");
+    symlinkSync(sessions, linkedRoot);
+    const viaLinkedDir = join(linkedRoot, "real.jsonl");
+    await expect(
+      discoverAgentHistory({
+        agent: "pi",
+        agentSession: { agent: "pi", kind: "path", source: "herdr:pi", value: viaLinkedDir },
+        homeDir,
+      }),
+    ).resolves.toMatchObject({ path: real });
+  });
+
+  test("does not repeat a failed lookup, nor its warning, until the official values change", async () => {
+    const homeDir = await tempHome("herdsman-negative-cache-");
+    const conversations = await agyConversations(homeDir);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const lookup = (value: string) => agyLookup(homeDir, value, { paneId: "wA:p13" });
+
+    await expect(lookup(AGY_ID)).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // The conversation database appears, but the same official values are still
+    // inside their retry window: the pane is not re-resolved and does not warn
+    // again.
+    const dbPath = join(conversations, `${AGY_ID}.db`);
+    await writeFile(dbPath, "");
+    await expect(lookup(AGY_ID)).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // A different official value is a different key and is attempted at once.
+    const otherId = "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff";
+    await writeFile(join(conversations, `${otherId}.db`), "");
+    await expect(lookup(otherId)).resolves.toMatchObject({
+      path: join(conversations, `${otherId}.db`),
+    });
+    expect(warn).toHaveBeenCalledTimes(1);
   });
 });

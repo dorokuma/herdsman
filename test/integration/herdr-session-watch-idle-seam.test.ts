@@ -159,7 +159,7 @@ async function startSeam(input: {
       async resolveCompactHistory() {
         return {
           compactHistory: {
-            ...emptyCompactHistory("claude-jsonl"),
+            ...emptyCompactHistory("pi-jsonl"),
             lastAssistantMessage: { ref: "history", text: "turn complete", timestamp: null },
           },
           historyRef: null,

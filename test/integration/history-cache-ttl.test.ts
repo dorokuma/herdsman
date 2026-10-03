@@ -87,19 +87,6 @@ describe("agent history cache TTL reconcile", () => {
         .all(),
     ).toEqual([{ source_path: freshPath }]);
   });
-
-  test("keeps an opencode-sqlite cache key whose backing file still exists", async () => {
-    const harness = setup();
-    const backing = sourceFile(harness, "opencode.db");
-    const cacheKey = `${backing}#session=sess-1`;
-    putCache(harness, { sourcePath: cacheKey });
-    const result = await reconciler(harness).reconcile();
-    expect(result.historyCacheExpired).toBe(0);
-    expect(result.historyCacheMissing).toBe(0);
-    expect(harness.sqlite.prepare("select source_path from agent_history_cache").all()).toEqual([
-      { source_path: cacheKey },
-    ]);
-  });
 });
 
 describe("AgentHistoryCacheStore cleanup", () => {

@@ -7,12 +7,11 @@ import type {
   CompactAgentHistory,
 } from "@/observability/contracts.js";
 import { AntigravityHistoryReader } from "./antigravity-reader.js";
-import { ClaudeHistoryReader } from "./claude-reader.js";
-import { CodexHistoryReader } from "./codex-reader.js";
-import { type AgentHistoryLookupInput, discoverAgentHistory } from "./discovery.js";
-import { GeminiHistoryReader } from "./gemini-reader.js";
-import { GrokHistoryReader } from "./grok-reader.js";
-import { OpenCodeHistoryReader } from "./opencode-reader.js";
+import {
+  type AgentHistoryLookupInput,
+  discoverAgentHistory,
+  discoveryFailureFresh,
+} from "./discovery.js";
 import { PiHistoryReader } from "./pi-reader.js";
 import type { AgentHistoryReader } from "./readers.js";
 import { statSourceFingerprint } from "./source-fingerprint.js";
@@ -20,7 +19,10 @@ import { statSourceFingerprint } from "./source-fingerprint.js";
 export const agentHistoryFormatterVersion = "agent-history-v3";
 
 type CacheLike = Pick<AgentHistoryCacheStore, "getFresh" | "put">;
-type Discovery = (input: AgentHistoryLookupInput) => Promise<AgentHistoryRef | null>;
+type Discovery = (
+  input: AgentHistoryLookupInput,
+  options?: { force?: boolean },
+) => Promise<AgentHistoryRef | null>;
 
 export type ResolvedCompactAgentHistory = {
   compactHistory: CompactAgentHistory;
@@ -36,22 +38,30 @@ export function createAgentHistoryService(
     readers?: AgentHistoryReader[];
   } = {},
 ) {
-  const readers = options.readers ?? [
-    new PiHistoryReader(),
-    new ClaudeHistoryReader(),
-    new CodexHistoryReader(),
-    new OpenCodeHistoryReader(),
-    new GeminiHistoryReader(),
-    new AntigravityHistoryReader(),
-    new GrokHistoryReader(),
-  ];
+  // Exactly two agents have a reader: pi (official session file path) and agy
+  // (official conversation id). Everything else resolves to `unknown` and is
+  // rejected here, so a pane for another agent reports no history.
+  const readers = options.readers ?? [new PiHistoryReader(), new AntigravityHistoryReader()];
+  const withHomeDir = (input: AgentHistoryLookupInput): AgentHistoryLookupInput =>
+    options.homeDir ? { ...input, homeDir: options.homeDir } : input;
   const discover: Discovery =
     options.discover ??
-    ((input) =>
-      discoverAgentHistory({
-        ...input,
-        ...(options.homeDir ? { homeDir: options.homeDir } : {}),
-      }));
+    ((input, discoverOptions) => discoverAgentHistory(withHomeDir(input), discoverOptions));
+
+  /**
+   * A pane whose official values just failed to resolve is not looked up again
+   * (and not warned about again) until its retry window expires: the failure is
+   * already reported once by `discoverAgentHistory`. Only the real discovery has
+   * that memory, so an injected one keeps its own behaviour. The lookup key is
+   * computed from the same input the discovery sees, `homeDir` included.
+   *
+   * This deceleration is for the ordinary per-round cadence only. Callers that
+   * pass `forceDiscovery` (an explicit operator read, or an external forced
+   * refresh) retry regardless. Warn dedup stays keyed, so a forced retry never
+   * duplicates a warning.
+   */
+  const discoverySuppressed = (input: AgentHistoryLookupInput): boolean =>
+    options.discover === undefined && discoveryFailureFresh(withHomeDir(input));
 
   async function readCompactRef(
     historyRef: AgentHistoryRef,
@@ -64,12 +74,11 @@ export function createAgentHistoryService(
     const sourceFingerprint = await statSourceFingerprint(path);
     if (!sourceFingerprint) return unresolvedCompactHistory(historyRef.source);
 
-    const cacheSourcePath = cacheSourcePathForRef(historyRef);
     if (!readCompactOptions.forceRefresh) {
       const cached = options.cache?.getFresh({
         formatterVersion: agentHistoryFormatterVersion,
         sourceMtimeMs: sourceFingerprint.mtimeMs,
-        sourcePath: cacheSourcePath,
+        sourcePath: path,
         sourceSize: sourceFingerprint.size,
       });
       if (cached && cached.compactHistory.lastAssistantMessage !== null) {
@@ -93,7 +102,7 @@ export function createAgentHistoryService(
         formatterVersion: agentHistoryFormatterVersion,
         historyRef,
         sourceMtimeMs: sourceFingerprint.mtimeMs,
-        sourcePath: cacheSourcePath,
+        sourcePath: path,
         sourceSize: sourceFingerprint.size,
       });
       return { compactHistory, historyRef, sourceFingerprint };
@@ -126,9 +135,23 @@ export function createAgentHistoryService(
       );
       if (preferred.historyRef) return preferred;
     }
-    const historyRef = await discover(input);
+    // The failure memory only decelerates the ordinary refresh cadence: it skips
+    // the lookup the daemon would otherwise repeat every round. An explicit
+    // caller action (`forceDiscovery`) must get a real lookup instead, so it
+    // bypasses both this skip and the memory inside `discoverAgentHistory`. The
+    // warning is still deduplicated per key, so this adds no noise.
+    const forcedDiscovery = resolveOptions.forceDiscovery === true;
+    if (!forcedDiscovery && discoverySuppressed(input)) {
+      return unresolvedCompactHistory();
+    }
+    const historyRef = await discover(input, forcedDiscovery ? { force: true } : {});
     if (!historyRef) {
-      console.warn("Herdsman agent history discovery returned no reference", input);
+      // `discoverAgentHistory` already warned about this failure with the richer
+      // official values, so the real path must not log a second warning for the
+      // same round. An injected discovery has no such report, so keep this one.
+      if (options.discover !== undefined) {
+        console.warn("Herdsman agent history discovery returned no reference", input);
+      }
       return unresolvedCompactHistory();
     }
     return readCompactRef(
@@ -172,13 +195,23 @@ export function createAgentHistoryService(
     resolveCompactHistory,
     async read(
       input: AgentHistoryLookupInput,
-      readOptions: { limit: number; preferredRef?: AgentHistoryRef | null },
+      readOptions: {
+        forceDiscovery?: boolean | undefined;
+        limit: number;
+        preferredRef?: AgentHistoryRef | null;
+      },
     ): Promise<{ historyRef: AgentHistoryRef | null; messages: AgentHistoryMessage[] }> {
-      if (readOptions.preferredRef) {
+      // `forceDiscovery` means "this caller asked right now": skip the persisted
+      // ref like `resolveCompactHistory` does, and do not let the failure memory
+      // answer with a memoized empty history.
+      if (readOptions.preferredRef && !readOptions.forceDiscovery) {
         const preferred = await readRef(readOptions.preferredRef, readOptions);
         if (preferred.historyRef) return preferred;
       }
-      const historyRef = await discover(input);
+      if (!readOptions.forceDiscovery && discoverySuppressed(input)) {
+        return { historyRef: null, messages: [] };
+      }
+      const historyRef = await discover(input, readOptions.forceDiscovery ? { force: true } : {});
       if (!historyRef) return { historyRef: null, messages: [] };
       return readRef(historyRef, readOptions);
     },
@@ -194,16 +227,6 @@ function unresolvedCompactHistory(source: string | null = null): ResolvedCompact
 }
 
 export type AgentHistoryService = ReturnType<typeof createAgentHistoryService>;
-
-export function cacheSourcePathForRef(historyRef: {
-  kind?: string;
-  path?: string;
-  source: string;
-  value: string;
-}): string {
-  const path = historyRef.path ?? historyRef.value;
-  return historyRef.source === "opencode-sqlite" ? `${path}#session=${historyRef.value}` : path;
-}
 
 export function emptyCompactHistory(source: string | null = null): CompactAgentHistory {
   return {

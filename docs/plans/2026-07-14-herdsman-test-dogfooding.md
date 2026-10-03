@@ -1,6 +1,8 @@
 # Herdsman-Test Dogfooding Plan
 
 > **注记（2026-09-29）**：本文件中出现的 `herdsman daemon start|stop|restart` 已从 CLI 删除，daemon 启停改用 `systemctl restart|stop|start herdsman.service`；开发/验证要用前台入口时必须显式指定临时数据目录（`HERDSMAN_HOME=/tmp/<名字>`）。以下历史步骤保持原样。
+>
+> **注记（2026-10-04）**：本文件记录的 `claude-jsonl` / `codex-jsonl` / `gemini-json` / `opencode-sqlite` 历史源与 Claude/Codex 步骤均为**历史叙述**——herdsman 现已只解析 `pi`（官方 path）与 `agy`（官方 id → 会话库），其余 agent 一律报无历史（见 `.agents/notes/20261003-official-only-agent-session-discovery.md`）。勿按本文件复核能力现状。
 
 **Status:** Phase 1 core acceptance completed; extended routing/lifecycle phases pending
 

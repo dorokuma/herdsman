@@ -1,52 +1,42 @@
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
-import { basename, join } from "node:path";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { type AgentHistoryLookupInput, discoverAgentHistory } from "@/agent-history/discovery.js";
+import {
+  discoverAgentHistory,
+  safeAllowedSessionPath,
+  safeOfficialSessionPath,
+} from "@/agent-history/discovery.js";
 
 const HERDR_ROLE_SESSIONS_ROOT = "/tmp/herdr-role-sessions";
 const RETIRED_ROLE_SESSIONS_ROOT = "/tmp/pi-role-sessions";
-const roleDirs: string[] = [];
+const tempDirs: string[] = [];
 
 vi.setConfig({ testTimeout: 30_000 });
 
 afterEach(async () => {
-  await Promise.all(roleDirs.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
+  vi.restoreAllMocks();
+  await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
 });
 
-async function roleRoot() {
-  await mkdir(HERDR_ROLE_SESSIONS_ROOT, { recursive: true });
-  const root = await mkdtemp(join(HERDR_ROLE_SESSIONS_ROOT, "herdsman-history-regression-"));
-  roleDirs.push(root);
-  return root;
+async function tempRoot(name: string): Promise<string> {
+  const dir = await mkdtemp(join("/tmp", name));
+  tempDirs.push(dir);
+  return dir;
 }
 
-async function session(root: string, name: string, cwd: string) {
-  const path = join(root, name, "session.jsonl");
-  await mkdir(join(root, name), { recursive: true });
-  await writeFile(path, `${JSON.stringify({ cwd })}\n`);
+async function sessionFile(dir: string, name: string): Promise<string> {
+  await mkdir(dir, { recursive: true });
+  const path = join(dir, `${name}.jsonl`);
+  await writeFile(path, `${JSON.stringify({ cwd: "/repo" })}\n`);
   return path;
 }
 
-function piLookup(
-  root: string,
-  extra: Partial<AgentHistoryLookupInput> = {},
-): AgentHistoryLookupInput {
-  return {
-    agent: "pi",
-    agentSession: null,
-    cwd: "/repo",
-    foregroundCwd: null,
-    herdrSessionName: basename(root),
-    homeDir: "/nonexistent-herdsman-home",
-    ...extra,
-  };
-}
-
-describe("agent history discovery regressions (independent coverage)", () => {
-  test("safeAllowedSessionPath accepts only owned files in allowed roots", async () => {
-    const root = await roleRoot();
-    const path = await session(root, "safe", "/repo");
-    const { safeAllowedSessionPath } = await import("@/agent-history/discovery.js");
+describe("agent history discovery (official value only)", () => {
+  test("safeAllowedSessionPath keeps the root whitelist for herdsman-pi registration", async () => {
+    await mkdir(HERDR_ROLE_SESSIONS_ROOT, { recursive: true });
+    const root = await mkdtemp(join(HERDR_ROLE_SESSIONS_ROOT, "herdsman-regression-"));
+    tempDirs.push(root);
+    const path = await sessionFile(root, "safe");
     expect(safeAllowedSessionPath(path, "/nonexistent")).toBe(path);
     expect(safeAllowedSessionPath("relative/session.jsonl", "/nonexistent")).toBeNull();
     expect(safeAllowedSessionPath(join(root, "..", "escape"), "/nonexistent")).toBeNull();
@@ -54,269 +44,104 @@ describe("agent history discovery regressions (independent coverage)", () => {
       safeAllowedSessionPath("/tmp/not-an-allowed-root/session.jsonl", "/nonexistent"),
     ).toBeNull();
   });
-  test("role 会话会被 pi fallback 发现", async () => {
-    const root = await roleRoot();
-    const path = await session(root, "role-x", "/repo");
 
-    await expect(discoverAgentHistory(piLookup(root))).resolves.toMatchObject({
-      kind: "discovered_file",
-      path,
-      source: "pi-jsonl",
-      value: path,
-    });
+  test("safeOfficialSessionPath keeps the file-safety checks without a root whitelist", async () => {
+    const root = await tempRoot("herdsman-official-shape-");
+    const path = await sessionFile(root, "official-session");
+    expect(safeOfficialSessionPath(path)).toBe(path);
+    expect(safeOfficialSessionPath("relative/session.jsonl")).toBeNull();
+    expect(safeOfficialSessionPath(join(root, "..", "escape"))).toBeNull();
+    expect(safeOfficialSessionPath(join(root, "missing.jsonl"))).toBeNull();
+
+    const directory = join(root, "a-directory.jsonl");
+    await mkdir(directory, { recursive: true });
+    expect(safeOfficialSessionPath(directory)).toBeNull();
   });
 
-  test("cwd 不匹配的较新候选不会被 pi fallback 采纳", async () => {
-    const root = await roleRoot();
-    const path = await session(root, "role-x", "/main-agent-repo");
-    const old = Date.now() - 1_000;
-    await utimes(path, new Date(old), new Date(old));
-
-    await expect(discoverAgentHistory(piLookup(root))).resolves.toBeNull();
-  });
-
-  test("occupiedSessionPaths 命中的候选会被跳过且唯一占用候选返回 null", async () => {
-    const root = await roleRoot();
-    const older = await session(root, "role-old", "/repo");
-    const newer = await session(root, "role-new", "/repo");
-    const newerTime = Date.now();
-    await utimes(older, new Date(newerTime - 2_000), new Date(newerTime - 2_000));
-    await utimes(newer, new Date(newerTime), new Date(newerTime));
-
-    await expect(
-      discoverAgentHistory(piLookup(root, { occupiedSessionPaths: new Set([newer]) })),
-    ).resolves.toMatchObject({ path: older, value: older });
-
-    await expect(
-      discoverAgentHistory(piLookup(root, { occupiedSessionPaths: new Set([older, newer]) })),
-    ).resolves.toBeNull();
-  });
-});
-
-describe("agent history discovery bounds (independent coverage)", () => {
-  test("does not scan jsonl beyond maxDepth=4", async () => {
-    const root = await roleRoot();
-    let current = root;
-    for (let depth = 1; depth <= 5; depth += 1) {
-      current = join(current, `depth-${depth}`);
-      await mkdir(current, { recursive: true });
-    }
-    await writeFile(join(current, "too-deep.jsonl"), `${JSON.stringify({ cwd: "/repo" })}\n`);
-    await expect(discoverAgentHistory(piLookup(root))).resolves.toBeNull();
-  });
-
-  test("Pi id ref resolves a filename match before mtime discovery", async () => {
-    const root = await roleRoot();
-    const id = "ses-target-123";
-    const matched = join(root, `${id}-new.jsonl`);
-    const competing = join(root, "unrelated.jsonl");
-    await writeFile(matched, `${JSON.stringify({ cwd: "/wrong" })}\n`);
-    await writeFile(competing, `${JSON.stringify({ cwd: "/repo" })}\n`);
-    const now = Date.now();
-    await utimes(matched, new Date(now - 2_000), new Date(now - 2_000));
-    await utimes(competing, new Date(now), new Date(now));
-
-    await expect(
-      discoverAgentHistory(
-        piLookup(root, {
-          agentSession: { agent: "pi", kind: "id", source: "herdr:pi", value: id },
-        }),
-      ),
-    ).resolves.toMatchObject({ kind: "agent_session", path: matched, value: id });
-  });
-
-  test("Pi id ref falls back to recursive discovery when no filename contains the id", async () => {
-    const root = await roleRoot();
-    const fallback = await session(root, "nested-session", "/repo");
-    await expect(
-      discoverAgentHistory(
-        piLookup(root, {
-          agentSession: { agent: "pi", kind: "id", source: "herdr:pi", value: "missing-id" },
-        }),
-      ),
-    ).resolves.toMatchObject({ kind: "discovered_file", path: fallback, value: fallback });
-  });
-
-  test("normalizes trailing and repeated slashes when matching candidate cwd", async () => {
-    const root = await roleRoot();
-    const path = await session(root, "normalized-cwd", "//repo///");
-    await expect(discoverAgentHistory(piLookup(root, { cwd: "/repo/" }))).resolves.toMatchObject({
-      path,
-      value: path,
-    });
-  });
-
-  test("stops discovery at maxFiles=2000 while returning candidates before the bound", async () => {
-    const root = await roleRoot();
-    const dir = join(root, "many");
-    await mkdir(dir, { recursive: true });
-    for (let index = 0; index < 2_000; index += 1) {
-      await writeFile(
-        join(dir, `session-${String(index).padStart(4, "0")}.jsonl`),
-        `${JSON.stringify({ cwd: "/repo" })}\n`,
-      );
-    }
-    await writeFile(
-      join(root, "many", "session-2000.jsonl"),
-      `${JSON.stringify({ cwd: "/repo" })}\n`,
-    );
-    const result = await discoverAgentHistory(piLookup(root));
-    const resultPath = result?.path;
-    expect(resultPath).toBeDefined();
-    expect(resultPath?.startsWith(`${dir}/`)).toBe(true);
-    expect(resultPath).toMatch(/\/session-\d{4}\.jsonl$/);
-    expect(resultPath).not.toBe(join(dir, "session-2000.jsonl"));
-    await expect(discoverAgentHistory(piLookup(root))).resolves.not.toMatchObject({
-      path: join(dir, "session-2000.jsonl"),
-    });
-  }, 30_000);
-
-  test("reads only the bounded prefix of an oversized jsonl and finds cwd", async () => {
-    const root = await roleRoot();
-    const path = join(root, "large", "session.jsonl");
-    await mkdir(join(root, "large"), { recursive: true });
-    await writeFile(path, `${JSON.stringify({ cwd: "/repo" })}\n${"x".repeat(300 * 1024)}\n`);
-    const started = performance.now();
-    await expect(discoverAgentHistory(piLookup(root))).resolves.toMatchObject({ path });
-    expect(performance.now() - started).toBeLessThan(2_000);
-  }, 30_000);
-});
-
-describe("herdr role session root isolation", () => {
-  test("discovers role jsonl under the agent's own herdr session subdirectory", async () => {
-    const root = await roleRoot();
-    const path = await session(root, "role-worker", "/repo");
-
-    await expect(discoverAgentHistory(piLookup(root))).resolves.toMatchObject({
-      kind: "discovered_file",
-      path,
-      source: "pi-jsonl",
-      value: path,
-    });
-    await expect(
-      discoverAgentHistory(
-        piLookup(root, {
-          agentSession: { agent: "pi", kind: "path", source: "herdr:pi", value: path },
-        }),
-      ),
-    ).resolves.toMatchObject({ kind: "agent_session", path, source: "pi-jsonl", value: path });
-  });
-
-  test("beta fallback candidates exclude /tmp/herdr-role-sessions/charlie/**", async () => {
-    const betaRoot = await roleRoot();
-    const charlieRoot = await roleRoot();
-    const betaPath = await session(betaRoot, "role-worker", "/repo");
-    const charliePath = await session(charlieRoot, "role-worker", "/repo");
-    const now = Date.now();
-    await utimes(betaPath, new Date(now - 5_000), new Date(now - 5_000));
-    await utimes(charliePath, new Date(now), new Date(now));
-
-    const result = await discoverAgentHistory(piLookup(betaRoot));
-    expect(result).toMatchObject({ path: betaPath, source: "pi-jsonl" });
-    expect(result?.path).not.toBe(charliePath);
-    expect(result?.path?.includes(`/${basename(charlieRoot)}/`)).toBe(false);
-
-    await expect(
-      discoverAgentHistory(piLookup(betaRoot, { occupiedSessionPaths: new Set([betaPath]) })),
-    ).resolves.toBeNull();
-
-    const id = "ses-shared-id";
-    const charlieIdPath = join(charlieRoot, `${id}-session.jsonl`);
-    await writeFile(charlieIdPath, `${JSON.stringify({ cwd: "/other" })}\n`);
-    await expect(
-      discoverAgentHistory(
-        piLookup(betaRoot, {
-          agentSession: { agent: "pi", kind: "id", source: "herdr:pi", value: id },
-          occupiedSessionPaths: new Set([betaPath]),
-        }),
-      ),
-    ).resolves.toBeNull();
-  });
-
-  test("terminalTitle role segment matches the role directory and rejects other roles", async () => {
-    const root = await roleRoot();
-    const own = await session(root, "role-worker-53c500b2", "/repo");
-    const other = await session(root, "role-scout", "/repo");
-    const now = Date.now();
-    await utimes(own, new Date(now - 5_000), new Date(now - 5_000));
-    await utimes(other, new Date(now), new Date(now));
-
-    await expect(
-      discoverAgentHistory(piLookup(root, { terminalTitle: "π - role-worker-53c500b2 - root" })),
-    ).resolves.toMatchObject({ path: own, source: "pi-jsonl" });
-    await expect(
-      discoverAgentHistory(piLookup(root, { terminalTitle: "π - role-scout - root" })),
-    ).resolves.toMatchObject({ path: other, source: "pi-jsonl" });
-    await expect(discoverAgentHistory(piLookup(root))).resolves.toMatchObject({
-      path: other,
-      source: "pi-jsonl",
-    });
-  });
-
-  test("does not extract a role hint from foo-role-x or substring matches", async () => {
-    const root = await roleRoot();
-    const own = await session(root, "role-worker", "/repo");
-    const other = await session(root, "role-scout", "/repo");
-    const now = Date.now();
-    await utimes(own, new Date(now - 5_000), new Date(now - 5_000));
-    await utimes(other, new Date(now), new Date(now));
-
-    await expect(
-      discoverAgentHistory(piLookup(root, { terminalTitle: "π - foo-role-x - root" })),
-    ).resolves.toMatchObject({ path: other, source: "pi-jsonl" });
-    await expect(
-      discoverAgentHistory(piLookup(root, { terminalTitle: "pane role-worker" })),
-    ).resolves.toMatchObject({ path: other, source: "pi-jsonl" });
-  });
-
-  test("role hint excludes ~/.pi/agent/sessions from scan roots", async () => {
-    const root = await roleRoot();
-    const own = await session(root, "role-worker", "/repo");
-    const homeDir = await mkdtemp(join("/tmp", "herdsman-role-hint-home-"));
-    roleDirs.push(homeDir);
-    const leakedDir = join(homeDir, ".pi", "agent", "sessions");
-    await mkdir(leakedDir, { recursive: true });
-    const leaked = join(leakedDir, "leaked.jsonl");
-    await writeFile(leaked, `${JSON.stringify({ cwd: "/repo" })}\n`);
-    const now = Date.now();
-    await utimes(own, new Date(now - 5_000), new Date(now - 5_000));
-    await utimes(leaked, new Date(now), new Date(now));
-
-    await expect(
-      discoverAgentHistory(piLookup(root, { homeDir, terminalTitle: "π - role-worker - root" })),
-    ).resolves.toMatchObject({ path: own, source: "pi-jsonl" });
-    await expect(discoverAgentHistory(piLookup(root, { homeDir }))).resolves.toMatchObject({
-      path: leaked,
-      source: "pi-jsonl",
-    });
-  });
-
-  test("retired /tmp/pi-role-sessions is not scanned or accepted", async () => {
-    await mkdir(RETIRED_ROLE_SESSIONS_ROOT, { recursive: true });
-    const oldRoot = await mkdtemp(join(RETIRED_ROLE_SESSIONS_ROOT, "retired-"));
-    roleDirs.push(oldRoot);
-    const oldPath = await session(oldRoot, "role-old", "/repo");
-    const { safeAllowedSessionPath } = await import("@/agent-history/discovery.js");
-    expect(safeAllowedSessionPath(oldPath, "/nonexistent")).toBeNull();
+  test("a plausible session file on disk is never picked up without an official value", async () => {
+    const root = await tempRoot("herdsman-no-scan-");
+    await sessionFile(join(root, ".pi", "agent", "sessions"), "leaked");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
 
     await expect(
       discoverAgentHistory({
         agent: "pi",
         agentSession: null,
-        cwd: "/repo",
-        foregroundCwd: null,
-        herdrSessionName: basename(oldRoot),
-        homeDir: "/nonexistent-herdsman-home",
+        herdrSessionName: "default",
+        homeDir: root,
+        paneId: "wA:p1",
       }),
     ).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringContaining("no usable official Herdr agent session"),
+      expect.objectContaining({ paneId: "wA:p1" }),
+    );
+  });
+
+  test("an official id is never resolved by walking a session directory", async () => {
+    const root = await tempRoot("herdsman-no-traversal-");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Both files carry the official id in their name, which is exactly what the
+    // deleted scanners matched on. Nothing walks these trees any more: an id is
+    // only resolved through its agent's deterministic template (`agy`), so an
+    // unsupported agent's session file sitting on disk stays unresolved.
+    await sessionFile(
+      join(root, ".codex", "sessions", "2026", "07", "09"),
+      "rollout-2026-07-09T10-00-00-aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    );
+    await sessionFile(
+      join(root, ".claude", "projects", "-repo"),
+      "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+    );
+
+    for (const [agent, source, detail] of [
+      ["codex", "herdr:codex", "is not a supported herdsman history agent"],
+      ["claude", "herdr:claude", "is not a supported herdsman history agent"],
+      // pi *is* supported, so its id-shaped value must not be described as an
+      // unsupported agent: it is the documented gap (no id-based derivation).
+      ["pi", "herdr:pi", "reported an id; herdsman has no id-based session-file derivation"],
+    ] as const) {
+      await expect(
+        discoverAgentHistory({
+          agent,
+          agentSession: {
+            agent,
+            kind: "id",
+            source,
+            value: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+          },
+          herdrSessionName: "default",
+          homeDir: root,
+          paneId: "wA:p1",
+        }),
+      ).resolves.toBeNull();
+      expect(warn).toHaveBeenCalledWith(
+        expect.stringContaining("no usable official Herdr agent session"),
+        expect.objectContaining({
+          detail: expect.stringContaining(detail),
+          paneId: "wA:p1",
+        }),
+      );
+    }
+    expect(warn).toHaveBeenCalledTimes(3);
+  });
+
+  test("an official path under a retired role root is accepted; the registration whitelist still rejects it", async () => {
+    await mkdir(RETIRED_ROLE_SESSIONS_ROOT, { recursive: true });
+    const oldRoot = await mkdtemp(join(RETIRED_ROLE_SESSIONS_ROOT, "retired-"));
+    tempDirs.push(oldRoot);
+    const oldPath = await sessionFile(oldRoot, "role-old");
+
+    // The registration whitelist only knows the current role root.
+    expect(safeAllowedSessionPath(oldPath, "/nonexistent")).toBeNull();
+    // An official value is consumed as reported, whatever root it lives in.
     await expect(
       discoverAgentHistory({
         agent: "pi",
         agentSession: { agent: "pi", kind: "path", source: "herdr:pi", value: oldPath },
-        cwd: "/repo",
-        foregroundCwd: null,
-        homeDir: "/nonexistent-herdsman-home",
+        herdrSessionName: "default",
+        paneId: "wA:p9",
       }),
-    ).resolves.toBeNull();
+    ).resolves.toMatchObject({ kind: "agent_session", path: oldPath, source: "pi-jsonl" });
   });
 });

@@ -594,7 +594,7 @@ describe("HerdrSessionWatchManager", () => {
         async resolveCompactHistory() {
           return {
             compactHistory: {
-              ...emptyCompactHistory("claude-jsonl"),
+              ...emptyCompactHistory("pi-jsonl"),
               lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
             },
             historyRef: null,
@@ -607,7 +607,7 @@ describe("HerdrSessionWatchManager", () => {
     const agent = harness.agents.listForHerdrSession("default")[0];
     if (!agent) throw new Error("expected indexed agent");
     const plan = testPlan(agent, {
-      ...emptyCompactHistory("claude-jsonl"),
+      ...emptyCompactHistory("pi-jsonl"),
       lastAssistantMessage: { ref: "history", text: "final answer", timestamp: null },
     });
     // Two plans for the same agent (event + refresh paths can both produce

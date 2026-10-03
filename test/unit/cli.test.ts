@@ -281,7 +281,7 @@ function createFakeClient(overrides: { name?: string | null } = {}): FakeClient 
               history: {
                 lastAssistantMessage: { text: "done", timestamp: null, ref: "r2" },
                 lastUserMessage: { text: "fix bug", timestamp: null, ref: "r1" },
-                source: "codex-jsonl",
+                source: "pi-jsonl",
                 updatedAt: "2026-07-22T00:00:00.000Z",
               },
               name,

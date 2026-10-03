@@ -35,7 +35,7 @@ function snapshotInput(agentId: string) {
   const historyRef = {
     kind: "discovered_file" as const,
     path: "/tmp/claude.jsonl",
-    source: "claude-jsonl" as const,
+    source: "pi-jsonl" as const,
     value: "/tmp/claude.jsonl",
   };
   return {
@@ -46,7 +46,7 @@ function snapshotInput(agentId: string) {
       lastToolResult: null,
       lastUserMessage: { ref: "entry-1", text: "work", timestamp: null },
       messageCount: 2,
-      source: "claude-jsonl",
+      source: "pi-jsonl",
       updatedAt: "2026-07-16T00:00:00.000Z",
     },
     historyRef,
