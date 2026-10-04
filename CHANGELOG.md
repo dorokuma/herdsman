@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+## 0.14.1
+
+- 幽灵唤醒循环修复（`packages/herdsman-pi`，`2bad14f`；配套留痕 `5d6d6b9`），四项：① 续传预算（`MAX_WAKE_CONTINUATION_ATTEMPTS` = 5 次）用尽后 `writeOffStrandedWakeDelivery`——滞留事件 id 退出 `wakeAwaitingConsumption` 并走普通路径 ack，治「永不 ack、daemon 幽灵重投」；② 显式关页（`pane.closed`）隐含消费——已投递行在 `#invalidatePaneCore` 步骤 0 直接 ack，不再走关页保留，从未投递行仍保留一次投递机会；③ wake 摘要与 wake/上下文正文归一化保留换行与行内缩进（只折叠 3+ 连续换行、去行尾空白），治「截断假象」；④ `REDELIVERY_FRESHNESS_MS` 维持 300s 未动。涉及 `packages/herdsman-pi/src/index.ts`、`packages/herdsman-pi/src/wake.ts`、`src/db/agent-events.ts`、`src/observability/agent-index-service.ts`。
+- 测试：`test/unit/event-dedup-pane-generation.test.ts` 新增关页保留/丢弃与死信回填用例；`test/unit/herdsman-pi-extension.test.ts`、`test/unit/herdsman-pi-wake.test.ts` 覆盖 write-off、隐含消费 ack 与正文归一化。用例总数 847 → 850。
+- 已知残余（诚实说明，详见 `.agents/notes/2026-10-04-ghost-wake-fix-followups.md`）：write-off notify 文案仍写「交给另一个终端让 daemon 重投」，与 write-off 已同步 ack 的新行为不符，留待下个版本改文案；write-off ack 在存在 id 更小的 pending 行时可能以 `ORCHESTRATOR_EVENT_OUT_OF_ORDER` 失败，退化为「永久静默 churn」（唯一信号是一行 warn），上线后观察该 warn 是否出现；保留换行后含大代码块的更新会全量进入 wake 投影文本，token 成本高于折叠为一行的旧行为。
+- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.14.1；`README.md` 与 `packages/herdsman-herdr-plugin/README.md` 的 Herdr 安装 tag 同步至 `v0.14.1`。
+- 范围：本版本包含 0.14.0 之后的全部内容（`2bad14f` pi 包修复 + `5d6d6b9` 双审观察留痕笔记）；`packages/herdsman-pi/src` 与 `src/db/agent-events.ts`、`src/observability/agent-index-service.ts`、`test/unit/**` 均有改动，`packages/herdsman-herdr-plugin` 无源码改动；无 schema 变更、无迁移。
+
 ## 0.14.0
 
 - root 包 agent 历史支持面收窄为「只解析 pi 与 agy」（`bd97dd2`）：pi 走官方 `agent_session.kind === "path"` 直用通路；agy 走官方 id → `conversations/<uuid>.db` 单一模板；其余 agent（claude/codex/opencode/grok/gemini/omp）一律不解析、不读取。删除 `claude-reader.ts` / `codex-reader.ts` / `opencode-reader.ts` / `grok-reader.ts` / `gemini-reader.ts` 五个 reader 及相关模板，以及旧扫盘、mtime 排行、终端标题猜目录等兜底。显式读取不再回退持久 ref（`preferredHistoryRef` 已删）：官方值瞬时不可读时返回空并打一条 warn（诚实失败、可立即重试）；负缓存只降频后台常规刷新，`agent.get` / `agent.read` 与 `forceRefresh:true` 调用点恒绕过。omp 按设计不打 warn（官方给 `path`，discovery 层解析成功、reader 层拒绝）。`agents.grok_home` 遗留列恒写 `null` 且无读取方，删列需 drizzle migration，本批不做。
