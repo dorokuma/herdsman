@@ -1,5 +1,13 @@
 ## [Unreleased]
 
+## 0.14.2
+
+- 删除 `HERDSMAN AGENT CONTEXT` 预览块（`packages/herdsman-pi`，`ce316b5`）：`pi.on("context")` 不再向编排者上下文注入 `herdsman-agent-context` 自定义消息。该预览块把每个 agent 的报告经 `truncateSummary(..., 100)` 截略成单行（tabTitle 60 字符上限）后随 context 注入，设计意图是「速览」，实际反复造成「报告被截断」的误判——审计确认数据从未丢失（wake 全文轨始终投递完整报告），预览块信息价值为零，盘面状态本应实时查 herdr。同步删除仅服务该块的死代码：`formatHiddenAgentContext`、`truncateSummary`、`formatTimestamp`、`HerdsmanState.pinnedContext` 及只为它服务的 `retain` 快照求交；被 wake 侧复用的 `formatHiddenAgentUpdates`、`sanitizeAndCleanContextText` / `cleanContextText` 与 wake.ts `normalizeExcerpt` / `formatAgentOutcomeUpdates` 保留，全文投递路径零改动。`context` 钩子保留为入口清洗：重放旧会话时把 herdsman 自己的旧 context/wake 条目从传入列表过滤掉（`herdsman-wake-context` 唤醒全文本体不过滤，它是 turn 消费的证据）。测试：删除 22 个引用预览块/pinnedContext 的用例（17 个预览格式 + 3 个 cached-context pinning + `context intersection regressions` describe 4 个），改写 2 个（ack 排序用例去掉预览断言、busy-defer 用例改为断言 context 钩子零注入），其余用例未动；用例总数 852 → 830。
+- busy 唤醒投递单轨化（`packages/herdsman-pi`，`0a6a8a2`）：busy 路径不再经 `context` 钩子钉 `herdsman-wake-queued` 第二份副本，子代理回传只走 follow-up 消息一条轨（busy = 排队 `triggerTurn:false`，idle = `triggerTurn:true`），按 eventId 升序、一条不丢、一条不重。
+- 续传预算按事件独立记账（`packages/herdsman-pi`，`fea08a4`）：驱动计数器由单一共享值改为按 event id 记账的 `wakeContinuationDrives`，任一事件总驱动次数硬上界 ≤5 后必走 write-off，新事件注入不再刷新滞留事件的预算（修复同一事件被全量刷屏的线上空转循环）。
+- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.14.2；`README.md` 与 `packages/herdsman-herdr-plugin/README.md` 的 Herdr 安装 tag 同步至 `v0.14.2`。
+- 范围：本版本包含 0.14.1 之后的全部内容（`fea08a4` 续传预算 + `0a6a8a2` 单轨化 + `ce316b5` 预览块删除，及相应留痕笔记）；仅 `packages/herdsman-pi/src/index.ts`、`test/unit/herdsman-pi-extension.test.ts` 与 `.agents/notes/` 有改动，`packages/herdsman-herdr-plugin` 与 `src/**` 无源码改动；无 schema 变更、无迁移。
+
 ## 0.14.1
 
 - 幽灵唤醒循环修复（`packages/herdsman-pi`，`2bad14f`；配套留痕 `5d6d6b9`），四项：① 续传预算（`MAX_WAKE_CONTINUATION_ATTEMPTS` = 5 次）用尽后 `writeOffStrandedWakeDelivery`——滞留事件 id 退出 `wakeAwaitingConsumption` 并走普通路径 ack，治「永不 ack、daemon 幽灵重投」；② 显式关页（`pane.closed`）隐含消费——已投递行在 `#invalidatePaneCore` 步骤 0 直接 ack，不再走关页保留，从未投递行仍保留一次投递机会；③ wake 摘要与 wake/上下文正文归一化保留换行与行内缩进（只折叠 3+ 连续换行、去行尾空白），治「截断假象」；④ `REDELIVERY_FRESHNESS_MS` 维持 300s 未动。涉及 `packages/herdsman-pi/src/index.ts`、`packages/herdsman-pi/src/wake.ts`、`src/db/agent-events.ts`、`src/observability/agent-index-service.ts`。
