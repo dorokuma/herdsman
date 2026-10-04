@@ -141,8 +141,12 @@ type HerdsmanState = {
    * delivery from being written off, and it carries three guarantees at once:
    *
    * - never lost: while it is non-empty the settlement drives a continuation
-   *   (bounded by MAX_WAKE_CONTINUATION_ATTEMPTS) so a later run drains the queue
-   *   and carries the update out;
+   *   (bounded by MAX_WAKE_CONTINUATION_ATTEMPTS drives) so a later run drains
+   *   the queue and carries the update out. The bound is a real ceiling, not a
+   *   suggestion: once it is spent the ids are released from here and
+   *   acknowledged (`writeOffStrandedWakeDelivery`), because an update that no
+   *   turn will ever carry out must not keep a run loop — and the daemon's
+   *   redelivery of it — alive forever;
    * - never acknowledged unseen: these ids are excluded from the acknowledgement
    *   path, so the daemon keeps them pending and redelivers them when this
    *   session never consumes them (the only way a delivery Pi itself dropped —
@@ -281,17 +285,25 @@ export const WAKE_BUSY_SPIN_MS = 100;
  */
 export const WAKE_DEFERRED_TIMEOUT_MS = 5_000;
 /**
- * Upper bound on the continuation drives spent on one unconsumed delivery.
+ * Upper bound on the continuation drives spent on one unconsumed wake delivery.
  *
- * Every drive costs a full agent run, so three attempts cover the drive that
- * follows the settlement which missed Pi's follow-up queue plus two retries
- * after intervening runs that also ended before their stop point. Beyond that
- * the condition is systemic (Pi dropped the queue, the runs keep ending early)
- * and further attempts could only start runs without delivering anything: the
- * delivery stays unacknowledged, hence pending on the daemon, which redelivers
- * it to a later run or session.
+ * Every drive costs a full agent run, so the budget is deliberately small: three
+ * attempts already cover the drive that follows the settlement which missed Pi's
+ * follow-up queue plus two retries after intervening runs that also ended before
+ * their stop point, and five adds margin for a run that spent its stop point on
+ * a tool call. Beyond that the cause is systemic — the runs keep ending early, so
+ * starting another one could only produce another empty turn — and the delivery
+ * is written off instead (`writeOffStrandedWakeDelivery`): the ids leave
+ * `wakeAwaitingConsumption` and are acknowledged, which stops both the
+ * continuation loop and the daemon's redelivery of the same event.
+ *
+ * The trade-off is deliberate and asymmetric: losing one agent update is
+ * recoverable (the agent is still there and its transcript can be read
+ * directly), while an unbounded continuation loop floods the orchestrator
+ * session with empty turns and makes it unusable. A missed update is therefore
+ * strictly better than an endless one.
  */
-export const MAX_WAKE_CONTINUATION_ATTEMPTS = 3;
+export const MAX_WAKE_CONTINUATION_ATTEMPTS = 5;
 /** `customType` of the hidden wake context this extension injects. */
 const WAKE_CONTEXT_CUSTOM_TYPE = "herdsman-wake-context";
 /** `customType` of the hidden marker that drives a missed wake continuation. */
@@ -935,6 +947,42 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       return { deliveryQueue, confirmablePrefix, blockedByMissingTurn, stillAwaitingConsumption };
     };
 
+    const writeOffStrandedWakeDelivery = (eventIds: number[], ctx: PiContext): void => {
+      // Release first, acknowledge second: the release is what breaks the loop
+      // synchronously, while the acknowledgement is an RPC that may fail.
+      for (const eventId of eventIds) {
+        state.wakeAwaitingConsumption.delete(eventId);
+        // This set only ever holds the id of a delivery that was already handed
+        // to Pi, so releasing it is not permission to present it again: the
+        // session-wide presented guard stays behind and keeps a daemon replay
+        // of the same id out of the transcript.
+        state.presentedEventIds.add(eventId);
+      }
+      // Fresh budget for whatever is still awaiting consumption: the ids just
+      // written off are gone, and the ones that remain have not had their own
+      // MAX_WAKE_CONTINUATION_ATTEMPTS drives spent on them yet.
+      state.wakeContinuationAttempts = 0;
+      const stranded = eventIds
+        .map((eventId) => state.unackedDelivered.get(eventId))
+        .filter((event): event is AgentEventWireRecord => event !== undefined)
+        .sort((left, right) => left.id - right.id);
+      logHerdsmanPi(
+        "warn",
+        `[herdsman-pi] wake continuation gave up eventIds=${eventIds.join(",")} drives=${MAX_WAKE_CONTINUATION_ATTEMPTS} · released and acknowledged as consumed so the daemon stops redelivering them`,
+      );
+      ctx.ui.notify?.(
+        `Herdsman · ${eventIds.length} agent update${eventIds.length === 1 ? "" : "s"} could not be delivered by a wake turn · given up on (possibly never seen): read the agent directly for the details, or hand this workspace to another terminal so the daemon delivers it there`,
+        "warning",
+      );
+      if (stranded.length === 0) return;
+      void acknowledgeEventIds(stranded, { notify: false }, ctx).catch((error: unknown) => {
+        logHerdsmanPi(
+          "warn",
+          `[herdsman-pi] wake write-off acknowledgement failed eventIds=${stranded.map((event) => event.id).join(",")} · ${String(error)}`,
+        );
+      });
+    };
+
     /**
      * Drives one continuation that carries out a wake Pi has not drained.
      *
@@ -952,12 +1000,12 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      * ends before its stop point (error, user abort, a refused tool) leaves the
      * next settlement driving again. That is bounded by
      * MAX_WAKE_CONTINUATION_ATTEMPTS: starting runs cannot fix a cause that is
-     * not about the queue, and once the budget is spent the delivery stays
-     * unacknowledged and therefore pending on the daemon.
+     * not about the queue, so once the budget is spent the delivery is written
+     * off (released and acknowledged) instead of looping forever — see
+     * `writeOffStrandedWakeDelivery` for the trade-off.
      */
     const driveWakeContinuation = (ctx: PiContext) => {
       if (state.wakeAwaitingConsumption.size === 0) return;
-      if (state.wakeContinuationAttempts >= MAX_WAKE_CONTINUATION_ATTEMPTS) return;
       if (!pi.sendMessage) return;
       const eventIds = [...state.wakeAwaitingConsumption].sort((left, right) => left - right);
       state.wakeContinuationAttempts += 1;
@@ -978,23 +1026,15 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         logHerdsmanPi("warn", "[herdsman-pi] wake continuation refused by pi");
       }
       if (state.wakeContinuationAttempts >= MAX_WAKE_CONTINUATION_ATTEMPTS) {
-        logHerdsmanPi(
-          "warn",
-          `[herdsman-pi] wake continuation limit reached awaiting=${eventIds.join(",")} attempts=${state.wakeContinuationAttempts} · delivery stays unacknowledged for daemon redelivery`,
-        );
-        // Bounded retries cannot deliver this update, and the daemon does not
-        // redeliver while this terminal still holds the scope
-        // (`nextDeliverableAfter` skips events already delivered to the same
-        // owner), so the session is where it has to be visible. The notice must
-        // not promise what the extension cannot do: a copy that Pi dropped cannot
-        // be drained by "the next turn", it is simply gone here — so it says what
-        // is true (unconfirmed, possibly dropped) and what the user can actually
-        // do about it (a later turn still drains a queued copy, and handing the
-        // workspace to another terminal makes the daemon redeliver the update).
-        ctx.ui.notify?.(
-          `Herdsman · ${eventIds.length} agent update${eventIds.length === 1 ? "" : "s"} could not be delivered by a wake turn · unconfirmed and possibly dropped: keep working here so a later turn drains a queued copy, or hand this workspace to another terminal so the daemon redelivers it`,
-          "warning",
-        );
+        // This was the last drive the budget allows, and the queued copy is still
+        // undrained: the delivery is written off instead of being left pending
+        // forever. The ids are released from `wakeAwaitingConsumption` (no further
+        // run is started for them) and acknowledged, which is what stops the
+        // daemon from redelivering them every freshness window — the loop that
+        // used to flood the orchestrator session until manual sqlite surgery.
+        // Losing one update is the accepted cost; see
+        // `writeOffStrandedWakeDelivery`.
+        writeOffStrandedWakeDelivery([...state.wakeAwaitingConsumption], ctx);
       }
     };
 
@@ -2119,12 +2159,22 @@ function record(value: unknown): Record<string, unknown> {
 }
 
 function cleanContextText(value: string): string {
+  // Same newline-preserving scheme as `normalizeExcerpt` in wake.ts: which byte a
+  // line break is (CRLF, CR, U+2028/U+2029, NEL) is normalised to LF, trailing
+  // whitespace is dropped per line, 3+ newlines collapse to a blank line, and
+  // leading indentation plus inline runs of whitespace are kept as they are.
+  // NEL (U+0085) is excluded from the control-character clearing regex below,
+  // which would otherwise delete it as an unprintable byte; the rest of that
+  // regex is left intact.
   return stripVTControlCharacters(value)
     .replace(
-      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g,
+      /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u0084\u0086-\u009f\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/g,
       "",
     )
-    .replace(/\s+/g, " ")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u2028\u2029\u0085]/g, "\n")
+    .replace(/[^\S\n]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
     .trim();
 }
 

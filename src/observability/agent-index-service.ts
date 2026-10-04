@@ -1498,7 +1498,11 @@ export class AgentIndexService {
         paneId,
         paneGeneration: closedGeneration,
       });
+      // 显式关 Tab = 隐含消费：已经投递给编排者的行在这里直接 ack（不再走关页保留、
+      // 不再被 daemon 重投），只把「从未投递过」的行留给保留规则。崩溃/掉线路径
+      // （reconciler / reclaimDelivered）不经过这里，保留语义不变。
       this.#stores.agentEvents.invalidatePane({
+        acknowledgeDelivered: true,
         herdrSessionName: input.herdrSessionName,
         paneId,
         paneGeneration: closedGeneration,

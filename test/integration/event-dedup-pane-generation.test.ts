@@ -221,6 +221,93 @@ describe("event deduplication and pane generations", () => {
     h.sqlite.close();
   });
 
+  test("explicit pane.closed writes off an already delivered event instead of retaining it for redelivery", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const indexed = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [agent("claude", "gen-7")],
+    })[0];
+    if (!indexed) throw new Error("Expected indexed agent");
+    const event = h.agentEvents.append({
+      agentId: indexed.id,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "ref-1", text: "done text", timestamp: null },
+      },
+      herdrSessionName: "default",
+      paneId: indexed.paneId,
+      paneGeneration: indexed.paneGeneration ?? null,
+      payload: { from: "working" },
+      terminalId: indexed.terminalId,
+      type: "agent.done",
+      workspaceId: "wJ",
+    });
+
+    // The orchestrator already received the delivery (it read the pane out of
+    // band) and never acknowledged it — the row that used to stay
+    // delivered/invalidated-forever and be handed out again on every get.
+    expect(h.agentEvents.reservePending("term-owner").map((e) => e.id)).toEqual([event.id]);
+    expect(h.agentEvents.get(event.id)).toMatchObject({
+      deliveryAttempts: 1,
+      status: "delivered",
+    });
+
+    await new AgentIndexService({ stores: h }).handleHerdrEvent({
+      event: { pane_id: "wJ:p2", pane_generation: "gen-7", type: "pane.closed" },
+      ...session,
+    });
+
+    // Closing the tab is implicit consumption: the row is acknowledged, so it can
+    // never be redelivered — neither through a pending reservation nor through
+    // the after-cursor listing the extension polls.
+    expect(h.agentEvents.get(event.id)).toMatchObject({ deliverable: 0, status: "acked" });
+    expect(h.agentEvents.reservePending("term-owner")).toEqual([]);
+    expect(
+      h.agentEvents.listAfter({ ...scope, afterEventId: 0, ownerTerminalId: "term-owner" }),
+    ).toEqual([]);
+    h.sqlite.close();
+  });
+
+  test("explicit pane.closed keeps the delivery chance of an event that was never delivered", async () => {
+    const h = openObservabilityDbHarness();
+    h.herdrSessions.upsertRunning(dbSession);
+    const indexed = h.agents.replaceForSession({
+      herdrSessionName: "default",
+      agents: [agent("claude", "gen-7")],
+    })[0];
+    if (!indexed) throw new Error("Expected indexed agent");
+    const event = h.agentEvents.append({
+      agentId: indexed.id,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "ref-2", text: "done text", timestamp: null },
+      },
+      herdrSessionName: "default",
+      paneId: indexed.paneId,
+      paneGeneration: indexed.paneGeneration ?? null,
+      payload: { from: "working" },
+      terminalId: indexed.terminalId,
+      type: "agent.done",
+      workspaceId: "wJ",
+    });
+
+    await new AgentIndexService({ stores: h }).handleHerdrEvent({
+      event: { pane_id: "wJ:p2", pane_generation: "gen-7", type: "pane.closed" },
+      ...session,
+    });
+
+    // Never handed to anybody, so the pane-close retention still applies: the
+    // outcome of a tab the user closed while the agent was finishing still has to
+    // reach the orchestrator exactly once.
+    expect(h.agentEvents.get(event.id)).toMatchObject({
+      deliverable: 1,
+      invalidatedReason: "RETAINED_OUTCOME_PANE_CLOSED",
+      status: "invalidated",
+    });
+    h.sqlite.close();
+  });
+
   test("legacy pane.closed invalidates legacy events with an explicit reason", async () => {
     const h = openObservabilityDbHarness();
     h.herdrSessions.upsertRunning(dbSession);

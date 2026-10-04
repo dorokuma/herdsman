@@ -34,7 +34,26 @@ function asRecord(value: unknown): Record<string, unknown> {
 function stringValue(value: unknown): string | undefined { return typeof value === "string" && value.length > 0 ? value : undefined; }
 function normalizeExcerpt(value: unknown): string {
   const raw = stringValue(value) ?? "";
-  return stripVTControlCharacters(raw).replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/g, "").replace(/\s+/g, " ").trim();
+  // Line structure is evidence, not noise: a code block or a markdown heading
+  // only reads as one while its newlines survive, so this chain normalises
+  // *which byte* a line break is and where whitespace sits inside a line, and
+  // never folds a newline into a space:
+  //   - CRLF/CR and the Unicode line separators (U+2028, U+2029, NEL) become LF,
+  //     so "a line" means one thing everywhere downstream (NEL is excluded from
+  //     the control-character regex, which would otherwise delete it);
+  //   - trailing whitespace is dropped per line, so a "blank" line padded with
+  //     spaces still collapses (it would otherwise defeat the 3+ newline rule);
+  //   - three or more newlines collapse to a single blank line;
+  //   - leading indentation and inline runs of whitespace are kept as they are,
+  //     because they are what keeps a code block readable.
+  // No length cap is applied here.
+  return stripVTControlCharacters(raw)
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u0084\u0086-\u009f]/g, "")
+    .replace(/\r\n?/g, "\n")
+    .replace(/[\u2028\u2029\u0085]/g, "\n")
+    .replace(/[^\S\n]+$/gm, "")
+    .replace(/\n{3,}/g, "\n\n")
+    .trim();
 }
 function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefined {
   if (!event.terminalId) return undefined;

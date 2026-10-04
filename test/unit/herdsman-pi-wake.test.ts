@@ -262,9 +262,51 @@ describe("Pi agent wake projection", () => {
     expect(formatted).not.toContain("herdsman agent read");
     expect(outcomes[0]).toMatchObject({ agent: "claude", name: "reviewer" });
     expect(formatted).toContain("- completed reviewer · Claude wB:p2");
-    expect(formatted).toContain("last assistant: finished with evidence");
+    // Newlines survive normalization, and only the whitespace at the end of a
+    // line is dropped: the line that follows the break keeps its indentation and
+    // its inline whitespace, so a code block still reads as one.
+    expect(formatted).toContain("last assistant: finished\n  with   evidence");
     expect(formatted).toContain("event: 12");
     expect(formatted).not.toContain("240");
+  });
+
+  test("preserves indentation and markdown structure while collapsing padded blank lines", () => {
+    const text = [
+      "# 标题",
+      "",
+      "",
+      "正文   含   多空格\t和\ttab",
+      "",
+      "- 列表项 A",
+      "- 列表项 B",
+    ].join("\n");
+    const [outcome] = projectAgentOutcomes([event(52, "agent.done", {}, { text })]).outcomes;
+    // Line breaks and the markdown headings/list markers survive normalization ...
+    expect(outcome?.text).toContain("\n");
+    expect(outcome?.text).toContain("# 标题");
+    expect(outcome?.text).toContain("- 列表项 A");
+    // ... a run of newlines collapses to a single blank line ...
+    expect(outcome?.text).toContain("# 标题\n\n正文");
+    expect(outcome?.text).not.toMatch(/\n{3,}/);
+    // ... and whitespace inside a line (indentation, inline runs of spaces and
+    // tabs) is kept as it is, because it is what makes the excerpt readable.
+    expect(outcome?.text).toContain("\n正文   含   多空格\t和\ttab");
+    expect(outcome?.text).toContain("\n- 列表项 A\n- 列表项 B");
+  });
+
+  test("normalises CRLF, U+2028/U+2029 and NEL to LF and folds whitespace-only lines", () => {
+    // A "blank" line padded with spaces used to defeat the 3+ newline collapse,
+    // and NEL (U+0085) used to be deleted as an unprintable control byte.
+    const text = ["def f(x):", "   \t ", "    return x + 1", "", "  \t  ", "done"].join("\n");
+    const [padded] = projectAgentOutcomes([event(60, "agent.done", {}, { text })]).outcomes;
+    expect(padded?.text).toBe("def f(x):\n\n    return x + 1\n\ndone");
+
+    const separators = "first\r\nsecond\u2028third\u2029fourth\u0085fifth";
+    const [lines] = projectAgentOutcomes([
+      event(61, "agent.done", {}, { text: separators }),
+    ]).outcomes;
+    expect(lines?.text).toBe("first\nsecond\nthird\nfourth\nfifth");
+    expect(lines?.text).not.toContain("\u0085");
   });
 
   test("falls back to kind for unnamed or malformed live names", () => {

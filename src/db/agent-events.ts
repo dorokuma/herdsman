@@ -242,6 +242,7 @@ export class AgentEventStore {
   }
 
   invalidatePane(input: {
+    acknowledgeDelivered?: boolean;
     herdrSessionName: string;
     paneId: string;
     paneGeneration?: string | null;
@@ -259,6 +260,7 @@ export class AgentEventStore {
    * with respect to other concurrent writers.
    */
   invalidatePaneDirect(input: {
+    acknowledgeDelivered?: boolean;
     herdrSessionName: string;
     paneId: string;
     paneGeneration?: string | null;
@@ -268,6 +270,7 @@ export class AgentEventStore {
   }
 
   #invalidatePaneCore(input: {
+    acknowledgeDelivered?: boolean;
     herdrSessionName: string;
     paneId: string;
     paneGeneration?: string | null;
@@ -285,6 +288,26 @@ export class AgentEventStore {
     const legacyOrMatchedParams = legacy
       ? []
       : [input.paneGeneration ?? null, input.paneGeneration ?? null];
+    if (input.acknowledgeDelivered) {
+      // 步骤 0（仅显式关页）：已经投递过的行一律按「隐含消费」ack 掉。
+      // 显式关 Tab 是用户主动收尾，编排者早已拿到这份更新（哪怕是通过 pane read
+      // 带外读的，于是扩展侧永远不会 ack），此时再走步骤 2 的关页保留，就等于把一条
+      // delivered-forever 的行留在表里：daemon 按 300s 窗口无限重投，主会话的
+      // wakeAwaitingConsumption 永不清空、持续驱动空续传——线上正是这样被刷屏的。
+      // 宁可漏一条更新，也不能让一个已关闭的 pane 无限重投。
+      //
+      // 只认 delivery_attempts >= 1（投递过的行）：从未投递的行仍然值得一次投递机会，
+      // 由步骤 2 的保留规则照旧处理。崩溃/掉线路径（reconciler、reclaimDelivered）不经过
+      // 这里，保留语义不变。
+      this.#sqlite
+        .prepare(
+          `update agent_events
+              set status = 'acked', deliverable = 0, invalidated_reason = null
+            where herdr_session_name = ? and pane_id = ? and status in ('pending', 'delivered')
+              and delivery_attempts >= 1 and ${legacyOrMatched}`,
+        )
+        .run(input.herdrSessionName, input.paneId, ...legacyOrMatchedParams);
+    }
     this.#sqlite
       .prepare(
         `update agent_events
@@ -298,6 +321,8 @@ export class AgentEventStore {
     // agent.failed 则以 delivery_attempts = 0（尚未投递过）为界——失败结果常常
     // 是在 pane/agents 行已经消失之后才写出来的，必须有一轮投递机会。
     // agent.discarded 不保留。
+    // 显式关页（acknowledgeDelivered）已在步骤 0 把投递过的行 ack 掉，所以这里的
+    // 保留规则只会命中「从未投递过」的行；崩溃/掉线路径不看这个开关，语义不变。
     const genCondition = legacy ? "1 = 1" : "pane_generation = ?";
     const genParams = legacy ? [] : [input.paneGeneration ?? null];
     this.#sqlite
