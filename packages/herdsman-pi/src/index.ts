@@ -207,18 +207,29 @@ type HerdsmanState = {
    */
   wakeSkipLogReasons: Map<number, string>;
   /**
-   * Continuation drives already spent on the current unconsumed delivery.
+   * Continuation drives already spent, keyed by event id.
    *
-   * Reset when a delivery is handed over and when the unconsumed set empties, so
-   * the bound applies per delivery instead of accumulating for the session.
-   */
-  wakeContinuationAttempts: number;
   /**
    * Event content queued for a busy orchestrator. Injected through the
    * `context` hook so the running turn sees the update without being
    * interrupted.
+   * The bound is per event, never per delivery and never per session: an
+   * unrelated event being injected must not hand a stuck one a fresh budget. A
+   * session that keeps receiving new updates used to reset a shared counter at
+   * every injection, so the one id no run ever drained drove on unboundedly and
+   * `MAX_WAKE_CONTINUATION_ATTEMPTS` never fired — the loop that flooded the
+   * orchestrator session with empty turns.
+   *
+   * `MAX_WAKE_CONTINUATION_ATTEMPTS` is therefore a hard ceiling per id: the
+   * drive that reaches it writes that id off
+   * (`writeOffStrandedWakeDelivery`), and an id that still has drives left keeps
+   * both its copy and its count even when a sibling is written off next to it.
+   *
+   * An entry leaves the map with the id itself: acknowledged, dead-lettered,
+   * consumed (its copy reached the transcript), or a role/scope reset.
    */
   wakeContext: { content: string; eventIds: number[] } | undefined;
+  wakeContinuationDrives: Map<number, number>;
   wakeRequested: boolean;
   wakeRequestedThroughEventId: number;
   wakeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -285,17 +296,23 @@ export const WAKE_BUSY_SPIN_MS = 100;
  */
 export const WAKE_DEFERRED_TIMEOUT_MS = 5_000;
 /**
- * Upper bound on the continuation drives spent on one unconsumed wake delivery.
+ * Upper bound on the continuation drives spent on **one** unconsumed wake
+ * event id.
  *
  * Every drive costs a full agent run, so the budget is deliberately small: three
  * attempts already cover the drive that follows the settlement which missed Pi's
  * follow-up queue plus two retries after intervening runs that also ended before
  * their stop point, and five adds margin for a run that spent its stop point on
  * a tool call. Beyond that the cause is systemic — the runs keep ending early, so
- * starting another one could only produce another empty turn — and the delivery
- * is written off instead (`writeOffStrandedWakeDelivery`): the ids leave
- * `wakeAwaitingConsumption` and are acknowledged, which stops both the
+ * starting another one could only produce another empty turn — and that id is
+ * written off instead (`writeOffStrandedWakeDelivery`): it leaves
+ * `wakeAwaitingConsumption` and is acknowledged, which stops both the
  * continuation loop and the daemon's redelivery of the same event.
+ *
+ * The bound is per event id (`wakeContinuationDrives`) and is never reset by a
+ * later injection: a session that keeps receiving new updates must not hand an
+ * already-stuck id a fresh ceiling, or the loop it was meant to stop continues
+ * for exactly the events that are stuck.
  *
  * The trade-off is deliberate and asymmetric: losing one agent update is
  * recoverable (the agent is still there and its transcript can be read
@@ -406,8 +423,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       wakeConsumptionObserved: new Set(),
       wakeSuppressedEventIds: new Set(),
       wakeSkipLogReasons: new Map(),
-      wakeContinuationAttempts: 0,
       wakeContext: undefined,
+      wakeContinuationDrives: new Map(),
       wakeRequested: false,
       wakeRequestedThroughEventId: 0,
       wakeTimer: undefined,
@@ -516,7 +533,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.wakeAwaitingConsumption.delete(eventId);
       state.wakeConsumptionObserved.delete(eventId);
       state.wakeSuppressedEventIds.delete(eventId);
-      if (state.wakeAwaitingConsumption.size === 0) state.wakeContinuationAttempts = 0;
+      // The id can no longer owe a drive, so its own budget leaves with it.
+      state.wakeContinuationDrives.delete(eventId);
     };
 
     /**
@@ -556,7 +574,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.wakeAwaitingConsumption.clear();
       state.wakeConsumptionObserved.clear();
       state.wakeSkipLogReasons.clear();
-      state.wakeContinuationAttempts = 0;
+      state.wakeContinuationDrives.clear();
     };
 
     const pruneAcknowledgedEvents = (ackedEventId: number | undefined) => {
@@ -958,10 +976,12 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         // of the same id out of the transcript.
         state.presentedEventIds.add(eventId);
       }
-      // Fresh budget for whatever is still awaiting consumption: the ids just
-      // written off are gone, and the ones that remain have not had their own
-      // MAX_WAKE_CONTINUATION_ATTEMPTS drives spent on them yet.
-      state.wakeContinuationAttempts = 0;
+      // The written-off ids can no longer owe a drive, so their budgets leave
+      // with them. Every id that is still awaiting consumption keeps its own
+      // budget: it has not spent its own MAX_WAKE_CONTINUATION_ATTEMPTS drives
+      // yet, and resetting it here is what used to let a sibling's fresh budget
+      // cover for an unrelated stuck id.
+      for (const eventId of eventIds) state.wakeContinuationDrives.delete(eventId);
       const stranded = eventIds
         .map((eventId) => state.unackedDelivered.get(eventId))
         .filter((event): event is AgentEventWireRecord => event !== undefined)
@@ -998,17 +1018,25 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      *
      * Only consumption evidence writes a delivery off, so an intervening run that
      * ends before its stop point (error, user abort, a refused tool) leaves the
-     * next settlement driving again. That is bounded by
-     * MAX_WAKE_CONTINUATION_ATTEMPTS: starting runs cannot fix a cause that is
-     * not about the queue, so once the budget is spent the delivery is written
-     * off (released and acknowledged) instead of looping forever — see
+     * next settlement driving again. That bound is per event id and nothing
+     * resets it: starting runs cannot fix a cause that is not about the queue, so
+     * once an id's own budget is spent the id is written off (released and
+     * acknowledged) instead of looping forever — see
      * `writeOffStrandedWakeDelivery` for the trade-off.
      */
     const driveWakeContinuation = (ctx: PiContext) => {
       if (state.wakeAwaitingConsumption.size === 0) return;
       if (!pi.sendMessage) return;
       const eventIds = [...state.wakeAwaitingConsumption].sort((left, right) => left - right);
-      state.wakeContinuationAttempts += 1;
+      // Every id that is still waiting spends one drive of its own budget. The
+      // counters are keyed by event id and are never reset by an injection, so a
+      // delivery handed over later cannot buy an already-stuck id a fresh budget.
+      const spent: number[] = [];
+      for (const eventId of eventIds) {
+        const drives = (state.wakeContinuationDrives.get(eventId) ?? 0) + 1;
+        state.wakeContinuationDrives.set(eventId, drives);
+        spent.push(drives);
+      }
       try {
         pi.sendMessage(
           {
@@ -1020,21 +1048,27 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         );
         logHerdsmanPi(
           "info",
-          `[herdsman-pi] wake continuation driven eventIds=${eventIds[0] ?? 0}-${eventIds.at(-1) ?? 0} count=${eventIds.length} attempt=${state.wakeContinuationAttempts}`,
+          `[herdsman-pi] wake continuation driven eventIds=${eventIds[0] ?? 0}-${eventIds.at(-1) ?? 0} count=${eventIds.length} drives=${spent.join(",")}`,
         );
       } catch {
         logHerdsmanPi("warn", "[herdsman-pi] wake continuation refused by pi");
       }
-      if (state.wakeContinuationAttempts >= MAX_WAKE_CONTINUATION_ATTEMPTS) {
-        // This was the last drive the budget allows, and the queued copy is still
-        // undrained: the delivery is written off instead of being left pending
-        // forever. The ids are released from `wakeAwaitingConsumption` (no further
-        // run is started for them) and acknowledged, which is what stops the
-        // daemon from redelivering them every freshness window — the loop that
-        // used to flood the orchestrator session until manual sqlite surgery.
-        // Losing one update is the accepted cost; see
-        // `writeOffStrandedWakeDelivery`.
-        writeOffStrandedWakeDelivery([...state.wakeAwaitingConsumption], ctx);
+      // Only the ids whose own budget this drive spent are written off. A sibling
+      // that still has drives left keeps its copy in the queue and its count, so
+      // it is neither lost nor granted a fresh ceiling.
+      const exhausted = eventIds.filter(
+        (_eventId, index) => (spent[index] ?? 0) >= MAX_WAKE_CONTINUATION_ATTEMPTS,
+      );
+      if (exhausted.length > 0) {
+        // This was the last drive the id's own budget allows, and the queued copy
+        // is still undrained: the id is written off instead of being left
+        // pending forever. The ids are released from
+        // `wakeAwaitingConsumption` (no further run is started for them) and
+        // acknowledged, which is what stops the daemon from redelivering them
+        // every freshness window — the loop that used to flood the orchestrator
+        // session until manual sqlite surgery. Losing one update is the accepted
+        // cost; see `writeOffStrandedWakeDelivery`.
+        writeOffStrandedWakeDelivery(exhausted, ctx);
       }
     };
 
@@ -1278,10 +1312,16 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             // `driveWakeContinuation`), and until the content is seen in the
             // transcript the delivery is neither acknowledged nor injected again.
             if (orchestratorBusy) {
+              // A freshly queued id starts its own continuation budget; an id that
+              // was already awaiting consumption (merged into this batch from an
+              // earlier injection) keeps the drives it already spent. Only a new
+              // id may get a fresh ceiling — never an unrelated one.
               for (const outcome of batchOutcomes) {
                 state.wakeAwaitingConsumption.add(outcome.eventId);
+                if (!state.wakeContinuationDrives.has(outcome.eventId)) {
+                  state.wakeContinuationDrives.set(outcome.eventId, 0);
+                }
               }
-              state.wakeContinuationAttempts = 0;
             }
             // A queued (non-triggering) delivery keeps the content available to
             // the current turn through the context hook until it is settled or
@@ -1836,6 +1876,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         }
         for (const eventId of consumedEventIds) {
           state.wakeAwaitingConsumption.delete(eventId);
+          // Its copy reached the transcript, so the id owes no drive any more and
+          // its budget leaves with it.
+          state.wakeContinuationDrives.delete(eventId);
           // The content reached the transcript, so this id counts as presented from
           // now on: a daemon redelivery of it (it is still unacknowledged whenever
           // its batch was already dropped) must not inject the same update again.
@@ -1847,7 +1890,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           // Only an id the daemon can still be told about is worth remembering.
           if (state.unackedDelivered.has(eventId)) state.wakeConsumptionObserved.add(eventId);
         }
-        if (state.wakeAwaitingConsumption.size === 0) state.wakeContinuationAttempts = 0;
       }
       if (message.role !== "assistant") return;
       const stopReason = stringValue(message.stopReason);

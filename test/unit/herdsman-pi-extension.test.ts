@@ -2322,6 +2322,95 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
+  test("keeps a stuck event's drive budget when unrelated new events are injected", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: false });
+    const previous = withHerdrEnv();
+    const wakeDrives = () =>
+      pi.hiddenMessages.filter(([message]) => message.customType === "herdsman-wake-continuation")
+        .length;
+    const wakeInjections = () =>
+      pi.hiddenMessages.filter(([message]) => message.customType === "herdsman-wake-context");
+    const ackedIds = () =>
+      client.calls
+        .filter(([method]) => method === "agent.notifications.ack")
+        .map(([, params]) => (params as { eventId: number }).eventId);
+    const stuckNotices = () =>
+      ctx.notifications.filter(([text]) => String(text).includes("could not be delivered"));
+    const { MAX_WAKE_CONTINUATION_ATTEMPTS } = (await import(extensionModuleUrl)) as Module;
+    try {
+      await startExtension(client, pi, ctx);
+      await pi.emit("agent_start", {}, ctx);
+      client.emitStream({ method: "agent.event", params: { event: event(301, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(5_100);
+      expect(wakeInjections()).toHaveLength(1);
+      expect(wakeInjections()[0]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
+
+      // The stuck event (301) is never drained, and a brand-new event arrives
+      // before every settlement. Each new event is itself injected as a queued
+      // follow-up once the 5s hard deadline releases it, so the delivery queue
+      // grows while 301 stays unconsumed. Under the shared counter this reset the
+      // budget to 0 at every injection, so 301 drove on forever and the 5-drive
+      // circuit breaker never fired.
+      let nextEventId = 302;
+      for (let drive = 1; drive <= MAX_WAKE_CONTINUATION_ATTEMPTS; drive += 1) {
+        await pi.emit("agent_start", {}, ctx);
+        await pi.emit("message_end", assistantMessage("error"), ctx);
+        await pi.emit("agent_settled", {}, ctx);
+        expect(wakeDrives()).toBe(drive);
+
+        if (drive === MAX_WAKE_CONTINUATION_ATTEMPTS) break;
+        client.emitStream({
+          method: "agent.event",
+          params: { event: event(nextEventId, "term_agent") },
+        });
+        await vi.advanceTimersByTimeAsync(5_100);
+        nextEventId += 1;
+      }
+
+      // 301 reached its own ceiling and is written off: released, acknowledged
+      // once, and never injected again — even though five further events were
+      // injected into the same session in the meantime.
+      expect(ackedIds()).toEqual([301]);
+      expect(stuckNotices()).toHaveLength(1);
+      expect(
+        wakeInjections().filter(([message]) =>
+          (message.details as { presentedEventIds?: number[] }).presentedEventIds?.includes(301),
+        ),
+      ).toHaveLength(1);
+      expect(wakeInjections()).toHaveLength(MAX_WAKE_CONTINUATION_ATTEMPTS);
+
+      // The siblings that were injected alongside it keep their own (smaller)
+      // budgets: they are neither lost nor granted a fresh ceiling, so a later
+      // settlement drives them — 301 is never driven again.
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("error"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(wakeDrives()).toBe(MAX_WAKE_CONTINUATION_ATTEMPTS + 1);
+      // 302 only reaches its own ceiling now, one settlement after 301; the ids
+      // are written off on their own budget, each exactly once.
+      expect(ackedIds()).toEqual([301, 302]);
+      expect(new Set(ackedIds()).size).toBe(ackedIds().length);
+
+      // And 301 never comes back: no further drive, no further injection, no
+      // second acknowledgement — the 54346-style flood is bounded. The siblings
+      // keep draining on their own budgets (one write-off per settlement), but
+      // 301 is acknowledged exactly once across all of them.
+      await vi.advanceTimersByTimeAsync(30_000);
+      await pi.emit("agent_settled", {}, ctx);
+      await vi.advanceTimersByTimeAsync(30_000);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(ackedIds().filter((eventId) => eventId === 301)).toEqual([301]);
+      expect(wakeInjections()).toHaveLength(MAX_WAKE_CONTINUATION_ATTEMPTS);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
   test("writes off a stuck wake once the continuation budget is spent, without re-injecting it", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
