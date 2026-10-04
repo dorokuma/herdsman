@@ -7,7 +7,6 @@ export { logHerdsmanPi };
 export type { HerdsmanPiLogLevel } from "./logger.js";
 
 import {
-  type AgentContextListItem,
   type AgentEventWireRecord,
   type AgentOrchestratorChanged,
   type AgentOrchestratorWireState,
@@ -105,7 +104,6 @@ type HerdsmanState = {
   launchIdentity: LaunchIdentity | undefined;
   latestContext: AgentWorkspaceContextSnapshot | undefined;
   pendingEvents: AgentEventWireRecord[];
-  pinnedContext: AgentWorkspaceContextSnapshot | undefined;
   presentedEventIds: Set<number>;
   reconnectingFromOn: boolean;
   registrationInFlight: Promise<void> | undefined;
@@ -402,7 +400,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       launchIdentity: undefined,
       latestContext: undefined,
       pendingEvents: [],
-      pinnedContext: undefined,
       presentedEventIds: new Set(),
       reconnectingFromOn: false,
       registrationInFlight: undefined,
@@ -473,7 +470,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     const clearAgentContext = () => {
       state.latestContext = undefined;
-      state.pinnedContext = undefined;
       state.runActive = false;
     };
 
@@ -1645,23 +1641,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.currentScope.workspaceId === message.params.workspaceId
         ) {
           const next = message.params.context ?? undefined;
-          const retain = (snapshot: AgentWorkspaceContextSnapshot | undefined) =>
-            snapshot
-              ? {
-                  ...snapshot,
-                  agents: snapshot.agents.flatMap((agent) => {
-                    const nextAgents =
-                      next?.agents.filter((candidate) => candidate.paneId === agent.paneId) ?? [];
-                    if (nextAgents.length === 0) return [];
-                    const nextAgent = nextAgents.find(
-                      (candidate) => !agent.id || !candidate.id || agent.id === candidate.id,
-                    );
-                    return nextAgent ? [nextAgent] : [];
-                  }),
-                }
-              : undefined;
           state.latestContext = next;
-          state.pinnedContext = retain(state.pinnedContext);
         }
         return;
       }
@@ -1917,43 +1897,25 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       // the next user message.
       if (state.runActive) return;
       state.runActive = true;
-      state.pinnedContext =
-        state.isOrchestrator && !state.deliveredBatch?.herdsmanTriggered
-          ? state.latestContext
-          : undefined;
     });
 
     pi.on("context", (event: { messages: PiAgentMessage[] }) => {
+      // The wake content rides the single follow-up track and is never pinned
+      // into the context here, so this hook injects nothing at all. What it
+      // still does is drop herdsman's own context/wake entries from the
+      // incoming list: a session replayed from disk can carry an old
+      // `[HERDSMAN AGENT CONTEXT]` preview (its truncated one-line reports
+      // repeatedly read as cut-off reports, and live board state is queried
+      // through herdr), so those entries are filtered out instead of being
+      // re-served to the model. The wake message itself
+      // (`herdsman-wake-context`, the full report text) is not filtered - it is
+      // the evidence the turn acts on.
       const messages = event.messages.filter((message) => !isNormalHerdsmanContext(message));
-      const additions: PiAgentMessage[] = [];
-      const snapshot = state.pinnedContext;
-      if (snapshot && snapshot.agents.length > 0) {
-        additions.push({
-          content: formatHiddenAgentContext({
-            agents: snapshot.agents,
-            workspaceId: snapshot.workspaceId,
-          }),
-          customType: "herdsman-agent-context",
-          display: false,
-          role: "custom",
-          timestamp: Date.now(),
-        });
-      }
-      // A wake queued for a busy orchestrator is delivered on the same single
-      // track as an idle one: the follow-up message. A busy run cannot act on
-      // an extra copy through this hook, so the hook only ever supplies the
-      // cached agent context here and the wake content is never pinned a second
-      // time.
-      //
-      // Deduplication stays in place: herdsman's own context/wake entries are
-      // dropped from the incoming list, so at most one copy of each entry is
-      // present per call.
-      return additions.length === 0 ? { messages } : { messages: [...messages, ...additions] };
+      return { messages };
     });
 
     pi.on("agent_settled", async (_event: unknown, ctx: PiContext) => {
       state.runActive = false;
-      state.pinnedContext = undefined;
       // A wake delivered as a queued follow-up is drained only when a run reaches
       // its stop point. If the run that received it settled without draining it,
       // no further run exists to carry the update out: drive a continuation (up to
@@ -2037,62 +1999,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 }
 
 export default createHerdsmanPiExtension();
-
-export function formatHiddenAgentContext(input: {
-  agents: AgentContextListItem[];
-  workspaceId: string;
-}): string {
-  return [
-    "[HERDSMAN AGENT CONTEXT]",
-    `Current Herdr workspace: ${input.workspaceId}`,
-    ...input.agents.map((agent) => {
-      const history = agent.history ?? {};
-      const identity = agentIdentityLabel({
-        agent: agent.agent ?? "unknown",
-        name: agent.name,
-      });
-      const paneId = agent.paneId ?? "unknown";
-      const status = agent.agentStatus ?? "unknown";
-      const prefix = `- ${identity} ${paneId} ${status}`;
-
-      const rawAgent = record(agent);
-      const tabTitleCandidate =
-        stringValue(rawAgent.terminalTitle) ?? stringValue(rawAgent.label);
-      const tabTitleCleaned =
-        tabTitleCandidate !== null ? sanitizeAndCleanContextText(tabTitleCandidate) : "";
-      const tabTitle =
-        tabTitleCleaned.length > 0 ? truncateSummary(tabTitleCleaned, 60) : null;
-
-      const rawHistory = record(history);
-      const lastAssistantRecord = record(history.lastAssistantMessage);
-      const timeCandidate =
-        lastAssistantRecord.timestamp ??
-        history.updatedAt ??
-        rawHistory.updatedAt ??
-        rawAgent.updatedAt ??
-        rawAgent.time;
-      const formattedTime = formatTimestamp(timeCandidate);
-
-      const assistantRaw = history.lastAssistantMessage?.text;
-      const assistantCleaned =
-        assistantRaw !== undefined && assistantRaw !== null
-          ? sanitizeAndCleanContextText(assistantRaw)
-          : "";
-      const assistantSummary =
-        assistantCleaned.length > 0 ? truncateSummary(assistantCleaned, 100) : null;
-
-      const segments = [
-        prefix,
-        tabTitle,
-        formattedTime,
-        assistantSummary,
-      ].filter((segment): segment is string => segment !== null && segment.length > 0);
-
-      return segments.join(" · ");
-    }),
-    "Use herdsman agent get/read if details are needed.",
-  ].join("\n");
-}
 
 export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string {
   return [
@@ -2197,34 +2103,5 @@ function sanitizeAndCleanContextText(value: string): string {
   if (!preCleaned) return "";
   const sanitized = sanitizeText(preCleaned).text;
   return cleanContextText(sanitized);
-}
-
-function truncateSummary(value: string, limit = 100): string {
-  if (value.length <= limit) return value;
-  const maxSearch = Math.min(value.length, limit + 8);
-  const searchSlice = value.slice(0, maxSearch);
-  const lastSpaceIndex = searchSlice.search(/\s[^\s]*$/);
-  if (lastSpaceIndex >= limit - 20) {
-    return `${value.slice(0, lastSpaceIndex)}…`;
-  }
-  return `${value.slice(0, limit)}…`;
-}
-
-function formatTimestamp(value: unknown): string | null {
-  if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (/^\d{2}:\d{2}:\d{2}$/.test(trimmed)) return trimmed;
-    if (/^\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/.test(trimmed)) return trimmed;
-  }
-  if (!value) return null;
-  const date = value instanceof Date ? value : new Date(value as string | number);
-  if (Number.isNaN(date.getTime())) return null;
-  const pad = (n: number) => String(n).padStart(2, "0");
-  const month = pad(date.getMonth() + 1);
-  const day = pad(date.getDate());
-  const hours = pad(date.getHours());
-  const minutes = pad(date.getMinutes());
-  const seconds = pad(date.getSeconds());
-  return `${month}-${day} ${hours}:${minutes}:${seconds}`;
 }
 
