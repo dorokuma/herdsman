@@ -8,7 +8,7 @@ superseded: ""
 
 # 幽灵唤醒修复的遗留观察项（ghost wake fix follow-ups）
 
-依据：幽灵唤醒修复提交 `2bad14f`（`fix(herdsman-pi): end ghost wake loops by writing off stranded deliveries`，分支 `fix/wake-excerpt-and-redelivery`，7 文件 +333/−117）、双审结论（reviewer PASS + oracle 同意）。本笔记登记双审与上线过程产生的 7 项观察/建议（a–g），全部非阻塞；经用户过目后落盘。
+依据：幽灵唤醒修复提交 `2bad14f`（`fix(herdsman-pi): end ghost wake loops by writing off stranded deliveries`，分支 `fix/wake-excerpt-and-redelivery`，7 文件 +333/−117）、双审结论（reviewer PASS + oracle 同意）。本笔记登记双审与上线过程产生的 7 项观察/建议（a–g），全部非阻塞；经用户过目后落盘。其中观察项 5「部署身份错位」已随 0.14.1 完整发布对齐（见该条与 `.agents/notes/20261004-release-0.14.1.md`），其余 6 项仍为未处置观察。
 
 ## 一句话结论
 
@@ -45,10 +45,11 @@ superseded: ""
    - 现状：显式关页的隐含消费 ack 无任何日志，线上无法确认该路径真的在生效。
    - 后续：补一行 `console.warn`（或 daemon 既有日志设施）记录被隐含消费的 eventIds，低优先级。
 
-5. **部署身份错位：已部署字节曾与任何版本号对不上（oracle 观察）**
+5. **部署身份错位：已部署字节曾与任何版本号对不上（oracle 观察）——已对齐**
    - 位置：生产部署面（本修复为应急部署，字节落在 commit 之前）。
-   - 现状：已部署字节在 commit 前与任何已发布版本号都对不上，违背「版本号即部署身份」口径。
-   - 后续：commit 后尽快走 `docs/releasing.md` 完整发布流程（`@dorokuma/herdsman` 与 `@dorokuma/herdsman-pi` 两包发布 + `v<version>` tag 推远端 + registry 钉版本部署），对齐部署身份。
+   - 现状：~~已部署字节在 commit 前与任何已发布版本号都对不上，违背「版本号即部署身份」口径。~~
+   - 处置：**已对齐（2026-10-04T08:11Z）**。commit `2bad14f` 经分支 `fix/wake-excerpt-and-redelivery` 合入 main（fast-forward `5d6d6b9`）后走 `docs/releasing.md` 完整发布：release commit `05ef5ab`（`chore(release): 0.14.1`），tag `v0.14.1` 已推远端（剥离指向 `05ef5ab`），`@dorokuma/herdsman` 与 `@dorokuma/herdsman-pi` 两包 0.14.1 均已发布且 `latest` 已推进；随后按 registry 单一渠道钉版本部署（`npm install --global @dorokuma/herdsman@0.14.1 @dorokuma/herdsman-pi@0.14.1` + `systemctl restart herdsman.service`），部署后核对（版本 / MainPID 3472026→3510442 / `herdsman daemon status` / `herdsman agent list` / 优雅关停 `exitCode: 0`）全部通过。发布落地事实详见 `.agents/notes/20261004-release-0.14.1.md`。
+   - 后续：无遗留；线上版本号（0.14.1）与 registry 发布物、tag、commit 一一对应，「版本号即部署身份」口径恢复。
 
 6. **换行保留后大代码块全量进 wake 文本，token 成本上升（oracle 观察，暂不改）**
    - 位置：`packages/herdsman-pi/src/wake.ts` `normalizeExcerpt`（显式声明「No length cap is applied here」）。
