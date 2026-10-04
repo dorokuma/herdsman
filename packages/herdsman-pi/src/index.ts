@@ -121,30 +121,20 @@ type HerdsmanState = {
    */
   unackedDelivered: Map<number, AgentEventWireRecord>;
   wakeDeferredUntilSettled: boolean;
-  /** Wall-clock start of the current bounded wake deferral, if any. */
-  wakeDeferredSince: number | undefined;
   /**
-   * Set once the hard deferral budget elapsed: the next pass injects the batch
-   * from the current state instead of deferring again.
-   */
-  wakeForcedRelease: boolean;
-  /**
-   * Event ids handed to Pi as a *queued* (non-triggering) follow-up whose
-   * content has not been seen entering the transcript yet.
+   * Event ids handed to Pi as a follow-up whose content has not been seen
+   * entering the transcript yet.
    *
-   * A wake injected while the orchestrator streams is parked in the agent's
-   * follow-up queue, and Pi only drains that queue when a run reaches its stop
-   * point. When the run it rode on already passed that point, the update sits in
-   * the queue until the next user message. This set is what keeps such a
-   * delivery from being written off, and it carries three guarantees at once:
+   * A wake is only ever injected into an idle orchestrator, and it always
+   * triggers its own turn, so the copy Pi holds is a normal turning message
+   * rather than a queued follow-up nothing may drain. This set is what keeps such
+   * an in-flight delivery out of both the acknowledgement path and the
+   * transcript, and it carries three guarantees at once:
    *
-   * - never lost: while it is non-empty the settlement drives a continuation
-   *   (bounded by MAX_WAKE_CONTINUATION_ATTEMPTS drives) so a later run drains
-   *   the queue and carries the update out. The bound is a real ceiling, not a
-   *   suggestion: once it is spent the ids are released from here and
-   *   acknowledged (`writeOffStrandedWakeDelivery`), because an update that no
-   *   turn will ever carry out must not keep a run loop — and the daemon's
-   *   redelivery of it — alive forever;
+   * - never lost: while it is non-empty the next settlement leaves the id
+   *   pending, so the next `scheduleWake` re-presents it (with the real update
+   *   content, never with an empty marker run) instead of parking it in a
+   *   follow-up queue nothing drains;
    * - never acknowledged unseen: these ids are excluded from the acknowledgement
    *   path, so the daemon keeps them pending and redelivers them when this
    *   session never consumes them (the only way a delivery Pi itself dropped —
@@ -157,7 +147,10 @@ type HerdsmanState = {
    * evidence: the hidden wake message's `message_end`, which then moves them to
    * `wakeConsumptionObserved`) or when the event leaves the delivery queue for
    * good (acknowledged, covered by the acknowledgement watermark,
-   * dead-lettered), and with the delivery queue on a role/scope reset.
+   * dead-lettered), and with the delivery queue on a role/scope reset. A
+   * settlement that saw no evidence dead-letters them: it lifts the injection
+   * barrier (via `wakeRetryableEventIds`) but not the watermark one, because the
+   * content was never confirmed.
    */
   wakeAwaitingConsumption: Set<number>;
   /**
@@ -205,24 +198,22 @@ type HerdsmanState = {
    */
   wakeSkipLogReasons: Map<number, string>;
   /**
-   * Continuation drives already spent, keyed by event id.
+   * Ids whose delivery was dead-lettered and which a later wake must be allowed
+   * to present again.
    *
-   * The bound is per event, never per delivery and never per session: an
-   * unrelated event being injected must not hand a stuck one a fresh budget. A
-   * session that keeps receiving new updates used to reset a shared counter at
-   * every injection, so the one id no run ever drained drove on unboundedly and
-   * `MAX_WAKE_CONTINUATION_ATTEMPTS` never fired — the loop that flooded the
-   * orchestrator session with empty turns.
+   * `wakeAwaitingConsumption` deliberately keeps holding these ids: unconfirmed
+   * content must still block the acknowledgement watermark, because the daemon
+   * confirms by `where id <= ?` and letting a larger id through would swallow the
+   * dead-lettered one for good. What the write-off changes is only the *other*
+   * role of that set: an id that is still awaiting consumption is also barred
+   * from every later injection, and a dead-lettered one has to be presented
+   * again — it never reached the transcript, so a redelivery is the only remedy.
    *
-   * `MAX_WAKE_CONTINUATION_ATTEMPTS` is therefore a hard ceiling per id: the
-   * drive that reaches it writes that id off
-   * (`writeOffStrandedWakeDelivery`), and an id that still has drives left keeps
-   * both its copy and its count even when a sibling is written off next to it.
-   *
-   * An entry leaves the map with the id itself: acknowledged, dead-lettered,
-   * consumed (its copy reached the transcript), or a role/scope reset.
+   * An id leaves the set as soon as a wake hands it to Pi again (it is in flight
+   * once more, so the ordinary `awaiting` guard applies), when the daemon
+   * confirms it, or on a role/scope reset.
    */
-  wakeContinuationDrives: Map<number, number>;
+  wakeRetryableEventIds: Set<number>;
   wakeRequested: boolean;
   wakeRequestedThroughEventId: number;
   wakeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -281,51 +272,8 @@ export const ACK_BACKOFF_CAP_MS = 30_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
 /** Retry interval used while a wake cannot be injected (busy orchestrator). */
 export const WAKE_BUSY_SPIN_MS = 100;
-/**
- * Hard upper bound for every deferred wake. Once it elapses the scheduler stops
- * waiting for the orchestrator to become idle or for a settlement to arrive and
- * forces the injection decision from the current state, so a wake can never be
- * parked forever.
- */
-export const WAKE_DEFERRED_TIMEOUT_MS = 5_000;
-/**
- * Upper bound on the continuation drives spent on **one** unconsumed wake
- * event id.
- *
- * Every drive costs a full agent run, so the budget is deliberately small: three
- * attempts already cover the drive that follows the settlement which missed Pi's
- * follow-up queue plus two retries after intervening runs that also ended before
- * their stop point, and five adds margin for a run that spent its stop point on
- * a tool call. Beyond that the cause is systemic — the runs keep ending early, so
- * starting another one could only produce another empty turn — and that id is
- * written off instead (`writeOffStrandedWakeDelivery`): it leaves
- * `wakeAwaitingConsumption` and is acknowledged, which stops both the
- * continuation loop and the daemon's redelivery of the same event.
- *
- * The bound is per event id (`wakeContinuationDrives`) and is never reset by a
- * later injection: a session that keeps receiving new updates must not hand an
- * already-stuck id a fresh ceiling, or the loop it was meant to stop continues
- * for exactly the events that are stuck.
- *
- * The trade-off is deliberate and asymmetric: losing one agent update is
- * recoverable (the agent is still there and its transcript can be read
- * directly), while an unbounded continuation loop floods the orchestrator
- * session with empty turns and makes it unusable. A missed update is therefore
- * strictly better than an endless one.
- */
-export const MAX_WAKE_CONTINUATION_ATTEMPTS = 5;
 /** `customType` of the hidden wake context this extension injects. */
 const WAKE_CONTEXT_CUSTOM_TYPE = "herdsman-wake-context";
-/** `customType` of the hidden marker that drives a missed wake continuation. */
-const WAKE_CONTINUATION_CUSTOM_TYPE = "herdsman-wake-continuation";
-/**
- * Content of the continuation marker. Its only job is to start a run
- * (`triggerTurn: true`) so the run's loop drains the queued follow-up that was
- * never delivered; the wake content itself is not repeated here, so the
- * evidence is not presented twice.
- */
-const WAKE_CONTINUATION_CONTENT =
-  "[HERDSMAN WAKE CONTINUATION]\nA queued Herdsman agent update was not delivered by the previous turn; it follows this message. Handle it, and do not start unrelated work.";
 
 type AckFailureClass = "terminal" | "resync" | "transient";
 
@@ -409,13 +357,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       subscriberId: undefined,
       unackedDelivered: new Map(),
       wakeDeferredUntilSettled: false,
-      wakeDeferredSince: undefined,
-      wakeForcedRelease: false,
       wakeAwaitingConsumption: new Set(),
       wakeConsumptionObserved: new Set(),
       wakeSuppressedEventIds: new Set(),
       wakeSkipLogReasons: new Map(),
-      wakeContinuationDrives: new Map(),
+      wakeRetryableEventIds: new Set(),
       wakeRequested: false,
       wakeRequestedThroughEventId: 0,
       wakeTimer: undefined,
@@ -458,8 +404,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (state.wakeTimer) clearTimeout(state.wakeTimer);
       state.wakeTimer = undefined;
       state.wakeDeferredUntilSettled = false;
-      state.wakeDeferredSince = undefined;
-      state.wakeForcedRelease = false;
     };
 
     const cancelWake = () => {
@@ -519,8 +463,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.wakeAwaitingConsumption.delete(eventId);
       state.wakeConsumptionObserved.delete(eventId);
       state.wakeSuppressedEventIds.delete(eventId);
-      // The id can no longer owe a drive, so its own budget leaves with it.
-      state.wakeContinuationDrives.delete(eventId);
+      state.wakeRetryableEventIds.delete(eventId);
     };
 
     /**
@@ -560,7 +503,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.wakeAwaitingConsumption.clear();
       state.wakeConsumptionObserved.clear();
       state.wakeSkipLogReasons.clear();
-      state.wakeContinuationDrives.clear();
+      state.wakeRetryableEventIds.clear();
     };
 
     const pruneAcknowledgedEvents = (ackedEventId: number | undefined) => {
@@ -619,9 +562,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      * Whether an event was already handed to the orchestrator in this session and
      * therefore must not be injected again (logging why, at most once per reason).
      *
-     * - `awaiting`: a copy of it was handed over as a queued follow-up that no run
-     *   has drained yet, and the continuation is what carries it out (checked
-     *   first: for a queued copy this is the state that explains the redelivery);
+     * - `awaiting`: a copy of it was handed to Pi and has not been seen in the
+     *   transcript yet (a dead-lettered one is re-presentable instead, see
+     *   `wakeRetryableEventIds`, and is therefore checked first);
      * - `presented`: it was injected before (or its content has since been observed
      *   in the transcript), so a redelivery would duplicate it;
      * - `suppressed`: its copy may still sit in Pi's process-wide follow-up queue
@@ -629,6 +572,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      *   only one that must not be shown (see `wakeSuppressedEventIds`).
      */
     const alreadyPresented = (eventId: number): boolean => {
+      if (state.wakeRetryableEventIds.has(eventId)) {
+        // Its delivery was dead-lettered, so the content never reached the
+        // transcript: a redelivery is the only remedy and must not be skipped.
+        return false;
+      }
       if (state.wakeAwaitingConsumption.has(eventId)) {
         noteSkippedWakeInjection(eventId, "awaiting");
         return true;
@@ -847,29 +795,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     };
 
     /**
-     * Ends the current wake-deferral episode without injecting.
-     *
-     * `wakeForcedRelease` and `wakeDeferredSince` describe *one* bounded
-     * deferral: the released deadline is re-derived from `wakeDeferredSince`
-     * every time `scheduleDeferredWake` runs, so a stale pair would let an
-     * unrelated later wake bypass the busy gate. Every path that ends a wake
-     * pass without injecting clears both, which gives the next deferral its own
-     * full `WAKE_DEFERRED_TIMEOUT_MS` budget. The 5s hard deadline itself is
-     * unchanged: it is measured inside a single episode, and an episode that
-     * reaches it still force-releases the batch on its next pass.
-     */
-    const endWakeDeferral = () => {
-      state.wakeForcedRelease = false;
-      state.wakeDeferredSince = undefined;
-    };
-
-    /**
      * Event ids a hidden wake message proves to have reached the transcript.
      *
      * A wake injection names the outcomes it presents in
      * `details.presentedEventIds`, and Pi writes those details onto the session
-     * entry it emits on `message_end` (both for a triggered turn and when a run
-     * finally drains the queued follow-up). That emission is the only consumption
+     * entry it emits on `message_end`. That emission is the only consumption
      * evidence there is: nothing else tells us that the content — not merely the
      * request that carried it — reached the orchestrator.
      *
@@ -909,6 +839,13 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      * blocks the prefix: leaving it unacknowledged keeps it pending, which is what
      * lets the daemon redeliver the one copy that never arrived.
      *
+     * An id awaiting consumption is the in-flight state of a delivery that has been
+     * handed to Pi but whose `message_end` has not been seen yet. It blocks the
+     * prefix, and the settlement that still finds it there dead-letters it
+     * (`writeOffStrandedWakeDelivery`): the content never reached the transcript, so
+     * it must stay pending in the daemon and be eligible for the next wake instead
+     * of being confirmed by a heuristic.
+     *
      * An event whose own acknowledgement already failed is left out (the daemon's
      * cursor advance sweeps it, and a retry would reset its attempt/backoff
      * accounting), but it must not hold the prefix back: it stays in the queue until
@@ -927,7 +864,19 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const confirmablePrefix: AgentEventWireRecord[] = [];
       let blockedByMissingTurn = false;
       for (const event of deliveryQueue) {
-        if (state.wakeAwaitingConsumption.has(event.id)) break;
+        // An id that was handed to Pi and whose evidence has not arrived yet
+        // blocks the prefix: it has no evidence at all, and the settlement still
+        // owes it either that evidence (a run drains the copy) or a dead-letter.
+        // A dead-lettered id keeps blocking it for the same reason — unconfirmed
+        // content must never be swept by the watermark — while an id that is not
+        // awaiting consumption and not observed otherwise looks like a delivered,
+        // triggered prompt and would be confirmed by the turn heuristic.
+        if (
+          state.wakeAwaitingConsumption.has(event.id) ||
+          state.wakeRetryableEventIds.has(event.id)
+        ) {
+          break;
+        }
         if (!state.wakeConsumptionObserved.has(event.id) && !turnProducedFinalResponse) {
           blockedByMissingTurn = true;
           break;
@@ -939,161 +888,88 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         }
         confirmablePrefix.push(event);
       }
-      // Any id still awaiting consumption keeps the batch in flight: it owns the
-      // acknowledgement cursor, so the settlement of the run that finally drains
-      // the queued copy (the continuation driven by the settle handler) confirms it
-      // then. Reading the queue directly — instead of comparing two filtered lists —
-      // keeps that decision independent of the `attempts` exclusion above, which
-      // would otherwise hide an unconsumed id and drop the batch too early.
-      const stillAwaitingConsumption = deliveryQueue.some((event) =>
-        state.wakeAwaitingConsumption.has(event.id),
-      );
-      return { deliveryQueue, confirmablePrefix, blockedByMissingTurn, stillAwaitingConsumption };
+      // Nothing else keeps the batch in flight once the settlement has decided:
+      // any id that is still awaiting consumption has been dead-lettered above,
+      // which lifts only the injection barrier — it still blocks the watermark.
+      return { deliveryQueue, confirmablePrefix, blockedByMissingTurn };
     };
 
+    /**
+     * Dead-letters a wake delivery whose content never reached the transcript.
+     *
+     * The caller is a settlement that produced no consumption evidence for these
+     * ids: the injected message was never carried out by any run (the turn ended
+     * before its stop point, was aborted, or Pi dropped the message), so nothing
+     * may be told to the daemon about them. An acknowledgement is a statement
+     * that the orchestrator has the content, and here that statement would be a
+     * lie: the daemon would mark the event consumed and never redeliver it.
+     *
+     * What the write-off does is local only: the ids stop being barred from a
+     * later injection, so the next `scheduleWake` re-presents them with the real
+     * update content. They deliberately stay in `wakeAwaitingConsumption` (and
+     * therefore in the delivery queue): unconfirmed content must keep blocking
+     * the acknowledgement watermark, because the daemon confirms by
+     * `where id <= ?` and confirming a larger id would swallow them for good.
+     * The events themselves stay pending in the daemon: nothing was acknowledged,
+     * so a later wake is still eligible to present them, and a replacement
+     * session can still receive them.
+     *
+     * The presentation guard is deliberately *not* extended here:
+     * `presentedEventIds` is the "this content is in the transcript" set, and
+     * these ids have no evidence of ever being there. Writing them off would
+     * lock the update out of this session for good, which is exactly the
+     * "busy delivery never arrives" failure this replaces.
+     */
     const writeOffStrandedWakeDelivery = (eventIds: number[], ctx: PiContext): void => {
-      // Release first, acknowledge second: the release is what breaks the loop
-      // synchronously, while the acknowledgement is an RPC that may fail.
+      if (eventIds.length === 0) return;
       for (const eventId of eventIds) {
         state.wakeAwaitingConsumption.delete(eventId);
-        // This set only ever holds the id of a delivery that was already handed
-        // to Pi, so releasing it is not permission to present it again: the
-        // session-wide presented guard stays behind and keeps a daemon replay
-        // of the same id out of the transcript.
-        state.presentedEventIds.add(eventId);
+        // Unconfirmed content must still block the acknowledgement watermark: the
+        // daemon confirms by `where id <= ?`, so letting a later id through would
+        // swallow this one for good. The retry set is that barrier, and it is also
+        // what lifts the injection barrier — a delivery that never reached the
+        // transcript has to be presented again (see `alreadyPresented`).
+        state.wakeRetryableEventIds.add(eventId);
       }
-      // The written-off ids can no longer owe a drive, so their budgets leave
-      // with them. Every id that is still awaiting consumption keeps its own
-      // budget: it has not spent its own MAX_WAKE_CONTINUATION_ATTEMPTS drives
-      // yet, and resetting it here is what used to let a sibling's fresh budget
-      // cover for an unrelated stuck id.
-      for (const eventId of eventIds) state.wakeContinuationDrives.delete(eventId);
-      const stranded = eventIds
-        .map((eventId) => state.unackedDelivered.get(eventId))
-        .filter((event): event is AgentEventWireRecord => event !== undefined)
-        .sort((left, right) => left.id - right.id);
       logHerdsmanPi(
         "warn",
-        `[herdsman-pi] wake continuation gave up eventIds=${eventIds.join(",")} drives=${MAX_WAKE_CONTINUATION_ATTEMPTS} · released and acknowledged as consumed so the daemon stops redelivering them`,
+        `[herdsman-pi] wake delivery dead-lettered eventIds=${eventIds.join(",")} · updates retained unacked in daemon: no consumption evidence, nothing acknowledged, and the ids stay eligible for a later wake`,
       );
       ctx.ui.notify?.(
-        `Herdsman · ${eventIds.length} agent update${eventIds.length === 1 ? "" : "s"} could not be delivered by a wake turn · given up on (possibly never seen): read the agent directly for the details, or hand this workspace to another terminal so the daemon delivers it there`,
+        `Herdsman · ${eventIds.length} agent update${eventIds.length === 1 ? "" : "s"} could not be delivered by a wake turn · updates retained unacked in daemon: read the agent directly for the details, or hand this workspace to another terminal so the daemon delivers it there`,
         "warning",
       );
-      if (stranded.length === 0) return;
-      void acknowledgeEventIds(stranded, { notify: false }, ctx).catch((error: unknown) => {
-        logHerdsmanPi(
-          "warn",
-          `[herdsman-pi] wake write-off acknowledgement failed eventIds=${stranded.map((event) => event.id).join(",")} · ${String(error)}`,
-        );
-      });
     };
 
-    /**
-     * Drives one continuation that carries out a wake Pi has not drained.
-     *
-     * A wake injected while the orchestrator streams is delivered as a queued
-     * follow-up (`triggerTurn: false`), and Pi only drains that queue when a run
-     * reaches its stop point (`agent-loop` "Agent would stop here. Check for
-     * follow-up messages."). When the run it rode on already passed that point,
-     * the update sits in the queue until the next user message. At settlement the
-     * orchestrator is no longer streaming, so `triggerTurn: true` starts a real
-     * run (`_runAgentPrompt`) and that run's loop drains the queued follow-up.
-     * The marker carries no wake content: the queued follow-up is what delivers
-     * the evidence, exactly once.
-     *
-     * Only consumption evidence writes a delivery off, so an intervening run that
-     * ends before its stop point (error, user abort, a refused tool) leaves the
-     * next settlement driving again. That bound is per event id and nothing
-     * resets it: starting runs cannot fix a cause that is not about the queue, so
-     * once an id's own budget is spent the id is written off (released and
-     * acknowledged) instead of looping forever — see
-     * `writeOffStrandedWakeDelivery` for the trade-off.
-     */
-    const driveWakeContinuation = (ctx: PiContext) => {
-      if (state.wakeAwaitingConsumption.size === 0) return;
-      if (!pi.sendMessage) return;
-      const eventIds = [...state.wakeAwaitingConsumption].sort((left, right) => left - right);
-      // Every id that is still waiting spends one drive of its own budget. The
-      // counters are keyed by event id and are never reset by an injection, so a
-      // delivery handed over later cannot buy an already-stuck id a fresh budget.
-      const spent: number[] = [];
-      for (const eventId of eventIds) {
-        const drives = (state.wakeContinuationDrives.get(eventId) ?? 0) + 1;
-        state.wakeContinuationDrives.set(eventId, drives);
-        spent.push(drives);
-      }
-      try {
-        pi.sendMessage(
-          {
-            content: WAKE_CONTINUATION_CONTENT,
-            customType: WAKE_CONTINUATION_CUSTOM_TYPE,
-            display: false,
-          },
-          { deliverAs: "followUp", triggerTurn: true },
-        );
-        logHerdsmanPi(
-          "info",
-          `[herdsman-pi] wake continuation driven eventIds=${eventIds[0] ?? 0}-${eventIds.at(-1) ?? 0} count=${eventIds.length} drives=${spent.join(",")}`,
-        );
-      } catch {
-        logHerdsmanPi("warn", "[herdsman-pi] wake continuation refused by pi");
-      }
-      // Only the ids whose own budget this drive spent are written off. A sibling
-      // that still has drives left keeps its copy in the queue and its count, so
-      // it is neither lost nor granted a fresh ceiling.
-      const exhausted = eventIds.filter(
-        (_eventId, index) => (spent[index] ?? 0) >= MAX_WAKE_CONTINUATION_ATTEMPTS,
-      );
-      if (exhausted.length > 0) {
-        // This was the last drive the id's own budget allows, and the queued copy
-        // is still undrained: the id is written off instead of being left
-        // pending forever. The ids are released from
-        // `wakeAwaitingConsumption` (no further run is started for them) and
-        // acknowledged, which is what stops the daemon from redelivering them
-        // every freshness window — the loop that used to flood the orchestrator
-        // session until manual sqlite surgery. Losing one update is the accepted
-        // cost; see `writeOffStrandedWakeDelivery`.
-        writeOffStrandedWakeDelivery(exhausted, ctx);
-      }
-    };
 
     /**
-     * Arms the bounded deferral for a wake that cannot be injected right now.
+     * Arms the deferral for a wake that cannot be injected right now.
      *
      * The retry spins every `WAKE_BUSY_SPIN_MS` while the orchestrator is busy
-     * and flips `wakeForcedRelease` once `WAKE_DEFERRED_TIMEOUT_MS` has elapsed,
-     * so the next pass injects the batch from the current state (as a queued,
-     * non-triggering follow-up) instead of waiting for an idle signal or a
-     * settlement that may never arrive.
+     * or an earlier delivery is still in flight, and it does so for as long as
+     * that lasts. There is deliberately no deadline: a wake injected into a
+     * busy orchestrator either lands in a follow-up queue nothing drains — the
+     * "busy delivery never arrives" failure this replaces — or interrupts the
+     * user's own turn, so waiting is the only outcome that loses nothing. The
+     * spin is short and re-reads `isIdle`, so the gap between the turn that ends
+     * and the injection is one tick, and `agent_settled` closes it immediately
+     * through `scheduleWake`.
      */
     const scheduleDeferredWake = (ctx: PiContext) => {
       state.wakeDeferredUntilSettled = true;
-      const since = state.wakeDeferredSince ?? Date.now();
-      state.wakeDeferredSince = since;
-      const remaining = WAKE_DEFERRED_TIMEOUT_MS - (Date.now() - since);
-      if (remaining <= 0) state.wakeForcedRelease = true;
       if (state.wakeTimer) return;
       state.wakeTimer = setTimeout(() => {
         state.wakeTimer = undefined;
-        if (state.wakeForcedRelease && state.deliveredBatch && ctx.isIdle?.() !== false) {
-          // The hard deadline only releases the delivery — it never discards an
-          // unconfirmed event. The batch record is dropped so a wake turn that
-          // is no longer running cannot gate later wakes, but its events stay in
-          // the delivery queue (`unackedDelivered`) and are re-attached to the
-          // batch injected right below, which acknowledges them once it settles.
-          state.deliveredBatch = undefined;
-        }
         scheduleWake(ctx);
-      }, Math.max(0, Math.min(WAKE_BUSY_SPIN_MS, remaining)));
+      }, WAKE_BUSY_SPIN_MS);
     };
 
     const scheduleWake = (ctx: PiContext | undefined) => {
       if (!ctx || !state.isOrchestrator || !state.currentScope || !pi.sendMessage) return;
       if (state.wakeTimer || state.wakeRequested) {
         // A pending wake owns the release; this branch is also hit re-entrantly by
-        // a running pass (its fired settle timer is still set), where clearing
-        // `wakeForcedRelease` would re-defer a batch the deadline just released.
+        // a running pass (its fired settle timer is still set), and ending the
+        // deferral there would let a second injection ride in behind it.
         return;
       }
       const projection = projectAgentOutcomes(state.pendingEvents, wakeFilter);
@@ -1117,10 +993,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         isWakeableEvent(state.pendingEvents.find((pending) => pending.id === outcome.eventId)),
       );
       if (wakeable.length === 0) {
-        // Nothing is wakeable right now, so the deferral that led here is over:
-        // its released deadline must not let a later, unrelated wake bypass the
-        // busy gate.
-        endWakeDeferral();
         // A suppressed upstream error that is now due must be silently
         // acknowledged before any backoff timer is planted: planting the timer
         // first would make scheduleSilentUpstreamErrorAck's entry guard
@@ -1153,10 +1025,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }
 
       // An in-flight batch owns the ack cursor and a busy orchestrator must not
-      // be interrupted, so neither is woken immediately — but both are deferred
-      // on a bounded spin (never parked until an event that may never come).
+      // be interrupted, so neither is woken immediately — the wake stays
+      // deferred on the spin until the batch settles and the orchestrator is
+      // idle, and nothing is released past that gate.
       const inFlight = state.deliveredBatch !== undefined || state.ackInFlight;
-      if (!state.wakeForcedRelease && (inFlight || ctx.isIdle?.() === false)) {
+      if (inFlight || ctx.isIdle?.() === false) {
         scheduleDeferredWake(ctx);
         return;
       }
@@ -1165,8 +1038,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const ownerTerminalId = state.currentScope.terminalId;
       const ownerWorkspaceId = state.currentScope.workspaceId;
       state.wakeTimer = setTimeout(() => {
-        const startWake = async () => {
-          if (
+        const startWake = async () => {          if (
             generation !== wakeGeneration ||
             !state.isOrchestrator ||
             state.currentScope?.herdrSessionName !== ownerHerdrSessionName ||
@@ -1174,16 +1046,12 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             state.currentScope?.workspaceId !== ownerWorkspaceId
           ) {
             state.wakeTimer = undefined;
-            // The pass belongs to a stale generation or scope, so its deferral
-            // episode ends here (a scope reset usually got there first through
-            // `cancelWakeTimer`).
-            endWakeDeferral();
             return;
           }
-          if (ctx.isIdle?.() === false && !state.wakeForcedRelease) {
+          if (ctx.isIdle?.() === false) {
             state.wakeTimer = undefined;
-            // Still busy: this pass re-defers, so the deferral episode (and with
-            // it the 5s deadline) must keep running instead of restarting.
+            // Still busy: this pass re-defers and keeps waiting, so nothing is
+            // injected into (or parked for) a running turn.
             scheduleDeferredWake(ctx);
             return;
           }
@@ -1195,13 +1063,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             )) as ConnectionStateResponse | undefined;
             if (!response) {
               state.wakeTimer = undefined;
-              endWakeDeferral();
               return;
             }
             applyConnectionStateResponse(response, ctx);
           } catch {
             state.wakeTimer = undefined;
-            endWakeDeferral();
             // A failed load is only temporary: the batch stays pending and is
             // retried on the next wake instead of being permanently suppressed.
             ctx.ui.notify?.(
@@ -1219,14 +1085,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             state.currentScope?.workspaceId !== ownerWorkspaceId
           ) {
             state.wakeTimer = undefined;
-            // See the earlier generation re-check: the episode ends with it.
-            endWakeDeferral();
             return;
           }
-          if (ctx.isIdle?.() === false && !state.wakeForcedRelease) {
+          if (ctx.isIdle?.() === false) {
             state.wakeTimer = undefined;
-            // See the earlier re-check: re-deferring keeps this episode's 5s
-            // deadline intact.
+            // See the earlier re-check: a busy orchestrator keeps waiting.
             scheduleDeferredWake(ctx);
             return;
           }
@@ -1242,7 +1105,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           );
           if (batchOutcomes.length === 0) {
             state.wakeTimer = undefined;
-            endWakeDeferral();
             return;
           }
           const current = batchOutcomes;
@@ -1254,24 +1116,19 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.wakeRequested = true;
           state.wakeRequestedThroughEventId = current.at(-1)?.eventId ?? 0;
           // Single-track injection: the wake content is handed to Pi exactly
-          // once, as the follow-up message below. An idle orchestrator gets a
-          // triggered follow-up turn (immediate delivery); a busy one is not
-          // interrupted and receives the same content as a queued,
-          // non-triggering follow-up that a later run drains out of the
-          // follow-up queue. There is deliberately no second copy on the
-          // `context` hook: a run that is busy cannot act on an early copy
-          // anyway, while a second copy is exactly what puts the same update
-          // into the session twice. So the transcript holds one entry per event
-          // id, and the continuation drive (see `driveWakeContinuation`) is what
-          // carries a queued copy that no run drained into the transcript.
-          const orchestratorBusy = ctx.isIdle?.() === false;
+          // once, as the follow-up message below, and only once the orchestrator
+          // is idle — a busy one has been deferred (see `scheduleDeferredWake`),
+          // because a follow-up parked in a running turn's queue may never be
+          // drained. There is deliberately no second copy on the `context` hook
+          // either: the update enters the transcript exactly once per event id,
+          // through the one message this path sends.
           const wakeContent = formatAgentOutcomeUpdates(batchOutcomes);
-          // Single line, injection path only: the decision that produced this
-          // batch plus the signals it came from, so a wake that still arrives
-          // late can be told apart from one parked by a stale gate.
+          // Single line, injection path only: the state the batch was taken from,
+          // so a wake that still arrives late can be told apart from one that was
+          // held back by the busy gate.
           logHerdsmanPi(
             "info",
-            `[herdsman-pi] wake inject deliverAs=followUp triggerTurn=${String(!orchestratorBusy)} forced=${state.wakeForcedRelease} runActive=${String(state.runActive)} isIdle=${ctx.isIdle === undefined ? "unknown" : String(ctx.isIdle())} eventIds=${batchOutcomes[0]?.eventId ?? 0}-${batchOutcomes.at(-1)?.eventId ?? 0} count=${batchOutcomes.length}`,
+            `[herdsman-pi] wake inject deliverAs=followUp triggerTurn=true runActive=${String(state.runActive)} isIdle=${ctx.isIdle === undefined ? "unknown" : String(ctx.isIdle())} eventIds=${batchOutcomes[0]?.eventId ?? 0}-${batchOutcomes.at(-1)?.eventId ?? 0} count=${batchOutcomes.length}`,
           );
           try {
             pi.sendMessage?.(
@@ -1293,35 +1150,30 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
                 },
                 display: false,
               },
-              orchestratorBusy
-                ? { deliverAs: "followUp", triggerTurn: false }
-                : { deliverAs: "followUp", triggerTurn: true },
+              // `triggerTurn: true` is what makes this a real turn: pi hands the
+              // message to the agent core, which produces a regular `message_end`
+              // for the hidden entry, and only that emission is the consumption
+              // evidence the acknowledgement waits for. A `triggerTurn: false`
+              // variant only parks the message in a follow-up queue that a run
+              // drains at its stop point — the copy that made "busy delivery
+              // failed" possible.
+              { deliverAs: "followUp", triggerTurn: true },
             );
-            // A queued (non-triggering) delivery rides the running turn: Pi parks it
-            // in the agent's follow-up queue, which a run only drains when it reaches
-            // its stop point. If the run it rode on already passed that point, nothing
-            // drains it — the settlement drives a continuation instead (see
-            // `driveWakeContinuation`), and until the content is seen in the
-            // transcript the delivery is neither acknowledged nor injected again.
-            if (orchestratorBusy) {
-              // A freshly queued id starts its own continuation budget; an id that
-              // was already awaiting consumption (merged into this batch from an
-              // earlier injection) keeps the drives it already spent. Only a new
-              // id may get a fresh ceiling — never an unrelated one.
-              for (const outcome of batchOutcomes) {
-                state.wakeAwaitingConsumption.add(outcome.eventId);
-                if (!state.wakeContinuationDrives.has(outcome.eventId)) {
-                  state.wakeContinuationDrives.set(outcome.eventId, 0);
-                }
-              }
+            // A freshly delivered id is in flight until its content is seen in
+            // the transcript: it can neither be acknowledged (the evidence is
+            // what authorises that) nor injected again (the content must not
+            // enter the transcript twice). An id merged into this batch from an
+            // earlier delivery keeps that same state; a dead-lettered one is in
+            // flight again and loses its retry flag.
+            for (const outcome of batchOutcomes) {
+              state.wakeAwaitingConsumption.add(outcome.eventId);
+              state.wakeRetryableEventIds.delete(outcome.eventId);
             }
-            state.wakeForcedRelease = false;
-            state.wakeDeferredSince = undefined;
             // Only expose the batch after the hidden context was accepted by pi. This
             // keeps an injection failure eligible for daemon redelivery.
             //
             // The batch is the delivery queue plus this injection: previously
-            // unconfirmed events are merged (never replaced) so that a forced
+            // unconfirmed events are merged (never replaced) so that a later
             // release always leaves both the old and the new events deliverable
             // and acknowledgeable in id order. The turn-consumption flags of a
             // still-running previous batch are carried over, because they
@@ -1330,39 +1182,37 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             // `hasSubstantiveWork` is the sole gate that decides whether an
             // ownership/scope change may abort the in-flight turn (see loseRole
             // and resetForScopeChange), and aborting is only ever allowed for a
-            // *pure* Herdsman wake turn. A busy orchestrator gets the batch as a
-            // non-triggering queued follow-up, which rides the user's own turn:
-            // that turn is not a Herdsman wake turn, so it must never be aborted
-            // on our behalf and the flag is set here.
+            // *pure* Herdsman wake turn. The injected message starts one of those
+            // (it is only ever sent to an idle orchestrator, and it triggers its
+            // own turn), and nothing here has produced substance yet, so the
+            // flag starts false and the tool/assistant hooks raise it.
             state.deliveredBatch = {
               abortedByUser: previousBatch?.abortedByUser ?? false,
               assistantFinalSucceeded: previousBatch?.assistantFinalSucceeded ?? false,
               events: mergeUnackedDelivered(incomingEvents),
-              hasSubstantiveWork: orchestratorBusy || (previousBatch?.hasSubstantiveWork ?? false),
+              hasSubstantiveWork: previousBatch?.hasSubstantiveWork ?? false,
               invalidated: false,
               ownerTerminalId,
               herdsmanTriggered: true,
             };
             state.wakeRequested = false;
             state.wakeRequestedThroughEventId = 0;
-            // Record the presentation so a reclaim redelivery of the same id is
-            // never presented twice. The set is monotonic for the lifetime of
-            // the current orchestrator scope: ids are only removed on role
-            // loss, scope change, or shutdown (pruneAcknowledgedEvents keeps
-            // acknowledged ids on purpose).
-            for (const outcome of batchOutcomes) {
-              state.presentedEventIds.add(outcome.eventId);
-            }
+            // The ids deliberately do *not* enter `presentedEventIds` here: that set
+            // means "this content is in the transcript", and only consumption
+            // evidence (`pi.on("message_end")` for this hidden wake message, see
+            // the handler below) knows that. Recording the injection instead would
+            // let an update whose run never carried it out — a failed turn, an
+            // abort, a message Pi dropped — become unrecoverable in this session,
+            // which is the lock-out this path is meant to remove. The in-flight
+            // state is exactly what keeps it out of the transcript twice in the
+            // meantime: `alreadyPresented` reports "awaiting".
           } catch {
             state.deliveredBatch = undefined;
             state.wakeRequested = false;
-            // Nothing was queued by the refused injection, so nothing is awaiting
-            // consumption on its account either: the ids only enter the awaiting set
-            // once Pi accepted the message (see the queued branch above). The
-            // refused injection consumed this deferral, so clearing it keeps the
-            // elapsed deadline from letting a later, unrelated wake bypass the busy
-            // gate.
-            endWakeDeferral();
+            // Nothing was sent, so nothing is awaiting consumption on its account
+            // either: the ids only enter the awaiting set once Pi accepted the
+            // message. Nothing was delivered, so the event stays pending and the
+            // next wake retries it.
           }
         };
         void startWake();
@@ -1826,11 +1676,10 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     pi.on("message_end", (event: Record<string, unknown>) => {
       const message = record(event.message);
       if (message.role === "custom" && message.customType === WAKE_CONTEXT_CUSTOM_TYPE) {
-        // Consumption evidence: the wake content reached the transcript, so some
-        // run drained the queued follow-up and carried the update out. The ids the
-        // message presented are confirmed — no further continuation is owed for
-        // them, and they are now authorised for acknowledgement on their own,
-        // whatever conclusion the turn reached.
+        // Consumption evidence: the wake content reached the transcript, so the
+        // turn that carried it out is confirmed. The ids the message presented are
+        // now authorised for acknowledgement on their own, whatever conclusion the
+        // turn reached.
         const consumedEventIds = wakeConsumedEventIds(message);
         if (consumedEventIds.length === 0) {
           // Nothing may be confirmed from a message whose evidence cannot be read
@@ -1845,9 +1694,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         }
         for (const eventId of consumedEventIds) {
           state.wakeAwaitingConsumption.delete(eventId);
-          // Its copy reached the transcript, so the id owes no drive any more and
-          // its budget leaves with it.
-          state.wakeContinuationDrives.delete(eventId);
+          // The delivery is settled (carried out, or dead-lettered and now
+          // re-delivered): it owes no further drive and no further retry.
+          state.wakeRetryableEventIds.delete(eventId);
           // The content reached the transcript, so this id counts as presented from
           // now on: a daemon redelivery of it (it is still unacknowledged whenever
           // its batch was already dropped) must not inject the same update again.
@@ -1916,12 +1765,22 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     pi.on("agent_settled", async (_event: unknown, ctx: PiContext) => {
       state.runActive = false;
-      // A wake delivered as a queued follow-up is drained only when a run reaches
-      // its stop point. If the run that received it settled without draining it,
-      // no further run exists to carry the update out: drive a continuation (up to
-      // the per-delivery bound, see `driveWakeContinuation`), which is what
-      // surfaces the queued update.
-      driveWakeContinuation(ctx);
+      // The settlement is the signal a deferral has been waiting for, so the
+      // pending spin is dropped: the wake decision below is taken now instead of
+      // one `WAKE_BUSY_SPIN_MS` tick later. A pass that is already being injected
+      // (`wakeRequested`) keeps its timer — clearing it would drop the injection.
+      if (state.wakeTimer && !state.wakeRequested) {
+        const pendingDeferral = state.wakeTimer;
+        state.wakeTimer = undefined;
+        clearTimeout(pendingDeferral);
+      }
+      // A wake whose content never reached the transcript gets no run of its own:
+      // there is deliberately no empty-marker continuation. The settlement writes
+      // those ids off locally (dead-letter, no acknowledgement) and the next
+      // `scheduleWake` re-presents them with the real update content, or a later
+      // settlement confirms them once their copy finally drains.
+      const unconsumed = [...state.wakeAwaitingConsumption].sort((left, right) => left - right);
+      if (unconsumed.length > 0) writeOffStrandedWakeDelivery(unconsumed, ctx);
       const failBatch = () => {
         ctx.ui.notify?.(
           "Herdsman couldn’t acknowledge agent updates · updates remain pending",
@@ -1931,8 +1790,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const finishBatch = () => {
         state.ackInFlight = false;
         state.wakeDeferredUntilSettled = false;
-        state.wakeDeferredSince = undefined;
-        state.wakeForcedRelease = false;
         setHerdsmanUi(ctx);
         scheduleWake(ctx);
       };
@@ -1969,10 +1826,14 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
       const stillOwner =
         state.isOrchestrator && state.currentScope?.terminalId === batch.ownerTerminalId;
-      const { deliveryQueue, confirmablePrefix, blockedByMissingTurn, stillAwaitingConsumption } =
-        confirmableDeliveryPrefix(batch.assistantFinalSucceeded || batch.abortedByUser);
+      const { deliveryQueue, confirmablePrefix, blockedByMissingTurn } = confirmableDeliveryPrefix(
+        batch.assistantFinalSucceeded || batch.abortedByUser,
+      );
       const reachable = stillOwner && state.client !== undefined && state.connected;
-      if (!stillAwaitingConsumption) state.deliveredBatch = undefined;
+      // Every id awaiting consumption was dead-lettered at the top of this
+      // handler, so nothing holds the cursor open any more and the batch can be
+      // dropped: a later wake is not gated by it.
+      state.deliveredBatch = undefined;
       state.ackInFlight = true;
       if (!reachable) {
         // Unreachable (ownership gone, or a disconnect): attempting an

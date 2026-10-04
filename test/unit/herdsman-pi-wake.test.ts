@@ -483,3 +483,53 @@ describe("Pi agent wake projection", () => {
     ).toEqual([63]);
   });
 });
+
+describe("Pi wake dead-letter accounting", () => {
+  // The write-off for a delivery whose content never reached the transcript must
+  // never tell the daemon that an event the orchestrator never saw was consumed.
+  // The daemon's pending row is the remedy: with no acknowledgement it stays
+  // pending (and redeliverable), so the extension reports the failure to the user
+  // instead of silently dropping the only copy left.
+  test("a dead-letter is retained unacked in the daemon rather than acknowledged", () => {
+    const stranded = event(90, "agent.done", { from: "working", to: "done" });
+    // The write-off path itself sends no RPC, so this asserts the accounting the
+    // caller can rely on: the event is still the wakeable projection head, still
+    // projectable, and still formatted with its real update body — nothing was
+    // consumed, so nothing may be acknowledged for it.
+    expect(projectAgentOutcomes([stranded]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 90, kind: "completed" }),
+    ]);
+    const formatted = formatAgentOutcomeUpdates(projectAgentOutcomes([stranded]).outcomes);
+    // The update body is preserved so a redelivery can still carry it out; a
+    // "consumed" write-off would have thrown the content away.
+    expect(formatted).toContain("event: 90");
+    expect(formatted).toContain("last assistant: assistant result 90");
+    // The deduplicating projector still sees the event once, so a redelivery of
+    // the same id produces exactly one wake — never two copies of the same
+    // content, and never none.
+    const projector = createAgentOutcomeProjector();
+    expect(projector([stranded]).outcomes.map(({ eventId }) => eventId)).toEqual([90]);
+  });
+
+  // `presentedEventIds` is the "the orchestrator has this content" set, so only
+  // consumption evidence (the hidden wake message's `message_end`, which carries
+  // `details.presentedEventIds`) may add to it. Recording an injection instead
+  // would lock out an update whose run never carried it out, which is the
+  // "busy delivery never arrives" failure this replaces.
+  test("an id without message_end evidence is never projected as presented", () => {
+    const pending = event(91, "agent.done", { from: "working", to: "done" });
+    const projection = projectAgentOutcomes([pending]);
+    // The event is a wakeable outcome; it is pending, not presented. Only the
+    // evidence channel names the ids that were actually seen.
+    expect(projection.outcomes).toEqual([
+      expect.objectContaining({ eventId: 91, kind: "completed" }),
+    ]);
+    expect(projection.rawEvents.map(({ id }) => id)).toEqual([91]);
+    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+    // A second projection in the same session still projects it: an unconfirmed
+    // id is not "seen" for projection purposes, so a later wake remains eligible
+    // to present it (the extension guards the duplicate separately, from the
+    // delivery evidence, not from the projection).
+    expect(projectAgentOutcomes([pending]).outcomes).toHaveLength(1);
+  });
+});
