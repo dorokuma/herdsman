@@ -2668,7 +2668,7 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("delivers one busy-path update to the transcript exactly once (the pin is only early visibility)", async () => {
+  test("delivers one busy-path update on a single track to the transcript exactly once", async () => {
     vi.useFakeTimers();
     const client = createWakeClient();
     const pi = createFakePi();
@@ -2686,19 +2686,22 @@ describe("herdsman-pi orchestrator bridge", () => {
       client.emitStream({ method: "agent.event", params: { event: event(105, "term_agent") } });
       await vi.advanceTimersByTimeAsync(5_100);
 
-      // One delivery: exactly one transcript entry (the queued follow-up), and the
-      // context pin shows the same content with the same ids for the running turn.
+      // Single track: exactly one transcript entry (the queued, non-triggering
+      // follow-up) and no second copy anywhere else - not on the context hook.
       expect(wakeInjections()).toHaveLength(1);
       expect(wakeInjections()[0]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
-      const pinned = (await pi.emitContext([], ctx)).filter(
-        (message) => (message as { customType?: string }).customType === "herdsman-wake-queued",
-      ) as Array<{ content?: unknown; details?: { eventIds?: number[] } }>;
-      expect(pinned).toHaveLength(1);
-      expect(String(pinned[0]?.content)).toContain("event: 105");
-      expect(pinned[0]?.details?.eventIds).toEqual([105]);
+      const contextMessages = (await pi.emitContext([], ctx)) as Array<{
+        customType?: string;
+      }>;
+      expect(contextMessages.some((message) => message.customType === "herdsman-wake-queued")).toBe(
+        false,
+      );
+      expect(
+        contextMessages.some((message) => message.customType === "herdsman-wake-context"),
+      ).toBe(false);
 
-      // The pin is not consumption evidence: only a drained copy is, so the update
-      // may not be acknowledged yet.
+      // No pin is consumption evidence either: only the drained copy is, so the
+      // update may not be acknowledged yet.
       await pi.emit("message_end", assistantMessage("stop"), ctx);
       await pi.emit("agent_settled", {}, ctx);
       expect(ackedIds()).toEqual([]);
@@ -2725,6 +2728,69 @@ describe("herdsman-pi orchestrator bridge", () => {
       expect(
         wakeInjections().filter(([message]) => String(message.content).includes("event: 105")),
       ).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("delivers a busy multi-event batch in ascending eventId order on the single track", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: false });
+    const previous = withHerdrEnv();
+    const wakeInjections = () =>
+      pi.hiddenMessages.filter(([message]) => message.customType === "herdsman-wake-context");
+    try {
+      await startExtension(client, pi, ctx);
+      await pi.emit("agent_start", {}, ctx);
+      // Three pending outcomes, emitted out of order, from three different panes.
+      client.emitStream({
+        method: "agent.event",
+        params: { event: event(203, "term_third", { paneId: "wB:p-third" }) },
+      });
+      client.emitStream({
+        method: "agent.event",
+        params: { event: event(201, "term_agent") },
+      });
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(202, "term_other", { paneId: "wB:p-other", type: "agent.blocked" }),
+        },
+      });
+      await vi.advanceTimersByTimeAsync(5_100);
+
+      // One message, one track: a single queued follow-up that carries every
+      // pending outcome, listed in ascending eventId order. Because there is only
+      // one message, the order the queued follow-up drains in is the order the
+      // update was injected in — the batch cannot arrive shuffled or split.
+      expect(wakeInjections()).toHaveLength(1);
+      expect(wakeInjections()[0]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
+      const content = String(wakeInjections()[0]?.[0]?.content);
+      const first = content.indexOf("event: 201");
+      const second = content.indexOf("event: 202");
+      const third = content.indexOf("event: 203");
+      expect(first).toBeGreaterThanOrEqual(0);
+      expect(second).toBeGreaterThan(first);
+      expect(third).toBeGreaterThan(second);
+      expect(wakeInjections()[0]?.[0]?.details).toEqual({
+        eventIds: [201, 202, 203],
+        presentedEventIds: [201, 202, 203],
+      });
+
+      // Single track means single copy: the context hook adds nothing for it.
+      const contextMessages = (await pi.emitContext([], ctx)) as Array<{
+        customType?: string;
+      }>;
+      expect(contextMessages.some((message) => message.customType === "herdsman-wake-queued")).toBe(
+        false,
+      );
+      expect(
+        contextMessages.some((message) => message.customType === "herdsman-wake-context"),
+      ).toBe(false);
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
@@ -2965,15 +3031,18 @@ describe("herdsman-pi orchestrator bridge", () => {
       expect(pi.hiddenMessages).toHaveLength(1);
       expect(pi.hiddenMessages[0]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: false });
 
-      // The queued content is also pinned to the current context so the running
-      // tool chain sees it without being interrupted.
-      const contextMessages = await pi.emitContext([], ctx);
-      const queuedMessage = contextMessages.find(
-        (message) => (message as { customType?: string }).customType === "herdsman-wake-queued",
-      ) as { content?: unknown; details?: { eventIds?: number[] } } | undefined;
-      expect(String(queuedMessage?.content)).toContain("AGENT UPDATES");
-      // The queued entry carries the same provenance as the follow-up message.
-      expect(queuedMessage?.details?.eventIds).toEqual([63]);
+      // The queued content is the only copy: no context pin, nothing on the
+      // context hook the running tool chain could read an extra copy from.
+      const contextMessages = (await pi.emitContext([], ctx)) as Array<{
+        customType?: string;
+      }>;
+      expect(contextMessages.some((message) => message.customType === "herdsman-wake-queued")).toBe(
+        false,
+      );
+      expect(
+        contextMessages.some((message) => message.customType === "herdsman-wake-context"),
+      ).toBe(false);
+      expect(pi.hiddenMessages).toHaveLength(1);
       expect(ctx.aborts).toBe(0);
     } finally {
       vi.clearAllTimers();

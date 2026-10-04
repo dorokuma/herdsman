@@ -209,10 +209,6 @@ type HerdsmanState = {
   /**
    * Continuation drives already spent, keyed by event id.
    *
-  /**
-   * Event content queued for a busy orchestrator. Injected through the
-   * `context` hook so the running turn sees the update without being
-   * interrupted.
    * The bound is per event, never per delivery and never per session: an
    * unrelated event being injected must not hand a stuck one a fresh budget. A
    * session that keeps receiving new updates used to reset a shared counter at
@@ -228,7 +224,6 @@ type HerdsmanState = {
    * An entry leaves the map with the id itself: acknowledged, dead-lettered,
    * consumed (its copy reached the transcript), or a role/scope reset.
    */
-  wakeContext: { content: string; eventIds: number[] } | undefined;
   wakeContinuationDrives: Map<number, number>;
   wakeRequested: boolean;
   wakeRequestedThroughEventId: number;
@@ -423,7 +418,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       wakeConsumptionObserved: new Set(),
       wakeSuppressedEventIds: new Set(),
       wakeSkipLogReasons: new Map(),
-      wakeContext: undefined,
       wakeContinuationDrives: new Map(),
       wakeRequested: false,
       wakeRequestedThroughEventId: 0,
@@ -475,10 +469,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       cancelWakeTimer();
       state.wakeRequested = false;
       state.wakeRequestedThroughEventId = 0;
-      // A wake queued for a busy orchestrator belongs to the role/scope that
-      // queued it: dropping it here keeps a stale event body out of the context
-      // of whatever session takes over next.
-      state.wakeContext = undefined;
     };
 
     const clearAgentContext = () => {
@@ -1267,11 +1257,17 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           state.wakeTimer = undefined;
           state.wakeRequested = true;
           state.wakeRequestedThroughEventId = current.at(-1)?.eventId ?? 0;
-          // Dual-track injection: an idle orchestrator gets a triggered
-          // follow-up turn (immediate delivery), while a busy one is not
-          // interrupted — the same content is queued as a non-triggering
-          // follow-up and additionally exposed through the `context` hook so the
-          // running turn can already see it.
+          // Single-track injection: the wake content is handed to Pi exactly
+          // once, as the follow-up message below. An idle orchestrator gets a
+          // triggered follow-up turn (immediate delivery); a busy one is not
+          // interrupted and receives the same content as a queued,
+          // non-triggering follow-up that a later run drains out of the
+          // follow-up queue. There is deliberately no second copy on the
+          // `context` hook: a run that is busy cannot act on an early copy
+          // anyway, while a second copy is exactly what puts the same update
+          // into the session twice. So the transcript holds one entry per event
+          // id, and the continuation drive (see `driveWakeContinuation`) is what
+          // carries a queued copy that no run drained into the transcript.
           const orchestratorBusy = ctx.isIdle?.() === false;
           const wakeContent = formatAgentOutcomeUpdates(batchOutcomes);
           // Single line, injection path only: the decision that produced this
@@ -1323,12 +1319,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
                 }
               }
             }
-            // A queued (non-triggering) delivery keeps the content available to
-            // the current turn through the context hook until it is settled or
-            // superseded by the next injection.
-            state.wakeContext = orchestratorBusy
-              ? { content: wakeContent, eventIds: batchOutcomes.map((outcome) => outcome.eventId) }
-              : undefined;
             state.wakeForcedRelease = false;
             state.wakeDeferredSince = undefined;
             // Only expose the batch after the hidden context was accepted by pi. This
@@ -1568,7 +1558,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           // already acked events are covered by the server cursor
           // (pruneAcknowledgedEvents below).
           state.deliveredBatch = undefined;
-          state.wakeContext = undefined;
         }
         // Otherwise the batch's wake turn is still in flight: keep it so the
         // settlement acknowledges it and the events are not re-presented.
@@ -1950,35 +1939,15 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           timestamp: Date.now(),
         });
       }
-      // A wake queued for a busy orchestrator is not allowed to interrupt the
-      // running tool chain, so its content is additionally pinned to the current
-      // context: the orchestrator sees the child-agent outcome in this turn
-      // without a triggered follow-up. The entry is dropped again by
-      // isNormalHerdsmanContext, so at most one copy is present per call.
+      // A wake queued for a busy orchestrator is delivered on the same single
+      // track as an idle one: the follow-up message. A busy run cannot act on
+      // an extra copy through this hook, so the hook only ever supplies the
+      // cached agent context here and the wake content is never pinned a second
+      // time.
       //
-      // `eventIds` mirrors what this turn actually presents (the freshly injected
-      // outcomes): events carried over in the delivery queue were already shown
-      // to the orchestrator in the turn that presented them, so they are not
-      // re-listed here. The queued follow-up message itself keeps the wider
-      // `details.eventIds` set (everything still unconfirmed).
-      //
-      // The pin is not a second delivery of the update: it makes the same queued
-      // copy visible early to the turn that is running, it is not written to the
-      // transcript, it is never acknowledged on its own, and it is not consumption
-      // evidence — only the hidden wake message's `message_end` is. So it may not be
-      // dropped in the name of "one copy only" either: it is the only way this turn
-      // ever sees the update.
-      const queuedWake = state.wakeContext;
-      if (queuedWake) {
-        additions.push({
-          content: queuedWake.content,
-          customType: "herdsman-wake-queued",
-          details: { eventIds: queuedWake.eventIds },
-          display: false,
-          role: "custom",
-          timestamp: Date.now(),
-        });
-      }
+      // Deduplication stays in place: herdsman's own context/wake entries are
+      // dropped from the incoming list, so at most one copy of each entry is
+      // present per call.
       return additions.length === 0 ? { messages } : { messages: [...messages, ...additions] };
     });
 
@@ -2002,7 +1971,6 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         state.wakeDeferredUntilSettled = false;
         state.wakeDeferredSince = undefined;
         state.wakeForcedRelease = false;
-        state.wakeContext = undefined;
         setHerdsmanUi(ctx);
         scheduleWake(ctx);
       };
@@ -2148,6 +2116,10 @@ export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string
 function isNormalHerdsmanContext(message: PiAgentMessage): boolean {
   return (
     message.customType === "herdsman-agent-context" ||
+    // Defensive for session replay: older versions pinned a queued wake to the
+    // context hook under this customType. A replayed history may still carry
+    // those entries, and they are herdsman's own, so they are dropped from the
+    // incoming list like the agent-context ones (see the context hook).
     message.customType === "herdsman-wake-queued" ||
     contentIncludesMarker(message.content, "[HERDSMAN AGENT CONTEXT]")
   );
