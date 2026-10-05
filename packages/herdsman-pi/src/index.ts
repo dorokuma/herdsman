@@ -303,6 +303,17 @@ const KEEPALIVE_INTERVAL_MS = 30_000;
  */
 export const WAKE_BUSY_SPIN_MS = 100;
 /**
+ * Ceiling the busy fallback ladder settles on for an arbitrarily long turn.
+ *
+ * The ladder does not simply stop at its last rung: `scheduleDeferredWake`
+ * clamps every tick to this value (the same shape `ackBackoffMs` uses for
+ * `ACK_BACKOFF_CAP_MS`), so raising a rung above the ceiling cannot silently
+ * raise the real cap. The ladder's top rung is this constant, which keeps the
+ * exported value, the comment, the decision note and the timed behaviour one
+ * and the same number.
+ */
+export const WAKE_BUSY_BACKOFF_CAP_MS = 5_000;
+/**
  * Fallback spin ladder while the orchestrator is busy (milliseconds).
  *
  * `agent_settled` is the primary signal that closes the deferral — it fires
@@ -315,11 +326,17 @@ export const WAKE_BUSY_SPIN_MS = 100;
  * Growing the gap keeps the correctness contract (nothing is injected until the
  * orchestrator is idle, however long that takes) while making the fallback
  * cheap: the tick count per turn drops from ~10/s to at most ~2 in the first
- * second and then ~1/s.
+ * second and then ~1/s. The last rung is `WAKE_BUSY_BACKOFF_CAP_MS`, so a turn
+ * that outlives the ladder is re-evaluated at most once every 5s.
  */
-export const WAKE_BUSY_BACKOFF_MS = [WAKE_BUSY_SPIN_MS, 200, 500, 1_000, 2_000] as const;
-/** Ceiling the busy fallback ladder settles on for an arbitrarily long turn. */
-export const WAKE_BUSY_BACKOFF_CAP_MS = 5_000;
+export const WAKE_BUSY_BACKOFF_MS = [
+  WAKE_BUSY_SPIN_MS,
+  200,
+  500,
+  1_000,
+  2_000,
+  WAKE_BUSY_BACKOFF_CAP_MS,
+] as const;
 /**
  * How many times a dead-lettered wake event may be re-presented automatically
  * before the client stops driving turns for it.
@@ -629,6 +646,21 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }
       for (const eventId of [...state.wakeSkipLogReasons.keys()]) {
         if (eventId <= ackedEventId) state.wakeSkipLogReasons.delete(eventId);
+      }
+      // A confirmed event is neither re-presentable nor owed a retry, so the three
+      // fields that describe a dead letter for it are swept together, here and in
+      // `dropUnackedDelivered`: the flag (may a wake present it again?), the spent
+      // attempt counter (does it still owe automatic retries?) and the retry
+      // deadline (when is the next one due?). Keeping any of them for an id the
+      // daemon has confirmed would let a later redelivery treat a settled event as
+      // an unfinished one — `alreadyPresented` would wave the id through and
+      // `deadLetterRetryDue` would hand it a budget it no longer needs.
+      //
+      // Ids still in the delivery queue are swept by the queue loop above (which
+      // routes through `dropUnackedDelivered`); this loop is what keeps the same
+      // three fields consistent for an id the queue no longer holds.
+      for (const eventId of [...state.wakeRetryableEventIds]) {
+        if (eventId <= ackedEventId) state.wakeRetryableEventIds.delete(eventId);
       }
       // A confirmed event owes no retry, so the dead-letter bookkeeping for it is
       // garbage from here on: the counter would otherwise make the id's next
@@ -1163,8 +1195,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      * `agent_settled` is what normally closes a deferral: it fires exactly when
      * the turn ends and re-takes the wake decision. The timer here is only the
      * fallback for a settlement that never arrives, and it backs off along
-     * `WAKE_BUSY_BACKOFF_MS` instead of spinning at a flat `WAKE_BUSY_SPIN_MS`
-     * — a long turn used to be re-evaluated ten times a second forever.
+     * `WAKE_BUSY_BACKOFF_MS` up to `WAKE_BUSY_BACKOFF_CAP_MS` instead of spinning
+     * at a flat `WAKE_BUSY_SPIN_MS` — a long turn used to be re-evaluated ten
+     * times a second forever.
      *
      * There is deliberately no deadline: a wake injected into a busy orchestrator
      * either lands in a follow-up queue nothing drains — the "busy delivery never
@@ -1181,7 +1214,13 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (state.wakeTimer) return;
       const rung = Math.min(state.wakeBusySpinRung, WAKE_BUSY_BACKOFF_MS.length - 1);
       state.wakeBusySpinRung = Math.min(rung + 1, WAKE_BUSY_BACKOFF_MS.length - 1);
-      const delay = WAKE_BUSY_BACKOFF_MS[rung] ?? WAKE_BUSY_SPIN_MS;
+      // Clamped to the cap rather than trusted to the ladder's last rung: a rung
+      // edited above the ceiling would otherwise raise the real backoff while the
+      // exported constant, the note and the tests still say 5s.
+      const delay = Math.min(
+        WAKE_BUSY_BACKOFF_MS[rung] ?? WAKE_BUSY_SPIN_MS,
+        WAKE_BUSY_BACKOFF_CAP_MS,
+      );
       state.wakeTimer = setTimeout(() => {
         state.wakeTimer = undefined;
         scheduleWake(ctx);

@@ -8,6 +8,8 @@ supersedes: ""
 
 # dead-letter 事件的重投改为「骑新事件 / 有界退避重试」
 
+> **部分订正（2026-10-05，`20261005-busy-backoff-cap-and-retry-sweep.md`）**：第 5 条里 busy 退避梯子的取值已作废——`WAKE_BUSY_BACKOFF_CAP_MS = 5_000` 当时只是被导出、没参与计算，梯子真实封顶是 2000ms；现梯子末级即该常量并每次 clamp 到它，真实上限为 5s。第 1–4、6 条（`representableWakeOutcomes` / 重试预算 / 预算计数口径 / 耗尽终态 / 挂起 UI 提示）仍然有效，本笔记整体仍为 active。
+
 ## 一句话结论
 
 `606edcb` 的 dead-letter 语义补上重投闸门：dead-letter 的 id 不再被同一个 settle 周期无条件重新调度（那是无退避、无上限的开 turn 死循环），只有「骑在实际有内容的新事件上」或「经过显式退避的自动重试」才能重新呈现，自动重试上限 2 次（5s → 15s），耗尽后该 id 只保留 ack watermark 屏障与人工可见告警；同时 busy 自旋从固定 100ms 改成指数退避梯子（100/200/500/1000/2000，上限 5s）。

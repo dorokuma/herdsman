@@ -3495,6 +3495,62 @@ describe("herdsman-pi dead-letter retry budget (turn-loop regression)", () => {
       restoreEnv(previous);
     }
   });
+
+  test("sweeps the retry flag, the attempt counter and the deadline together once the daemon confirms the id", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState:
+      | {
+          wakeRetryableEventIds: Set<number>;
+          wakeDeadLetterAttempts: Map<number, number>;
+          wakeDeadLetterRetryAt: Map<number, number>;
+          unackedDelivered: Map<number, AgentEventWireRecord>;
+        }
+      | undefined;
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state as unknown as typeof extensionState;
+        },
+      });
+      // A written-off id the delivery queue no longer holds. Every real write-off
+      // keeps its id in the queue, where the queue sweep already covers it, so the
+      // bookkeeping is seeded here to pin the watermark sweep itself: the three
+      // fields describe one dead letter and must leave together. 652 sits past
+      // the watermark and has to survive it.
+      extensionState?.wakeRetryableEventIds.add(651);
+      extensionState?.wakeDeadLetterAttempts.set(651, 2);
+      extensionState?.wakeDeadLetterRetryAt.set(651, Date.now() + 15_000);
+      extensionState?.wakeRetryableEventIds.add(652);
+      extensionState?.wakeDeadLetterAttempts.set(652, 1);
+      extensionState?.wakeDeadLetterRetryAt.set(652, Date.now() + 5_000);
+      expect(extensionState?.unackedDelivered.has(651)).toBe(false);
+
+      // The daemon confirms 651 behind this client's back (another session, or a
+      // CLI/SDK acknowledgement), so the next connection-state response carries
+      // the advanced watermark. A confirmed id owes no re-presentation, no
+      // automatic retry and no deadline: leaving any of the three behind would
+      // let a later redelivery treat a settled event as an unfinished one.
+      client.response = (method) =>
+        method === "agent.orchestrator.get"
+          ? connectionResponse({ ackedEventId: 651 })
+          : { acknowledged: true };
+      await pi.command("status", ctx);
+      expect(extensionState?.wakeRetryableEventIds.has(651)).toBe(false);
+      expect(extensionState?.wakeDeadLetterAttempts.has(651)).toBe(false);
+      expect(extensionState?.wakeDeadLetterRetryAt.has(651)).toBe(false);
+      expect(extensionState?.wakeRetryableEventIds.has(652)).toBe(true);
+      expect(extensionState?.wakeDeadLetterAttempts.get(652)).toBe(1);
+      expect(extensionState?.wakeDeadLetterRetryAt.has(652)).toBe(true);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
 });
 
 describe("herdsman-pi busy wake fallback backoff", () => {
@@ -3564,6 +3620,54 @@ describe("herdsman-pi busy wake fallback backoff", () => {
       await vi.advanceTimersByTimeAsync(500);
       expect(wakeInjections()).toHaveLength(1);
       expect(ctx.statuses.get("herdsman-wake")).toBeUndefined();
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("caps the busy fallback ladder at the 5s ceiling and keeps the first rung at 100ms", async () => {
+    vi.useFakeTimers();
+    const { WAKE_BUSY_BACKOFF_MS, WAKE_BUSY_BACKOFF_CAP_MS, WAKE_BUSY_SPIN_MS } = (await import(
+      extensionModuleUrl
+    )) as Module;
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: false });
+    const previous = withHerdrEnv();
+    const wakeInjections = () =>
+      pi.hiddenMessages.filter(([message]) => message.customType === "herdsman-wake-context");
+    // The ladder, its ceiling and the first-rung export have to be the same
+    // numbers: the cap used to be exported without taking part in any delay,
+    // which left the real ceiling on the 2000ms rung while the constant, the
+    // comment and the note all said 5s.
+    expect(WAKE_BUSY_BACKOFF_MS[0]).toBe(WAKE_BUSY_SPIN_MS);
+    expect(WAKE_BUSY_BACKOFF_MS.at(-1)).toBe(WAKE_BUSY_BACKOFF_CAP_MS);
+    const rungsBelowCap = WAKE_BUSY_BACKOFF_MS.slice(0, -1).reduce((sum, ms) => sum + ms, 0);
+    try {
+      await startExtension(client, pi, ctx);
+      await pi.emit("agent_start", {}, ctx);
+      client.emitStream({ method: "agent.event", params: { event: event(642, "term_agent") } });
+
+      // Walk the whole ladder up to its last rung: the deferral is still armed,
+      // nothing is injected into the busy orchestrator, and no deadline force-
+      // releases it either.
+      await vi.advanceTimersByTimeAsync(rungsBelowCap);
+      expect(wakeInjections()).toEqual([]);
+
+      // The turn ended but no settlement arrived, so the only thing left is the
+      // capped fallback tick: exactly one ceiling away. One millisecond short of
+      // it nothing happens — that is what pins the top rung at 5s (a reused lower
+      // rung would have released the wake long before).
+      ctx.setIdle(true);
+      await vi.advanceTimersByTimeAsync(WAKE_BUSY_BACKOFF_CAP_MS - 1);
+      expect(wakeInjections()).toEqual([]);
+      // The capped tick releases it: the extra millisecond is the slack the fake
+      // clock needs to run the deadline it lands on exactly.
+      await vi.advanceTimersByTimeAsync(2);
+      expect(wakeInjections()).toHaveLength(1);
+      expect(wakeInjections()[0]?.[1]).toEqual({ deliverAs: "followUp", triggerTurn: true });
     } finally {
       vi.clearAllTimers();
       vi.useRealTimers();
