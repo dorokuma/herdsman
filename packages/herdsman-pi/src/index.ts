@@ -23,6 +23,7 @@ import {
 import {
   projectAgentOutcomes,
   formatAgentOutcomeUpdates,
+  type AgentOutcome,
   WAKE_SETTLE_MS,
 } from "./wake.js";
 import { loadWakeFilterConfig } from "./wake-filter-config.js";
@@ -212,8 +213,31 @@ type HerdsmanState = {
    * An id leaves the set as soon as a wake hands it to Pi again (it is in flight
    * once more, so the ordinary `awaiting` guard applies), when the daemon
    * confirms it, or on a role/scope reset.
+   *
+   * Membership here does *not* by itself authorise a re-presentation: an
+   * unconditional pass turned every write-off into an immediate re-injection on
+   * the settlement that produced it, and an injection that fails the same way
+   * dead-letters the id again — an unbounded turn loop with no backoff and no
+   * limit. `representableWakeOutcomes` gates that instead (a wake carried by
+   * fresh content, or an explicit backoff with a bounded attempt budget).
    */
   wakeRetryableEventIds: Set<number>;
+  /**
+   * Automatic re-presentations already spent per dead-lettered event id.
+   *
+   * Counted here rather than on the wire record because the budget is a
+   * property of *this* client's retry policy: the daemon's own `attempts`
+   * counter tracks acknowledgement failures, which are a different thing.
+   */
+  wakeDeadLetterAttempts: Map<number, number>;
+  /** Earliest timestamp at which an id's next automatic retry may fire. */
+  wakeDeadLetterRetryAt: Map<number, number>;
+  /**
+   * Consecutive busy fallback spins, i.e. the position in
+   * `WAKE_BUSY_BACKOFF_MS`. Reset when the orchestrator settles or the wake is
+   * cancelled, so a new busy period starts at the first rung again.
+   */
+  wakeBusySpinRung: number;
   wakeRequested: boolean;
   wakeRequestedThroughEventId: number;
   wakeTimer: ReturnType<typeof setTimeout> | undefined;
@@ -270,8 +294,58 @@ const RECONNECTING_MESSAGE = "Herdsman is reconnecting · try again shortly";
 export const MAX_ACK_ATTEMPTS = 5;
 export const ACK_BACKOFF_CAP_MS = 30_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
-/** Retry interval used while a wake cannot be injected (busy orchestrator). */
+/**
+ * First tick of the busy fallback spin, and the first rung of
+ * `WAKE_BUSY_BACKOFF_MS`.
+ *
+ * Kept as its own export for callers/tests that only care about the latency of
+ * the first deferral; everything else about the spin is in the ladder.
+ */
 export const WAKE_BUSY_SPIN_MS = 100;
+/**
+ * Fallback spin ladder while the orchestrator is busy (milliseconds).
+ *
+ * `agent_settled` is the primary signal that closes the deferral — it fires
+ * exactly when the turn ends and re-takes the wake decision. This ladder is
+ * only the safety net for a settlement that never arrives, and it used to spin
+ * at a flat 100ms forever: a busy orchestrator therefore made the extension
+ * re-evaluate the same deferral ten times a second for the whole turn, which
+ * burns the turn's wall clock without ever being able to inject anything.
+ *
+ * Growing the gap keeps the correctness contract (nothing is injected until the
+ * orchestrator is idle, however long that takes) while making the fallback
+ * cheap: the tick count per turn drops from ~10/s to at most ~2 in the first
+ * second and then ~1/s.
+ */
+export const WAKE_BUSY_BACKOFF_MS = [WAKE_BUSY_SPIN_MS, 200, 500, 1_000, 2_000] as const;
+/** Ceiling the busy fallback ladder settles on for an arbitrarily long turn. */
+export const WAKE_BUSY_BACKOFF_CAP_MS = 5_000;
+/**
+ * How many times a dead-lettered wake event may be re-presented automatically
+ * before the client stops driving turns for it.
+ *
+ * Two, because a dead-letter means the content never reached the transcript and
+ * the usual causes (a turn that ended before its stop point, an abort, a
+ * message Pi dropped) leave no evidence that an immediate retry helps: one
+ * extra attempt covers a genuinely transient hiccup, the second covers a
+ * hiccup that also broke the first retry, and a third would only turn the
+ * retry into the unbounded turn-churn this cap exists to prevent. Each attempt
+ * is separated by `WAKE_DEAD_LETTER_RETRY_BACKOFF_MS`, so the bounded worst case
+ * is ~20s of automatic effort; after that the pending update is the human's
+ * (the write-off notify already says so), and the id stays unacked as the
+ * watermark barrier until a new external event merges it into a wake.
+ */
+export const WAKE_DEAD_LETTER_RETRY_LIMIT = 2;
+/**
+ * Delay before the n-th automatic re-presentation of a dead-lettered event
+ * (milliseconds), i.e. `[0] === 5_000` for the first retry, `[1] === 15_000` for
+ * the second.
+ *
+ * Deliberately far from the 100ms busy tick: the retry must not read as a spin,
+ * and the settlement that produced the dead-letter has just finished, so an
+ * immediate re-injection would re-run exactly the turn that just failed.
+ */
+const WAKE_DEAD_LETTER_RETRY_BACKOFF_MS = [5_000, 15_000] as const;
 /** `customType` of the hidden wake context this extension injects. */
 const WAKE_CONTEXT_CUSTOM_TYPE = "herdsman-wake-context";
 
@@ -362,6 +436,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       wakeSuppressedEventIds: new Set(),
       wakeSkipLogReasons: new Map(),
       wakeRetryableEventIds: new Set(),
+      wakeDeadLetterAttempts: new Map(),
+      wakeDeadLetterRetryAt: new Map(),
+      wakeBusySpinRung: 0,
       wakeRequested: false,
       wakeRequestedThroughEventId: 0,
       wakeTimer: undefined,
@@ -388,15 +465,24 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     const setHerdsmanUi = (ctx: PiContext | undefined) => {
       if (!ctx) return;
+      const pendingOutcomeCount = projectAgentOutcomes(state.pendingEvents, wakeFilter).outcomes.length;
       const footerState: HerdsmanFooterState = state.reconnectingFromOn
         ? { kind: "reconnecting" }
         : state.isOrchestrator
-          ? {
-              kind: "on",
-              updateCount: projectAgentOutcomes(state.pendingEvents, wakeFilter).outcomes.length,
-            }
+          ? { kind: "on", updateCount: pendingOutcomeCount }
           : { kind: "off" };
       ctx.ui.setStatus?.("herdsman", formatHerdsmanFooterStatus(footerState));
+      // A held-back wake is otherwise invisible during a long turn: updates are
+      // pending and nothing is injected, so the count alone reads as "Herdsman
+      // has work queued" instead of "the orchestrator is busy and this is what
+      // it is waiting for". The hint gets its own line (the pending count stays a
+      // count) and disappears the moment the wake is released or the queue drains.
+      ctx.ui.setStatus?.(
+        "herdsman-wake",
+        state.isOrchestrator && state.wakeDeferredUntilSettled && pendingOutcomeCount > 0
+          ? "Herdsman · waiting for the current turn to end"
+          : undefined,
+      );
     };
 
     const cancelWakeTimer = () => {
@@ -404,6 +490,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (state.wakeTimer) clearTimeout(state.wakeTimer);
       state.wakeTimer = undefined;
       state.wakeDeferredUntilSettled = false;
+      state.wakeBusySpinRung = 0;
     };
 
     const cancelWake = () => {
@@ -456,7 +543,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      * (and holding its batch open) for content that can never arrive. The other
      * two sets describe the same ids and follow the queue just as well: a
      * confirmed id needs no evidence flag, and an id that is gone from the queue
-     * cannot be re-injected, so it needs no suppression either.
+     * cannot be re-injected, so it needs no suppression either. The dead-letter
+     * retry bookkeeping follows for the same reason: a confirmed event needs no
+     * backoff and no attempt budget.
      */
     const dropUnackedDelivered = (eventId: number): void => {
       state.unackedDelivered.delete(eventId);
@@ -464,6 +553,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.wakeConsumptionObserved.delete(eventId);
       state.wakeSuppressedEventIds.delete(eventId);
       state.wakeRetryableEventIds.delete(eventId);
+      state.wakeDeadLetterAttempts.delete(eventId);
+      state.wakeDeadLetterRetryAt.delete(eventId);
     };
 
     /**
@@ -504,6 +595,12 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.wakeConsumptionObserved.clear();
       state.wakeSkipLogReasons.clear();
       state.wakeRetryableEventIds.clear();
+      // The automatic retry budget is a property of the id inside this scope: a
+      // scope that never held the id cannot owe it a retry, and keeping the
+      // counter would silently make the next scope's first write-off final.
+      state.wakeDeadLetterAttempts.clear();
+      state.wakeDeadLetterRetryAt.clear();
+      state.wakeBusySpinRung = 0;
     };
 
     const pruneAcknowledgedEvents = (ackedEventId: number | undefined) => {
@@ -532,6 +629,15 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }
       for (const eventId of [...state.wakeSkipLogReasons.keys()]) {
         if (eventId <= ackedEventId) state.wakeSkipLogReasons.delete(eventId);
+      }
+      // A confirmed event owes no retry, so the dead-letter bookkeeping for it is
+      // garbage from here on: the counter would otherwise make the id's next
+      // write-off (after a reset) start from a spent budget.
+      for (const eventId of [...state.wakeDeadLetterAttempts.keys()]) {
+        if (eventId <= ackedEventId) {
+          state.wakeDeadLetterAttempts.delete(eventId);
+          state.wakeDeadLetterRetryAt.delete(eventId);
+        }
       }
     };
 
@@ -575,6 +681,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (state.wakeRetryableEventIds.has(eventId)) {
         // Its delivery was dead-lettered, so the content never reached the
         // transcript: a redelivery is the only remedy and must not be skipped.
+        // *When* that redelivery may happen is a separate question, answered by
+        // `representableWakeOutcomes`; this predicate only says "no copy of this
+        // id is rightfully in the transcript".
         return false;
       }
       if (state.wakeAwaitingConsumption.has(eventId)) {
@@ -590,6 +699,92 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         return true;
       }
       return false;
+    };
+
+    /**
+     * Backoff before the n-th automatic re-presentation of a dead-lettered id.
+     *
+     * The deadline and the budget are read together, so this maps "attempts
+     * already spent" to "how long this id must now stay quiet": 0 spent → 5s,
+     * 1 spent → 15s, anything beyond the budget is unreachable (the caller stops
+     * asking once `WAKE_DEAD_LETTER_RETRY_LIMIT` is reached).
+     */
+    const deadLetterRetryBackoffMs = (attempts: number): number => {
+      const ladder = WAKE_DEAD_LETTER_RETRY_BACKOFF_MS;
+      const rung = Math.min(Math.max(attempts, 0), ladder.length - 1);
+      // `noUncheckedIndexedAccess` types every index access as optional; `rung` is
+      // clamped into a non-empty ladder, so the fallback is unreachable.
+      return ladder[rung] ?? ladder[0];
+    };
+
+    /**
+     * Whether a dead-lettered id's automatic retry is due and still budgeted.
+     *
+     * This answers the question "may this id drive a turn of its own right
+     * now?", which is deliberately much narrower than "may it be presented
+     * again": a dead-lettered id may also ride a wake that fresh content leads
+     * (see `representableWakeOutcomes`), and that ride costs it nothing.
+     *
+     * The deadline is set when the id is written off (`writeOffStrandedWakeDelivery`)
+     * and the budget is `WAKE_DEAD_LETTER_RETRY_LIMIT`, so standing on its own
+     * means: not before the backoff has elapsed, and not after the last attempt
+     * has been spent. Once it is spent the id stops driving turns entirely — it
+     * stays in `unackedDelivered` as the watermark barrier and in the pending
+     * projection with its human-visible warning, and only fresh content can
+     * still carry it.
+     */
+    const deadLetterRetryDue = (eventId: number): boolean => {
+      if (!state.wakeRetryableEventIds.has(eventId)) return false;
+      if ((state.wakeDeadLetterAttempts.get(eventId) ?? 0) >= WAKE_DEAD_LETTER_RETRY_LIMIT) {
+        return false;
+      }
+      return (state.wakeDeadLetterRetryAt.get(eventId) ?? 0) <= Date.now();
+    };
+
+    /** Earliest moment a still-budgeted id's automatic retry may fire. */
+    const deadLetterRetryAt = (eventId: number): number | undefined => {
+      if (!state.wakeRetryableEventIds.has(eventId)) return undefined;
+      if ((state.wakeDeadLetterAttempts.get(eventId) ?? 0) >= WAKE_DEAD_LETTER_RETRY_LIMIT) {
+        return undefined;
+      }
+      return state.wakeDeadLetterRetryAt.get(eventId);
+    };
+
+    /**
+     * The outcomes a wake may present: everything presentable that is not
+     * dead-lettered, plus the dead-lettered ids that may join it.
+     *
+     * A dead-letter used to be an unconditional pass through `alreadyPresented`,
+     * and because the settlement that produced it immediately scheduled the next
+     * wake, that turned every failed wake turn into the next wake turn: an
+     * unbounded loop with no backoff and no ceiling. The remedy is to separate
+     * the two ways an id can come back:
+     *
+     * - *rides*: the wake is led by content that is not a dead letter — an id this
+     *   session has not handed over yet, or a genuinely new external event. That
+     *   turn belongs to the fresh content, and merging the dead-lettered id into
+     *   it is exactly the recovery it needs (the batch merge invariant), so it
+     *   costs none of the id's retry budget;
+     * - *retries*: no fresh content is left, and the id waits for its explicit
+     *   backoff (`deadLetterRetryDue`) and then spends one automatic attempt.
+     *
+     * Everything else leaves the id alone: the settlement that wrote it off, a
+     * daemon redelivery of the same id, an acknowledgement sweep, a reconnect,
+     * or an exhausted budget. The id is not lost in that case — it keeps blocking
+     * the watermark, keeps its pending row and its human-visible warning, and is
+     * still picked up by the next wake that fresh content leads.
+     */
+    const representableWakeOutcomes = (
+      candidates: readonly AgentOutcome[],
+    ): { lead: readonly AgentOutcome[]; outcomes: readonly AgentOutcome[] } => {
+      const lead = candidates.filter(
+        (outcome) => !state.wakeRetryableEventIds.has(outcome.eventId),
+      );
+      if (lead.length > 0) return { lead, outcomes: candidates };
+      return {
+        lead,
+        outcomes: candidates.filter((outcome) => deadLetterRetryDue(outcome.eventId)),
+      };
     };
 
     const isWakeableEvent = (event: AgentEventWireRecord | undefined) =>
@@ -904,21 +1099,26 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      * that the orchestrator has the content, and here that statement would be a
      * lie: the daemon would mark the event consumed and never redeliver it.
      *
-     * What the write-off does is local only: the ids stop being barred from a
-     * later injection, so the next `scheduleWake` re-presents them with the real
-     * update content. They deliberately stay in `wakeAwaitingConsumption` (and
-     * therefore in the delivery queue): unconfirmed content must keep blocking
-     * the acknowledgement watermark, because the daemon confirms by
-     * `where id <= ?` and confirming a larger id would swallow them for good.
-     * The events themselves stay pending in the daemon: nothing was acknowledged,
-     * so a later wake is still eligible to present them, and a replacement
-     * session can still receive them.
+     * What the write-off does is local only: the ids stop being barred from every
+     * later injection, so a later `scheduleWake` may re-present them with the real
+     * update content. *May* is the whole point: `representableWakeOutcomes` decides
+     * when, and until content that is not itself a dead letter leads a wake, the
+     * only automatic resurface is a bounded, explicitly backed-off retry.
+     * Re-presenting unconditionally on the settlement that had just written the id
+     * off is what produced the turn loop this replaces. They deliberately stay in
+     * `wakeAwaitingConsumption` (and therefore in the delivery queue): unconfirmed
+     * content must keep blocking the acknowledgement watermark, because the daemon
+     * confirms by `where id <= ?` and confirming a larger id would swallow them for
+     * good. The events themselves stay pending in the daemon: nothing was
+     * acknowledged, so a later wake is still eligible to present them, and a
+     * replacement session can still receive them.
      *
      * The presentation guard is deliberately *not* extended here:
      * `presentedEventIds` is the "this content is in the transcript" set, and
      * these ids have no evidence of ever being there. Writing them off would
      * lock the update out of this session for good, which is exactly the
-     * "busy delivery never arrives" failure this replaces.
+     * "busy delivery never arrives" failure this replaces — it is only the
+     * *timing* of the next presentation that is now bounded.
      */
     const writeOffStrandedWakeDelivery = (eventIds: number[], ctx: PiContext): void => {
       if (eventIds.length === 0) return;
@@ -928,12 +1128,27 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         // daemon confirms by `where id <= ?`, so letting a later id through would
         // swallow this one for good. The retry set is that barrier, and it is also
         // what lifts the injection barrier — a delivery that never reached the
-        // transcript has to be presented again (see `alreadyPresented`).
+        // transcript has to be presented again (see `alreadyPresented`), but only
+        // on `representableWakeOutcomes`' terms.
         state.wakeRetryableEventIds.add(eventId);
+        // The write-off happens *after* the turn that failed to carry the content
+        // out, so this is where "quiet since" is pinned: until the backoff
+        // elapses, nothing may present the id on its own. A budget that is already
+        // spent gets no new deadline either — the id stays a barrier, not a turn
+        // driver, and only content that is fresh can still carry it.
+        const attempts = state.wakeDeadLetterAttempts.get(eventId) ?? 0;
+        if (attempts < WAKE_DEAD_LETTER_RETRY_LIMIT) {
+          state.wakeDeadLetterRetryAt.set(
+            eventId,
+            Date.now() + deadLetterRetryBackoffMs(attempts),
+          );
+        } else {
+          state.wakeDeadLetterRetryAt.delete(eventId);
+        }
       }
       logHerdsmanPi(
         "warn",
-        `[herdsman-pi] wake delivery dead-lettered eventIds=${eventIds.join(",")} · updates retained unacked in daemon: no consumption evidence, nothing acknowledged, and the ids stay eligible for a later wake`,
+        `[herdsman-pi] wake delivery dead-lettered eventIds=${eventIds.join(",")} automaticRetries=${eventIds.map((eventId) => state.wakeDeadLetterAttempts.get(eventId) ?? 0).join(",")} limit=${WAKE_DEAD_LETTER_RETRY_LIMIT} · updates retained unacked in daemon: no consumption evidence, nothing acknowledged, and the ids stay eligible for a later wake`,
       );
       ctx.ui.notify?.(
         `Herdsman · ${eventIds.length} agent update${eventIds.length === 1 ? "" : "s"} could not be delivered by a wake turn · updates retained unacked in daemon: read the agent directly for the details, or hand this workspace to another terminal so the daemon delivers it there`,
@@ -945,23 +1160,32 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     /**
      * Arms the deferral for a wake that cannot be injected right now.
      *
-     * The retry spins every `WAKE_BUSY_SPIN_MS` while the orchestrator is busy
-     * or an earlier delivery is still in flight, and it does so for as long as
-     * that lasts. There is deliberately no deadline: a wake injected into a
-     * busy orchestrator either lands in a follow-up queue nothing drains — the
-     * "busy delivery never arrives" failure this replaces — or interrupts the
-     * user's own turn, so waiting is the only outcome that loses nothing. The
-     * spin is short and re-reads `isIdle`, so the gap between the turn that ends
-     * and the injection is one tick, and `agent_settled` closes it immediately
-     * through `scheduleWake`.
+     * `agent_settled` is what normally closes a deferral: it fires exactly when
+     * the turn ends and re-takes the wake decision. The timer here is only the
+     * fallback for a settlement that never arrives, and it backs off along
+     * `WAKE_BUSY_BACKOFF_MS` instead of spinning at a flat `WAKE_BUSY_SPIN_MS`
+     * — a long turn used to be re-evaluated ten times a second forever.
+     *
+     * There is deliberately no deadline: a wake injected into a busy orchestrator
+     * either lands in a follow-up queue nothing drains — the "busy delivery never
+     * arrives" failure this replaces — or interrupts the user's own turn, so
+     * waiting is the only outcome that loses nothing. Backing off only makes that
+     * wait cheaper, never shorter.
      */
     const scheduleDeferredWake = (ctx: PiContext) => {
       state.wakeDeferredUntilSettled = true;
+      // The deferral is the state the user cannot see (nothing is injected, no
+      // turn is started, and the pending count alone reads as idle work), so it
+      // is announced once per arming rather than left to be guessed.
+      setHerdsmanUi(ctx);
       if (state.wakeTimer) return;
+      const rung = Math.min(state.wakeBusySpinRung, WAKE_BUSY_BACKOFF_MS.length - 1);
+      state.wakeBusySpinRung = Math.min(rung + 1, WAKE_BUSY_BACKOFF_MS.length - 1);
+      const delay = WAKE_BUSY_BACKOFF_MS[rung] ?? WAKE_BUSY_SPIN_MS;
       state.wakeTimer = setTimeout(() => {
         state.wakeTimer = undefined;
         scheduleWake(ctx);
-      }, WAKE_BUSY_SPIN_MS);
+      }, delay);
     };
 
     const scheduleWake = (ctx: PiContext | undefined) => {
@@ -992,7 +1216,12 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       const wakeable = outcomes.filter((outcome) =>
         isWakeableEvent(state.pendingEvents.find((pending) => pending.id === outcome.eventId)),
       );
-      if (wakeable.length === 0) {
+      // A dead-lettered id may only join a wake that fresh content leads, or, on
+      // its own, wait for its explicit backoff (see `representableWakeOutcomes`).
+      // Without this the settlement that wrote it off re-injects it in the same
+      // cycle, which is the turn loop this replaces.
+      const { outcomes: injectableOutcomes } = representableWakeOutcomes(wakeable);
+      if (injectableOutcomes.length === 0) {
         // A suppressed upstream error that is now due must be silently
         // acknowledged before any backoff timer is planted: planting the timer
         // first would make scheduleSilentUpstreamErrorAck's entry guard
@@ -1007,12 +1236,21 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         // No suppressed event is due, so plant a backoff timer for the next
         // future `nextAttemptAt`. Expired timestamps are excluded (strictly
         // greater than now) so an already-past window does not produce a
-        // zero-delay spin.
+        // zero-delay spin. A dead-lettered id that still owes an automatic retry
+        // contributes its own deadline here: without it the retry the write-off
+        // scheduled would wait for an unrelated event to come along.
         const nextAttemptAt = [
           ...outcomes.map((outcome) => outcome.eventId),
           ...suppressedEvents.map((event) => event.id),
         ]
-          .map((eventId) => state.pendingEvents.find((event) => event.id === eventId)?.nextAttemptAt)
+          .flatMap((eventId) => {
+            const nextAttempt = state.pendingEvents.find((event) => event.id === eventId)
+              ?.nextAttemptAt;
+            const retryAt = state.wakeRetryableEventIds.has(eventId)
+              ? deadLetterRetryAt(eventId)
+              : undefined;
+            return [nextAttempt, retryAt];
+          })
           .filter((value): value is number => value !== undefined && value > Date.now())
           .sort((left, right) => left - right)[0];
         if (nextAttemptAt !== undefined) {
@@ -1097,12 +1335,18 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
           const batchProjection = projectAgentOutcomes(batchEvents, wakeFilter);
           const batchSuppressedIds = new Set(batchProjection.suppressedUpstreamErrorEventIds);
-          const batchOutcomes = batchProjection.outcomes.filter(
+          const projectableBatchOutcomes = batchProjection.outcomes.filter(
             (outcome) =>
               outcome.eventId > state.failedWakeThroughEventId &&
               !alreadyPresented(outcome.eventId) &&
               isWakeableEvent(batchEvents.find((event) => event.id === outcome.eventId)),
           );
+          // Same split as in `scheduleWake`, re-taken here because the pass
+          // awaited an `agent.orchestrator.get` in between: a dead-lettered id
+          // may only ride content that is fresh, or retry on its own once its
+          // backoff is due (see `representableWakeOutcomes`).
+          const { lead: batchLeadOutcomes, outcomes: batchOutcomes } =
+            representableWakeOutcomes(projectableBatchOutcomes);
           if (batchOutcomes.length === 0) {
             state.wakeTimer = undefined;
             return;
@@ -1122,7 +1366,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           // drained. There is deliberately no second copy on the `context` hook
           // either: the update enters the transcript exactly once per event id,
           // through the one message this path sends.
-          const wakeContent = formatAgentOutcomeUpdates(batchOutcomes);
+          const wakeContent = formatAgentOutcomeUpdates([...batchOutcomes]);
           // Single line, injection path only: the state the batch was taken from,
           // so a wake that still arrives late can be told apart from one that was
           // held back by the busy gate.
@@ -1166,8 +1410,21 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             // earlier delivery keeps that same state; a dead-lettered one is in
             // flight again and loses its retry flag.
             for (const outcome of batchOutcomes) {
+              // A dead-lettered id that retried on its own spends one of its
+              // automatic attempts; one that rode a wake fresh content led is
+              // riding that update's turn, not its own, and rides for free.
+              if (
+                batchLeadOutcomes.length === 0 &&
+                state.wakeRetryableEventIds.has(outcome.eventId)
+              ) {
+                state.wakeDeadLetterAttempts.set(
+                  outcome.eventId,
+                  (state.wakeDeadLetterAttempts.get(outcome.eventId) ?? 0) + 1,
+                );
+              }
               state.wakeAwaitingConsumption.add(outcome.eventId);
               state.wakeRetryableEventIds.delete(outcome.eventId);
+              state.wakeDeadLetterRetryAt.delete(outcome.eventId);
             }
             // Only expose the batch after the hidden context was accepted by pi. This
             // keeps an injection failure eligible for daemon redelivery.
@@ -1197,6 +1454,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             };
             state.wakeRequested = false;
             state.wakeRequestedThroughEventId = 0;
+            // The busy wait is over: whatever turn comes next starts its fallback
+            // spin from the first rung again.
+            state.wakeBusySpinRung = 0;
             // The ids deliberately do *not* enter `presentedEventIds` here: that set
             // means "this content is in the transcript", and only consumption
             // evidence (`pi.on("message_end")` for this hidden wake message, see
@@ -1765,6 +2025,10 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     pi.on("agent_settled", async (_event: unknown, ctx: PiContext) => {
       state.runActive = false;
+      // The busy period this settlement ends is over, so the fallback spin starts
+      // from its first rung again for whatever turn comes next (see
+      // `WAKE_BUSY_BACKOFF_MS`).
+      state.wakeBusySpinRung = 0;
       // The settlement is the signal a deferral has been waiting for, so the
       // pending spin is dropped: the wake decision below is taken now instead of
       // one `WAKE_BUSY_SPIN_MS` tick later. A pass that is already being injected
