@@ -233,7 +233,7 @@ type HerdsmanState = {
   /** Earliest timestamp at which an id's next automatic retry may fire. */
   wakeDeadLetterRetryAt: Map<number, number>;
   /**
-   * Consecutive busy fallback spins, i.e. the position in
+   * Consecutive ticks spent waiting for the orchestrator, i.e. the position in
    * `WAKE_BUSY_BACKOFF_MS`. Reset when the orchestrator settles or the wake is
    * cancelled, so a new busy period starts at the first rung again.
    */
@@ -295,15 +295,15 @@ export const MAX_ACK_ATTEMPTS = 5;
 export const ACK_BACKOFF_CAP_MS = 30_000;
 const KEEPALIVE_INTERVAL_MS = 30_000;
 /**
- * First tick of the busy fallback spin, and the first rung of
+ * First tick of the busy poll ladder, and the first rung of
  * `WAKE_BUSY_BACKOFF_MS`.
  *
  * Kept as its own export for callers/tests that only care about the latency of
- * the first deferral; everything else about the spin is in the ladder.
+ * the first deferral; everything else about the wait is in the ladder.
  */
 export const WAKE_BUSY_SPIN_MS = 100;
 /**
- * Ceiling the busy fallback ladder settles on for an arbitrarily long turn.
+ * Ceiling the busy poll ladder settles on for an arbitrarily long turn.
  *
  * The ladder does not simply stop at its last rung: `scheduleDeferredWake`
  * clamps every tick to this value (the same shape `ackBackoffMs` uses for
@@ -314,17 +314,22 @@ export const WAKE_BUSY_SPIN_MS = 100;
  */
 export const WAKE_BUSY_BACKOFF_CAP_MS = 5_000;
 /**
- * Fallback spin ladder while the orchestrator is busy (milliseconds).
+ * Poll-frequency ladder while a wake waits for the orchestrator (milliseconds).
  *
- * `agent_settled` is the primary signal that closes the deferral — it fires
- * exactly when the turn ends and re-takes the wake decision. This ladder is
- * only the safety net for a settlement that never arrives, and it used to spin
- * at a flat 100ms forever: a busy orchestrator therefore made the extension
- * re-evaluate the same deferral ten times a second for the whole turn, which
- * burns the turn's wall clock without ever being able to inject anything.
+ * Delivery does not branch on busy versus idle: every wake is queued and is
+ * injected once the orchestrator has settled (or a poll observes it idle), and
+ * a busy one cannot be interrupted anyway. `agent_settled` is therefore the
+ * primary signal that closes a deferral — it fires exactly when the turn ends
+ * and re-takes the wake decision — so the liveness bound is "until
+ * `agent_settled`, or until one of these ticks observes an idle orchestrator",
+ * never a deadline. The ladder exists to make that wait cheap, and it is a
+ * poll-frequency reduction, not a safety net: there is no deadline to miss. It
+ * used to tick at a flat 100ms forever, which made the extension re-evaluate
+ * the same deferral ten times a second for the whole turn and burn the turn's
+ * wall clock without ever being able to inject anything.
  *
- * Growing the gap keeps the correctness contract (nothing is injected until the
- * orchestrator is idle, however long that takes) while making the fallback
+ * Growing the gap keeps the correctness contract (nothing is injected until
+ * the orchestrator is idle, however long that takes) while making the poll
  * cheap: the tick count per turn drops from ~10/s to at most ~2 in the first
  * second and then ~1/s. The last rung is `WAKE_BUSY_BACKOFF_CAP_MS`, so a turn
  * that outlives the ladder is re-evaluated at most once every 5s.
@@ -363,6 +368,17 @@ export const WAKE_DEAD_LETTER_RETRY_LIMIT = 2;
  * immediate re-injection would re-run exactly the turn that just failed.
  */
 const WAKE_DEAD_LETTER_RETRY_BACKOFF_MS = [5_000, 15_000] as const;
+/**
+ * Window after which an unchanged watermark hold-back is noted again
+ * (milliseconds).
+ *
+ * The hold-back note is deduplicated on its exact state (blocked id, reason,
+ * count), so a stable stall is logged once when it starts; this window is what
+ * keeps a stall that outlives that first line visible instead of silently
+ * freezing the queue forever, while still capping the noise at one line per
+ * minute per state.
+ */
+const WAKE_BARRIER_NOTE_INTERVAL_MS = 60_000;
 /** `customType` of the hidden wake context this extension injects. */
 const WAKE_CONTEXT_CUSTOM_TYPE = "herdsman-wake-context";
 
@@ -465,6 +481,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     let activeContext: PiContext | undefined;
     let keepaliveTimer: ReturnType<typeof setInterval> | undefined;
     let wakeGeneration = 0;
+    // Throttle state for the watermark hold-back note (see
+    // `noteWakeWatermarkHoldBack`): the last noted barrier state and when it was
+    // noted, so a stable stall notes itself once and a long one re-notes itself
+    // per window instead of flooding the log.
+    let lastWakeBarrierNote: { at: number; key: string } | undefined;
 
     const stopKeepalive = () => {
       if (!keepaliveTimer) return;
@@ -1122,6 +1143,93 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     };
 
     /**
+     * The smallest delivery-queue id that still blocks the acknowledgement
+     * watermark, plus why it blocks and how many ids it holds back.
+     *
+     * This is the barrier `confirmableDeliveryPrefix` walks (the `break` in its
+     * loop), read on its own because the silent upstream-error acknowledgement
+     * must respect it without a turn authorising a prefix: the daemon confirms
+     * by watermark (`update agent_events set status = 'acked' where id <= ?`), so
+     * an acknowledgement at or above this id would hand the daemon the authority
+     * to mark it confirmed without its content ever reaching the transcript —
+     * the "busy delivery never arrives" failure in its silent form, with no
+     * redelivery and no warning anywhere afterwards.
+     *
+     * An id awaiting consumption has no evidence at all yet, and a dead-lettered
+     * one never reached the transcript: exactly the two states that must not be
+     * confirmed by an ack meant for someone else's id. Ids the queue no longer
+     * holds are not barriers — a confirmed id is done, and an id the daemon
+     * itself terminally dead-lettered was its decision, made visible when it
+     * happened.
+     */
+    const unconfirmedWatermarkBarrier = ():
+      | { blocked: number; eventId: number; reason: string }
+      | undefined => {
+      // How many ids the barrier holds back: awaiting consumption, or still
+      // owed a dead-letter recovery (the two sets this walk checks).
+      const blocked = new Set([
+        ...state.wakeAwaitingConsumption,
+        ...state.wakeRetryableEventIds,
+      ]).size;
+      for (const queued of unackedDeliveredAscending()) {
+        if (state.wakeRetryableEventIds.has(queued.id)) {
+          return {
+            blocked,
+            eventId: queued.id,
+            reason:
+              (state.wakeDeadLetterAttempts.get(queued.id) ?? 0) >= WAKE_DEAD_LETTER_RETRY_LIMIT
+                ? "dead-letter-budget-exhausted"
+                : "dead-letter-backoff",
+          };
+        }
+        if (state.wakeAwaitingConsumption.has(queued.id)) {
+          return { blocked, eventId: queued.id, reason: "awaiting-consumption" };
+        }
+      }
+      return undefined;
+    };
+
+    /**
+     * Notes — once per state, and again after `WAKE_BARRIER_NOTE_INTERVAL_MS` —
+     * that the acknowledgement watermark is being held back on purpose.
+     *
+     * The hold-back is invisible otherwise: the queue simply stops advancing and
+     * the log shows nothing, so a stalled delivery cannot be told apart from an
+     * idle one. The line names the smallest blocked id, why it blocks
+     * (dead-letter backoff, spent dead-letter budget, or awaiting consumption)
+     * and how many ids it holds back, in the same field style as the write-off
+     * warning and the injection-skip note. Deduplicating on the exact state
+     * keeps a long stall from flooding the file; the window keeps a stall that
+     * outlives its first line visible.
+     *
+     * "Long-term" cannot be decided from inside the extension — a barrier that
+     * is about to be released looks exactly like one that never will be — so the
+     * minimal observable contract is this: note the moment a due
+     * acknowledgement is declined because of the barrier, not when a timer
+     * merely fires.
+     */
+    const noteWakeWatermarkHoldBack = (barrier: {
+      blocked: number;
+      eventId: number;
+      reason: string;
+    }): void => {
+      const key = `${barrier.eventId}:${barrier.reason}:${barrier.blocked}`;
+      const now = Date.now();
+      if (
+        lastWakeBarrierNote !== undefined &&
+        lastWakeBarrierNote.key === key &&
+        now - lastWakeBarrierNote.at < WAKE_BARRIER_NOTE_INTERVAL_MS
+      ) {
+        return;
+      }
+      lastWakeBarrierNote = { at: now, key };
+      logHerdsmanPi(
+        "info",
+        `[herdsman-pi] wake acknowledgement held eventId=${barrier.eventId} reason=${barrier.reason} blocked=${barrier.blocked} · the daemon confirms by watermark (id <= ?), so no larger id may be acknowledged while this one is unconfirmed; the held update stays pending in the daemon and recoverable`,
+      );
+    };
+
+    /**
      * Dead-letters a wake delivery whose content never reached the transcript.
      *
      * The caller is a settlement that produced no consumption evidence for these
@@ -1192,18 +1300,24 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     /**
      * Arms the deferral for a wake that cannot be injected right now.
      *
-     * `agent_settled` is what normally closes a deferral: it fires exactly when
-     * the turn ends and re-takes the wake decision. The timer here is only the
-     * fallback for a settlement that never arrives, and it backs off along
-     * `WAKE_BUSY_BACKOFF_MS` up to `WAKE_BUSY_BACKOFF_CAP_MS` instead of spinning
-     * at a flat `WAKE_BUSY_SPIN_MS` — a long turn used to be re-evaluated ten
-     * times a second forever.
+     * Delivery does not depend on whether the orchestrator is busy or idle:
+     * every wake is queued and injected once the orchestrator has settled (or a
+     * poll observes it idle). `agent_settled` is therefore the primary close
+     * signal — it fires exactly when the turn ends and re-takes the wake
+     * decision — and the timer here is only the poll that keeps the decision
+     * alive while the turn runs. It backs off along `WAKE_BUSY_BACKOFF_MS` up to
+     * `WAKE_BUSY_BACKOFF_CAP_MS` (a poll-frequency reduction, not a safety net):
+     * the ladder used to tick at a flat `WAKE_BUSY_SPIN_MS`, so a long turn was
+     * re-evaluated ten times a second forever.
      *
-     * There is deliberately no deadline: a wake injected into a busy orchestrator
-     * either lands in a follow-up queue nothing drains — the "busy delivery never
-     * arrives" failure this replaces — or interrupts the user's own turn, so
-     * waiting is the only outcome that loses nothing. Backing off only makes that
-     * wait cheaper, never shorter.
+     * There is deliberately no deadline (nothing like a `WAKE_DEFERRED_TIMEOUT_MS`
+     * that force-releases a busy orchestrator after N seconds): a wake injected
+     * into a busy orchestrator either lands in a follow-up queue nothing drains
+     * — the "busy delivery never arrives" failure this replaces — or interrupts
+     * the user's own turn, so waiting is the only outcome that loses nothing.
+     * The liveness bound is exactly "until `agent_settled`, or until one of these
+     * ticks observes an idle orchestrator"; backing off only makes that wait
+     * cheaper, never shorter.
      */
     const scheduleDeferredWake = (ctx: PiContext) => {
       state.wakeDeferredUntilSettled = true;
@@ -1268,9 +1382,29 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         // off its own timer and, once the backoff window has elapsed, the
         // 0ms-timer + blocked-ack loop never converges the queue.
         const dueSuppressed = suppressedEvents.filter(isWakeableEvent);
-        if (dueSuppressed.length > 0) {
-          scheduleSilentUpstreamErrorAck(ctx, dueSuppressed);
+        // A silent acknowledgement is a watermark statement, though: the daemon
+        // confirms every id at or below the acked one, so it may not cross an id
+        // that is still unconfirmed locally. The barrier is the same one
+        // `confirmableDeliveryPrefix` walks (`unconfirmedWatermarkBarrier`), and
+        // crossing it would hand the daemon the authority to mark the blocked id
+        // confirmed without its content ever reaching the transcript — the
+        // "busy delivery never arrives" failure in its silent form, with no
+        // redelivery and no warning afterwards. The held ids stay due and are
+        // acknowledged by a later pass, once the barrier id is confirmed (or
+        // recovered) and the watermark has moved past it.
+        const watermarkBarrier = unconfirmedWatermarkBarrier();
+        const ackableSuppressed =
+          watermarkBarrier === undefined
+            ? dueSuppressed
+            : dueSuppressed.filter((event) => event.id < watermarkBarrier.eventId);
+        if (ackableSuppressed.length > 0) {
+          scheduleSilentUpstreamErrorAck(ctx, ackableSuppressed);
           return;
+        }
+        if (watermarkBarrier !== undefined && dueSuppressed.length > 0) {
+          // Held back by the barrier rather than by a missing tick: say so, in
+          // the throttled shape above, so the stall is observable.
+          noteWakeWatermarkHoldBack(watermarkBarrier);
         }
         // No suppressed event is due, so plant a backoff timer for the next
         // future `nextAttemptAt`. Expired timestamps are excluded (strictly
@@ -1303,8 +1437,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
       // An in-flight batch owns the ack cursor and a busy orchestrator must not
       // be interrupted, so neither is woken immediately — the wake stays
-      // deferred on the spin until the batch settles and the orchestrator is
-      // idle, and nothing is released past that gate.
+      // deferred on the backed-off poll until the batch settles and the
+      // orchestrator is idle, and nothing is released past that gate.
       const inFlight = state.deliveredBatch !== undefined || state.ackInFlight;
       if (inFlight || ctx.isIdle?.() === false) {
         scheduleDeferredWake(ctx);
@@ -1493,8 +1627,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
             };
             state.wakeRequested = false;
             state.wakeRequestedThroughEventId = 0;
-            // The busy wait is over: whatever turn comes next starts its fallback
-            // spin from the first rung again.
+            // The busy wait is over: whatever turn comes next starts the poll
+            // ladder from its first rung again.
             state.wakeBusySpinRung = 0;
             // The ids deliberately do *not* enter `presentedEventIds` here: that set
             // means "this content is in the transcript", and only consumption
@@ -2064,7 +2198,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     pi.on("agent_settled", async (_event: unknown, ctx: PiContext) => {
       state.runActive = false;
-      // The busy period this settlement ends is over, so the fallback spin starts
+      // The busy period this settlement ends is over, so the poll ladder starts
       // from its first rung again for whatever turn comes next (see
       // `WAKE_BUSY_BACKOFF_MS`).
       state.wakeBusySpinRung = 0;

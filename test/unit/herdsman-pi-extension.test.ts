@@ -1,4 +1,4 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, test, vi } from "vitest";
@@ -3907,6 +3907,174 @@ describe("herdsman-pi upstream error wake filter", () => {
       restoreEnv(previous);
     }
   });
+
+  // The silent upstream-error acknowledgement is the one ack path that runs
+  // without a turn to authorize it, and the daemon confirms by watermark
+  // (`where id <= ?`): sending one for an id behind a still-unconfirmed
+  // smaller id hands the daemon the authority to mark that smaller id
+  // confirmed without its content ever reaching the transcript. These cases
+  // pin the barrier the silent path must respect.
+  test("holds a silent upstream-error ack behind a dead-lettered id still inside its retry backoff", async () => {
+    vi.useFakeTimers();
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    let extensionState:
+      | {
+          pendingEvents: AgentEventWireRecord[];
+          presentedEventIds: Set<number>;
+          unackedDelivered: Map<number, AgentEventWireRecord>;
+          wakeAwaitingConsumption: Set<number>;
+          wakeRetryableEventIds: Set<number>;
+        }
+      | undefined;
+    const ackCalls = () =>
+      client.calls
+        .filter(([method]) => method === "agent.notifications.ack")
+        .map(([, params]) => (params as { eventId: number }).eventId);
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state as typeof extensionState;
+        },
+      });
+
+      // 1) A normal update is delivered, and the settlement dead-letters it:
+      // no consumption evidence, so nothing is acknowledged and the id keeps
+      // blocking the daemon's watermark while it waits out its retry backoff.
+      client.emitStream({ method: "agent.event", params: { event: event(91, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("error"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      expect(extensionState?.wakeRetryableEventIds.has(91)).toBe(true);
+      expect(ackCalls()).toEqual([]);
+
+      // 2) A due upstream error arrives behind it. Acknowledging the error
+      // would tell the daemon "the orchestrator has 92", and the daemon
+      // confirms by watermark: the dead-lettered 91 would be swallowed for
+      // good without its content ever reaching the transcript.
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(92, "term_agent", {
+            compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+          }),
+        },
+      });
+      await vi.advanceTimersByTimeAsync(0);
+
+      // The silent ack is not sent at all — not sent-and-logged, not sent with
+      // a warning: under the watermark semantics, sending it *is* the swallow.
+      expect(ackCalls()).toEqual([]);
+      // The blocked id is still pending in the daemon ...
+      expect(client.currentEvents.has(91)).toBe(true);
+      expect(extensionState?.pendingEvents.some((item) => item.id === 91)).toBe(true);
+      // ... and still marked retryable, so a later wake fresh content leads
+      // can still recover it.
+      expect(extensionState?.wakeRetryableEventIds.has(91)).toBe(true);
+      // The held error stays pending too: nothing was confirmed, and the
+      // wake turns nothing on its own account.
+      expect(extensionState?.pendingEvents.some((item) => item.id === 92)).toBe(true);
+      expect(pi.hiddenMessages).toHaveLength(1);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+    }
+  });
+
+  test("keeps a silent upstream-error ack from swallowing a spent-budget dead-letter id, and notes the hold-back once per state", async () => {
+    vi.useFakeTimers();
+    const logHome = mkdtempSync(join(tmpdir(), "herdsman-pi-wake-barrier-"));
+    const previousHome = process.env.HERDSMAN_HOME;
+    process.env.HERDSMAN_HOME = logHome;
+    const client = createWakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    const limit = ((await import(extensionModuleUrl)) as Module).WAKE_DEAD_LETTER_RETRY_LIMIT;
+    let extensionState:
+      | {
+          pendingEvents: AgentEventWireRecord[];
+          presentedEventIds: Set<number>;
+          unackedDelivered: Map<number, AgentEventWireRecord>;
+          wakeAwaitingConsumption: Set<number>;
+          wakeRetryableEventIds: Set<number>;
+        }
+      | undefined;
+    const ackCalls = () =>
+      client.calls
+        .filter(([method]) => method === "agent.notifications.ack")
+        .map(([, params]) => (params as { eventId: number }).eventId);
+    try {
+      await startExtension(client, pi, ctx, {
+        onStateExposed: (state) => {
+          extensionState = state as typeof extensionState;
+        },
+      });
+
+      // Spend the automatic retry budget: the first delivery plus `limit`
+      // backed-off retries, each dead-lettered by a settlement without
+      // consumption evidence. 16s covers both backoff rungs.
+      client.emitStream({ method: "agent.event", params: { event: event(93, "term_agent") } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(pi.hiddenMessages).toHaveLength(1);
+      await pi.emit("agent_start", {}, ctx);
+      await pi.emit("message_end", assistantMessage("error"), ctx);
+      await pi.emit("agent_settled", {}, ctx);
+      for (let attempt = 1; attempt <= limit; attempt += 1) {
+        await vi.advanceTimersByTimeAsync(16_000);
+        expect(pi.hiddenMessages).toHaveLength(1 + attempt);
+        await pi.emit("agent_start", {}, ctx);
+        await pi.emit("message_end", assistantMessage("error"), ctx);
+        await pi.emit("agent_settled", {}, ctx);
+      }
+      expect(extensionState?.wakeRetryableEventIds.has(93)).toBe(true);
+      expect(ackCalls()).toEqual([]);
+
+      // A due upstream error arrives behind the spent id, and repeated
+      // settlements keep re-taking the same decision.
+      client.emitStream({
+        method: "agent.event",
+        params: {
+          event: event(94, "term_agent", {
+            compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+          }),
+        },
+      });
+      for (let round = 0; round < 3; round += 1) {
+        await pi.emit("agent_settled", {}, ctx);
+        await vi.advanceTimersByTimeAsync(0);
+      }
+
+      // Nothing is acknowledged ...
+      expect(ackCalls()).toEqual([]);
+      // ... the spent id is not swallowed by the watermark (it stays pending
+      // in the daemon and recoverable by a wake fresh content leads) ...
+      expect(client.currentEvents.has(93)).toBe(true);
+      expect(extensionState?.pendingEvents.some((item) => item.id === 93)).toBe(true);
+      expect(extensionState?.wakeRetryableEventIds.has(93)).toBe(true);
+      expect(extensionState?.pendingEvents.some((item) => item.id === 94)).toBe(true);
+      // ... and the hold-back is observable exactly once: same blocked id,
+      // same reason (budget spent), same count, inside the note window.
+      const heldLines = herdsmanPiLogLines(logHome).filter((line) =>
+        line.includes("wake acknowledgement held"),
+      );
+      expect(heldLines).toHaveLength(1);
+      expect(heldLines[0]).toContain("eventId=93");
+      expect(heldLines[0]).toContain("reason=dead-letter-budget-exhausted");
+      expect(heldLines[0]).toContain("blocked=1");
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      restoreEnv(previous);
+      process.env.HERDSMAN_HOME = previousHome;
+      rmSync(logHome, { force: true, recursive: true });
+    }
+  });
 });
 
 describe("herdsman-pi disconnect regression (independent coverage)", () => {
@@ -4064,8 +4232,12 @@ describe("pi batch delivery fixes (independent coverage)", () => {
         ["agent.notifications.ack", { eventId: 203 }],
         ["agent.notifications.ack", { eventId: 204 }],
       ]);
-      // The failed event stays pending (with backoff) and is not re-presented.
-      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman · 1 agent update");
+      // The failed event is not re-presented: the acks for 203 and 204 advanced
+      // the daemon watermark past it (`markAcked … where id <= ?` — the daemon
+      // deliberately lets a later batch ack through when the next candidate is
+      // already delivered to this owner), so 202 is confirmed with the batch
+      // instead of being woken again.
+      expect(ctx.statuses.get("herdsman")).toBe("◆ Herdsman");
       expect(pi.hiddenMessages).toHaveLength(1);
     } finally {
       vi.clearAllTimers();
@@ -4706,7 +4878,7 @@ function createWakeClient(replayedEvents: AgentEventWireRecord[] = [], ackedEven
       client.currentEvents.set(ev.id, ev);
     }
   }
-  client.response = (method, _params) => {
+  client.response = (method, params) => {
     if (method === "agent.orchestrator.register") {
       return connectionResponse({
         ...(ackedEventId === undefined ? {} : { ackedEventId }),
@@ -4720,7 +4892,15 @@ function createWakeClient(replayedEvents: AgentEventWireRecord[] = [], ackedEven
       });
     }
     if (method === "agent.list") return agentListResponse();
-    return { acknowledged: true };
+    // The daemon confirms by watermark (`update agent_events set status =
+    // 'acked' … where id <= ?`), so an accepted acknowledgement answers with
+    // the cursor it advanced to: the acked id *and every smaller id* are
+    // confirmed with it. The stub has to carry that cursor, otherwise an ack
+    // that crosses a still-unconfirmed smaller id would look harmless here
+    // while the real daemon swallows the smaller id for good — a fake green
+    // that hides the very watermark hazard these cases pin.
+    const { eventId } = params as { eventId: number };
+    return { acknowledged: true, ackedEventId: eventId, state: { ackedEventId: eventId } };
   };
   return client;
 }
@@ -5142,6 +5322,20 @@ function restoreEnv(previous: Record<string, string | undefined>) {
 
 async function tick(): Promise<void> {
   await new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+/** Every line the extension logger appended under `HERDSMAN_HOME`. */
+function herdsmanPiLogLines(home: string): string[] {
+  const logsDir = join(home, "logs");
+  let files: string[];
+  try {
+    files = readdirSync(logsDir).filter((name) => name.startsWith("herdsman-pi-"));
+  } catch {
+    return [];
+  }
+  return files
+    .flatMap((name) => readFileSync(join(logsDir, name), "utf8").split("\n"))
+    .filter((line) => line.length > 0);
 }
 
 describe("herdsman-pi turn completion signal", () => {
