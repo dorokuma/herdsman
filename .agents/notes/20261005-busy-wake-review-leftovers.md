@@ -10,13 +10,13 @@ supersedes: ""
 
 ## 一句话结论
 
-收尾轮（`4679db8` 之后）reviewer 与 oracle 均判定放行、无 must fix / should fix，但各提出建议级发现；按项目约定建议级发现必须落盘闭环，本笔记收纳三条：① reviewer——`pruneAcknowledgedEvents` 补的对称清扫在真实路径下被 `dropUnackedDelivered` 遮蔽（常态不可达），属防御性对称，留待大重构收口；② oracle（M-1）——不改 OBS-1 的决定成立，但存在更便宜的观测手段（`clearDeliveryBookkeeping` 对已写 off 的 id 补一条与 carriedOver 同形状的 info 日志，零行为变化），留待后续迭代；③ oracle（L-3）——`wakeRetryableEventIds` / `wakeDeadLetterAttempts` / `wakeDeadLetterRetryAt` 可收敛为一张 `Map<id, {attempts, retryAt}>`，属重构项、不是合并前置条件。三条均不阻塞本分支收尾，触发条件写入各条。
+收尾轮（`4679db8` 之后）reviewer 与 oracle 均判定放行、无 must fix / should fix，但各提出建议级发现；按项目约定建议级发现必须落盘闭环，本笔记收纳四条：① reviewer——`pruneAcknowledgedEvents` 补的对称清扫在真实路径下被 `dropUnackedDelivered` 遮蔽（常态不可达），属防御性对称，留待大重构收口；② oracle（M-1）——不改 OBS-1 的决定成立，但存在更便宜的观测手段（`clearDeliveryBookkeeping` 对已写 off 的 id 补一条与 carriedOver 同形状的 info 日志，零行为变化），留待后续迭代；③ oracle（L-3）——`wakeRetryableEventIds` / `wakeDeadLetterAttempts` / `wakeDeadLetterRetryAt` 可收敛为一张 `Map<id, {attempts, retryAt}>`，属重构项、不是合并前置条件；④ oracle（第四轮）——它自认无法独立证实前三轮审查的观察项均已落盘，合并后需对照前三轮 reviewer / oracle 报告原文，与两份笔记的「决策 / 被放弃方案」节做一次条目清点，属流程性核对、不阻塞本轮合并。四条均不阻塞本分支收尾，触发条件写入各条。
 
 ## 背景
 
-本分支经三轮返修后进入收尾轮双审放行。oracle 的 M-1 同时指出 `20261005-busy-backoff-cap-and-retry-sweep.md` 决策第 4 条有一处事实性含糊（`alreadyPresented` 的检查顺序），该措辞已直接订正进那份笔记（结论不变，见其「来源」节交叉链接）；本笔记只承载三条**未修**的建议级发现。
+本分支经三轮返修后进入收尾轮双审放行。oracle 的 M-1 同时指出 `20261005-busy-backoff-cap-and-retry-sweep.md` 决策第 4 条有一处事实性含糊（`alreadyPresented` 的检查顺序），该措辞已直接订正进那份笔记（结论不变，见其「来源」节交叉链接）；本笔记只承载四条**未修**的建议级发现（第 4 条为 oracle 第四轮的流程性待办，无代码定位）。
 
-为何新建而不是追加到既有笔记：最贴切的 `20261005-busy-backoff-cap-and-retry-sweep.md` 是 `4679db8` 的**已决决策记录**（本笔记已按要求只订正其事实措辞），而 `.agents/notes/README.md` 的历史笔记不可变原则不支持把开放遗留项混进已决记录；`wake-delivery-r4f1-remaining-risks.md` 属另一条工作线（R4F1 合同轮、以 daemon/db 条目为主），追加会模糊其范围。三条遗留同属收尾轮、同模块（herdsman-pi），单独成篇才能在 INDEX.md 里有一个可检索的落脚点。
+为何新建而不是追加到既有笔记：最贴切的 `20261005-busy-backoff-cap-and-retry-sweep.md` 是 `4679db8` 的**已决决策记录**（本笔记已按要求只订正其事实措辞），而 `.agents/notes/README.md` 的历史笔记不可变原则不支持把开放遗留项混进已决记录；`wake-delivery-r4f1-remaining-risks.md` 属另一条工作线（R4F1 合同轮、以 daemon/db 条目为主），追加会模糊其范围。四条中前三条同属收尾轮、同模块（herdsman-pi），第 4 条为流程性待办；单独成篇才能在 INDEX.md 里有一个可检索的落脚点。
 
 ## 遗留项
 
@@ -38,21 +38,28 @@ supersedes: ""
 ### 3. 三个 dead-letter 记账字段可收敛为一张 Map（oracle L-3 重构建议）
 
 - **来源角色**：oracle（收尾轮 L-3，重构建议）。
-- **位置**：字段声明 `packages/herdsman-pi/src/index.ts`：`wakeRetryableEventIds`（`:224`）、`wakeDeadLetterAttempts`（`:232`）、`wakeDeadLetterRetryAt`（`:234`）；三处删除分别在 `dropUnackedDelivered`（`:572-574`）、注入后批次清理（`:1465-1466`）、消费确认清理（`:1998`）；另有成组清空（`:614-619`）、写入（`:1165-1179`、attempts 自增 `:1459-1463`）与只读（`:713`、`:769-782`、`:813`、`:1103`、`:1288`、`:1457`）。
+- **位置**：字段声明 `packages/herdsman-pi/src/index.ts`：`wakeRetryableEventIds`（`:224`）、`wakeDeadLetterAttempts`（`:232`）、`wakeDeadLetterRetryAt`（`:234`）；三处删除点删除的字段并不相同：`dropUnackedDelivered`（`:572-574`）删齐 trio 三项；注入后批次清理（`:1465-1466`）只删 `wakeRetryableEventIds` 与 `wakeDeadLetterRetryAt`（attempts 不在此删）；消费确认清理（`:1998`）只删 `wakeRetryableEventIds` 一个键，`wakeDeadLetterAttempts` / `wakeDeadLetterRetryAt` 在该路径不动——其安全性来自 `deadLetterRetryDue` / `deadLetterRetryAt`（只读点 `:769-782`）均先查 `wakeRetryableEventIds.has`：键已在 `:1998` 删掉，两个 Map 里的残留项便永不可达（惰性残留，兜底依靠 trio 的键门控）。将来按字面做 Map 收敛时须知：消费确认处只删一次键（原表述称该路径三字段齐删，与源码不符，已按源码订正；订正来源为 oracle 第四轮观察）；另有成组清空（`:614-619`）、写入（`:1165-1179`、attempts 自增 `:1459-1463`）与只读（`:713`、`:769-782`、`:813`、`:1103`、`:1288`、`:1457`）。
 - **当时不修的理由**：纯重构项，不是本分支合并前置条件，收尾轮只放行建议、不返工。三个字段的语义（可否再投递 / 已花费预算 / 下次重投时点）在注释里已按 trio 成组维护；收敛收益是三处删除并为一处、漏删其一的风险下降，不改变任何行为——没有行为变化就没有回归收益，单独为它开一轮不值。
-- **将来什么条件下值得处理**：下一次大改触及 trio 任一字段时，顺手收敛为 `Map<eventId, { attempts: number; retryAt: number }>`（遗留项 2 的日志与遗留项 1 的清扫收口是天然同批触发器）；与遗留项 1 并入同一轮「wake 记账收敛」做，不单独为重构返工。
+- **将来什么条件下值得处理**：下一次大改触及 trio 任一字段时，顺手收敛为 `Map<eventId, { attempts: number; retryAt: number }>`（遗留项 2 的日志与遗留项 1 的清扫收口是天然同批触发器；注意消费确认处只删键，收敛时该路径仍只删一次键）；与遗留项 1 并入同一轮「wake 记账收敛」做，不单独为重构返工。
+
+### 4. 合并后对照前三轮报告原文清点观察项落盘情况（oracle 第四轮流程待办）
+
+- **来源角色**：oracle（第四轮评审；其对 `581d183` 的判定为通过、分支合并无实质风险，本待办来自其自认无法独立证实事项的后续建议）。
+- **位置**：无代码定位，属流程核对。核对对象是两份笔记的「决策 / 被放弃方案」节——`20261005-busy-backoff-cap-and-retry-sweep.md`、`20261005-busy-wake-review-leftovers.md`；核对依据是前三轮 reviewer / oracle 报告原文。
+- **当时不处理的原因**：oracle 自认无法独立证实「前三轮审查的所有观察项均已落盘」；逐条清点需要三轮报告的完整原文比对，属合并后的流程动作，不阻塞本轮合并（本轮只追加笔记收尾 commit，不改代码、不加测试）。
+- **将来什么条件下值得处理**：合并后择机，或下次触及 wake 投递 / dead-letter 记账模块时，对照前三轮 reviewer / oracle 报告原文，与上述两份笔记的「决策 / 被放弃方案」节做一次条目清点，确认每条观察项都有对应落盘或已决结论。
 
 ## 决策
 
-本笔记只把三条建议级发现落盘闭环，不构成新方案、不改任何代码、不加任何测试断言；三条均判定「当前保留现状」，后续触发条件已写入各条。oracle M-1 对 `20261005-busy-backoff-cap-and-retry-sweep.md` 的事实性订正（`alreadyPresented` 检查顺序 retryable 在最前，suppressed 拦不住仍在 retryable 集合里的 id）已直接改进该笔记的决策第 4 条与对应被放弃方案条目，原决策结论不变。
+本笔记只把四条发现落盘闭环，不构成新方案、不改任何代码、不加任何测试断言；四条均判定「当前不做」，后续触发条件已写入各条（第 4 条的触发条件是「合并后择机或下次触及该模块时」）。遗留项 3 的位置表述按 oracle 第四轮观察订正——消费确认清理（`:1998`）只删 `wakeRetryableEventIds` 一个键，另两个字段在该路径保留且因 `deadLetterRetryDue` / `deadLetterRetryAt` 先查 retryable 而不可达——其 Map 收敛的重构建议与结论均不变。oracle M-1 对 `20261005-busy-backoff-cap-and-retry-sweep.md` 的事实性订正（`alreadyPresented` 检查顺序 retryable 在最前，suppressed 拦不住仍在 retryable 集合里的 id）已直接改进该笔记的决策第 4 条与对应被放弃方案条目，原决策结论不变。
 
 ## 被放弃的方案（必填）
 
-- **把三条遗留项中的任意一条在本轮顺手做掉**：本轮已是三轮返修后的收尾轮，reviewer 与 oracle 均无 must fix / should fix；任何一条落地都会重新打开评审面（日志形状要过 observability 惯例、Map 收敛要动七个以上读写点及其测试替身），超出「只含文档与笔记的收尾 commit」的授权范围。
+- **把四条遗留项中的任意一条在本轮顺手做掉**：本轮已是三轮返修后的收尾轮，reviewer 与 oracle 均无 must fix / should fix；任何一条落地都会重新打开评审面（日志形状要过 observability 惯例、Map 收敛要动七个以上读写点及其测试替身），超出「只含文档与笔记的收尾 commit」的授权范围。
 - **只刷新 INDEX.md、不写本笔记**：建议级发现不落盘即视为未闭环，违反项目约定（决策与踩坑留痕须记入 `.agents/notes/` 并执行 `scripts/notes-index.sh`）。
 
 ## 来源
 
 - 分支 / 提交：`fix/busy-wake-delivery` 的 `606edcb` → `abb357b` → `4679db8`（未 push、未合并回 main）；本笔记为纯文档收尾，不动 `packages/` 下任何代码逻辑、不动版本号与 CHANGELOG、不碰 daemon、不新增测试断言。
-- 评审：收尾轮 reviewer 与 oracle 均判定放行（无 must fix / should fix）；上述三条为各自提出的建议级发现——第 1 条 reviewer，第 2、3 条 oracle。
+- 评审：收尾轮 reviewer 与 oracle 均判定放行（无 must fix / should fix）；上述四条为各自提出的发现——第 1 条 reviewer，第 2、3 条 oracle（收尾轮），第 4 条 oracle（第四轮，流程性待办、无代码定位）。
 - 代码行号均以 `4679db8` 时的 `packages/herdsman-pi/src/index.ts` 为准。相关笔记：`20261005-busy-backoff-cap-and-retry-sweep.md`（M-1 订正落地处）、`20261005-dead-letter-retry-budget.md`（dead-letter 记账语义前置）、`20261004-busy-wake-defer-to-settled.md`（busy wake defer 语义前置）。
