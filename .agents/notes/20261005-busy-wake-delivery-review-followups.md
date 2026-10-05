@@ -95,14 +95,14 @@ reviewer 判定分支可以收口、无 must fix / should fix，仅余 3 条建�
 
 ## 来源
 
-- 分支 / 提交：`fix/busy-wake-delivery`，reviewer 引用代码基线 `581d183`（未 push、未合并回 main）；`packages/herdsman-pi/src/index.ts` 自 `4679db8` 起未变，`581d183` 之后的提交均为 docs-only，均已核对。X-1 补修轮开工基准 = 分支 HEAD `70963e8`（docs-only），该文件与 `4679db8` 内容一致。
+- 分支 / 提交：`fix/busy-wake-delivery`，reviewer 引用代码基线 `581d183`（该基线及其后的提交已随合并提交 `e63e65b` 合入 main 并已 push，`main = origin/main = e63e65b`；原记「未 push、未合并回 main」在 HEAD 上已是假陈述，此处改为事实状态）；`packages/herdsman-pi/src/index.ts` 自 `4679db8` 起未变，`581d183` 之后的提交均为 docs-only，均已核对。X-1 补修轮开工基准 = 分支 HEAD `70963e8`（docs-only），该文件与 `4679db8` 内容一致。
 - 评审：reviewer 判定可以收口，无 must fix / should fix，3 条建议级发现见上；oracle 第二意见**已取得**（前稿「未取得、无正文产出」的记载有误，已更正）：X-1 证实旁路（must fix，已修）、X-2 / X-3 观察（已落地）、X-4 / X-5 无反例、覆盖面 8 条、未验证项与 3 条反问记录在案。
-- 本轮改动范围（未 commit）：`packages/herdsman-pi/src/index.ts`（X-1 屏障 + X-3 节流 info + X-2 注释）、`test/unit/herdsman-pi-extension.test.ts`（fake client 水位语义 + 两条 X-1/X-3 回归测试 + 一条既有假绿期望更正）、本笔记。客观门槛（mise node 26.7.0 `pnpm check`、生产面 node 22.23.1 `pnpm check`、`pnpm build`、`pnpm package:check`）四条全部退出码 0。
+- 本轮改动范围（已落库为 X-1 补修提交 `2934393`，并随合并提交 `e63e65b` 合入 main / 已 push；原记「未 commit」在 HEAD 上已是假陈述，此处改为事实状态）：`packages/herdsman-pi/src/index.ts`（X-1 屏障 + X-3 节流 info + X-2 注释）、`test/unit/herdsman-pi-extension.test.ts`（fake client 水位语义 + 两条 X-1/X-3 回归测试 + 一条既有假绿期望更正）、本笔记。客观门槛（mise node 26.7.0 `pnpm check`、生产面 node 22.23.1 `pnpm check`、`pnpm build`、`pnpm package:check`）四条全部退出码 0。
 - 相关笔记：`20261005-busy-wake-review-leftovers.md`（上轮收尾轮四项，与本篇前三条同源）、`20261005-busy-backoff-cap-and-retry-sweep.md`（水位清扫对称化的决策记录）、`20261005-dead-letter-retry-budget.md`（dead-letter 记账语义前置）、`20261004-busy-wake-defer-to-settled.md`（busy wake defer 语义前置）、`2026-10-04-ghost-wake-fix-followups.md`（本篇格式范本）。
 
 ## oracle 收口轮遗留项（X-1 补修 diff 的第二意见，docs-only 落盘）
 
-本节记录 oracle 对**本轮 X-1 补修 diff**（`fix/busy-wake-delivery`，未 commit：`packages/herdsman-pi/src/index.ts` + `test/unit/herdsman-pi-extension.test.ts`）收口评审的第二意见：双审结论文摘要、3 条建议级（B / C / H）、1 条必须记账的观察项（D）、2 条观察项（E / F）、4 条 open decisions。全部**照实转述，不改写语义、不美化**。**行号口径**：本节行号均为本 worker 开工时点的**实际工作树**核对结果（= 分支 HEAD `70963e8` + 上述未提交补修；基准 commit 记 `70963e8`），与 oracle 原引用并列备查。
+本节记录 oracle 对**本轮 X-1 补修 diff**（`fix/busy-wake-delivery`，该 diff 已落库为 `2934393` 并随 `e63e65b` 合入 main / 已 push：`packages/herdsman-pi/src/index.ts` + `test/unit/herdsman-pi-extension.test.ts`）收口评审的第二意见：双审结论文摘要、3 条建议级（B / C / H）、1 条必须记账的观察项（D）、2 条观察项（E / F）、4 条 open decisions。全部**照实转述，不改写语义、不美化**。**行号口径**：本节行号均为本 worker 开工时点的**实际工作树**核对结果（= 分支 HEAD `70963e8` + 上述未提交补修；基准 commit 记 `70963e8`），与 oracle 原引用并列备查。
 
 ### 本轮双审结论文摘要（照实）
 
