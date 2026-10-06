@@ -151,6 +151,14 @@ function retryRingAuthorized(error: unknown): error is PlanWaitingHistoryError {
  */
 const PLAN_CANCELLED = Symbol("herdsman.status-event-plan-cancelled");
 
+/**
+ * `reason` carried by the orphan terminal row written when a plan still held
+ * deliverable terminal content but its `agents` row was already gone (the
+ * orchestrator closed the pane while the plan was pending). It names the shape,
+ * not a failure of the round: the body it carries is the round's answer.
+ */
+const ORPHAN_SALVAGE_REASON = "pane_closed_before_delivery";
+
 export type AgentIndexRefreshFastResult = {
   agents: AgentIndexRecord[];
   contextChangedScopes: AgentScope[];
@@ -522,27 +530,20 @@ export class AgentIndexService {
   }
 
   async drainPendingPlans(): Promise<void> {
-    if (!this.#stores.statusEventPlans) return;
-    this.#stores.statusEventPlans.resetRunningToPending();
-    const rows = this.#stores.statusEventPlans.listUnfinished();
+    const store = this.#stores.statusEventPlans;
+    if (!store) return;
+    store.resetRunningToPending();
+    const rows = store.listUnfinished();
     const tasks = rows.map((row) => {
       try {
         return this.#enqueueAgentPlan(row.agentId, () => this.#drainPlanRow(row));
       } catch (_error) {
         // A row whose agent cannot even be resolved must never take down the
-        // daemon boot drain (that failure mode used to boot-loop systemd).
-        try {
-          this.#stores.statusEventPlans.markCancelled(row.id);
-        } catch {
-          // The row may already be gone; the drain must continue regardless.
-        }
-        console.warn("Herdsman cancelling status event plan for missing agent", {
-          agentId: row.agentId,
-          herdrSessionName: row.herdrSessionName,
-          paneId: row.paneId,
-          from: row.fromStatus,
-          to: row.toStatus,
-        });
+        // daemon boot drain (that failure mode used to boot-loop systemd). Its
+        // terminal content is salvaged first: a pending plan whose pane was
+        // closed still holds this round's answer.
+        const salvaged = this.#salvageOrCancelMissingAgentPlan(store, row);
+        if (salvaged) this.#publishSalvagedEvent(salvaged);
         return Promise.resolve();
       }
     });
@@ -778,6 +779,274 @@ export class AgentIndexService {
     };
   }
 
+  /**
+   * Terminal content a plan whose agent can no longer be resolved may still
+   * hand to the orchestrator, or null when there is nothing worth salvaging.
+   *
+   * Two sources, in order:
+   *  1. the plan row's own baseline snapshot (`compact_history_json`, written once
+   *     at plan creation and never updated). In the frozen-baseline shape that
+   *     snapshot *is* this round's answer — it is the session tail as of plan
+   *     creation — which is exactly the content a `no_advance_from_input` degrade
+   *     blanks and the replacement row then never gets to deliver;
+   *  2. the pane's newest recorded tail that never reached the orchestrator.
+   *     Re-reading the session file is not possible here: history discovery needs
+   *     the `agent_session` that lived on the now-deleted `agents` row, and
+   *     herdsman deliberately does not guess a session path
+   *     (`src/agent-history/discovery.ts`), so the pane's own event history is the
+   *     only remaining record of that tail. A row the orchestrator already
+   *     consumed (`delivery_attempts > 0`) is skipped, and so is a body that
+   *     matches one it already consumed: those are not lost, so re-sending them
+   *     would only duplicate a delivery.
+   *
+   * Both sources run the same "already delivered" comparison, over the same
+   * window (this pane's delivered/acked terminal rows that predate the plan).
+   * The baseline is frequently the previous round's already-delivered body (the
+   * pane closes right after a finished round), so source ① skipping that
+   * comparison would resurrect an answer the orchestrator already has — as a
+   * false `agent.failed` carrying a stale body, which no same-pane `completed`
+   * row would suppress.
+   */
+  #salvageableTerminalBody(row: StatusEventPlanRecord): CompactAgentHistory | null {
+    const generationClause =
+      row.paneGeneration === null ? "pane_generation is null" : "pane_generation = ?";
+    const paneParams: Array<string | number> = [
+      row.herdrSessionName,
+      row.paneId,
+      row.createdAt.getTime(),
+    ];
+    if (row.paneGeneration !== null) paneParams.push(row.paneGeneration);
+    const recorded = this.#stores.sqlite
+      .prepare(
+        `select compact_history_json, delivery_attempts from agent_events
+         where herdr_session_name = ? and pane_id = ? and created_at <= ? and ${generationClause}
+         order by id desc limit 20`,
+      )
+      .all(...paneParams) as Array<{
+      compact_history_json: string | null;
+      delivery_attempts: number;
+    }>;
+    const delivered = this.#stores.sqlite
+      .prepare(
+        `select compact_history_json, payload_json from agent_events
+         where herdr_session_name = ? and pane_id = ? and created_at <= ?
+           and type in ('agent.idle', 'agent.done', 'agent.blocked')
+           and status in ('delivered', 'acked')
+         order by id desc limit ?`,
+      )
+      .all(
+        row.herdrSessionName,
+        row.paneId,
+        row.createdAt.getTime(),
+        STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+      ) as Array<{ compact_history_json: string | null; payload_json: string }>;
+    // The pane's current agent kind, taken from the newest delivered row's
+    // payload — the closest surviving evidence once the `agents` row is gone.
+    // `sameTerminalAssistantContent` compares agy/antigravity tails by ref alone,
+    // so a hardcoded "pi" would dedupe an agy body that shares a ref with an
+    // older delivery but carries new text, and skip a real salvage.
+    const deliveredKind = agentKindFromPayloadJson(delivered[0]?.payload_json);
+    const alreadyDelivered = (body: CompactAgentHistory | null | undefined): boolean =>
+      body !== null &&
+      body !== undefined &&
+      delivered.some((other) =>
+        sameTerminalAssistantContent(
+          body,
+          parseCompactHistoryJson(other.compact_history_json),
+          deliveredKind,
+        ),
+      );
+    if (
+      isTerminalAssistant(row.compactHistory) &&
+      hasNonEmptyAssistantMessage(row.compactHistory) &&
+      !alreadyDelivered(row.compactHistory)
+    ) {
+      return row.compactHistory ?? null;
+    }
+    for (const candidate of recorded) {
+      if (candidate.delivery_attempts !== 0) continue;
+      const parsed = parseCompactHistoryJson(candidate.compact_history_json);
+      if (!isTerminalAssistant(parsed) || !hasNonEmptyAssistantMessage(parsed)) continue;
+      if (alreadyDelivered(parsed)) continue;
+      return parsed;
+    }
+    return null;
+  }
+
+  /**
+   * Keeps a pending plan's terminal content from dying with its agent row.
+   *
+   * A plan can still be pending when the orchestrator closes the pane (the
+   * normal "finished, close it" discipline): the `agents` row is physically
+   * deleted, and the drain that used to cancel the row as a "missing agent"
+   * then lost the content for good — the plan never produced its replacement
+   * row and nothing else carried the body. When the plan still holds (or the
+   * pane still records) a legal terminal assistant body, the content is emitted
+   * through H1's orphan terminal channel instead of being cancelled.
+   *
+   * Returns the emitted event, or null when the plan had nothing to
+   * salvage (cancelling is then the correct outcome). Null also covers the
+   * undeliverable case — content exists, but the orphan row that would carry it
+   * could not pass the delivery gate (its scope cannot be stitched) — because
+   * writing such a row is strictly worse than cancelling: it dead-letters, and
+   * its idempotency key would make every later append return that dead row.
+   */
+  #salvageOrphanTerminalEvent(row: StatusEventPlanRecord): AgentEventRecord | null {
+    const body = this.#salvageableTerminalBody(row);
+    if (!body) return null;
+    // Same orphan construction H1 uses for plan outcomes: resolve the pane's own
+    // metadata from its event history, keep `agent_id = null` when the `agents`
+    // row is gone, and leave the original id / pane / session in the payload. The
+    // row is written as an orphan terminal event (`agent.failed`), which is the
+    // one shape the delivery gate still lets through without a live agent row;
+    // an orphan `agent.done` would be written and then never delivered.
+    const orphanAgent: AgentIndexRecord = {
+      agent: null,
+      agentSession: null,
+      agentStatus: "unknown",
+      cwd: null,
+      firstSeenAt: new Date(0),
+      focused: false,
+      foregroundCwd: null,
+      herdrSessionName: row.herdrSessionName,
+      id: row.agentId,
+      lastSeenAt: new Date(0),
+      name: null,
+      paneId: row.paneId,
+      paneRevision: null,
+      ...(row.paneGeneration === null ? {} : { paneGeneration: row.paneGeneration }),
+      tabId: null,
+      terminalId: null,
+      workspaceId: "",
+    };
+    // Deliverability is decided *before* the append. `#appendPlanFailedEvent`
+    // stitches the orphan scope from the pane's own event history
+    // (`#resolvePlanOutcomeAgent` -> `#minimalAgentFromLatestEvent`, bound to
+    // `created_at <= plan.createdAt`), but an event written during *this* plan's
+    // execution is newer than the plan row, and the pane may carry no earlier
+    // event at all. The orphan row then keeps the placeholders above
+    // (`terminal_id = null`, `workspace_id = ""`): `isDeliverableAgentEvent`
+    // rejects it and `publishAgentEvent` dead-letters it, while the idempotency
+    // key `agent.failed:plan:<id>` would make every later append of this plan
+    // return that dead row — a strictly worse outcome than the cancel this
+    // method returns instead. A stitch that resolved is taken at face value:
+    // `#appendAndAckSelfEvent` re-resolves the same row, so the append writes
+    // exactly what was just judged deliverable.
+    if (!this.#orphanScopeDeliverable(orphanAgent, row.createdAt.getTime())) {
+      console.warn(
+        "Herdsman left a status event plan cancellable because the pane scope could not be stitched",
+        {
+          agentId: row.agentId,
+          herdrSessionName: row.herdrSessionName,
+          paneId: row.paneId,
+          planId: row.id,
+          reason: ORPHAN_SALVAGE_REASON,
+        },
+      );
+      return null;
+    }
+    const event = this.#appendPlanFailedEvent({
+      agent: orphanAgent,
+      attempts: row.attempts,
+      compactHistory: body,
+      from: row.fromStatus,
+      planCreatedAt: row.createdAt.getTime(),
+      planId: row.id,
+      reason: ORPHAN_SALVAGE_REASON,
+      to: row.toStatus,
+    });
+    console.warn("Herdsman salvaged an orphan terminal event for a plan whose agent row is gone", {
+      agentId: row.agentId,
+      eventId: event.id,
+      from: row.fromStatus,
+      herdrSessionName: row.herdrSessionName,
+      paneId: row.paneId,
+      planId: row.id,
+      reason: ORPHAN_SALVAGE_REASON,
+      to: row.toStatus,
+    });
+    return event;
+  }
+
+  /**
+   * Whether an orphan terminal event for this plan would carry a scope the
+   * delivery gate can route. Mirrors exactly what `#appendPlanFailedEvent` will
+   * resolve: a non-null `terminal_id` and non-empty `workspace_id` are what
+   * `publishAgentEvent` requires (everything else the gate checks — an
+   * `agent.failed` row in `pending` state — holds by construction).
+   */
+  #orphanScopeDeliverable(orphanAgent: AgentIndexRecord, planCreatedAt: number): boolean {
+    const resolved = this.#resolvePlanOutcomeAgent(orphanAgent, planCreatedAt).agent;
+    return resolved.terminalId !== null && resolved.workspaceId !== "";
+  }
+
+  /**
+   * Settles a plan whose agent row can no longer be resolved: salvage its
+   * terminal content as an orphan event, or cancel it when there is none.
+   *
+   * The cancel branch keeps its original shape (including the warning that makes
+   * a content-free cancellation visible), so only the "there was something to
+   * deliver" case changes behaviour. Returns the salvaged event (or null when
+   * the plan was cancelled) so callers can publish it: the orchestrator's wake
+   * is `agent.event`-push driven (`handleAgentEvent` in the pi extension), and
+   * a salvaged row that is only written to the database would sit `pending`
+   * until the next reconcile tick rather than waking the (already idle, pane
+   * closed) orchestrator now.
+   */
+  #salvageOrCancelMissingAgentPlan(
+    store: StatusEventPlanStore,
+    row: StatusEventPlanRecord,
+  ): AgentEventRecord | null {
+    let salvaged: AgentEventRecord | null = null;
+    try {
+      salvaged = this.#salvageOrphanTerminalEvent(row);
+      if (salvaged) {
+        // The content reached the orphan channel, so the plan is settled — not
+        // cancelled, and not left pending for the next tick to lose again.
+        store.markCompleted(row.id);
+      }
+    } catch (error) {
+      // The salvage must never take the drain down: a failed write falls back to
+      // the pre-existing cancel behaviour.
+      console.warn("Herdsman failed to salvage a status event plan for a missing agent", {
+        agentId: row.agentId,
+        herdrSessionName: row.herdrSessionName,
+        paneId: row.paneId,
+        planId: row.id,
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+    if (salvaged) return salvaged;
+    try {
+      store.markCancelled(row.id);
+    } catch {
+      // The row may already be gone; the drain must continue regardless.
+    }
+    console.warn("Herdsman cancelling status event plan for missing agent", {
+      agentId: row.agentId,
+      herdrSessionName: row.herdrSessionName,
+      paneId: row.paneId,
+      from: row.fromStatus,
+      to: row.toStatus,
+    });
+    return null;
+  }
+
+  /**
+   * Publishes a salvaged orphan event on the same channel a normal terminal
+   * event takes (`#onAgentEvent`, used for the retry-exhausted failed branch and
+   * by every caller that forwards `#runPlanRow`'s result). The wake is
+   * `agent.event`-push driven (`handleAgentEvent` in the pi extension; keepalive
+   * only pings), so a salvage that is merely written to the database would leave
+   * the row `pending` while the orchestrator — pane closed, idle — has nothing
+   * to trigger a fetch.
+   */
+  #publishSalvagedEvent(event: AgentEventRecord): void {
+    if (VALID_AGENT_EVENT_TYPES.has(event.type)) {
+      this.#onAgentEvent?.(event);
+    }
+  }
+
   async #drainPlanRow(row: StatusEventPlanRecord): Promise<void> {
     const store = this.#stores.statusEventPlans;
     if (!store) return;
@@ -809,14 +1078,12 @@ export class AgentIndexService {
       agent = undefined;
     }
     if (!agent) {
-      store.markCancelled(current.id);
-      console.warn("Herdsman cancelling status event plan for missing agent", {
-        agentId: current.agentId,
-        herdrSessionName: current.herdrSessionName,
-        paneId: current.paneId,
-        from: current.fromStatus,
-        to: current.toStatus,
-      });
+      // The agent row is gone (pane retired while the plan was pending). Cancel
+      // only when the plan has no terminal content left to hand over; the
+      // salvage is published from here because no caller sees this path's
+      // result (the drain owns it).
+      const salvaged = this.#salvageOrCancelMissingAgentPlan(store, current);
+      if (salvaged) this.#publishSalvagedEvent(salvaged);
       return;
     }
     let activeCompact = current.compactHistory;
@@ -1041,7 +1308,14 @@ export class AgentIndexService {
       const event = await this.#appendStatusEvents(activePlan);
       if (event === PLAN_CANCELLED) {
         this.#clearWaitingTimer(row.id);
-        store.markCancelled(row.id);
+        // The append-time guard refused the plan because the agent row is gone
+        // (pane closed mid-execution — the common case: the orchestrator's
+        // "finish and close" lands in the TURN_SIGNAL_WAIT_MS window). That is
+        // the same content-loss the drain-time salvage fixes, so it settles
+        // through the same path; the published result keeps waking the
+        // orchestrator exactly as a normal terminal event would.
+        const salvaged = this.#salvageOrCancelMissingAgentPlan(store, row);
+        if (salvaged) this.#publishSalvagedEvent(salvaged);
         return undefined;
       }
       if (
@@ -1053,7 +1327,11 @@ export class AgentIndexService {
         })
       ) {
         this.#clearWaitingTimer(row.id);
-        store.markCancelled(row.id);
+        // Execution-time pane close (abort/early return before the append
+        // round): same salvage as the drain-time missing-agent path instead of a
+        // blind cancel, so content on disk is not lost with the plan.
+        const salvaged = this.#salvageOrCancelMissingAgentPlan(store, row);
+        if (salvaged) this.#publishSalvagedEvent(salvaged);
         return undefined;
       }
       this.#clearWaitingTimer(row.id);
@@ -1181,7 +1459,9 @@ export class AgentIndexService {
         err?.message?.includes("aborted");
       if (isPaneClosed) {
         this.#clearWaitingTimer(row.id);
-        store.markCancelled(row.id);
+        // Same salvage as the other mid-execution pane-close exits above.
+        const salvaged = this.#salvageOrCancelMissingAgentPlan(store, row);
+        if (salvaged) this.#publishSalvagedEvent(salvaged);
         return undefined;
       }
       this.#clearWaitingTimer(row.id);
@@ -2045,34 +2325,55 @@ export class AgentIndexService {
             // given agent (47/94 in a 7-day sample) carry the same ref as a `done` row
             // of that agent; they are never deliverable) can sit in the window and must
             // not blank a deliverable round; the tightened guard is not a strict
-            // superset of the old one (it fires only in the mismatch arm).
-            const staleBaselineDuplicate = (
-              this.#stores.sqlite
-                .prepare(
-                  `select compact_history_json from agent_events
-                   where agent_id = ? and herdr_session_name = ?
-                     and type in ('agent.idle', 'agent.done', 'agent.blocked')
-                     and status in ('delivered', 'acked')
-                   order by id desc limit ?`,
-                )
-                .all(
-                  input.agent.id,
-                  input.agent.herdrSessionName,
-                  STALE_DUPLICATE_GUARD_SCAN_LIMIT,
-                ) as Array<{ compact_history_json: string | null }>
-            ).some((row) =>
+            // superset of the old one (its window is narrower than "every terminal
+            // row", and the same window now also answers the no-advance release
+            // question below — "did this agent ever deliver a terminal row?" —
+            // which for unconfirmed rounds replaced `confirmed` as the gate; a
+            // confirmed round is released there regardless of that answer).
+            // Kept as rows (not just the boolean below) so the frozen-baseline
+            // release can ask the same window whether this agent ever handed a
+            // terminal row to the orchestrator: one query, one window, no second
+            // parallel criterion.
+            const deliveredTerminalHistories = this.#stores.sqlite
+              .prepare(
+                `select compact_history_json from agent_events
+                 where agent_id = ? and herdr_session_name = ?
+                   and type in ('agent.idle', 'agent.done', 'agent.blocked')
+                   and status in ('delivered', 'acked')
+                 order by id desc limit ?`,
+              )
+              .all(
+                input.agent.id,
+                input.agent.herdrSessionName,
+                STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+              ) as Array<{ compact_history_json: string | null }>;
+            const staleBaselineDuplicate = deliveredTerminalHistories.some((row) =>
               sameTerminalAssistantContent(
                 advanced,
                 parseCompactHistoryJson(row.compact_history_json),
                 "pi",
               ),
             );
-            // A confirmed turn carrying a non-empty terminal assistant message is
-            // trusted as-is, so `no_advance_from_input` stays reserved for rounds
-            // with genuinely no deliverable assistant text (empty or non-terminal
-            // tail).
-            const confirmedDeliverable =
-              confirmedTerminal &&
+            // Whether this agent ever delivered a terminal row. This is an
+            // existence question over the bounded window, not a content question:
+            // `limit 200` fetches the newest ≤200 delivered/acked terminal rows, so
+            // any delivery at all makes `length > 0` (an agent with 300 delivered
+            // rows still reads > 0 — "older than 200 rows is invisible" applies
+            // only to `staleBaselineDuplicate`, which compares a *specific* body
+            // against the window and so can miss a body older than the newest 200).
+            // The existence judgement therefore carries no >200-row cost.
+            const hasDeliveredTerminalRow = deliveredTerminalHistories.length > 0;
+            // M2 deliverability judgement: the turn-end signal already arrived
+            // (the enclosing `if (turn?.received)`), so only the disk matters — a
+            // non-empty terminal assistant message that was not already delivered
+            // (`diskDeliverable`) is this round's answer. The client's `confirmed`
+            // flag is deliberately not a conjunct here: its `expectedText` is only
+            // the extension's own guess at the final tail and can systematically
+            // disagree with the transcript that landed on disk (rewrite-type
+            // extensions and credential redaction both make the text-level
+            // confirmation never match), while the disk tail is the authoritative
+            // evidence.
+            const diskDeliverable =
               isTerminalAssistant(advanced) &&
               hasNonEmptyAssistantMessage(advanced) &&
               !staleBaselineDuplicate;
@@ -2080,11 +2381,63 @@ export class AgentIndexService {
               !isRetry &&
               !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
             ) {
-              if (confirmedDeliverable) {
+              // Frozen-baseline release. `historyHasAdvanced(...,
+              // { requireAssistantChange: true })` compares the assistant
+              // ref/text against the plan baseline, and that baseline is written
+              // once when the plan row is created (no UPDATE ever follows) —
+              // routinely after the final assistant message already reached disk.
+              // "No advance" therefore does not mean "nothing to deliver": it
+              // usually means the answer is already in place, and blanking it is
+              // what lost finished work (degrade -> invalidate -> the replacement
+              // row waits for a 15-minute tick). Release is judged from the disk
+              // (`diskDeliverable`), never from `confirmed`.
+              //
+              // The extra conjunct is the one the mismatch arm below does not
+              // need, and it is scoped strictly to unconfirmed rounds: this arm
+              // cannot tell "the frozen baseline holds this round's answer" from
+              // "this round wrote nothing new". Once the agent has delivered a
+              // terminal row before, an unchanged history is ambiguous — the tail
+              // may be that earlier, already-delivered answer — and only the
+              // content-level guard (bounded window, delivered/acked rows only,
+              // ref/text comparison) stands between the two, which is not sound
+              // enough to release on. For an agent that never delivered a
+              // terminal row (its first terminal round) there is no earlier
+              // answer to re-release, so the body on disk can only be this
+              // round's.
+              //
+              // `confirmedTerminal` overrides that structural hold, and only for
+              // this one arm. A confirmed round already proved (text-level, at
+              // the client) that the on-disk tail is this round's final message,
+              // so "the agent delivered a terminal row before" no longer makes
+              // the tail ambiguous: it is not "this round wrote nothing new", it
+              // is "this round's answer is already in place and verified". The
+              // structural hold therefore stays the fallback for the unconfirmed
+              // round — where nothing vouches the tail is this round's — and
+              // keeps the safety netting the previous empty-body bug
+              // (`20261001-pi-confirmed-turn-frozen-baseline-empty-body.md`)
+              // depended on: a confirmed round with a *blanked* body is no
+              // longer reachable, because the release runs before the blanking.
+              // Confirming is *not* a licence to blank: with the hold lifted the
+              // body is released, and a confirmed round whose disk body is
+              // empty still takes `degradeOrRelease`'s soften path below.
+              if (diskDeliverable && (!hasDeliveredTerminalRow || confirmedTerminal)) {
                 // Trust the already-in-place answer: release it as a non-stale
-                // snapshot and without a `degraded` marker.
+                // snapshot and without a `degraded` marker (`degraded: true` is
+                // what made #runPlanRow invalidate the content it had just
+                // written).
                 compactHistory = advanced;
                 payloadExtra = { staleSnapshot: false };
+                console.warn(
+                  "Herdsman released a pi status event from a frozen baseline that already holds the on-disk answer",
+                  {
+                    agentId: input.agent.id,
+                    confirmed: confirmedTerminal,
+                    herdrSessionName: input.agent.herdrSessionName,
+                    paneId: input.agent.paneId,
+                    planId: input.planId ?? null,
+                    terminalId: input.agent.terminalId,
+                  },
+                );
               } else {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease(
@@ -2094,24 +2447,11 @@ export class AgentIndexService {
             } else {
               const advancedText = advanced.lastAssistantMessage?.text?.trim() ?? "";
               const advancedMatchesExpected = !expectedText || advancedText.endsWith(expectedText);
-              // M2 deliverability judgement: the turn-end signal already arrived
-              // (the enclosing `if (turn?.received)`), so only the disk matters — a
-              // non-empty terminal assistant message that was not already delivered
-              // (`diskDeliverable`) is this round's answer. The
-              // client's `confirmed` flag is deliberately not a conjunct here: its
-              // `expectedText` is only the extension's own guess at the final tail
-              // and can systematically disagree with the transcript that landed on
-              // disk (rewrite-type extensions and credential redaction both make
-              // the text-level confirmation never match), while the disk tail is
-              // the authoritative evidence. When the guess disagrees the body is
-              // still released as-is — `degraded` stays off, because `degraded:
-              // true` makes #runPlanRow call invalidateById(..., "degraded_retry")
-              // on content that is already written — and the mismatch is recorded
-              // as a warning (split by `confirmed`) so it stays diagnosable.
-              const diskDeliverable =
-                isTerminalAssistant(advanced) &&
-                hasNonEmptyAssistantMessage(advanced) &&
-                !staleBaselineDuplicate;
+              // When the guess disagrees the body is still released as-is —
+              // `degraded` stays off, because `degraded: true` makes #runPlanRow
+              // call invalidateById(..., "degraded_retry") on content that is
+              // already written — and the mismatch is recorded as a warning (split
+              // by `confirmed`) so it stays diagnosable.
               if (diskDeliverable) {
                 if (!advancedMatchesExpected) {
                   console.warn(
@@ -2360,17 +2700,22 @@ export class AgentIndexService {
         paneGeneration: input.agent.paneGeneration ?? null,
       });
       if (!currentAgent) {
-        // The agent row is gone: appending would create a dangling event with
-        // a dead agent_id that only the reconciler could sweep. Cancel the
-        // plan instead of marking it completed (the skip->completed branch
+        // The agent row is gone (pane retired mid-execution): appending would
+        // create a dangling event with a dead agent_id that only the reconciler
+        // could sweep, so no terminal row is appended here. `#runPlanRow` settles
+        // the plan from here — salvaging its terminal content as an orphan event
+        // when there is any, cancelling otherwise (the skip->completed branch
         // must stay reserved for genuine skips).
-        console.debug("Herdsman cancelling terminal status plan because agent row is gone", {
-          agentId: input.agent.id,
-          herdrSessionName: input.agent.herdrSessionName,
-          paneId: input.agent.paneId,
-          from: input.from,
-          to: input.to,
-        });
+        console.debug(
+          "Herdsman refusing to append a terminal status event because the agent row is gone",
+          {
+            agentId: input.agent.id,
+            herdrSessionName: input.agent.herdrSessionName,
+            paneId: input.agent.paneId,
+            from: input.from,
+            to: input.to,
+          },
+        );
         return PLAN_CANCELLED;
       }
       let targetAgent: AgentIndexRecord;
@@ -2771,6 +3116,20 @@ function parseCompactHistoryJson(value: string | null): CompactAgentHistory | nu
   if (!value) return null;
   try {
     return JSON.parse(value) as CompactAgentHistory;
+  } catch {
+    return null;
+  }
+}
+
+function agentKindFromPayloadJson(value: string | null | undefined): string | null {
+  if (!value) return null;
+  try {
+    const payload = JSON.parse(value) as unknown;
+    const agent =
+      typeof payload === "object" && payload !== null
+        ? (payload as { agent?: unknown }).agent
+        : undefined;
+    return typeof agent === "string" ? agent : null;
   } catch {
     return null;
   }

@@ -2363,4 +2363,300 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     }
     harness.sqlite.close();
   }, 20_000);
+
+  test("A: an unconfirmed turn with a frozen baseline holding the answer delivers the disk body without degrade", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // The lost-update chain: the extension could not text-confirm the write
+      // (`confirmed: false`), its expectedText never reached disk, and the plan
+      // baseline was written after the final assistant message landed — so the
+      // refreshed snapshot is byte-identical to the frozen baseline and the arm
+      // used to blank the body as `no_advance_from_input` and invalidate it.
+      const terminalHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m2",
+          stopReason: "stop",
+          text: "final answer",
+          timestamp: null,
+        },
+      };
+      const index = staleGuardIndex({ disk: () => terminalHistory, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      const delivered = await runConfirmedPlanRound({
+        baseline: terminalHistory,
+        confirmed: false,
+        eventKey: "evt-round-1",
+        expectedText: "expected tail that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      // The body on disk is this round's answer and the agent never delivered a
+      // terminal row, so the round is released as a normal terminal event: the
+      // text survives, nothing is degraded and nothing is invalidated.
+      expect(delivered?.type).toBe("agent.done");
+      expect(delivered?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+      expect(delivered?.payload).toMatchObject({ staleSnapshot: false });
+      expect(delivered?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+      expect(delivered?.deliverable).toBe(1);
+      const doneRows = harness.sqlite
+        .prepare("select * from agent_events where type = 'agent.done'")
+        .all() as Array<Record<string, unknown>>;
+      expect(doneRows).toHaveLength(1);
+      expect(doneRows[0]).toMatchObject({ deliverable: 1, status: "pending" });
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated'")
+        .all();
+      expect(invalidatedRows).toHaveLength(0);
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] ===
+              "Herdsman released a pi status event from a frozen baseline that already holds the on-disk answer" &&
+            call[1]?.confirmed === false,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("A guard: an unconfirmed frozen baseline that repeats the last delivered body still degrades", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Round 1 delivers "round-1 answer" and the orchestrator consumes it, so
+      // the agent has a delivered terminal row on record.
+      const firstRound: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      let disk: CompactAgentHistory = firstRound;
+      const index = staleGuardIndex({ disk: () => disk, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      const first = await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-round-1",
+        harness,
+        index,
+        registry,
+      });
+      if (!first) throw new Error("expected round-1 event");
+      harness.agentEvents.reservePending("term_owner", 100, [first.id]);
+
+      // Round 2 is unconfirmed, wrote nothing new, and its frozen baseline is the
+      // body already delivered in round 1: handing that body out again as this
+      // round's answer is exactly what the release must not do. The degraded row
+      // is invalidated for a retry, so `executeStatusEventPlan` returns undefined
+      // and the evidence lives in the event row itself.
+      disk = { ...firstRound };
+      const released = await runConfirmedPlanRound({
+        baseline: firstRound,
+        confirmed: false,
+        eventKey: "evt-round-2",
+        expectedText: "round-2 answer that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(released).toBeUndefined();
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+        .all() as Array<Record<string, unknown>>;
+      expect(invalidatedRows).toHaveLength(1);
+      const degradedRow = invalidatedRows[0];
+      if (!degradedRow) throw new Error("expected the degraded row");
+      expect(JSON.parse(String(degradedRow.payload_json))).toMatchObject({
+        degraded: true,
+        degradedReason: "stale_baseline_duplicate",
+      });
+      expect(JSON.parse(String(degradedRow.compact_history_json))).toMatchObject({
+        lastAssistantMessage: null,
+      });
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] === "Herdsman emitted degraded status event" &&
+            call[1]?.degradedReason === "stale_baseline_duplicate",
+        ),
+      ).toHaveLength(1);
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] ===
+            "Herdsman released a pi status event from a frozen baseline that already holds the on-disk answer",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("A guard: an unconfirmed frozen baseline over a non-terminal tail still degrades", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // The frozen baseline and every re-read agree, but the tail is a tool-use
+      // turn: there is no finished answer on disk, so a half-written body must
+      // not be released as this round's result.
+      const toolTurn: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m2",
+          text: "calling a tool",
+          timestamp: null,
+        },
+      };
+      const index = staleGuardIndex({ disk: () => toolTurn, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      const released = await runConfirmedPlanRound({
+        baseline: toolTurn,
+        confirmed: false,
+        eventKey: "evt-round-1",
+        expectedText: "expected tail that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      // No finished answer on disk: the round degrades (and is invalidated for a
+      // retry, so the plan runner returns undefined) instead of shipping the
+      // half-written tool turn.
+      expect(released).toBeUndefined();
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+        .all() as Array<Record<string, unknown>>;
+      expect(invalidatedRows).toHaveLength(1);
+      const degradedRow = invalidatedRows[0];
+      if (!degradedRow) throw new Error("expected the degraded row");
+      expect(JSON.parse(String(degradedRow.payload_json))).toMatchObject({
+        degraded: true,
+        degradedReason: "no_advance_from_input",
+      });
+      expect(JSON.parse(String(degradedRow.compact_history_json))).toMatchObject({
+        lastAssistantMessage: null,
+      });
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] === "Herdsman emitted degraded status event" &&
+            call[1]?.degradedReason === "no_advance_from_input",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("A: a confirmed frozen-baseline round over a delivered tail still releases this round's answer", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // W17's frozen-baseline shape, but the agent has already handed the
+      // orchestrator a terminal row: round 1 delivered "round-1 answer" and the
+      // orchestrator consumed it (`reservePending` -> delivered), so the release
+      // arm below runs over an agent with a delivered terminal history. Round 2
+      // is CONFIRMED, its answer is already on disk and frozen into the plan
+      // baseline, and its expectedText never reached disk — the round wrote
+      // nothing *new*, yet the answer is in place and the client vouched for it.
+      const firstRound: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      const secondRound: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m2",
+          stopReason: "stop",
+          text: "round-2 answer",
+          timestamp: null,
+        },
+      };
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      let disk: CompactAgentHistory = firstRound;
+      const index = staleGuardIndex({ disk: () => disk, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+
+      const first = await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-round-1",
+        harness,
+        index,
+        registry,
+      });
+      if (!first) throw new Error("expected round-1 event");
+      harness.agentEvents.reservePending("term_owner", 100, [first.id]);
+
+      // Round 2: a confirmed round whose frozen baseline is its own on-disk
+      // answer. The never-delivered hold must NOT apply here — holding it blanks
+      // the body, and the confirmed soften path would ship an empty `agent.done`
+      // with no degrade and no retry, exactly the silent empty body
+      // 20261001-pi-confirmed-turn-frozen-baseline-empty-body.md fixed.
+      disk = secondRound;
+      const released = await runConfirmedPlanRound({
+        baseline: secondRound,
+        confirmed: true,
+        eventKey: "evt-round-2",
+        expectedText: "round-2 answer that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(released?.type).toBe("agent.done");
+      expect(released?.compactHistory?.lastAssistantMessage?.text).toBe("round-2 answer");
+      expect(released?.payload).toMatchObject({ staleSnapshot: false });
+      expect(released?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated'")
+        .all();
+      expect(invalidatedRows).toHaveLength(0);
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] ===
+              "Herdsman released a pi status event from a frozen baseline that already holds the on-disk answer" &&
+            call[1]?.confirmed === true,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
 });

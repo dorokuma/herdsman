@@ -2694,6 +2694,250 @@ describe("AgentIndexService status event plan drain resilience", () => {
     harness.sqlite.close();
   });
 
+  test("retains and delivers orphan terminal event when pane is closed while plan is pending", async () => {
+    const harness = openObservabilityDbHarness();
+    const pushed: AgentEventRecord[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      onAgentEvent: (event) => {
+        pushed.push(event);
+      },
+      stores: harness,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await index.refreshHerdrSession(sessionInput());
+      const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+      if (!agent) throw new Error("expected indexed agent");
+
+      // The pane's own event history is what keeps an orphan terminal row
+      // routable once the `agents` row is gone (pane id, terminal, workspace).
+      harness.agentEvents.append({
+        agentId: agent.id,
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        payload: { agent: "pi", from: "working", to: "done" },
+        terminalId: "term_claude",
+        type: "agent.status.changed",
+        workspaceId: "wJ",
+      });
+
+      // A pending plan whose frozen baseline holds this round's final answer.
+      const row = harness.statusEventPlans.insertPending({
+        agentId: agent.id,
+        compactHistory: {
+          ...emptyCompactHistory("pi-jsonl"),
+          lastAssistantMessage: {
+            ref: "m2",
+            stopReason: "stop",
+            text: "final answer",
+            timestamp: null,
+          },
+        },
+        fromStatus: "working",
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        toStatus: "done",
+      });
+
+      // The orchestrator closes the pane: the `agents` row is physically
+      // deleted (ON DELETE SET NULL then clears the event's agent_id too).
+      harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+
+      await expect(index.drainPendingPlans()).resolves.toBeUndefined();
+
+      // The plan is settled, not cancelled: its content survives as an orphan
+      // terminal event with the full body.
+      expect(harness.statusEventPlans.get(row.id).status).toBe("completed");
+      const events = harness.agentEvents.listAfter({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+      });
+      const orphan = events.find((event) => event.type === "agent.failed");
+      if (!orphan) throw new Error("expected the salvaged orphan terminal event");
+      expect(orphan.agentId).toBeNull();
+      expect(orphan).toMatchObject({ deliverable: 1, status: "pending" });
+      expect(orphan.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+      expect(orphan.payload).toMatchObject({
+        agentId: agent.id,
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        reason: "pane_closed_before_delivery",
+      });
+      expect(events.filter((event) => event.type === "agent.done")).toHaveLength(0);
+
+      // The salvage is published, not just written: the orchestrator's wake is
+      // `agent.event`-push driven, and a pending-only row would sit untouched
+      // while the pane is closed and the orchestrator is idle.
+      expect(pushed).toHaveLength(1);
+      expect(pushed[0]).toMatchObject({
+        id: orphan.id,
+        payload: expect.objectContaining({ reason: "pane_closed_before_delivery" }),
+        type: "agent.failed",
+      });
+
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) => call[0] === "Herdsman cancelling status event plan for missing agent",
+        ),
+      ).toHaveLength(0);
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] ===
+              "Herdsman salvaged an orphan terminal event for a plan whose agent row is gone" &&
+            call[1]?.planId === row.id,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  });
+
+  test("cancels and appends nothing when a pending plan's baseline repeats an already-delivered body", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = openIndex(harness);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await index.refreshHerdrSession(sessionInput());
+      const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+      if (!agent) throw new Error("expected indexed agent");
+
+      // The orchestrator already holds this body: a terminal row for the pane
+      // that was delivered (and consumed). It also doubles as the stitch source
+      // for the pane's terminal/workspace, so the only thing that can stop a
+      // salvage below is the already-delivered comparison.
+      const deliveredBody = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "already delivered answer",
+          timestamp: null,
+        },
+      };
+      const delivered = harness.agentEvents.append({
+        agentId: agent.id,
+        compactHistory: deliveredBody,
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        payload: { agent: "pi", from: "working", to: "done" },
+        terminalId: "term_claude",
+        type: "agent.done",
+        workspaceId: "wJ",
+      });
+      harness.agentEvents.reservePending("term_owner", 100, [delivered.id]);
+
+      // The plan's frozen baseline is exactly that delivered body — the pane
+      // closes right after a finished round, so the baseline frequently *is*
+      // the previous round's answer. Sending it again would be a false failure
+      // with a stale body; no same-pane completed row can suppress it.
+      const row = harness.statusEventPlans.insertPending({
+        agentId: agent.id,
+        compactHistory: deliveredBody,
+        fromStatus: "working",
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        toStatus: "done",
+      });
+
+      harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+      await expect(index.drainPendingPlans()).resolves.toBeUndefined();
+
+      expect(harness.statusEventPlans.get(row.id).status).toBe("cancelled");
+      const events = harness.agentEvents.listAfter({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+      });
+      expect(events.filter((event) => event.type === "agent.failed")).toHaveLength(0);
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) => call[0] === "Herdsman cancelling status event plan for missing agent",
+        ),
+      ).toHaveLength(1);
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] ===
+            "Herdsman salvaged an orphan terminal event for a plan whose agent row is gone",
+        ),
+      ).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  });
+
+  test("cancels and appends nothing when the pane scope cannot be stitched for an orphan salvage", async () => {
+    const harness = openObservabilityDbHarness();
+    const index = openIndex(harness);
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await index.refreshHerdrSession(sessionInput());
+      const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+      if (!agent) throw new Error("expected indexed agent");
+
+      // A pending plan whose baseline holds this round's answer, but whose pane
+      // has NO event history at all: nothing on the pane predates the plan, so
+      // the orphan row's scope cannot be stitched and writing it would dead-
+      // letter (`terminal_id = null`, `workspace_id = ""`) and poison the
+      // plan's idempotency key. The plan must stay cancelled instead.
+      const row = harness.statusEventPlans.insertPending({
+        agentId: agent.id,
+        compactHistory: {
+          ...emptyCompactHistory("pi-jsonl"),
+          lastAssistantMessage: {
+            ref: "m2",
+            stopReason: "stop",
+            text: "final answer",
+            timestamp: null,
+          },
+        },
+        fromStatus: "working",
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        toStatus: "done",
+      });
+
+      harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+      await expect(index.drainPendingPlans()).resolves.toBeUndefined();
+
+      // Nothing appended (no dead row, no idempotency key written), plan
+      // cancelled, and the reason is a warning rather than a silent cancel.
+      expect(harness.statusEventPlans.get(row.id).status).toBe("cancelled");
+      const events = harness.agentEvents.listAfter({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+      });
+      expect(events.filter((event) => event.type === "agent.failed")).toHaveLength(0);
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] ===
+            "Herdsman left a status event plan cancellable because the pane scope could not be stitched",
+        ),
+      ).toHaveLength(1);
+      expect(
+        warnCalls.filter(
+          (call) => call[0] === "Herdsman cancelling status event plan for missing agent",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  });
+
   test("a runtime-failed plan is retried by the next drain and completes", async () => {
     const harness = openObservabilityDbHarness();
     const index = openIndex(harness);
@@ -2762,7 +3006,7 @@ describe("AgentIndexService status event plan drain resilience", () => {
     harness.sqlite.close();
   });
 
-  test("appending a terminal plan whose agent row is gone cancels the plan and appends nothing", async () => {
+  test("a terminal plan whose agent row is gone mid-execution still cancels when nothing is salvageable", async () => {
     const harness = openObservabilityDbHarness();
     const index = openIndex(harness);
     await index.refreshHerdrSession(sessionInput());
@@ -2775,9 +3019,13 @@ describe("AgentIndexService status event plan drain resilience", () => {
     const plan = fast.statusEventPlans[0];
     if (!plan) throw new Error("expected status event plan");
 
-    // The agent row disappears before the plan executes: the append-time
-    // mismatch guard must cancel (not append a dangling event, not mark
-    // completed).
+    // The agent row disappears before the plan executes (the orchestrator's
+    // "finish and close" lands inside the execution window). The fast-path plan
+    // carries no terminal body and the pane recorded none, so the mid-execution
+    // loss — which now settles through the same salvage path as a drain-time
+    // missing agent — still cancels: nothing to salvage means a content-free
+    // round stays cancelled, never an appended dangling event and never a
+    // completed plan.
     const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
     if (!agent) throw new Error("expected indexed agent");
     harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
@@ -2793,7 +3041,91 @@ describe("AgentIndexService status event plan drain resilience", () => {
       herdrSessionName: "default",
       workspaceId: "wJ",
     });
-    expect(events.filter((e) => e.type === "agent.done")).toHaveLength(0);
+    expect(events.filter((e) => e.type === "agent.done" || e.type === "agent.failed")).toHaveLength(
+      0,
+    );
+    harness.sqlite.close();
+  });
+
+  test("salvages deliverable terminal content when the agent row is gone mid-execution", async () => {
+    const harness = openObservabilityDbHarness();
+    const pushed: AgentEventRecord[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      onAgentEvent: (event) => {
+        pushed.push(event);
+      },
+      stores: harness,
+    });
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected indexed agent");
+
+    // The pane's own event history keeps the orphan row routable (terminal +
+    // workspace) once the `agents` row is gone.
+    harness.agentEvents.append({
+      agentId: agent.id,
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+      payload: { agent: "pi", from: "working", to: "done" },
+      terminalId: "term_claude",
+      type: "agent.status.changed",
+      workspaceId: "wJ",
+    });
+
+    // The orchestrator closes the pane while the plan is pending: the row is
+    // physically deleted and only then the plan reaches its append.
+    harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+
+    await expect(
+      index.executeStatusEventPlan({
+        agent,
+        compactHistory: {
+          ...emptyCompactHistory("pi-jsonl"),
+          lastAssistantMessage: {
+            ref: "m2",
+            stopReason: "stop",
+            text: "final answer",
+            timestamp: null,
+          },
+        },
+        from: "working",
+        herdrEventKey: "evt-exec-1",
+        to: "done",
+      }),
+    ).resolves.toBeUndefined();
+
+    // The mid-execution loss settles like the drain-time one: the plan holds
+    // this round's answer, so it is salvaged as an orphan terminal event and
+    // published — not cancelled, not left pending for a tick that may never
+    // see the pane again.
+    const rows = harness.sqlite
+      .prepare("select id, status from status_event_plans order by id")
+      .all() as Array<{ id: number; status: string }>;
+    expect(rows).toHaveLength(1);
+    expect(rows[0]?.status).toBe("completed");
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const orphan = events.find((event) => event.type === "agent.failed");
+    if (!orphan) throw new Error("expected the salvaged orphan terminal event");
+    expect(orphan).toMatchObject({ agentId: null, deliverable: 1, status: "pending" });
+    expect(orphan.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+    expect(orphan.payload).toMatchObject({
+      agentId: agent.id,
+      paneId: "wJ:p2",
+      reason: "pane_closed_before_delivery",
+    });
+    expect(events.filter((event) => event.type === "agent.done")).toHaveLength(0);
+    expect(pushed).toHaveLength(1);
+    expect(pushed[0]?.id).toBe(orphan.id);
     harness.sqlite.close();
   });
 });
