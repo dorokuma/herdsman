@@ -622,7 +622,22 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       if (carriedOver.length > 0) {
         logHerdsmanPi(
           "info",
-          `[herdsman-pi] keeping ${carriedOver.length} unconsumed wake event id(s) suppressed across the scope change eventIds=${carriedOver.join(",")} · daemon redelivery for them is traded away to keep the transcript single-copy`,
+          `[herdsman-pi] keeping ${carriedOver.length} unconsumed wake event id(s) suppressed on a delivery reset eventIds=${carriedOver.join(",")} · daemon redelivery for them is traded away to keep the transcript single-copy`,
+        );
+      }
+      // Written-off ids leave with the same reset: they are still in the delivery
+      // queue (unconfirmed content must keep blocking the watermark), so without
+      // this line nothing would say which dead letters stopped being retried here.
+      // This function only copies ids from the awaiting set (`wakeAwaitingConsumption`)
+      // into the suppression set, so a written-off id is *not* suppressed: if the
+      // daemon redelivers it the update may be injected again. What the reset costs is
+      // the local retry bookkeeping for it; this function does not assert whether the
+      // daemon still holds the update.
+      const writtenOff = [...state.wakeRetryableEventIds].sort((left, right) => left - right);
+      if (writtenOff.length > 0) {
+        logHerdsmanPi(
+          "info",
+          `[herdsman-pi] dropping ${writtenOff.length} written-off wake event id(s) on a delivery reset eventIds=${writtenOff.join(",")} · only the local dead-letter retry bookkeeping is dropped here; these ids do not join the suppression set, so if the daemon redelivers them the update may be injected again`,
         );
       }
       state.presentedEventIds.clear();
@@ -862,8 +877,12 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           }
           const ackResponse = (await state.client.request("agent.notifications.ack", {
             eventId: event.id,
-          })) as { ackedEventId?: number; state?: { ackedEventId?: number } } | undefined;
-          pruneAcknowledgedEvents(ackResponse?.ackedEventId ?? ackResponse?.state?.ackedEventId);
+          })) as { state?: { ackedEventId?: number } } | undefined;
+          // The ack contract has no top-level field: the daemon answers
+          // `{ acknowledged: true, state: toWireState(state) }` (see
+          // `src/daemon/observability-server.ts`), so reading only `state` here
+          // is also fail-closed — `pruneAcknowledgedEvents(undefined)` is a no-op.
+          pruneAcknowledgedEvents(ackResponse?.state?.ackedEventId);
           state.pendingEvents = state.pendingEvents.filter((pending) => pending.id !== event.id);
           // The event is confirmed: it leaves the delivery queue for good, which
           // is what keeps the acknowledgement watermark monotonic (ids are acked
@@ -1165,8 +1184,10 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     const unconfirmedWatermarkBarrier = ():
       | { blocked: number; eventId: number; reason: string }
       | undefined => {
-      // How many ids the barrier holds back: awaiting consumption, or still
-      // owed a dead-letter recovery (the two sets this walk checks).
+      // How many ids the barrier sets hold (members of the two sets, not the
+      // number of later ids the watermark is held back over): awaiting
+      // consumption, or still owed a dead-letter recovery (the two sets this
+      // walk checks).
       const blocked = new Set([
         ...state.wakeAwaitingConsumption,
         ...state.wakeRetryableEventIds,
@@ -1197,7 +1218,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
      * the log shows nothing, so a stalled delivery cannot be told apart from an
      * idle one. The line names the smallest blocked id, why it blocks
      * (dead-letter backoff, spent dead-letter budget, or awaiting consumption)
-     * and how many ids it holds back, in the same field style as the write-off
+     * and how many ids form the barrier, in the same field style as the write-off
      * warning and the injection-skip note. Deduplicating on the exact state
      * keeps a long stall from flooding the file; the window keeps a stall that
      * outlives its first line visible.
@@ -1225,7 +1246,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       lastWakeBarrierNote = { at: now, key };
       logHerdsmanPi(
         "info",
-        `[herdsman-pi] wake acknowledgement held eventId=${barrier.eventId} reason=${barrier.reason} blocked=${barrier.blocked} · the daemon confirms by watermark (id <= ?), so no larger id may be acknowledged while this one is unconfirmed; the held update stays pending in the daemon and recoverable`,
+        `[herdsman-pi] wake acknowledgement held eventId=${barrier.eventId} reason=${barrier.reason} blocked=${barrier.blocked} · the daemon confirms by watermark (id <= ?), so no larger id may be acknowledged while this one is unconfirmed`,
       );
     };
 

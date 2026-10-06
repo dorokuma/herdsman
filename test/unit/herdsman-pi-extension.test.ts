@@ -1926,7 +1926,7 @@ describe("herdsman-pi orchestrator bridge", () => {
         const { eventId } = params as { eventId: number };
         ackedIds.push(eventId);
         // The daemon answers with the advanced watermark for every accepted id.
-        return { acknowledged: true, ackedEventId: eventId };
+        return { acknowledged: true, state: { ackedEventId: eventId } };
       }
       return base(method, params);
     };
@@ -2167,7 +2167,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       if (method === "agent.notifications.ack" && body?.eventId === eventId)
         throw new Error("Only the next pending orchestrator event can be acknowledged");
       if (method === "agent.notifications.ack" && body?.eventId === 903)
-        return { acknowledged: true, ackedEventId: 903, state: { ackedEventId: 903 } };
+        return { acknowledged: true, state: { ackedEventId: 903 } };
       return base(method, params);
     };
     const pi = createFakePi();
@@ -2247,7 +2247,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       if (method === "agent.notifications.ack" && body?.eventId === eventId)
         throw new Error("unknown daemon failure");
       if (method === "agent.notifications.ack" && body?.eventId === 904)
-        return { acknowledged: true, ackedEventId: 904, state: { ackedEventId: 904 } };
+        return { acknowledged: true, state: { ackedEventId: 904 } };
       return base(method, params);
     };
     const pi = createFakePi();
@@ -2337,7 +2337,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       if (method === "agent.notifications.ack" && eventId === k0.id)
         throw new Error("Only the next pending orchestrator event can be acknowledged");
       if (method === "agent.notifications.ack" && eventId === k1.id)
-        return { acknowledged: true, ackedEventId: k1.id, state: { ackedEventId: k1.id } };
+        return { acknowledged: true, state: { ackedEventId: k1.id } };
       return base(method, params);
     };
     const pi = createFakePi();
@@ -2481,7 +2481,7 @@ describe("herdsman-pi orchestrator bridge", () => {
       // K0 stays delivered server-side, so the ordering guard passes K1 and
       // markAcked (id <= cursor) sweeps K0; the ack carries ackedEventId = K1.id.
       if (method === "agent.notifications.ack" && eventId === k1.id)
-        return { acknowledged: true, ackedEventId: k1.id, state: { ackedEventId: k1.id } };
+        return { acknowledged: true, state: { ackedEventId: k1.id } };
       if (method === "agent.orchestrator.get" && reListK0) {
         // Faithful to the real server: every get re-lists the failed K0
         // (it stays pending/delivered in the scope until acked). The extension
@@ -3774,7 +3774,7 @@ describe("herdsman-pi upstream error wake filter", () => {
       client.response = (method, params) => {
         if (method === "agent.notifications.ack") {
           const eventId = (params as { eventId: number }).eventId;
-          return { acknowledged: true, ackedEventId: eventId, state: { ackedEventId: eventId } };
+          return { acknowledged: true, state: { ackedEventId: eventId } };
         }
         return baseResponse(method, params);
       };
@@ -4898,9 +4898,11 @@ function createWakeClient(replayedEvents: AgentEventWireRecord[] = [], ackedEven
     // confirmed with it. The stub has to carry that cursor, otherwise an ack
     // that crosses a still-unconfirmed smaller id would look harmless here
     // while the real daemon swallows the smaller id for good — a fake green
-    // that hides the very watermark hazard these cases pin.
+    // that hides the very watermark hazard these cases pin. The real daemon
+    // answers with `state` only (no top-level `ackedEventId`), so the stub
+    // keeps that shape and never widens the extension's reading of it.
     const { eventId } = params as { eventId: number };
-    return { acknowledged: true, ackedEventId: eventId, state: { ackedEventId: eventId } };
+    return { acknowledged: true, state: { ackedEventId: eventId } };
   };
   return client;
 }
