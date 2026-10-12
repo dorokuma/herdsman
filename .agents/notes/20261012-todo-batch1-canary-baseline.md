@@ -14,6 +14,7 @@ supersedes: ""
 ## 背景
 
 - 批次一任务项 6：对生产库做只读快照并落盘，作为 G-13 后续对比的自身基线（相对基线口径，非绝对阈值）。
+- **文件名口径**：本笔记创建于 2026-10-12；旧名把日期串误写成 2026-02-13（`20260213-` 前缀），已按 `YYYYMMDD-slug.md` 的创建日规范改名为 `20261012-todo-batch1-canary-baseline.md`。
 - 生产库路径按 AGENTS.md「默认数据目录 `~/.herdsman` 即生产」= `/root/.herdsman/state.db`；全程 `sqlite3 -readonly`（未写库、未启停服务、未改生产目录）。
 - **表结构纠偏（先 `.schema agent_events` 核对）**：任务示例 SQL 里的 `reason` 列**不存在**于实际 schema。degraded 轮的 reason 落在 `payload_json.degradedReason`，是否 degraded 看 `payload_json.degraded`；`agent_events` 确有 `invalidated_reason` 列，但本次快照中该列**全为 NULL**（失配于 M2/0.13.6 之前的行），故 reason 统计一律走 `payload_json`。
 - **`created_at` 单位是毫秒**（`max(created_at)=1791816154941`），24h 窗口必须写 `created_at > strftime('%s','now')*1000 - 86400000`；按秒写会把窗口放大 1000 倍（等价全库），基线失真。
