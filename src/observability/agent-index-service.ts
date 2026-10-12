@@ -121,6 +121,11 @@ export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
  * re-read measured 207) — and the body the guard cares about is always one of the
  * most recent deliveries, so 500 covers the whole recent history with margin while
  * keeping the read to a few hundred KB of JSON.
+ * Those 245/207 counts are a per-pane upper-bound proxy, not the guard's own
+ * grouping: the query below partitions by `(agent_id, herdr_session_name)`, and
+ * the canary snapshot measured at most 30 rows for the busiest such group
+ * (`.agents/notes/20261012-todo-batch1-canary-baseline.md`), so the real scan
+ * stays well under the per-pane proxy.
  *
  * Above the window the guard stops recognising a duplicate, so an older body that
  * resurfaces at the tail could be re-released as this round's answer once more.
@@ -2497,6 +2502,11 @@ export class AgentIndexService {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease("stale_baseline_duplicate");
               } else {
+                // Defensive arm, reached only if `diskDeliverable`'s definition
+                // grows a conjunct: it is exactly terminal && non-empty &&
+                // !staleBaselineDuplicate, and each of those negations is claimed
+                // by an arm above, so with those arms in place this branch is
+                // unreachable. Kept as a plain (non-degrading) release fallback.
                 compactHistory = advanced;
               }
             }
