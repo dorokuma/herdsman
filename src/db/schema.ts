@@ -135,6 +135,14 @@ export const agentEvents = sqliteTable(
       table.id,
     ),
     index("agent_events_delivery_retry_idx").on(table.status, table.nextAttemptAt),
+    // The stale-baseline duplicate guard reads one agent's newest delivered/acked
+    // terminal rows (`agent_id = ? and herdr_session_name = ?`, newest `id` first).
+    // Leading with both equality predicates and ending with `id` lets that
+    // `order by id desc limit ?` walk the index instead of scanning the session's
+    // rows; the partial predicate keeps it to the delivery states the guard reads.
+    index("agent_events_guard_scan_idx")
+      .on(table.agentId, table.herdrSessionName, table.id)
+      .where(sql`status in ('delivered', 'acked')`),
   ],
 );
 

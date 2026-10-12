@@ -5078,11 +5078,11 @@ describe("agy late startup idle supersession (p76 regression)", () => {
           Date.now(),
         );
 
-      // Step 3: simulate a pre-0010 database by removing only the 0010 migration record.
-      // Schema stays at 0009 shape; legacy rows are present in agent_events.
-      sqlite
-        .prepare("delete from __drizzle_migrations where hash = ?")
-        .run("52f3d8bfd24cc5b9e380d8e03cbf0d479034b75c16469a15683939111c82a26e");
+      // Step 3: simulate a pre-0010 database: drop the 0010 and later migration records
+      // and revert the schema change they carry (0011 creates the guard index), so the
+      // runner sees a true 0009-shape database with the legacy rows still present.
+      sqlite.exec("drop index if exists agent_events_guard_scan_idx");
+      sqlite.prepare("delete from __drizzle_migrations where created_at >= ?").run(1790610020312);
 
       // Step 4: run the real migration runner — 0010 must execute against existing data.
       applyMigrations(sqlite, { migrationsFolder: "drizzle" });

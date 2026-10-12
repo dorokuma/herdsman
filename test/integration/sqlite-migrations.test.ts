@@ -35,6 +35,14 @@ describe("SQLite migrations", () => {
       "status_event_plans",
     ]);
     expect(tables).not.toContain("observed_workspaces");
+    // drizzle/0011 adds the partial index behind the stale-baseline duplicate
+    // guard's "newest delivered/acked terminal rows for this agent" window.
+    const guardIndex = sqlite
+      .prepare("select sql from sqlite_master where name = 'agent_events_guard_scan_idx'")
+      .get() as { sql: string } | undefined;
+    expect(guardIndex?.sql).toContain(
+      "(`agent_id`,`herdr_session_name`,`id`) WHERE status in ('delivered', 'acked')",
+    );
     const scopeColumns = sqlite
       .prepare("pragma table_info(agent_orchestrator_scopes)")
       .all()
