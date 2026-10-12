@@ -2316,6 +2316,102 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   }, 20_000);
 
+  test("M2 guard: an unconfirmed matching tail that was already delivered is not re-released", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const m1: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      // A distinct, older plan baseline, so the round below takes the mismatch arm
+      // (the no-advance arm would otherwise claim it).
+      const oldHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "old-ref", stopReason: "stop", text: "old", timestamp: null },
+      };
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      // A round reads twice: the turn-signal snapshot first, then re-reads. Feeding
+      // the snapshot a non-terminal tail and the re-read the already-delivered one
+      // is what routes the round past both fast paths into the guard, the same way
+      // production does when the signal lands before this round's body reaches disk.
+      const disk: CompactAgentHistory = m1;
+      let snapshotOfRound: CompactAgentHistory | null = null;
+      const index = staleGuardIndex({
+        disk: () => {
+          if (snapshotOfRound) {
+            const value = snapshotOfRound;
+            snapshotOfRound = null;
+            return value;
+          }
+          return disk;
+        },
+        harness,
+        registry,
+      });
+      await index.refreshHerdrSession(sessionInput());
+
+      // Round 1 delivers m1 and the orchestrator consumes it.
+      const first = await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-round-1",
+        harness,
+        index,
+        registry,
+      });
+      if (!first) throw new Error("expected round-1 event");
+      harness.agentEvents.reservePending("term_owner", 100, [first.id]);
+
+      // Round 2's re-read is m1 — a body already delivered in round 1 — and no
+      // expectedText is reported, so `advancedMatchesExpected` holds. Matching on its
+      // own must not be enough to release it: the guard has to stop round 1's body
+      // from going out again as round 2's answer.
+      snapshotOfRound = emptyHistory;
+      const released = await runConfirmedPlanRound({
+        baseline: oldHistory,
+        confirmed: false,
+        eventKey: "evt-round-2",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(released).toBeUndefined();
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+        .all() as Array<Record<string, unknown>>;
+      expect(invalidatedRows).toHaveLength(1);
+      const degraded = invalidatedRows[0];
+      if (!degraded) throw new Error("expected degraded event row");
+      const payload = JSON.parse(degraded.payload_json as string);
+      expect(payload.degraded).toBe(true);
+      expect(payload.degradedReason).toBe("stale_baseline_duplicate");
+      expect(JSON.parse(degraded.compact_history_json as string)).toMatchObject({
+        lastAssistantMessage: null,
+      });
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] === "Herdsman emitted degraded status event" &&
+            call[1]?.degradedReason === "stale_baseline_duplicate",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
   test("W14b: a confirmed pi turn stays deliverable when every reread is terminal and identical to the frozen baseline", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });

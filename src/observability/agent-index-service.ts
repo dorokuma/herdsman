@@ -114,16 +114,19 @@ export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
  * The window keeps that comparison bounded instead of scanning every terminal row
  * the agent ever emitted (those live up to the 7-day settled TTL).
  *
- * Why 200: within that 7-day TTL a single agent's delivered/acked terminal rows
- * in production top out around 250, and the body the guard cares about is always
- * one of the most recent deliveries, so 200 covers it with margin while keeping
- * the read to a few hundred KB of JSON.
+ * Why 500: within that 7-day TTL the rows the guard scans top out in the low
+ * hundreds per pane — the production DB measured 245 acked `agent.done` rows for
+ * the busiest single pane (oracle read on 2026-10-06, registered in
+ * `.agents/notes/20261006-unconfirmed-frozen-baseline-delivery.md`; a 2026-10-12
+ * re-read measured 207) — and the body the guard cares about is always one of the
+ * most recent deliveries, so 500 covers the whole recent history with margin while
+ * keeping the read to a few hundred KB of JSON.
  *
  * Above the window the guard stops recognising a duplicate, so an older body that
  * resurfaces at the tail could be re-released as this round's answer once more.
  * That is the accepted cost of bounding the scan instead of walking every row.
  */
-const STALE_DUPLICATE_GUARD_SCAN_LIMIT = 200;
+const STALE_DUPLICATE_GUARD_SCAN_LIMIT = 500;
 
 export class PlanWaitingHistoryError extends Error {
   constructor() {
@@ -2356,12 +2359,12 @@ export class AgentIndexService {
             );
             // Whether this agent ever delivered a terminal row. This is an
             // existence question over the bounded window, not a content question:
-            // `limit 200` fetches the newest ≤200 delivered/acked terminal rows, so
-            // any delivery at all makes `length > 0` (an agent with 300 delivered
-            // rows still reads > 0 — "older than 200 rows is invisible" applies
+            // `limit 500` fetches the newest ≤500 delivered/acked terminal rows, so
+            // any delivery at all makes `length > 0` (an agent with 600 delivered
+            // rows still reads > 0 — "older than 500 rows is invisible" applies
             // only to `staleBaselineDuplicate`, which compares a *specific* body
-            // against the window and so can miss a body older than the newest 200).
-            // The existence judgement therefore carries no >200-row cost.
+            // against the window and so can miss a body older than the newest 500).
+            // The existence judgement therefore carries no >500-row cost.
             const hasDeliveredTerminalRow = deliveredTerminalHistories.length > 0;
             // M2 deliverability judgement: the turn-end signal already arrived
             // (the enclosing `if (turn?.received)`), so only the disk matters — a
@@ -2482,6 +2485,17 @@ export class AgentIndexService {
                 // only a non-terminal or empty tail is degraded.
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease("non_terminal_assistant");
+              } else if (staleBaselineDuplicate) {
+                // M2 guard, mismatch arm. The arms above left this round a
+                // terminal, non-empty tail whose `expectedText` matched, so
+                // `diskDeliverable` can only be false here for one reason: the tail
+                // was already delivered as an earlier terminal row. Releasing it
+                // would push that older body out a second time as this round's
+                // answer, so the mismatch arm applies the same content-level guard
+                // the frozen-baseline arm already applies — blank the body and keep
+                // the guard's reason — instead of releasing it.
+                compactHistory = { ...advanced, lastAssistantMessage: null };
+                payloadExtra = degradeOrRelease("stale_baseline_duplicate");
               } else {
                 compactHistory = advanced;
               }
