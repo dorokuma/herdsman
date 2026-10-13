@@ -209,10 +209,61 @@ export type PiPresenceRegistration = {
   workspaceId: string;
 };
 
-export type DegradedReason =
-  | "expected_text_mismatch"
-  | "no_advance_from_input"
-  | "non_terminal_assistant";
+/**
+ * Frozen metric-key contract for degraded releases and empty-turn alerts.
+ *
+ * Gate: `.agents/notes/20260930-terminal-event-delivery-open-items.md` A2 (the
+ * degraded metric keys had to be frozen before Phase 2 built anything on them);
+ * the contract itself and every value below are recorded in
+ * `.agents/notes/20261013-phase2-delivery-semantics.md`.
+ *
+ * The contract surface is: the event message prefix, the `degradedReason`
+ * values, the empty-turn alert reason, and the log dimension names
+ * (`planId / agentId / attempts / degradedReason / herdrSessionName / paneId`).
+ * The string values are the contract — operators and dashboards key on them.
+ * Renaming a value or the prefix is a contract change and must be recorded in
+ * the Phase 2 note and in the Phase 1 note's "遗留" section; adding a value is
+ * an additive contract change and must be recorded the same way.
+ *
+ * `stale_baseline_duplicate` is part of the same key family: it has been emitted
+ * since `.agents/notes/20261001-pi-confirmed-turn-frozen-baseline-empty-body.md`
+ * (judgement three) and is folded into the contract here rather than left as a
+ * bare literal.
+ */
+export const DEGRADED_EVENT_MESSAGE = "Herdsman emitted degraded status event";
+
+export const DEGRADED_REASON = {
+  /** The client's `expectedText` guess disagreed with the on-disk tail. */
+  expectedTextMismatch: "expected_text_mismatch",
+  /** History did not advance past the frozen plan baseline. */
+  noAdvanceFromInput: "no_advance_from_input",
+  /** The on-disk tail is not a terminal assistant message, or has no text. */
+  nonTerminalAssistant: "non_terminal_assistant",
+  /** The on-disk tail was already delivered as an earlier terminal row. */
+  staleBaselineDuplicate: "stale_baseline_duplicate",
+} as const;
+
+export type DegradedReason = (typeof DEGRADED_REASON)[keyof typeof DEGRADED_REASON];
+
+/**
+ * Alert reason for a round that settles with no deliverable assistant text at
+ * all (`upstream_empty_turn`). It shares the degraded log's field shape, but it
+ * is not a degradation: nothing was degraded — the round simply carried nothing
+ * to hand over. Emitted at most once per pane per empty streak (the suppression
+ * reset lives with the append funnel in `AgentIndexService`).
+ */
+export const EMPTY_TURN_ALERT_REASON = "upstream_empty_turn";
+export const EMPTY_TURN_ALERT_MESSAGE = "Herdsman observed an empty upstream turn";
+
+/**
+ * The synthetic plan-row error marker for a round whose deliverable body was
+ * degraded away. It is written to `status_event_plans.last_error` (and handed
+ * to `markRetry` as an `Error`) instead of a real failure message, and it is
+ * part of the same key family as the reasons above: operators grep for it, and
+ * Phase 2's "no assistant content ⇒ no `agent.failed`" rule keys off it.
+ * Changing the value is a contract change under the same rule.
+ */
+export const DEGRADED_PLAN_ERROR = "degraded";
 
 export type AgentTurnCompletedInput = {
   confirmed: boolean;
