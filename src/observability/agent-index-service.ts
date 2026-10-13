@@ -137,7 +137,7 @@ export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
  * resurfaces at the tail could be re-released as this round's answer once more.
  * That is the accepted cost of bounding the scan instead of walking every row.
  */
-const STALE_DUPLICATE_GUARD_SCAN_LIMIT = 500;
+export const STALE_DUPLICATE_GUARD_SCAN_LIMIT = 500;
 
 export class PlanWaitingHistoryError extends Error {
   constructor() {
@@ -201,6 +201,18 @@ export class AgentIndexService {
    * Bounded by the number of panes this daemon has settled a round for.
    */
   readonly #emptyTurnAlertPanes = new Set<string>();
+  /**
+   * Identities (`agentId\0herdrSessionName`) whose stale-duplicate guard window
+   * has already been reported as saturated. The window query in
+   * `#appendStatusEvents` fetches the newest `STALE_DUPLICATE_GUARD_SCAN_LIMIT`
+   * delivered/acked terminal rows for one identity, so when it returns that many
+   * rows there may be older rows it could not see — and a body surfacing from
+   * beyond the window leaves no other trace. The saturation is reported once per
+   * identity for the life of the process (the same in-memory, never-released
+   * shape as `#emptyTurnAlertPanes` and the D1 per-process warnings), so a busy
+   * pane cannot flood the log.
+   */
+  readonly #guardWindowSaturatedAgents = new Set<string>();
   readonly #clientFactory: (input: {
     socketPath: string;
   }) => Pick<HerdrSocketClient, "close" | "sessionSnapshot">;
@@ -2149,6 +2161,36 @@ export class AgentIndexService {
     });
   }
 
+  /**
+   * One-time observability for a saturated stale-duplicate guard window. The
+   * window query in `#appendStatusEvents` fetches the newest
+   * `STALE_DUPLICATE_GUARD_SCAN_LIMIT` delivered/acked terminal rows for one
+   * `(agent_id, herdr_session_name)`; when it returns that many rows there may be
+   * older rows it did not scan, and a body released from beyond the window
+   * (`staleBaselineDuplicate` can miss it) leaves no other trace. The saturation
+   * itself is therefore the only signal that a beyond-window release is possible,
+   * so it is reported at most once per identity for the life of the process.
+   * See leftover a in
+   * `.agents/notes/20261012-todo-batch1-followup-registry.md`.
+   */
+  #noteGuardWindowSaturated(input: {
+    agentId: string;
+    herdrSessionName: string;
+    paneId: string | null;
+    scanned: number;
+  }): void {
+    const key = `${input.agentId}\0${input.herdrSessionName}`;
+    if (this.#guardWindowSaturatedAgents.has(key)) return;
+    this.#guardWindowSaturatedAgents.add(key);
+    console.warn("Herdsman stale-duplicate guard window is saturated", {
+      agentId: input.agentId,
+      herdrSessionName: input.herdrSessionName,
+      limit: STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+      paneId: input.paneId,
+      scanned: input.scanned,
+    });
+  }
+
   async #appendStatusEvents(
     input: StatusEventPlan,
   ): Promise<AgentEventRecord | undefined | typeof PLAN_CANCELLED> {
@@ -2437,6 +2479,20 @@ export class AgentIndexService {
                 input.agent.herdrSessionName,
                 STALE_DUPLICATE_GUARD_SCAN_LIMIT,
               ) as Array<{ compact_history_json: string | null }>;
+            if (deliveredTerminalHistories.length >= STALE_DUPLICATE_GUARD_SCAN_LIMIT) {
+              // A full window means the newest STALE_DUPLICATE_GUARD_SCAN_LIMIT
+              // delivered/acked terminal rows came back with no room to spare, so
+              // any older row is invisible to the `staleBaselineDuplicate` check
+              // below — that saturation is the only trace a beyond-window release
+              // can leave, so it is surfaced once per identity
+              // (leftover a, `.agents/notes/20261012-todo-batch1-followup-registry.md`).
+              this.#noteGuardWindowSaturated({
+                agentId: input.agent.id,
+                herdrSessionName: input.agent.herdrSessionName,
+                paneId: input.agent.paneId,
+                scanned: deliveredTerminalHistories.length,
+              });
+            }
             const staleBaselineDuplicate = deliveredTerminalHistories.some((row) =>
               sameTerminalAssistantContent(
                 advanced,
