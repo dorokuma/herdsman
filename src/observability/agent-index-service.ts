@@ -213,6 +213,19 @@ export class AgentIndexService {
    * pane cannot flood the log.
    */
   readonly #guardWindowSaturatedAgents = new Set<string>();
+  /**
+   * Pane keys (`herdrSessionName\0paneId`) whose salvage window has already been
+   * reported as saturated. The delivered/acked window query in
+   * `#salvageableTerminalBody` fetches the newest
+   * `STALE_DUPLICATE_GUARD_SCAN_LIMIT` terminal rows for one pane, so when it
+   * returns that many rows there may be older rows it could not see — and a body
+   * surfacing from beyond the window leaves no other trace. Reported once per
+   * pane for the life of the process, kept separate from
+   * `#guardWindowSaturatedAgents` because it answers a different query under a
+   * pane key rather than an `(agentId, herdrSessionName)` key, so neither set
+   * can mask a saturation the other would have reported.
+   */
+  readonly #salvageWindowSaturatedKeys = new Set<string>();
   readonly #clientFactory: (input: {
     socketPath: string;
   }) => Pick<HerdrSocketClient, "close" | "sessionSnapshot">;
@@ -843,6 +856,9 @@ export class AgentIndexService {
    *
    * Both sources run the same "already delivered" comparison, over the same
    * window (this pane's delivered/acked terminal rows that predate the plan).
+   * That window is bounded (`STALE_DUPLICATE_GUARD_SCAN_LIMIT`), so a window
+   * that comes back full is surfaced as a saturation warning — the only
+   * observable trace that a row older than the window is invisible here.
    * The baseline is frequently the previous round's already-delivered body (the
    * pane closes right after a finished round), so source ① skipping that
    * comparison would resurrect an answer the orchestrator already has — as a
@@ -882,6 +898,19 @@ export class AgentIndexService {
         row.createdAt.getTime(),
         STALE_DUPLICATE_GUARD_SCAN_LIMIT,
       ) as Array<{ compact_history_json: string | null; payload_json: string }>;
+    if (delivered.length >= STALE_DUPLICATE_GUARD_SCAN_LIMIT) {
+      // A full window means the newest STALE_DUPLICATE_GUARD_SCAN_LIMIT
+      // delivered/acked terminal rows for this pane came back with no room to
+      // spare, so any older row is invisible to the `alreadyDelivered` check
+      // below — that saturation is the only trace a beyond-window salvage can
+      // leave, so it is surfaced once per pane (the salvage-side registration in
+      // `.agents/notes/20261012-todo-batch1-followup-registry.md`).
+      this.#noteSalvageWindowSaturated({
+        herdrSessionName: row.herdrSessionName,
+        paneId: row.paneId,
+        scanned: delivered.length,
+      });
+    }
     // The pane's current agent kind, taken from the newest delivered row's
     // payload — the closest surviving evidence once the `agents` row is gone.
     // `sameTerminalAssistantContent` compares agy/antigravity tails by ref alone,
@@ -2184,6 +2213,35 @@ export class AgentIndexService {
     this.#guardWindowSaturatedAgents.add(key);
     console.warn("Herdsman stale-duplicate guard window is saturated", {
       agentId: input.agentId,
+      herdrSessionName: input.herdrSessionName,
+      limit: STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+      paneId: input.paneId,
+      scanned: input.scanned,
+    });
+  }
+
+  /**
+   * One-time observability for a saturated salvage window. The delivered/acked
+   * window query in `#salvageableTerminalBody` fetches the newest
+   * `STALE_DUPLICATE_GUARD_SCAN_LIMIT` terminal rows for one
+   * `(herdr_session_name, pane_id)`; when it returns that many rows there may be
+   * older ones it did not scan, and a body released from beyond the window (the
+   * `alreadyDelivered` comparison can miss it) leaves no other trace. The
+   * saturation itself is therefore the only signal that a beyond-window salvage
+   * is possible — a necessary-condition signal, not an assertion that a
+   * duplicate was missed — so it is reported at most once per pane for the life
+   * of the process. See the salvage-side registration in
+   * `.agents/notes/20261012-todo-batch1-followup-registry.md`.
+   */
+  #noteSalvageWindowSaturated(input: {
+    herdrSessionName: string;
+    paneId: string;
+    scanned: number;
+  }): void {
+    const key = `${input.herdrSessionName}\0${input.paneId}`;
+    if (this.#salvageWindowSaturatedKeys.has(key)) return;
+    this.#salvageWindowSaturatedKeys.add(key);
+    console.warn("Herdsman salvage window is saturated", {
       herdrSessionName: input.herdrSessionName,
       limit: STALE_DUPLICATE_GUARD_SCAN_LIMIT,
       paneId: input.paneId,
