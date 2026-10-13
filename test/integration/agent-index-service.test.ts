@@ -5,7 +5,11 @@ import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { AgentEventStore } from "@/db/agent-events.js";
 import { STATUS_PLAN_MAX_ATTEMPTS } from "@/db/status-event-plans.js";
-import { AgentIndexService, type StatusEventPlan } from "@/observability/agent-index-service.js";
+import {
+  AgentIndexService,
+  STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+  type StatusEventPlan,
+} from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import type { AgentEventRecord, CompactAgentHistory } from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
@@ -2801,6 +2805,110 @@ describe("AgentIndexService status event plan drain resilience", () => {
     }
     harness.sqlite.close();
   });
+
+  test("salvage window: a saturated scan warns once per pane and throttles repeats", async () => {
+    const harness = openObservabilityDbHarness();
+    const pushed: AgentEventRecord[] = [];
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10);
+        },
+      }),
+      history: history(() => undefined),
+      onAgentEvent: (event) => {
+        pushed.push(event);
+      },
+      stores: harness,
+    });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      await index.refreshHerdrSession(sessionInput());
+      const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+      if (!agent) throw new Error("expected indexed agent");
+
+      // Saturate the salvage window: exactly the scan limit in delivered/acked
+      // terminal rows for this (herdr_session_name, pane_id) that predate the
+      // plans, so the newest-`limit` window comes back full and any older row
+      // would be invisible to the `alreadyDelivered` comparison.
+      const seed = harness.sqlite.prepare(
+        `insert into agent_events
+           (herdr_session_name, agent_id, pane_id, type, payload_json, deliverable, status, delivery_attempts, created_at)
+         values ('default', ?, 'wJ:p2', 'agent.done', '{}', 1, 'delivered', 1, ?)`,
+      );
+      const seededAt = Date.now() - 60_000;
+      for (let i = 0; i < STALE_DUPLICATE_GUARD_SCAN_LIMIT; i += 1) {
+        seed.run(agent.id, seededAt + i);
+      }
+
+      // The pane's own event history is what keeps an orphan terminal row
+      // routable once the `agents` row is gone (pane id, terminal, workspace).
+      // Appended after the saturated rows so it stays the newest pane event that
+      // predates the plans and therefore the one the orphan scope stitches from
+      // (the seeded rows carry no terminal id of their own).
+      harness.agentEvents.append({
+        agentId: agent.id,
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        payload: { agent: "pi", from: "working", to: "done" },
+        terminalId: "term_claude",
+        type: "agent.status.changed",
+        workspaceId: "wJ",
+      });
+
+      // Two pending plans whose frozen baselines hold bodies the saturated
+      // window does not mention, so each one runs the window query and salvages.
+      const planIds: number[] = [];
+      for (const [i, text] of ["salvage me", "salvage me too"].entries()) {
+        planIds.push(
+          harness.statusEventPlans.insertPending({
+            agentId: agent.id,
+            compactHistory: {
+              ...emptyCompactHistory("pi-jsonl"),
+              lastAssistantMessage: {
+                ref: `m${i + 1}`,
+                stopReason: "stop",
+                text,
+                timestamp: null,
+              },
+            },
+            fromStatus: "working",
+            herdrSessionName: "default",
+            paneId: "wJ:p2",
+            toStatus: "done",
+          }).id,
+        );
+      }
+
+      // The orchestrator closes the pane: the `agents` row is physically deleted.
+      harness.sqlite.prepare("delete from agents where id = ?").run(agent.id);
+
+      await expect(index.drainPendingPlans()).resolves.toBeUndefined();
+
+      // Both rounds are salvaged (the arm that runs the window query), yet the
+      // saturation is reported exactly once: the in-memory Set throttles per
+      // (herdr_session_name, pane_id), so the second round adds no warning.
+      expect(planIds.map((id) => harness.statusEventPlans.get(id).status)).toEqual([
+        "completed",
+        "completed",
+      ]);
+      expect(pushed.filter((event) => event.type === "agent.failed")).toHaveLength(2);
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      const saturated = warnCalls.filter(
+        (call) => call[0] === "Herdsman salvage window is saturated",
+      );
+      expect(saturated).toHaveLength(1);
+      expect(saturated[0]?.[1]).toMatchObject({
+        limit: STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+        paneId: "wJ:p2",
+        scanned: STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+      });
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
 
   test("cancels and appends nothing when a pending plan's baseline repeats an already-delivered body", async () => {
     const harness = openObservabilityDbHarness();
