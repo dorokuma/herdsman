@@ -78,17 +78,27 @@ supersedes: ""
   - **回退**：`DROP INDEX agent_events_guard_scan_idx` + 删 `__drizzle_migrations` 的 0011 行，使库回到 0.14.4 口径，等正式发布时再重新加上——属**写生产库**，须显式授权，且手工写库本身有风险。
   - 两条路都须记住：registry 不允许同版本重发，**版本号即部署身份**（AGENTS.md）；本事故不改动任何已发布制品，也不改变 0.14.4 的部署事实。
 
-## 遗留销账（ITEM-108 / ITEM-109 关账 + 遗留 a 落地）
+## 遗留销账（ITEM-108 关账 / ITEM-109 判据落地 + 遗留 a 落地）
 
-本批（`chore/leftover-close-and-window-warn`，从 `main` = `f5cddc3` 开）把两条登记项**销账**：它们在 0.13.5 → 0.14.5 之间已被现役实现覆盖，故只登记结论、不新改码（除下方遗留 a 的超窗 warn 新实现外）。
+本批（`chore/leftover-close-and-window-warn`，从 `main` = `f5cddc3` 开）对两条登记项结案，但**结案口径不同**：**ITEM-108 销账**（0.13.5 起现役实现已覆盖）；**ITEM-109 只销「扩窗与 ref 优先判据已落地」这一半**——判据确实在位，但**超窗漏拦仍是既定接受的代价、未关闭**，本批只补上它的观测（窗口饱和 warn）。两项除下方 warn 的新实现外均只登记结论、不新改码。
 
 - **ITEM-108（扩展尺寸确认）——已由 0.13.5（`ba18967`）覆盖关闭。** `new_content` 已删：扩展的 `TurnCompletionCheckReason` 联合类型只剩 `already_written | timeout | unavailable`，无 `new_content`（`packages/herdsman-pi/src/turn-signal.ts:7`）；文本级尾部比对已在位（同文件 `confirmSessionWrite`（`:84`）在 tail 窗口内比对 `expectedText` 或其 JSONL 转义形态，命中即 `confirmed: true, reason: "already_written"`）。一手依据：`CHANGELOG.md` 的 0.13.5 段（`ba18967`，合并 `874bf09`）与 `.agents/notes/20261002-empty-wake-expectedtext-rootcause.md`（根因 ② 已删除尺寸级确认）。`ba18967` 首次出现在 `v0.13.5`（`git tag --contains ba18967`）。
-- **ITEM-109（守卫最小硬化）——已由 0.13.6 扩窗 + 0.14.5（`0d176c3`，窗口 500 + 0011 索引）覆盖关闭。** 守卫窗口查询与 `sameTerminalAssistantContent` 的 ref 优先判据已在位：窗口查询 `src/observability/agent-index-service.ts:2469-2481`（**本批编辑前为 `:2427-2439`**；任务书记为 `:2432-2444`），ref 优先判据在同文件 `sameTerminalAssistantContent`（`:3364-3366`：pi 分支两侧 `ref` 均非 null 时按 `ref` 比较，文本比较只在 ref 缺失时落）。一手依据：0.13.6 的 M2 扩窗提交 `1b49443`（`fix(daemon): trust the on-disk body for unconfirmed turns (M2)`，`git tag --contains 1b49443` 首个 tag = `v0.13.6`；`20261002-release-0.13.6.md:23` 记该区间含 `agent-index-service.ts` 的 M2 实现）；0.14.5 的 `0d176c3`（`fix(observability): guard the mismatch arm against stale baselines`，`git tag --contains` = `v0.14.5`，`20261013-release-0.14.5.md:17` 记其「扫描上限 200→500」）与 `db82bb2`（0011 部分索引，`src/db/schema.ts:143-145` 的 `agent_events_guard_scan_idx`）。
+- **ITEM-109（守卫最小硬化）——扩窗与 ref 优先判据已落地（`1b49443`、`0d176c3`）；超窗漏拦仍是既定接受的代价，未关闭，由窗口饱和 warn 提供观测。** 守卫窗口查询与 `sameTerminalAssistantContent` 的 ref 优先判据已在位：窗口查询 `src/observability/agent-index-service.ts:2469-2481`（**本批编辑前为 `:2427-2439`**；任务书记为 `:2432-2444`），ref 优先判据在同文件 `sameTerminalAssistantContent`（`:3364-3366`：pi 分支两侧 `ref` 均非 null 时按 `ref` 比较，文本比较只在 ref 缺失时落）。一手依据：0.13.6 的 M2 扩窗提交 `1b49443`（`fix(daemon): trust the on-disk body for unconfirmed turns (M2)`，`git tag --contains 1b49443` 首个 tag = `v0.13.6`；`20261002-release-0.13.6.md:23` 记该区间含 `agent-index-service.ts` 的 M2 实现）；0.14.5 的 `0d176c3`（`fix(observability): guard the mismatch arm against stale baselines`，`git tag --contains` = `v0.14.5`，`20261013-release-0.14.5.md:17` 记其「扫描上限 200→500」）与 `db82bb2`（0011 部分索引，`src/db/schema.ts:143-145` 的 `agent_events_guard_scan_idx`）。
 
 **附带登记：遗留 a（超窗缺 warn）已实现。** 本批在窗口查询处加了一次性 `console.warn`（调用点 `agent-index-service.ts:2482-2495`，帮助函数 `#noteGuardWindowSaturated` `:2176`；消息 `Herdsman stale-duplicate guard window is saturated`，载荷含 `limit` 与 `scanned`），按 `(agent_id, herdr_session_name)` 键用内存态 `Set`（`#guardWindowSaturatedAgents`，`:215`）节流为「每进程每键一次」——与 D1「每进程一次」及 `#emptyTurnAlertPanes` 同型，不随 pane 的 streak 解除。
 
 - **判据与遗留 a 自留的误报空间（如实保留）**：触发条件是**窗口打满**（`scanned >= STALE_DUPLICATE_GUARD_SCAN_LIMIT`），不是「一定发生了超窗漏拦」——分组恰好等于上限时并不必然有更老的行。它是**必要条件信号**，不是漏拦断言；这正是本遗留 a 当初标注的、需先设计的误报空间，本轮按「超窗时更老行不可见，warn 是唯一可观测信号」的口径收下该代价。
 - **回归**：`test/integration/turn-completion-signal.test.ts`「guard window: a saturated scan warns once per identity and throttles repeats」——构造窗口打满（灌入恰 `STALE_DUPLICATE_GUARD_SCAN_LIMIT` 条 `delivered` 终态行）后跑两个轮次，断言 warn 恰好打出一次、第二轮不再打；先 FAIL（`expected [] to have a length of 1 but got +0`）后 PASS。
+
+**附带登记：salvage 查询（`#salvageableTerminalBody`）同型饱和 warn（本批补）。** 同一个 `STALE_DUPLICATE_GUARD_SCAN_LIMIT` 也被 salvage 的 delivered/acked 窗口查询使用（`src/observability/agent-index-service.ts` 的 `#salvageableTerminalBody`），此前只有守卫臂有观测锚点，salvage 臂打满时仍无声。本批补上：`#noteSalvageWindowSaturated` 帮助函数（消息 `Herdsman salvage window is saturated`，载荷含 `limit` / `scanned` / `paneId`，并按本批 warn 的模式一并带上 `herdrSessionName`），调用点紧跟该窗口查询、条件 `delivered.length >= STALE_DUPLICATE_GUARD_SCAN_LIMIT`；节流用**独立**的内存态 Set `#salvageWindowSaturatedKeys`（键 `herdrSessionName\0paneId`），与 `#guardWindowSaturatedAgents`（键 `agentId\0herdrSessionName`）**互不遮蔽**——两者查的是不同查询、不同键口径，复用同一 Set 会让一方压掉另一方的信号。
+
+- **判据口径与守卫臂一致（必要条件信号，非漏拦断言）**：salvage 窗口打满同样不等于一定发生了超窗漏拦——分组恰好等于上限时也可能只是「没有更老的行」，warn 只说明「更老的正文在这里不可见」，不是「漏拦已发生」的断言。
+- **回归**：`test/integration/agent-index-service.test.ts`「salvage window: a saturated scan warns once per pane and throttles repeats」——灌入恰 `STALE_DUPLICATE_GUARD_SCAN_LIMIT` 条 `delivered` 终态行后，让两条待处理计划（agent 行已删）各走一次 salvage 臂，断言两条都销账、warn 恰好一次且载荷为 `limit`/`scanned` = 500、`paneId` = `wJ:p2`，第二个 pane 轮次不再打；先 FAIL（探针法把条件临时改为 `>`，`expected [] to have a length of 1 but got +0`）后 PASS。
+
+### 本批 consider 登记（两条；处置均为「后续改注释 / 精确引用」，不动行为）
+
+1. **`#noteGuardWindowSaturated` 的注释类比不确切。** 该字段与帮助函数的注释把自身描述为「与 `#emptyTurnAlertPanes` 及 D1 每进程一次 warn 同型的、**永不释放**的内存态 Set」。但 `#emptyTurnAlertPanes` 的键会在该 pane 下一轮带交付正文时被删除（`#appendAndAckSelfEvent` 里 `emptyTurnAlertKey` 的释放），寿命是「随 streak 起落」；饱和键则是「每进程每键一次、全程不释放」。两者只在「内存态 Set + 每键一次」这一层同型，注释给出的寿命语义会让读者误判（以为 streak 结束会重新允许报警）。**处置：后续只改注释**——把类比限定为「同型的每键一次抑制」，或干脆不与 streak 型 alert 并提；不动任何逻辑。（本批新增的 `#noteSalvageWindowSaturated` 注释已避免该类比。）
+2. **饱和 warn 的误报空间须精确表述。** 触发条件是窗口**恰好打满**（`scanned >= STALE_DUPLICATE_GUARD_SCAN_LIMIT` = 500）：查询是 `order by id desc limit 500`，所以只有当「取回 500 行**且不存在第 501 行**」时才纯属误报（根本没有更老的行可漏）；若确有第 501 行，这条 warn 就是超窗漏拦可能性的唯一锚点。量级参照（本批复核给出，本笔记**未独立复测**）：canary 口径下 `(agent_id, herdr_session_name)` 分组最大 **30**、pane 口径最大 **399**，都远低于 500，故当前量级下自然打满的概率低而非零。**处置：登记**——今后引用该 warn 语义（文档、注释、告警说明）时必须带上「必要非充分」口径，不得写成「发生了漏拦」。
 
 ## 被放弃的方案（必填）
 
@@ -103,6 +113,7 @@ supersedes: ""
 
 - 任务书：`[MARK-WORKER-HSM-007]`（批次一小修补六项，`fix/todo-batch-1` 基于 `dd60f6b` 之后续提交，不 push 不合并）。
 - 销账任务书：`[MARK-WORKER-HSM-021]`（遗留关账 + 超窗 warn，分支 `chore/leftover-close-and-window-warn` 基于 `main` = `f5cddc3`，不 push 不部署不碰生产库）；见「遗留销账」节。
+- 收口任务书：`[MARK-WORKER-HSM-025]`（salvage 窗口饱和 warn + 回归 + 本笔记三处修正，分支 `chore/leftover-close-and-window-warn` 于 `8c038e8` 之上续提交，不 push 不部署不碰生产库）；其「ITEM-109 未关闭」口径与两条 consider 来自本批分歧裁定，本笔记按裁定登记。
 - 审查 / 复核：批次一评审报告的 should fix #1/#2 与 consider #3/#4/#5；oracle 只读复核点 1 / 点 3 / 点 4（分别对应遗留 b / 遗留 a / 遗留 c 的指针）。
 - 代码与数据事实：`AGENTS.md`（验证步骤节、本机运维部署 bullet、默认数据目录口径）、`docs/releasing.md`「Validate source and package contents」、`src/observability/agent-index-service.ts`（`STALE_DUPLICATE_GUARD_SCAN_LIMIT` 注释、mismatch 各臂与末尾 else、`sameTerminalAssistantContent`）、`src/db/migrate.ts` + `src/db/apply-migrations.ts`（`migrationsFolder: "drizzle"` 相对 cwd、`created_at = folderMillis`）、`drizzle/0011_lazy_enchantress.sql` 与 `drizzle/meta/_journal.json`、`test/unit/deployment-guidance.test.ts`、`test/integration/turn-completion-signal.test.ts`、`/root/.pi/agent/scripts/test_dispatch_agent.py:32-41,374-392`（仓外，指针）。
 - 只读核对命令：`sqlite3 -readonly /root/.herdsman/state.db`（`__drizzle_migrations` 计数与 hash、`sqlite_master` 的索引 SQL、`agent_events` 计数与 `stale_baseline_duplicate` 计数）、`git ls-tree --name-only v0.14.4 drizzle/`、`sha256sum drizzle/0011_lazy_enchantress.sql`。
