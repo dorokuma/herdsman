@@ -1881,11 +1881,15 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           (call) => call[0] === "Herdsman observed an empty upstream turn",
         );
 
-      // Phase 2 item 4: two empty rounds on the same pane report one alert — the
-      // second one goes down the confirmed path, which must not re-print either.
+      // Phase 2 item 4: two empty rounds on the same pane report one alert. The
+      // first round is *confirmed* on purpose: a confirmed empty round releases
+      // through `degradeOrRelease`'s soften branch (that path never degrades), so
+      // this first alert can only come from that branch's own
+      // `#noteEmptyTurnAlert` call (agent-index-service.ts:2353, call point 2) —
+      // dropping that call leaves zero alerts at the assertion below. The second
+      // round (also confirmed) must not re-print either.
       await runConfirmedPlanRound({
         baseline: emptyHistory,
-        confirmed: false,
         eventKey: "evt-empty-1",
         harness,
         index,
@@ -1918,8 +1922,15 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
       expect(delivered?.compactHistory?.lastAssistantMessage?.text).toBe("round answer");
       expect(emptyTurnAlerts()).toHaveLength(1);
       disk = emptyHistory;
+      // Unconfirmed on purpose: this is the first empty round of a *fresh* streak
+      // (the delivered round above released the pane key), so it takes the
+      // degraded-release path and its alert can only come from
+      // `#logDegradedRelease`'s `#noteEmptyTurnAlert` call
+      // (agent-index-service.ts:2112, call point 1). Together the two alerts of
+      // this case pin both call sites.
       await runConfirmedPlanRound({
         baseline: emptyHistory,
+        confirmed: false,
         eventKey: "evt-empty-3",
         harness,
         index,
