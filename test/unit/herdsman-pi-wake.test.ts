@@ -43,7 +43,7 @@ describe("Pi agent wake projection", () => {
     expect(projectAgentOutcomes(events)).toMatchObject({
       outcomes: [{ eventId: 3, kind: "completed", terminalId: "term_agent" }],
       rawEvents: [{ id: 1 }, { id: 2 }, { id: 3 }, { id: 4 }, { id: 5 }],
-      suppressedUpstreamErrorEventIds: [],
+      suppressedEventIds: [],
     });
   });
 
@@ -184,7 +184,7 @@ describe("Pi agent wake projection", () => {
       event(72, "agent.discarded", { from: "working", reason: "request timed out", to: "failed" }),
     ]);
     expect(upstream.outcomes).toEqual([]);
-    expect(upstream.suppressedUpstreamErrorEventIds).toEqual([72]);
+    expect(upstream.suppressedEventIds).toEqual([72]);
     // seen 去重不变：同一个 discarded id 在后续投影批次里不再产生 outcome。
     const projector = createAgentOutcomeProjector();
     const discarded = event(73, "agent.discarded", {
@@ -354,7 +354,7 @@ describe("Pi agent wake projection", () => {
     ]);
 
     expect(projection.outcomes).toEqual([]);
-    expect(projection.suppressedUpstreamErrorEventIds).toEqual([43]);
+    expect(projection.suppressedEventIds).toEqual([43]);
     expect(projection.rawEvents.map(({ id }) => id)).toEqual([43]);
   });
 
@@ -369,7 +369,7 @@ describe("Pi agent wake projection", () => {
     ]);
 
     expect(projection.outcomes).toEqual([]);
-    expect(projection.suppressedUpstreamErrorEventIds).toEqual([44]);
+    expect(projection.suppressedEventIds).toEqual([44]);
   });
 
   test("keeps a normal result as an outcome", () => {
@@ -378,7 +378,34 @@ describe("Pi agent wake projection", () => {
     ]);
 
     expect(projection.outcomes).toHaveLength(1);
-    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+    expect(projection.suppressedEventIds).toEqual([]);
+  });
+
+  test("suppresses a completed round with an empty body instead of delivering it", () => {
+    // Phase 2 item 2 (spec: .agents/notes/20260930-phase1-delivery-latency.md:193,204-205):
+    // an empty completed round carries no result. It used to be delivered and
+    // rendered as `last assistant: (no assistant message)`, which the orchestrator
+    // could not act on; now it is suppressed (and silently acknowledged by the
+    // extension) while the daemon reports the empty turn itself, once per pane.
+    const projection = projectAgentOutcomes([event(421, "agent.done", {}, { text: "" })]);
+
+    expect(projection.outcomes).toEqual([]);
+    expect(projection.suppressedEventIds).toEqual([421]);
+    // Stays visible as raw evidence, like the upstream-error family.
+    expect(projection.rawEvents.map(({ id }) => id)).toEqual([421]);
+
+    // A non-empty round in the same batch still projects, and an empty *failed*
+    // round keeps its reason-only outcome (only completed rounds are affected).
+    const mixed = projectAgentOutcomes([
+      event(422, "agent.done", {}, { text: "   " }),
+      event(423, "agent.failed", { from: "working", reason: "boom", to: "done" }, { text: "" }),
+      event(424, "agent.done", {}, { text: "kept" }),
+    ]);
+    expect(mixed.suppressedEventIds).toEqual([422]);
+    expect(mixed.outcomes.map(({ eventId, kind }) => ({ eventId, kind }))).toEqual([
+      { eventId: 423, kind: "failed" },
+      { eventId: 424, kind: "completed" },
+    ]);
   });
 
   test("keeps a long report that only mentions 429 as an outcome", () => {
@@ -387,7 +414,7 @@ describe("Pi agent wake projection", () => {
     const projection = projectAgentOutcomes([event(46, "agent.done", {}, { text: report })]);
 
     expect(projection.outcomes).toHaveLength(1);
-    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+    expect(projection.suppressedEventIds).toEqual([]);
   });
 
   test("keeps a 429 outcome when the filter is disabled", () => {
@@ -397,7 +424,7 @@ describe("Pi agent wake projection", () => {
     );
 
     expect(projection.outcomes).toHaveLength(1);
-    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+    expect(projection.suppressedEventIds).toEqual([]);
   });
 
   test("suppresses a harmless short sentence matched by a custom pattern", () => {
@@ -407,7 +434,7 @@ describe("Pi agent wake projection", () => {
     );
 
     expect(projection.outcomes).toEqual([]);
-    expect(projection.suppressedUpstreamErrorEventIds).toEqual([48]);
+    expect(projection.suppressedEventIds).toEqual([48]);
   });
 
   test("does not consume suppressed ids into seen so they stay visible as evidence", () => {
@@ -423,12 +450,12 @@ describe("Pi agent wake projection", () => {
     expect(projector([suppressedEvent])).toMatchObject({
       outcomes: [],
       rawEvents: [{ id: 49 }],
-      suppressedUpstreamErrorEventIds: [49],
+      suppressedEventIds: [49],
     });
     expect(projector([suppressedEvent, normalEvent])).toMatchObject({
       outcomes: [expect.objectContaining({ eventId: 50 })],
       rawEvents: [{ id: 49 }, { id: 50 }],
-      suppressedUpstreamErrorEventIds: [49],
+      suppressedEventIds: [49],
     });
   });
 
@@ -525,7 +552,7 @@ describe("Pi wake dead-letter accounting", () => {
       expect.objectContaining({ eventId: 91, kind: "completed" }),
     ]);
     expect(projection.rawEvents.map(({ id }) => id)).toEqual([91]);
-    expect(projection.suppressedUpstreamErrorEventIds).toEqual([]);
+    expect(projection.suppressedEventIds).toEqual([]);
     // A second projection in the same session still projects it: an unconfirmed
     // id is not "seen" for projection purposes, so a later wake remains eligible
     // to present it (the extension guards the duplicate separately, from the

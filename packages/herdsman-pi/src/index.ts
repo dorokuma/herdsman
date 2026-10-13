@@ -1378,7 +1378,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           // same content into the transcript twice. See `alreadyPresented`.
           !alreadyPresented(outcome.eventId),
       );
-      const suppressedEvents = projection.suppressedUpstreamErrorEventIds
+      const suppressedEvents = projection.suppressedEventIds
         .filter(
           (eventId) =>
             eventId > state.failedWakeThroughEventId && !state.presentedEventIds.has(eventId),
@@ -1528,7 +1528,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
           const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
           const batchProjection = projectAgentOutcomes(batchEvents, wakeFilter);
-          const batchSuppressedIds = new Set(batchProjection.suppressedUpstreamErrorEventIds);
+          const batchSuppressedIds = new Set(batchProjection.suppressedEventIds);
           const projectableBatchOutcomes = batchProjection.outcomes.filter(
             (outcome) =>
               outcome.eventId > state.failedWakeThroughEventId &&
