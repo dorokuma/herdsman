@@ -7,7 +7,7 @@ import { AgentEventStore } from "@/db/agent-events.js";
 import { STATUS_PLAN_MAX_ATTEMPTS } from "@/db/status-event-plans.js";
 import { AgentIndexService, type StatusEventPlan } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
-import type { AgentEventRecord } from "@/observability/contracts.js";
+import type { AgentEventRecord, CompactAgentHistory } from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
@@ -3587,7 +3587,20 @@ describe("batch2 window regressions", () => {
     // The plan is one round away from exhaustion when the pane is retired and the
     // agents row is physically deleted: this is the H1 write path (the retry
     // refresh fails and the terminal event is appended with the agent row gone).
-    const row = harness.statusEventPlans.insertPending({ agent, from: "working", to: "done" });
+    // The baseline carries a body on purpose: since Phase 2 item 1 no longer
+    // records `agent.failed` for a degraded round with no assistant content
+    // (.agents/notes/20260930-phase1-delivery-latency.md:193,204-205), this case
+    // keeps pinning the orphan write it exists for.
+    const retainedBaseline: CompactAgentHistory = {
+      ...emptyCompactHistory("pi-jsonl"),
+      lastAssistantMessage: { ref: "ref-1", text: "old", timestamp: null },
+    };
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: retainedBaseline,
+      from: "working",
+      to: "done",
+    });
     for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS - 1; i += 1) {
       expect(harness.statusEventPlans.markRetry(row.id, new Error("degraded"))?.status).toBe(
         "pending",
@@ -3598,7 +3611,7 @@ describe("batch2 window regressions", () => {
 
     const failed = await index.executeStatusEventPlan({
       agent,
-      compactHistory: undefined,
+      compactHistory: retainedBaseline,
       from: "working",
       planId: row.id,
       to: "done",
@@ -5128,7 +5141,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     }
   });
 
-  test("degraded done exhausting retries emits deliverable fallback failed event", async () => {
+  test("degraded done exhausting retries records no agent.failed for an empty round", async () => {
     const harness = openObservabilityDbHarness();
     const pushedEvents: AgentEventRecord[] = [];
     const index = new AgentIndexService({
@@ -5177,6 +5190,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     if (!agent) throw new Error("expected agent");
 
     // executeStatusEventPlan will run #runPlanRow with the near-exhausted plan.
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const result = await index.executeStatusEventPlan({
       agent,
       compactHistory: undefined,
@@ -5185,22 +5199,34 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       to: "done",
     });
 
-    // #runPlanRow transitions the plan to failed and returns the fallback event.
-    // The single publication path forwards this return value (see below), so
-    // there is no onAgentEvent capture to fall back on here.
-    const failedEvent = result;
-    expect(failedEvent).toBeDefined();
-    expect(failedEvent?.type).toBe("agent.failed");
-    expect(failedEvent?.deliverable).toBe(1);
-    const payload = failedEvent?.payload as Record<string, unknown> | undefined;
-    expect(payload?.fallbackOutcome).toBe(true);
-
+    // Phase 2 item 1: this round carries no assistant content at all (the plan
+    // exhausted on the synthetic `degraded` marker), so the daemon records no
+    // `agent.failed` row and pushes nothing: "the agent failed" is not a verdict
+    // this evidence supports, and the row would reach the orchestrator as a bare
+    // fail reason with an empty body. The empty round is observable through the
+    // once-per-pane `upstream_empty_turn` alert instead.
+    expect(result).toBeUndefined();
+    const failedRows = harness.sqlite
+      .prepare("select * from agent_events where type = 'agent.failed'")
+      .all();
+    expect(failedRows).toEqual([]);
     // 发布路径唯一：`executeStatusEventPlan` 只返回事件，不再自行推流；推流由调用方
     // 转发该返回值完成（herdr-session-watch-manager.ts:360 #submitPlan -> service.ts:206
-    // -> observability-server.ts:244 publishAgentEvent）。index 内部若再推一次，
-    // socket 上会出现两条相同的 `agent.event`，破坏合同 §4 的“恰好一次”。
-    expect(result?.type).toBe("agent.failed");
-    expect(pushedEvents.filter((e) => e.type === "agent.failed")).toHaveLength(0);
+    // -> observability-server.ts:244 publishAgentEvent）。本用例中计划落到 `failed`
+    // 但无内容可报，因此返回 undefined、内部也不推任何事件（否则 socket 上会出现重复
+    // 的 `agent.event`，破坏合同 §4 的「恰好一次」）。
+    expect(pushedEvents).toEqual([]);
+    expect(
+      (warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>).filter(
+        (call) => call[0] === "Herdsman observed an empty upstream turn",
+      ),
+    ).toEqual([
+      [
+        "Herdsman observed an empty upstream turn",
+        expect.objectContaining({ paneId: "wJ:p2", reason: "upstream_empty_turn" }),
+      ],
+    ]);
+    warn.mockRestore();
 
     harness.sqlite.close();
     // ~80% of the default 5s budget even in an isolated single run (4014ms

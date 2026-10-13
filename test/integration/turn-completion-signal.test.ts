@@ -1855,6 +1855,83 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   }, 20_000);
 
+  test("Phase 2: an empty upstream turn alerts once per pane and alerts again after a delivered round", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      const answer: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round answer",
+          timestamp: null,
+        },
+      };
+      let disk: CompactAgentHistory = emptyHistory;
+      const index = staleGuardIndex({ disk: () => disk, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+      const emptyTurnAlerts = () =>
+        (warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>).filter(
+          (call) => call[0] === "Herdsman observed an empty upstream turn",
+        );
+
+      // Phase 2 item 4: two empty rounds on the same pane report one alert — the
+      // second one goes down the confirmed path, which must not re-print either.
+      await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        confirmed: false,
+        eventKey: "evt-empty-1",
+        harness,
+        index,
+        registry,
+      });
+      expect(emptyTurnAlerts()).toHaveLength(1);
+      expect(emptyTurnAlerts()[0]?.[1]).toMatchObject({
+        paneId: "wJ:p2",
+        reason: "upstream_empty_turn",
+      });
+      await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-empty-2",
+        harness,
+        index,
+        registry,
+      });
+      expect(emptyTurnAlerts()).toHaveLength(1);
+
+      // A round that hands over a body ends the streak, so the next empty round
+      // for the same pane is reported again rather than suppressed forever.
+      disk = answer;
+      const delivered = await runConfirmedPlanRound({
+        baseline: answer,
+        eventKey: "evt-answer",
+        harness,
+        index,
+        registry,
+      });
+      expect(delivered?.compactHistory?.lastAssistantMessage?.text).toBe("round answer");
+      expect(emptyTurnAlerts()).toHaveLength(1);
+      disk = emptyHistory;
+      await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-empty-3",
+        harness,
+        index,
+        registry,
+      });
+      expect(emptyTurnAlerts()).toHaveLength(2);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
   // Shared fixture for the stale-baseline guard cases: the frozen plan baseline
   // is handed in per round and the daemon always re-reads `disk()` from JSONL.
   function staleGuardIndex(input: {

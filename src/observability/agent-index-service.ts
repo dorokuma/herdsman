@@ -24,6 +24,12 @@ import {
   type AgentSessionRef,
   type AgentStatus,
   type CompactAgentHistory,
+  DEGRADED_EVENT_MESSAGE,
+  DEGRADED_PLAN_ERROR,
+  DEGRADED_REASON,
+  type DegradedReason,
+  EMPTY_TURN_ALERT_MESSAGE,
+  EMPTY_TURN_ALERT_REASON,
   parseAgentStatus,
   VALID_AGENT_EVENT_TYPES,
 } from "@/observability/contracts.js";
@@ -186,6 +192,15 @@ type EventHandlingInternalResult = AgentEventHandlingFastResult;
 export class AgentIndexService {
   readonly #activeWaiters = new Map<string, Set<AbortController>>();
   readonly #clearRetry: (timer: unknown) => void;
+  /**
+   * Pane keys (`herdrSessionName\0paneId`) whose current empty-turn streak has
+   * already been alerted. Phase 2 item 4: the alert below must not re-print on
+   * every attempt of the same empty round, and a *new* streak must be reported
+   * again — so the key is dropped by the append funnel as soon as a round for
+   * that pane carries deliverable assistant text (`#appendAndAckSelfEvent`).
+   * Bounded by the number of panes this daemon has settled a round for.
+   */
+  readonly #emptyTurnAlertPanes = new Set<string>();
   readonly #clientFactory: (input: {
     socketPath: string;
   }) => Pick<HerdrSocketClient, "close" | "sessionSnapshot">;
@@ -435,8 +450,8 @@ export class AgentIndexService {
       });
       const currentPlan = store.get(planId);
       const retryError =
-        currentPlan.lastError === "degraded"
-          ? new Error("degraded")
+        currentPlan.lastError === DEGRADED_PLAN_ERROR
+          ? new Error(DEGRADED_PLAN_ERROR)
           : new PlanWaitingHistoryError();
       const updated = store.markRetry(planId, retryError);
       if (!updated) {
@@ -487,7 +502,7 @@ export class AgentIndexService {
           reason: updated.lastError,
           to: plan.to,
         });
-        if (VALID_AGENT_EVENT_TYPES.has(failedEvent.type)) {
+        if (failedEvent && VALID_AGENT_EVENT_TYPES.has(failedEvent.type)) {
           this.#onAgentEvent?.(failedEvent);
         }
       }
@@ -615,6 +630,13 @@ export class AgentIndexService {
           reason: row.lastError,
           to: row.toStatus,
         });
+        // Phase 2 item 1: a failed row whose round carried no assistant content is
+        // not recorded as `agent.failed` at all, so the backfill leaves it
+        // un-backfilled by design (not an error).
+        if (!event) {
+          skipped += 1;
+          continue;
+        }
         // Stock terminal results are ingested silently: the row is written, then
         // immediately acknowledged/non-deliverable, so it stays queryable without
         // waking the current owner with a long-past failure.
@@ -963,6 +985,12 @@ export class AgentIndexService {
       reason: ORPHAN_SALVAGE_REASON,
       to: row.toStatus,
     });
+    if (!event) {
+      // Unreachable: the Phase 2 item 1 guard only refuses a round with no
+      // assistant content, and `#salvageableTerminalBody` returns a body only
+      // when it holds a non-empty terminal assistant message.
+      return null;
+    }
     console.warn("Herdsman salvaged an orphan terminal event for a plan whose agent row is gone", {
       agentId: row.agentId,
       eventId: event.id,
@@ -1104,7 +1132,9 @@ export class AgentIndexService {
       activeCompact = refreshed.snapshot.compactHistory;
     } catch (err) {
       const retryError =
-        current.lastError === "degraded" ? new Error("degraded") : new PlanWaitingHistoryError();
+        current.lastError === DEGRADED_PLAN_ERROR
+          ? new Error(DEGRADED_PLAN_ERROR)
+          : new PlanWaitingHistoryError();
       const updated = store.markRetry(current.id, retryError);
       if (!updated) {
         this.#clearWaitingTimer(current.id);
@@ -1166,7 +1196,7 @@ export class AgentIndexService {
           reason: updated.lastError,
           to: current.toStatus,
         });
-        if (VALID_AGENT_EVENT_TYPES.has(failedEvent.type)) {
+        if (failedEvent && VALID_AGENT_EVENT_TYPES.has(failedEvent.type)) {
           this.#onAgentEvent?.(failedEvent);
         }
       }
@@ -1254,7 +1284,9 @@ export class AgentIndexService {
         // from this message, so passing PLAN_WAITING_HISTORY here would let a
         // degraded plan exhaust silently.
         const retryError =
-          row.lastError === "degraded" ? new Error("degraded") : new PlanWaitingHistoryError();
+          row.lastError === DEGRADED_PLAN_ERROR
+            ? new Error(DEGRADED_PLAN_ERROR)
+            : new PlanWaitingHistoryError();
         const updated = store.markRetry(row.id, retryError);
         if (!updated) {
           this.#clearWaitingTimer(row.id);
@@ -1354,7 +1386,7 @@ export class AgentIndexService {
           this.#stores.agentEvents.invalidateById(event.id, "degraded_retry");
           Object.assign(event, { status: "invalidated", deliverable: 0 });
         }
-        const degradedError = new Error("degraded");
+        const degradedError = new Error(DEGRADED_PLAN_ERROR);
         const updated = store.markRetry(row.id, degradedError);
         if (!updated) {
           return undefined;
@@ -1398,7 +1430,8 @@ export class AgentIndexService {
       return event;
     } catch (error) {
       if (error instanceof PlanWaitingHistoryError) {
-        const retryError = row.lastError === "degraded" ? new Error("degraded") : error;
+        const retryError =
+          row.lastError === DEGRADED_PLAN_ERROR ? new Error(DEGRADED_PLAN_ERROR) : error;
         const updated = store.markRetry(row.id, retryError);
         if (!updated) {
           this.#clearWaitingTimer(row.id);
@@ -1473,7 +1506,8 @@ export class AgentIndexService {
         return undefined;
       }
       this.#clearWaitingTimer(row.id);
-      const retryError = row.lastError === "degraded" ? new Error("degraded") : error;
+      const retryError =
+        row.lastError === DEGRADED_PLAN_ERROR ? new Error(DEGRADED_PLAN_ERROR) : error;
       const updated = store.markRetry(row.id, retryError);
       if (!updated) {
         return undefined;
@@ -2066,14 +2100,52 @@ export class AgentIndexService {
    * `StatusEventPlan` (see `executeStatusEventPlan`); it is `null` for the
    * row-less in-memory plans executed without the SQLite store.
    */
-  #logDegradedRelease(plan: StatusEventPlan, degradedReason: string): void {
-    console.warn("Herdsman emitted degraded status event", {
+  #logDegradedRelease(plan: StatusEventPlan, degradedReason: DegradedReason): void {
+    console.warn(DEGRADED_EVENT_MESSAGE, {
       agentId: plan.agent.id,
       attempts: plan.attempts ?? 0,
       degradedReason,
       herdrSessionName: plan.agent.herdrSessionName,
       paneId: plan.agent.paneId,
       planId: plan.planId ?? null,
+    });
+    this.#noteEmptyTurnAlert({
+      agentId: plan.agent.id,
+      attempts: plan.attempts ?? 0,
+      herdrSessionName: plan.agent.herdrSessionName,
+      paneId: plan.agent.paneId,
+      planId: plan.planId ?? null,
+    });
+  }
+
+  /**
+   * Observability for a round that ends with no deliverable assistant text at
+   * all — the `upstream_empty_turn` alert (Phase 2 item 4). It is deliberately
+   * separate from the per-reason degraded line above: the degradation reason
+   * answers "why was this round not deliverable", while this alert answers
+   * "this round carried nothing", which also covers the confirmed-release path
+   * that never degrades (`.agents/notes/20260930-phase1-delivery-latency.md:111-114`,
+   * the silent empty-body release). Repeats are suppressed per pane for the
+   * duration of the streak, so a stalled pane cannot flood the log; the key is
+   * released by the next round for that pane that appends a body.
+   */
+  #noteEmptyTurnAlert(input: {
+    agentId: string;
+    attempts: number;
+    herdrSessionName: string;
+    paneId: string | null;
+    planId: number | null;
+  }): void {
+    const key = emptyTurnAlertKey(input.herdrSessionName, input.paneId);
+    if (this.#emptyTurnAlertPanes.has(key)) return;
+    this.#emptyTurnAlertPanes.add(key);
+    console.warn(EMPTY_TURN_ALERT_MESSAGE, {
+      agentId: input.agentId,
+      attempts: input.attempts,
+      herdrSessionName: input.herdrSessionName,
+      paneId: input.paneId,
+      planId: input.planId,
+      reason: EMPTY_TURN_ALERT_REASON,
     });
   }
 
@@ -2256,7 +2328,7 @@ export class AgentIndexService {
           // a round no longer needs a (systematically unreliable) client-side
           // `confirmed` to be released. `confirmedTerminal` keeps its own meaning
           // for the released/degraded logging and payload.
-          const degradeOrRelease = (degradedReason: string): Record<string, unknown> => {
+          const degradeOrRelease = (degradedReason: DegradedReason): Record<string, unknown> => {
             if (confirmedTerminal) {
               // A confirmed round stays non-degraded (see above), but the reason
               // is no longer swallowed: this path used to release silently with
@@ -2275,6 +2347,16 @@ export class AgentIndexService {
                   terminalId: input.agent.terminalId,
                 },
               );
+              // The confirmed path never degrades, so it is the one empty-body
+              // release that the degraded line cannot cover: alert it here
+              // (same per-pane suppression).
+              this.#noteEmptyTurnAlert({
+                agentId: input.agent.id,
+                attempts: input.attempts ?? 0,
+                herdrSessionName: input.agent.herdrSessionName,
+                paneId: input.agent.paneId,
+                planId: input.planId ?? null,
+              });
               return { staleSnapshot: false };
             }
             this.#logDegradedRelease(input, degradedReason);
@@ -2449,7 +2531,9 @@ export class AgentIndexService {
               } else {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
                 payloadExtra = degradeOrRelease(
-                  staleBaselineDuplicate ? "stale_baseline_duplicate" : "no_advance_from_input",
+                  staleBaselineDuplicate
+                    ? DEGRADED_REASON.staleBaselineDuplicate
+                    : DEGRADED_REASON.noAdvanceFromInput,
                 );
               }
             } else {
@@ -2469,7 +2553,7 @@ export class AgentIndexService {
                     {
                       agentId: input.agent.id,
                       confirmed: confirmedTerminal,
-                      degradedReason: "expected_text_mismatch",
+                      degradedReason: DEGRADED_REASON.expectedTextMismatch,
                       herdrSessionName: input.agent.herdrSessionName,
                       paneId: input.agent.paneId,
                       planId: input.planId ?? null,
@@ -2481,7 +2565,7 @@ export class AgentIndexService {
                 compactHistory = advanced;
               } else if (!advancedMatchesExpected) {
                 compactHistory = { ...advanced, lastAssistantMessage: null };
-                payloadExtra = degradeOrRelease("expected_text_mismatch");
+                payloadExtra = degradeOrRelease(DEGRADED_REASON.expectedTextMismatch);
               } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
                 // `diskDeliverable` is false in this arm by construction (its
                 // terminal/non-empty conjuncts are exactly this condition's
@@ -2489,7 +2573,7 @@ export class AgentIndexService {
                 // it and `non_terminal_assistant` keeps its pre-existing meaning:
                 // only a non-terminal or empty tail is degraded.
                 compactHistory = { ...advanced, lastAssistantMessage: null };
-                payloadExtra = degradeOrRelease("non_terminal_assistant");
+                payloadExtra = degradeOrRelease(DEGRADED_REASON.nonTerminalAssistant);
               } else if (staleBaselineDuplicate) {
                 // M2 guard, mismatch arm. The arms above left this round a
                 // terminal, non-empty tail whose `expectedText` matched, so
@@ -2500,7 +2584,7 @@ export class AgentIndexService {
                 // the frozen-baseline arm already applies — blank the body and keep
                 // the guard's reason — instead of releasing it.
                 compactHistory = { ...advanced, lastAssistantMessage: null };
-                payloadExtra = degradeOrRelease("stale_baseline_duplicate");
+                payloadExtra = degradeOrRelease(DEGRADED_REASON.staleBaselineDuplicate);
               } else {
                 // Defensive arm, reached only if `diskDeliverable`'s definition
                 // grows a conjunct: it is exactly terminal && non-empty &&
@@ -2539,18 +2623,18 @@ export class AgentIndexService {
             !historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })
           ) {
             compactHistory = { ...advanced, lastAssistantMessage: null };
-            this.#logDegradedRelease(input, "no_advance_from_input");
+            this.#logDegradedRelease(input, DEGRADED_REASON.noAdvanceFromInput);
             payloadExtra = {
               degraded: true,
-              degradedReason: "no_advance_from_input",
+              degradedReason: DEGRADED_REASON.noAdvanceFromInput,
               staleSnapshot: false,
             };
           } else if (!isTerminalAssistant(advanced) || !hasNonEmptyAssistantMessage(advanced)) {
             compactHistory = { ...advanced, lastAssistantMessage: null };
-            this.#logDegradedRelease(input, "non_terminal_assistant");
+            this.#logDegradedRelease(input, DEGRADED_REASON.nonTerminalAssistant);
             payloadExtra = {
               degraded: true,
-              degradedReason: "non_terminal_assistant",
+              degradedReason: DEGRADED_REASON.nonTerminalAssistant,
               staleSnapshot: false,
             };
           } else {
@@ -2860,13 +2944,48 @@ export class AgentIndexService {
     planId: number;
     reason: string | null;
     to: AgentStatus;
-  }): AgentEventRecord {
+  }): AgentEventRecord | undefined {
+    // Phase 2 item 1 (spec: `.agents/notes/20260930-phase1-delivery-latency.md`
+    // lines 193 and 204-205: "缺 assistant 内容禁判 `failed`"). A round that
+    // settles with no assistant content at all must not be recorded as
+    // `agent.failed`: "the agent failed" is a claim this daemon cannot support
+    // when the round produced no assistant text, and the row it would write has
+    // an empty body, so all the orchestrator receives is a bare failure reason
+    // (`wake.ts` turns the synthetic `degraded` reason into a fallback outcome
+    // for exactly those rows). The plan row itself has already settled as
+    // `failed` — that is a plan-settlement state, not a verdict about the agent —
+    // and the empty round stays observable through the per-pane
+    // `upstream_empty_turn` alert (`#noteEmptyTurnAlert`). The failed-plan
+    // backfill below skips the same rows instead of writing what it was asked
+    // for, so no later drain round can land the row either.
+    //
+    // The marker is what makes "this round carried no assistant content"
+    // decidable here: a plan row only stores the synthetic error, not the body
+    // that was blanked (see `DEGRADED_PLAN_ERROR`), so a non-degraded failure
+    // keeps its row (W3/H1 backfills pin that) and only the degraded failure is
+    // refused when it truly has no assistant content to show.
+    if (
+      input.reason === DEGRADED_PLAN_ERROR &&
+      !hasNonEmptyAssistantMessage(input.compactHistory)
+    ) {
+      // The empty round is still observable: the alert is the replacement for
+      // the fallback wake this row used to carry, and the per-pane suppression
+      // keeps it to one line per empty streak.
+      this.#noteEmptyTurnAlert({
+        agentId: input.agent.id,
+        attempts: input.attempts,
+        herdrSessionName: input.agent.herdrSessionName,
+        paneId: input.agent.paneId,
+        planId: input.planId,
+      });
+      return undefined;
+    }
     const originalAgentId = input.agent.id;
     const resolved = this.#resolvePlanOutcomeAgent(input.agent, input.planCreatedAt);
     const agent = resolved.agent;
     const fallbackOutcome =
       input.fallbackOutcome ??
-      ((input.to === "done" || input.to === "blocked") && input.reason === "degraded");
+      ((input.to === "done" || input.to === "blocked") && input.reason === DEGRADED_PLAN_ERROR);
     return this.#appendAndAckSelfEvent({
       agentId: resolved.agentRowPresent ? agent.id : null,
       compactHistory: input.compactHistory ?? null,
@@ -2937,6 +3056,12 @@ export class AgentIndexService {
   }
 
   #appendAndAckSelfEvent(input: Parameters<AgentEventStore["append"]>[0]): AgentEventRecord {
+    // Phase 2 item 4: a round that appends a body ends the pane's empty streak.
+    // Dropping the key here is what lets a later empty streak alert again, and
+    // keeps the suppression from lasting for the life of the pane.
+    if (hasNonEmptyAssistantMessage(input.compactHistory)) {
+      this.#emptyTurnAlertPanes.delete(emptyTurnAlertKey(input.herdrSessionName, input.paneId));
+    }
     const event = this.#stores.agentEvents.append(input);
     const owner = this.#stores.agentOrchestratorScopes?.get({
       herdrSessionName: input.herdrSessionName,
@@ -3110,6 +3235,10 @@ function paneGenerationFromEvent(event: Record<string, unknown>): string | null 
 
 function paneIdentityKey(paneId: string, paneGeneration: string | null | undefined): string {
   return `${paneId}\0${paneGeneration ?? ""}`;
+}
+
+function emptyTurnAlertKey(herdrSessionName: string, paneId: string | null | undefined): string {
+  return `${herdrSessionName}\0${paneId ?? ""}`;
 }
 
 function stringValue(value: unknown): string | null {
