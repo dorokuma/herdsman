@@ -2,7 +2,10 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
 import { HerdrSessionWatchManager } from "@/daemon/herdr-session-watch-manager.js";
-import { AgentIndexService } from "@/observability/agent-index-service.js";
+import {
+  AgentIndexService,
+  STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+} from "@/observability/agent-index-service.js";
 import type { AgentEventRecord, CompactAgentHistory } from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
@@ -2312,6 +2315,86 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
           (call) =>
             call[0] === "Herdsman released a confirmed pi status event with no deliverable text" &&
             call[1]?.degradedReason === "stale_baseline_duplicate",
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
+  test("guard window: a saturated scan warns once per identity and throttles repeats", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      const roundOne: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      const disk: CompactAgentHistory = roundOne;
+      const index = staleGuardIndex({ disk: () => disk, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+      const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+      if (!agent) throw new Error("expected agent");
+
+      // Saturate the guard's delivered/acked window: exactly the scan limit in
+      // terminal rows for this (agent_id, herdr_session_name), so the newest-`limit`
+      // window comes back full and any older row would be invisible to the guard.
+      const seed = harness.sqlite.prepare(
+        `insert into agent_events
+           (herdr_session_name, agent_id, pane_id, type, payload_json, deliverable, status, delivery_attempts, created_at)
+         values ('default', ?, 'wJ:p2', 'agent.done', '{}', 1, 'delivered', 1, ?)`,
+      );
+      const seededAt = Date.now();
+      for (let i = 0; i < STALE_DUPLICATE_GUARD_SCAN_LIMIT; i += 1) {
+        seed.run(agent.id, seededAt + i);
+      }
+
+      // Force the arm that runs the window query: the extension names a body that
+      // never reached disk, so `textMatches` is false and neither release arm above
+      // fires.
+      const firstRound = await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-saturated-1",
+        expectedText: "answer that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+      expect(firstRound?.type).toBe("agent.done");
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      const saturated = warnCalls.filter(
+        (call) => call[0] === "Herdsman stale-duplicate guard window is saturated",
+      );
+      expect(saturated).toHaveLength(1);
+      expect(saturated[0]?.[1]).toMatchObject({
+        limit: STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+        scanned: STALE_DUPLICATE_GUARD_SCAN_LIMIT,
+      });
+
+      // A second saturated round for the same identity must not warn again — the
+      // in-memory Set throttles per (agent_id, herdr_session_name).
+      await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-saturated-2",
+        expectedText: "another answer that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+      expect(
+        warnCalls.filter(
+          (call) => call[0] === "Herdsman stale-duplicate guard window is saturated",
         ),
       ).toHaveLength(1);
     } finally {
