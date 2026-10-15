@@ -2583,6 +2583,99 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   }, 20_000);
 
+  test("M2 guard: an unconfirmed matching tail with a new ref and the same text as a delivered row is released as a new round", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      const m1: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m1",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      const m2SameTextNewRef: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m2",
+          stopReason: "stop",
+          text: "round-1 answer",
+          timestamp: null,
+        },
+      };
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      // Feed the initial turn-signal snapshot a non-terminal tail so the round
+      // bypasses both fast paths and runs the M2 guard query over the
+      // delivered/acked window.
+      let disk: CompactAgentHistory = m1;
+      let snapshotOfRound: CompactAgentHistory | null = null;
+      const index = staleGuardIndex({
+        disk: () => {
+          if (snapshotOfRound) {
+            const value = snapshotOfRound;
+            snapshotOfRound = null;
+            return value;
+          }
+          return disk;
+        },
+        harness,
+        registry,
+      });
+      await index.refreshHerdrSession(sessionInput());
+
+      // Round 1 delivers m1 ("round-1 answer", ref "m1") and the orchestrator
+      // consumes it (`status = 'delivered'`).
+      const first = await runConfirmedPlanRound({
+        baseline: emptyHistory,
+        eventKey: "evt-round-1",
+        harness,
+        index,
+        registry,
+      });
+      if (!first) throw new Error("expected round-1 event");
+      harness.agentEvents.reservePending("term_owner", 100, [first.id]);
+
+      // Round 2 produces the exact same assistant text ("round-1 answer"), but
+      // both terminal rows carry non-null refs and `m2 !== m1`. For pi,
+      // `sameTerminalAssistantContent` compares by ref when both refs are
+      // non-null, so the guard must NOT classify this round as
+      // `stale_baseline_duplicate` and must release it as a new round.
+      disk = m2SameTextNewRef;
+      snapshotOfRound = emptyHistory;
+      const released = await runConfirmedPlanRound({
+        baseline: m1,
+        confirmed: false,
+        eventKey: "evt-round-2",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(released?.type).toBe("agent.done");
+      expect(released?.deliverable).toBe(1);
+      expect(released?.compactHistory?.lastAssistantMessage?.text).toBe("round-1 answer");
+      expect(released?.compactHistory?.lastAssistantMessage?.ref).toBe("m2");
+      expect(released?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated' and type = 'agent.done'")
+        .all();
+      expect(invalidatedRows).toHaveLength(0);
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter((call) => call[1]?.degradedReason === "stale_baseline_duplicate"),
+      ).toHaveLength(0);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
   test("W14b: a confirmed pi turn stays deliverable when every reread is terminal and identical to the frozen baseline", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });

@@ -205,12 +205,12 @@ export class AgentIndexService {
    * Identities (`agentId\0herdrSessionName`) whose stale-duplicate guard window
    * has already been reported as saturated. The window query in
    * `#appendStatusEvents` fetches the newest `STALE_DUPLICATE_GUARD_SCAN_LIMIT`
-   * delivered/acked terminal rows for one identity, so when it returns that many
-   * rows there may be older rows it could not see — and a body surfacing from
-   * beyond the window leaves no other trace. The saturation is reported once per
-   * identity for the life of the process (the same in-memory, never-released
-   * shape as `#emptyTurnAlertPanes` and the D1 per-process warnings), so a busy
-   * pane cannot flood the log.
+   * delivered/acked terminal rows (`order by id desc limit 500`) for one
+   * identity, so `scanned >= 500` is a necessary-not-sufficient signal for a
+   * beyond-window miss (an exact 500-row group with no 501st row misses nothing).
+   * Keys are kept in memory for the life of the process and never released (like
+   * the D1 per-process warnings, and unlike streak-scoped `#emptyTurnAlertPanes`),
+   * so a busy pane cannot flood the log.
    */
   readonly #guardWindowSaturatedAgents = new Set<string>();
   /**
@@ -2193,13 +2193,16 @@ export class AgentIndexService {
   /**
    * One-time observability for a saturated stale-duplicate guard window. The
    * window query in `#appendStatusEvents` fetches the newest
-   * `STALE_DUPLICATE_GUARD_SCAN_LIMIT` delivered/acked terminal rows for one
-   * `(agent_id, herdr_session_name)`; when it returns that many rows there may be
-   * older rows it did not scan, and a body released from beyond the window
-   * (`staleBaselineDuplicate` can miss it) leaves no other trace. The saturation
-   * itself is therefore the only signal that a beyond-window release is possible,
-   * so it is reported at most once per identity for the life of the process.
-   * See leftover a in
+   * `STALE_DUPLICATE_GUARD_SCAN_LIMIT` delivered/acked terminal rows
+   * (`order by id desc limit 500`) for one `(agent_id, herdr_session_name)`;
+   * when it returns `scanned >= 500` rows there may be older rows it did not scan,
+   * and a body released from beyond the window (`staleBaselineDuplicate` can miss
+   * it) leaves no other trace. Window saturation (`scanned >= 500`) is a
+   * necessary-not-sufficient condition signal for a beyond-window miss: when the
+   * identity has exactly 500 rows and no 501st row, no row was omitted and no
+   * miss occurred. Reported at most once per identity for the life of the process
+   * (keys in `#guardWindowSaturatedAgents` are never released, unlike
+   * streak-scoped `#emptyTurnAlertPanes`). See leftover a and consider 1/2 in
    * `.agents/notes/20261012-todo-batch1-followup-registry.md`.
    */
   #noteGuardWindowSaturated(input: {
@@ -2538,12 +2541,14 @@ export class AgentIndexService {
                 STALE_DUPLICATE_GUARD_SCAN_LIMIT,
               ) as Array<{ compact_history_json: string | null }>;
             if (deliveredTerminalHistories.length >= STALE_DUPLICATE_GUARD_SCAN_LIMIT) {
-              // A full window means the newest STALE_DUPLICATE_GUARD_SCAN_LIMIT
-              // delivered/acked terminal rows came back with no room to spare, so
-              // any older row is invisible to the `staleBaselineDuplicate` check
-              // below — that saturation is the only trace a beyond-window release
-              // can leave, so it is surfaced once per identity
-              // (leftover a, `.agents/notes/20261012-todo-batch1-followup-registry.md`).
+              // A full window (`scanned >= 500`) means the newest
+              // STALE_DUPLICATE_GUARD_SCAN_LIMIT delivered/acked terminal rows
+              // came back with no room to spare, so any 501st or older row is
+              // invisible to the `staleBaselineDuplicate` check below — a
+              // necessary-not-sufficient signal for a beyond-window miss (an
+              // exact 500-row group with no 501st row misses nothing), surfaced
+              // once per identity for the life of the process (leftover a,
+              // `.agents/notes/20261012-todo-batch1-followup-registry.md`).
               this.#noteGuardWindowSaturated({
                 agentId: input.agent.id,
                 herdrSessionName: input.agent.herdrSessionName,
