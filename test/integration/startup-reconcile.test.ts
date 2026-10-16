@@ -2,6 +2,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import { AgentEventReconciler, INVALIDATED_GRACE_MS } from "@/daemon/agent-event-reconciler.js";
 import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
+import { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
 const scope = { herdrSessionName: "default", workspaceId: "wA" };
@@ -480,7 +481,7 @@ describe("startup reconcile dedicated coverage", () => {
       agentId: null,
       herdrSessionName: "default",
       paneId: "wA:gone-2",
-      payload: { agentId: "agent-gone", reason: "PLAN_WAITING_HISTORY" },
+      payload: { agentId: "agent-gone", reason: PLAN_WAITING_HISTORY },
       terminalId: "term-gone-2",
       type: "agent.discarded",
       workspaceId: "wA",

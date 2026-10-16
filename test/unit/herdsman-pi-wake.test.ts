@@ -1,4 +1,5 @@
 import { describe, expect, test } from "vitest";
+import { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
 import type { AgentEventWireRecord } from "../../packages/herdsman-pi/src/daemon-client.js";
 import type { AgentOutcome } from "../../packages/herdsman-pi/src/wake.js";
 import {
@@ -63,7 +64,7 @@ describe("Pi agent wake projection", () => {
         from: "working",
         name: "reviewer",
         paneId: "wB:p2",
-        reason: "PLAN_WAITING_HISTORY",
+        reason: PLAN_WAITING_HISTORY,
         to: "done",
       }),
     ]);
@@ -132,21 +133,21 @@ describe("Pi agent wake projection", () => {
         from: "working",
         name: "reviewer",
         paneId: "wB:p2",
-        reason: "PLAN_WAITING_HISTORY",
+        reason: PLAN_WAITING_HISTORY,
         to: "done",
       }),
     ]);
     // 终态失败必须能在编排者对话里被唤醒：观察者放弃等待也是一次没有结果的结果，
     // 不再静默丢弃。
     expect(projection.outcomes).toEqual([
-      expect.objectContaining({ eventId: 21, kind: "failed", reason: "PLAN_WAITING_HISTORY" }),
+      expect.objectContaining({ eventId: 21, kind: "failed", reason: PLAN_WAITING_HISTORY }),
     ]);
     expect(projection.rawEvents).toHaveLength(1);
     const [outcome] = projection.outcomes;
     if (!outcome) throw new Error("expected discarded outcome");
     const formatted = formatAgentOutcomeUpdates([outcome]);
     expect(formatted).toContain("- failed reviewer · Claude wB:p2");
-    expect(formatted).toContain("reason: PLAN_WAITING_HISTORY");
+    expect(formatted).toContain(`reason: ${PLAN_WAITING_HISTORY}`);
   });
 
   test("projects agent.discarded with a custom discard reason as a wakeable failed outcome", () => {

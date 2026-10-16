@@ -1,5 +1,9 @@
 import type { DatabaseSync } from "node:sqlite";
-import type { AgentStatus, CompactAgentHistory } from "@/observability/contracts.js";
+import {
+  type AgentStatus,
+  type CompactAgentHistory,
+  PLAN_WAITING_HISTORY,
+} from "@/observability/contracts.js";
 
 export const STATUS_PLAN_MAX_ATTEMPTS = 8;
 
@@ -273,9 +277,9 @@ export class StatusEventPlanStore {
   listWaitingHistory(): StatusEventPlanRecord[] {
     const rows = this.#sqlite
       .prepare(
-        "select * from status_event_plans where status = 'pending' and last_error = 'PLAN_WAITING_HISTORY' order by id asc",
+        "select * from status_event_plans where status = 'pending' and last_error = ? order by id asc",
       )
-      .all() as StatusEventPlanRow[];
+      .all(PLAN_WAITING_HISTORY) as StatusEventPlanRow[];
     return rows.map(mapStatusEventPlan);
   }
 
@@ -343,7 +347,7 @@ export class StatusEventPlanStore {
     const attempts = current.attempts + 1;
     let newStatus: StatusEventPlanStatus = "pending";
     if (attempts >= STATUS_PLAN_MAX_ATTEMPTS) {
-      newStatus = errorMessage === "PLAN_WAITING_HISTORY" ? "discarded" : "failed";
+      newStatus = errorMessage === PLAN_WAITING_HISTORY ? "discarded" : "failed";
     }
 
     const result = this.#sqlite

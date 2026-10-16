@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, test } from "vitest";
 import { STATUS_PLAN_MAX_ATTEMPTS } from "@/db/status-event-plans.js";
+import { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
 import {
   cleanupTempDirs,
   openObservabilityDbHarness,
@@ -191,13 +192,13 @@ describe("StatusEventPlanStore", () => {
       toStatus: "done",
     });
 
-    store.markRetry(row1.id, new Error("PLAN_WAITING_HISTORY"));
+    store.markRetry(row1.id, new Error(PLAN_WAITING_HISTORY));
     store.markRetry(row2.id, new Error("OTHER_ERROR"));
     // row3 is clean pending without error
 
     const waiting = store.listWaitingHistory();
     expect(waiting.map((p) => p.id)).toEqual([row1.id]);
-    expect(waiting[0]?.lastError).toBe("PLAN_WAITING_HISTORY");
+    expect(waiting[0]?.lastError).toBe(PLAN_WAITING_HISTORY);
     expect(waiting[0]?.status).toBe("pending");
 
     harness.sqlite.close();
@@ -252,9 +253,9 @@ describe("StatusEventPlanStore", () => {
       paneId: "p1",
       toStatus: "idle",
     });
-    store.markRetry(stale.id, new Error("PLAN_WAITING_HISTORY"));
+    store.markRetry(stale.id, new Error(PLAN_WAITING_HISTORY));
     expect(store.get(stale.id)).toMatchObject({
-      lastError: "PLAN_WAITING_HISTORY",
+      lastError: PLAN_WAITING_HISTORY,
       status: "pending",
     });
 
@@ -291,7 +292,7 @@ describe("StatusEventPlanStore", () => {
       paneId: "p1",
       toStatus: "done",
     });
-    store.markRetry(done.id, new Error("PLAN_WAITING_HISTORY"));
+    store.markRetry(done.id, new Error(PLAN_WAITING_HISTORY));
     const flipToIdle = store.insertPending({
       agentId: "ag_done",
       fromStatus: "done",
@@ -310,7 +311,7 @@ describe("StatusEventPlanStore", () => {
       paneId: "p2",
       toStatus: "idle",
     });
-    store.markRetry(workingIdle.id, new Error("PLAN_WAITING_HISTORY"));
+    store.markRetry(workingIdle.id, new Error(PLAN_WAITING_HISTORY));
     const resume = store.insertPending({
       agentId: "ag_working_idle",
       fromStatus: "idle",
@@ -328,7 +329,7 @@ describe("StatusEventPlanStore", () => {
       paneId: "p3",
       toStatus: "done",
     });
-    store.markRetry(unknownDone.id, new Error("PLAN_WAITING_HISTORY"));
+    store.markRetry(unknownDone.id, new Error(PLAN_WAITING_HISTORY));
     const afterDone = store.insertPending({
       agentId: "ag_unknown_done",
       fromStatus: "done",
@@ -419,14 +420,14 @@ describe("StatusEventPlanStore", () => {
     });
 
     for (let i = 0; i < STATUS_PLAN_MAX_ATTEMPTS - 1; i += 1) {
-      store.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      store.markRetry(row.id, new Error(PLAN_WAITING_HISTORY));
       expect(store.get(row.id).status).toBe("pending");
     }
 
-    store.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+    store.markRetry(row.id, new Error(PLAN_WAITING_HISTORY));
     const finalRow = store.get(row.id);
     expect(finalRow.status).toBe("discarded");
-    expect(finalRow.lastError).toBe("PLAN_WAITING_HISTORY");
+    expect(finalRow.lastError).toBe(PLAN_WAITING_HISTORY);
     expect(finalRow.attempts).toBe(STATUS_PLAN_MAX_ATTEMPTS);
 
     // Discarded plans must not appear in listFailed

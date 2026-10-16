@@ -11,7 +11,11 @@ import {
   type StatusEventPlan,
 } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
-import type { AgentEventRecord, CompactAgentHistory } from "@/observability/contracts.js";
+import {
+  type AgentEventRecord,
+  type CompactAgentHistory,
+  PLAN_WAITING_HISTORY,
+} from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
 
@@ -972,7 +976,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
     expect(plans).toHaveLength(1);
     expect(plans[0]).toMatchObject({
       attempts: 1,
-      lastError: "PLAN_WAITING_HISTORY",
+      lastError: PLAN_WAITING_HISTORY,
       status: "pending",
     });
 
@@ -1041,7 +1045,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       harness.agentEvents.listAfter({ herdrSessionName: "default", workspaceId: "wJ" }),
     ).toEqual([]);
     expect(harness.statusEventPlans.listUnfinished()).toMatchObject([
-      { attempts: 1, lastError: "PLAN_WAITING_HISTORY", status: "pending" },
+      { attempts: 1, lastError: PLAN_WAITING_HISTORY, status: "pending" },
     ]);
 
     index.stopWaitingHistoryRetries();
@@ -1280,7 +1284,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       if (!planRecord) throw new Error("expected pending plan");
       expect(harness.statusEventPlans.get(planRecord.id)).toMatchObject({
         attempts: 1,
-        lastError: "PLAN_WAITING_HISTORY",
+        lastError: PLAN_WAITING_HISTORY,
         status: "pending",
       });
 
@@ -1293,7 +1297,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       const finalPlan = harness.statusEventPlans.get(planRecord.id);
       expect(finalPlan.attempts).toBe(8);
       expect(finalPlan.status).toBe("discarded");
-      expect(finalPlan.lastError).toBe("PLAN_WAITING_HISTORY");
+      expect(finalPlan.lastError).toBe(PLAN_WAITING_HISTORY);
 
       const allEvents = harness.agentEvents.listAfter({
         herdrSessionName: "default",
@@ -1307,7 +1311,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         attempts: 8,
         from: "working",
         paneId: "wJ:p2",
-        reason: "PLAN_WAITING_HISTORY",
+        reason: PLAN_WAITING_HISTORY,
         to: "idle",
       });
 
@@ -1547,7 +1551,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       to: "done",
     });
     // Set to WAITING_HISTORY (attempts = 1)
-    harness.statusEventPlans.markRetry(p2Row.id, new Error("PLAN_WAITING_HISTORY"));
+    harness.statusEventPlans.markRetry(p2Row.id, new Error(PLAN_WAITING_HISTORY));
 
     // 3. Now simulate P2 retry entering #retryWaitingPlanRow
     // Disk still has R3 (matching latest terminal event in agent_events).
@@ -1757,7 +1761,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
 
       // Set attempts to 7 so the next failure becomes attempt 8 (discarded)
       for (let i = 1; i <= 7; i += 1) {
-        harness.statusEventPlans.markRetry(planRow.id, new Error("PLAN_WAITING_HISTORY"));
+        harness.statusEventPlans.markRetry(planRow.id, new Error(PLAN_WAITING_HISTORY));
       }
 
       await index.drainPendingPlans();
@@ -1786,7 +1790,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         attempts: 8,
         from: "working",
         paneId: "wJ:p2",
-        reason: "PLAN_WAITING_HISTORY",
+        reason: PLAN_WAITING_HISTORY,
         to: "done",
       });
 
@@ -1852,7 +1856,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         to: "done",
       });
       for (let i = 1; i <= 7; i += 1) {
-        harness.statusEventPlans.markRetry(planRow.id, new Error("PLAN_WAITING_HISTORY"));
+        harness.statusEventPlans.markRetry(planRow.id, new Error(PLAN_WAITING_HISTORY));
       }
 
       failRefresh = true;
@@ -1868,7 +1872,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
           agentId: agent.id,
           from: "working",
           planId: planRow.id,
-          reason: "PLAN_WAITING_HISTORY",
+          reason: PLAN_WAITING_HISTORY,
           to: "done",
         }),
       );
@@ -1892,7 +1896,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         attempts: 8,
         from: "working",
         paneId: "wJ:p2",
-        reason: "PLAN_WAITING_HISTORY",
+        reason: PLAN_WAITING_HISTORY,
         to: "done",
       });
 
@@ -1968,7 +1972,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       from: "working",
       to: "done",
     });
-    harness.statusEventPlans.markRetry(p2Row.id, new Error("PLAN_WAITING_HISTORY"));
+    harness.statusEventPlans.markRetry(p2Row.id, new Error(PLAN_WAITING_HISTORY));
 
     await index.drainPendingPlans();
 
@@ -2058,7 +2062,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       herdrEventKey: "key-2",
       to: "done",
     });
-    harness.statusEventPlans.markRetry(p2Row.id, new Error("PLAN_WAITING_HISTORY"));
+    harness.statusEventPlans.markRetry(p2Row.id, new Error(PLAN_WAITING_HISTORY));
 
     await index.drainPendingPlans();
 
@@ -2149,7 +2153,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         from: "working",
         to: "done",
       });
-      harness.statusEventPlans.markRetry(pRow.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(pRow.id, new Error(PLAN_WAITING_HISTORY));
       // Record turn completion signal so waitForSignal returns immediately without 5000ms delay
       turnRegistry.record({
         confirmed: true,
@@ -2270,7 +2274,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       from: "working",
       to: "done",
     });
-    harness.statusEventPlans.markRetry(p2Row.id, new Error("PLAN_WAITING_HISTORY"));
+    harness.statusEventPlans.markRetry(p2Row.id, new Error(PLAN_WAITING_HISTORY));
 
     turnRegistry.record({
       confirmed: true,
@@ -2465,7 +2469,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         from: "working",
         to: "done",
       });
-      harness.statusEventPlans.markRetry(pRow.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(pRow.id, new Error(PLAN_WAITING_HISTORY));
 
       // Now set failRefresh = true
       failRefresh = true;
@@ -2475,7 +2479,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
       const updated = harness.statusEventPlans.get(pRow.id);
       expect(updated.status).toBe("pending");
       expect(updated.attempts).toBe(2);
-      expect(updated.lastError).toBe("PLAN_WAITING_HISTORY");
+      expect(updated.lastError).toBe(PLAN_WAITING_HISTORY);
 
       const events = harness.agentEvents.listAfter({
         herdrSessionName: "default",
@@ -2541,7 +2545,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
         from: "working",
         to: "done",
       });
-      harness.statusEventPlans.markRetry(pRow.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(pRow.id, new Error(PLAN_WAITING_HISTORY));
 
       // 1. Refresh fails -> lastError must be PLAN_WAITING_HISTORY and timer scheduled
       failRefresh = true;
@@ -2549,7 +2553,7 @@ describe("AgentIndexService non-pi completed event generation", () => {
 
       const afterFail = harness.statusEventPlans.get(pRow.id);
       expect(afterFail.status).toBe("pending");
-      expect(afterFail.lastError).toBe("PLAN_WAITING_HISTORY");
+      expect(afterFail.lastError).toBe(PLAN_WAITING_HISTORY);
       expect(afterFail.attempts).toBe(2);
       expect(capturedTimerCallback).toBeDefined();
 
@@ -3357,10 +3361,8 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     harness.sqlite
-      .prepare(
-        "update status_event_plans set status = 'failed', last_error = 'PLAN_WAITING_HISTORY' where id = ?",
-      )
-      .run(legacyRow.id);
+      .prepare("update status_event_plans set status = 'failed', last_error = ? where id = ?")
+      .run(PLAN_WAITING_HISTORY, legacyRow.id);
 
     const infoSpy = vi.spyOn(console, "info").mockImplementation(() => {});
     try {
@@ -3460,7 +3462,7 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     for (let i = 0; i < 8; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(row.id, new Error(PLAN_WAITING_HISTORY));
     }
     expect(harness.statusEventPlans.get(row.id).status).toBe("discarded");
 
@@ -3479,7 +3481,7 @@ describe("batch2 window regressions", () => {
         attempts: 8,
         from: "working",
         planId: row.id,
-        reason: "PLAN_WAITING_HISTORY",
+        reason: PLAN_WAITING_HISTORY,
         to: "done",
       });
       expect(
@@ -3519,7 +3521,7 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     for (let i = 0; i < 8; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(row.id, new Error(PLAN_WAITING_HISTORY));
     }
     expect(harness.statusEventPlans.get(row.id).status).toBe("discarded");
 
@@ -3533,7 +3535,7 @@ describe("batch2 window regressions", () => {
         attempts: 8,
         from: "working",
         planId: row.id,
-        reason: "PLAN_WAITING_HISTORY",
+        reason: PLAN_WAITING_HISTORY,
         to: "done",
       },
       terminalId: agent.terminalId,
@@ -4058,14 +4060,12 @@ describe("batch2 window regressions", () => {
         harness.statusEventPlans.markDiscarded(row.id, "TEST_DISCARD");
       } else if (status === "failed") {
         for (let i = 0; i < 8; i += 1) {
-          harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+          harness.statusEventPlans.markRetry(row.id, new Error(PLAN_WAITING_HISTORY));
         }
         // Force status to failed for testing terminal failed row
         harness.sqlite
-          .prepare(
-            "update status_event_plans set status = 'failed', last_error = 'PLAN_WAITING_HISTORY' where id = ?",
-          )
-          .run(row.id);
+          .prepare("update status_event_plans set status = 'failed', last_error = ? where id = ?")
+          .run(PLAN_WAITING_HISTORY, row.id);
       }
       const record = harness.statusEventPlans.get(row.id);
       planRows.push({ attempts: record.attempts, id: row.id, status });
@@ -4146,7 +4146,7 @@ describe("batch2 window regressions", () => {
       to: "done",
     });
     for (let i = 1; i <= 6; i += 1) {
-      harness.statusEventPlans.markRetry(discardedRow.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(discardedRow.id, new Error(PLAN_WAITING_HISTORY));
     }
 
     // executeStatusEventPlan with failRefresh makes attempt 7 (pending) and schedules retry timer
@@ -4192,7 +4192,7 @@ describe("batch2 window regressions", () => {
       attempts: 8,
       from: "working",
       planId: discardedRow.id,
-      reason: "PLAN_WAITING_HISTORY",
+      reason: PLAN_WAITING_HISTORY,
       to: "done",
     });
 
@@ -4229,7 +4229,7 @@ describe("batch2 window regressions", () => {
     });
     // Set attempts to 7 so the next retry exhausts attempts to 8
     for (let i = 0; i < 7; i += 1) {
-      harness.statusEventPlans.markRetry(row.id, new Error("PLAN_WAITING_HISTORY"));
+      harness.statusEventPlans.markRetry(row.id, new Error(PLAN_WAITING_HISTORY));
     }
     expect(harness.statusEventPlans.get(row.id).attempts).toBe(7);
 
@@ -4239,7 +4239,7 @@ describe("batch2 window regressions", () => {
     harness.agentEvents.append = (input: Parameters<typeof originalAppend>[0]) => {
       appendCallCount += 1;
       if (appendCallCount === 1) {
-        throw new Error("PLAN_WAITING_HISTORY");
+        throw new Error(PLAN_WAITING_HISTORY);
       }
       return originalAppend(input);
     };
@@ -4269,7 +4269,7 @@ describe("batch2 window regressions", () => {
       attempts: 8,
       from: "working",
       planId: row.id,
-      reason: "PLAN_WAITING_HISTORY",
+      reason: PLAN_WAITING_HISTORY,
       to: "done",
     });
 
@@ -4383,7 +4383,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     expect(staleRow).toMatchObject({
       attempts: 1,
       fromStatus: "unknown",
-      lastError: "PLAN_WAITING_HISTORY",
+      lastError: PLAN_WAITING_HISTORY,
       status: "pending",
       toStatus: "idle",
     });
@@ -4548,7 +4548,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       from: "working",
       to: "done",
     });
-    harness.statusEventPlans.markRetry(retryRow.id, new Error("PLAN_WAITING_HISTORY"));
+    harness.statusEventPlans.markRetry(retryRow.id, new Error(PLAN_WAITING_HISTORY));
     await index.drainPendingPlans();
     expect(harness.statusEventPlans.get(retryRow.id).status).toBe("completed");
 
@@ -4605,7 +4605,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     expect(pending).toHaveLength(1);
     expect(pending[0]).toMatchObject({
       attempts: 1,
-      lastError: "PLAN_WAITING_HISTORY",
+      lastError: PLAN_WAITING_HISTORY,
       status: "pending",
       toStatus: "done",
     });
@@ -4776,7 +4776,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       from: "working",
       to: "done",
     });
-    harness.statusEventPlans.markRetry(waitingPlan.id, new Error("PLAN_WAITING_HISTORY"));
+    harness.statusEventPlans.markRetry(waitingPlan.id, new Error(PLAN_WAITING_HISTORY));
     await index.drainPendingPlans();
     expect(scheduledDelays).toContain(10_000);
 
@@ -4897,7 +4897,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       to: "done",
     });
     // Promote to retry so the first drain enters the retry path.
-    harness.statusEventPlans.markRetry(plan.id, new Error("PLAN_WAITING_HISTORY"));
+    harness.statusEventPlans.markRetry(plan.id, new Error(PLAN_WAITING_HISTORY));
 
     turnRegistry.record({
       confirmed: true,
