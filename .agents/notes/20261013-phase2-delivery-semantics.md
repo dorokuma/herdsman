@@ -216,11 +216,12 @@ supersedes: ""
    而这里的 `compactHistory` 是**计划行的冻结基线**。在降级臂（正文已被抹空）与首次终态轮上两者重合；
    若某条降级结算携带的基线是**更早一轮的正文**，守卫不会拒绝——「本轮无内容」这个字面条件并没有被直接判据覆盖。
    本批不改（无已知触达路径），登记为字面边界。
-10. **`PLAN_WAITING_HISTORY` 同族字面量未冻结**：常量只存在于 `src/observability/agent-index-service.ts:113`，
+10. **`PLAN_WAITING_HISTORY` 同族字面量未冻结**（**已裁定并实现，2026-10-16**）：原常量只存在于 `src/observability/agent-index-service.ts:113`，
     而 `src/db/status-event-plans.ts:276`（SQL 文本）与 `:346`（`markRetry` 比较；任务书记为 `:343`）、
     `packages/herdsman-pi/src/wake.ts:83`（兼容过滤）以及测试（`test/unit/herdsman-pi-agent-update-ui.test.ts:120`、`:483`）
     各自持有字面量。跨包（`src/` 与已发布的 `packages/herdsman-pi`）不能直接共享常量，所以「冻结」要么把它提到
-    `contracts.ts`（本包内 import，pi 包侧另立同值常量 + 一条对拍测试），要么显式登记**不冻**理由（本批未做，下轮裁定）。
+    `contracts.ts`（本包内 import，pi 包侧另立同值常量 + 一条对拍测试），要么显式登记**不冻**理由。
+    **已裁定（2026-10-16）**：`PLAN_WAITING_HISTORY` 已冻结进 `src/observability/contracts.ts:278`（`export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY"`，与既有 A2 metric key 契约同处，稳定性等级同为「取值字符串即契约」）；本轮实现位置：`src/observability/agent-index-service.ts`（`:33` 自 `contracts.ts` 导入、`:114` 重导出，`:145` 与 `:631` 引用）、`src/db/status-event-plans.ts`（`:280` `listWaitingHistory` SQL 参数化绑定与 `:350` `markRetry` 比较）、`packages/herdsman-pi/src/wake.ts`（跨独立发布包边界于 `:13` 另立同值常量并在 `:87` `outcomeKind` 兼容过滤中引用），以及 5 个测试文件（`test/unit/herdsman-pi-agent-update-ui.test.ts`、`test/unit/herdsman-pi-wake.test.ts`、`test/integration/startup-reconcile.test.ts`、`test/unit/status-event-plan-store.test.ts`、`test/integration/agent-index-service.test.ts`）的全部字面量统一改为引用该常量；属纯常量与字面量替换、行为零变化，按仓库测试纪律不新增测试。
 11. **`emptyTurnAlertKey` 的 `paneId` 空值共享键**（`src/observability/agent-index-service.ts:3240-3242`）：
     键是 `${herdrSessionName}\0${paneId ?? ""}`，`paneId` 为 `null` 与空串折叠成同一个键 ⇒ 同一 session 内
     「无 paneId」的结算行共享同一抑制状态（与 `paneIdentityKey` 的 `paneId` 必填 + `paneGeneration ?? ""` 处理不同）。
@@ -252,3 +253,4 @@ supersedes: ""
 ## 更新
 
 - 批次二判定：用户放行合并（2026-10-13）；部署后按本笔记遗留 2/3/4 与批次一 canary 基线（20261012-todo-batch1-canary-baseline.md）做部署后复读对比。
+- 遗留 10 裁定落地（2026-10-16）：`PLAN_WAITING_HISTORY` 已冻结进 `src/observability/contracts.ts:278`，全仓散落字面量已统一改为引用该常量（详见「遗留 / 观察项」第 10 条）。
