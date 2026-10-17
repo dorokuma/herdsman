@@ -153,7 +153,7 @@ pnpm check
 pnpm build
 ```
 
-See [Releasing Herdsman](./docs/releasing.md) for package validation, npm publication, and GitHub Release steps.
+See [Releasing Herdsman](./docs/releasing.md) for package validation, npm publication, and GitHub Release steps. Because the release commit on `main` must update the Herdr plugin `--ref <tag>` install command in `README.md` and `packages/herdsman-herdr-plugin/README.md` before the annotated git tag is created — so the tag snapshot itself seals the matching `--ref <tag>`, manifest versions, and `CHANGELOG.md` section — and the remote tag is pushed only after `main` is pushed and both npm packages are published and verified, `--ref <tag>` on `main` has a short structural window where the new tag is not yet resolvable on GitHub. Follow the release order in [docs/releasing.md](./docs/releasing.md) strictly: synchronize the four manifests, both README `--ref` lines, and `CHANGELOG.md` (recording only facts already true when the release commit is written), run `pnpm check` / `pnpm build` and isolated tarball checks, commit and push `main`, create and verify the local annotated tag snapshot, publish and verify both `@dorokuma/herdsman` and `@dorokuma/herdsman-pi` on npm, push the remote tag and create the GitHub Release (closing the `--ref` window; run `herdr plugin install` with the new `--ref <tag>` only after the remote tag and Release are live), and finally record the release under `.agents/notes/` as a separate commit on `main`. Published git tags, GitHub Releases, and already-released `CHANGELOG.md` sections are immutable and must never be rewritten, moved, or backfilled retroactively; record any post-release observations or wording corrections in `.agents/notes/` instead.
 
 DB schema changes require:
 

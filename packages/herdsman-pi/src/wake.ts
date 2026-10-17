@@ -7,6 +7,10 @@ import { DEFAULT_WAKE_FILTER_CONFIG, isUpstreamModelError, type WakeFilterConfig
 // next microtask (0ms timer) instead of waiting out a settle window. Delivery
 // latency is owned by the bounded deferral in the extension, not by this delay.
 export const WAKE_SETTLE_MS = 0;
+// Mirrors `PLAN_WAITING_HISTORY` in `src/observability/contracts.ts` (the string
+// value is the contract; duplicated here because `@dorokuma/herdsman-pi` ships
+// standalone `src/` without root `src/`).
+export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
 
 export type AgentOutcome = {
   agent: string;
@@ -80,7 +84,7 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
     const reason = stringValue(payload.reason);
     // Backward compatibility filter for legacy pre-upgrade failed rows with PLAN_WAITING_HISTORY
     // and degraded retries that exceeded the bounded retry budget.
-    if (reason === "PLAN_WAITING_HISTORY" || reason === "degraded") {
+    if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
       if (payload.fallbackOutcome === true) {
         return "failed";
       }

@@ -265,6 +265,18 @@ export const EMPTY_TURN_ALERT_MESSAGE = "Herdsman observed an empty upstream tur
  */
 export const DEGRADED_PLAN_ERROR = "degraded";
 
+/**
+ * The synthetic plan-row error marker for a status-event plan that is still
+ * waiting for session history to advance (`status_event_plans.last_error`,
+ * `markRetry`'s `discarded` vs `failed` branch, `#backfillFailedPlanEvents`'s
+ * legacy skip, and `agent.discarded` / legacy `agent.failed` payload `reason`).
+ * It belongs to the same frozen plan-error key family as `DEGRADED_PLAN_ERROR`:
+ * the string value is the contract — operators, SQL predicates, and wake
+ * filters key on it. Changing the value is a contract change under the same
+ * rule and must be recorded in `.agents/notes/20261013-phase2-delivery-semantics.md`.
+ */
+export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
+
 export type AgentTurnCompletedInput = {
   confirmed: boolean;
   expectedText?: string;

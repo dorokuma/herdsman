@@ -34,6 +34,7 @@
    - 位置：`packages/herdsman-pi/src/wake.ts:72-80`（收集）与 `:90-92`（压制）。
    - 现状：`completedPaneIds` 按单次投影批次构建。同批次内若同时存在某 pane 的旧代成功事件与紧随其后的新任务 `fallbackOutcome: true` 失败事件，后者会被一并压制（该 pane 的 fallback 失败不再唤醒编排者）。概率极低（需同一 paneId 跨代复用 + 完成态与 fallback 落在同一批次），符合合同 §3.4 的取舍；后续可加入 `paneGeneration` 维度辅助去重。
    - 本项与第一轮「建议 6」为同一风险，本轮补记入档。
+   - **已裁定（2026-10-16）**：跨批次压制采纳新增 `paneGeneration` 维度去重，但前置条件是先补齐保留行 `reserve→delivered→acked` 主链路与 reconciler 保留分支的回归测试，排入下一批次，本轮不动 `packages/herdsman-pi/src/wake.ts` 的唤醒语义（见文末「待办（下一轮）」）。
 
 ## 本轮（第三轮）新增非阻塞观察项
 
@@ -69,7 +70,7 @@ f. **`agent-event-delivery-lifecycle.test.ts` 的“deliverable 与 status 恒�
 
 g. **保留行 `reserve→delivered→acked` 链路与 reconciler 保留分支缺测试**
    - 影响：`reservePending`（`src/db/agent-events.ts:554-592`）、`markAcked`（`src/db/agent-events.ts:657-672`）、`markRetainedInvalidated`（`src/db/agent-events.ts:307-319`）与 reconciler 的保留分支（`src/daemon/agent-event-reconciler.ts:143-158`）无对应用例；合同「补齐断言 1」只覆盖 drain 成功分支。
-   - 现状：未补（本轮只授权补合同 §5 断言 2 与 `nextDeliverableAfter` 回归用例）。
+   - 现状：R4 当轮未补（当轮只授权补合同 §5 断言 2 与 `nextDeliverableAfter` 回归用例）；**2026-10-16 已裁定**：作为 `wake.ts` 跨批次压制新增 `paneGeneration` 维度去重的前置条件，排入下一批次先行补齐（见文末「待办（下一轮）」）。
 
 ## 第四轮（R4）补记
 
@@ -109,8 +110,8 @@ g. **保留行 `reserve→delivered→acked` 链路与 reconciler 保留分支�
 
 ## 待办（下一轮）
 
-1. 保留行 `reserve→delivered→acked` 主链路（`src/db/agent-events.ts:554-583,657-672`）与 reconciler 保留分支（`src/daemon/agent-event-reconciler.ts:143-158`）缺回归测试（即上文 g）。
-2. 跨批次压制：或改代码（让 pane 级完成态跨批次生效，即把 `completedPaneIds` 的语义提升为“本 scope 已见的完成 pane 集合”），或改合同 §3.4 措辞（见上文第 8 项 ①）。当前按噪声容忍，需 owner 在下一轮拍板方向。
+1. **保留行 `reserve→delivered→acked` 主链路与 reconciler 保留分支回归测试（上文 g，已裁定排期，2026-10-16）**：保留行 `reserve→delivered→acked` 主链路（`src/db/agent-events.ts:554-583,657-672`）与 reconciler 保留分支（`src/daemon/agent-event-reconciler.ts:143-158`）缺回归测试；已裁定作为第 2 项的前置条件，排入下一批次先行补齐。
+2. **跨批次压制（上文第 6 项、第 8 项 ①，已裁定排期，2026-10-16）**：跨批次压制采纳新增 `paneGeneration` 维度去重，但前置条件是先补齐保留行 `reserve→delivered→acked` 主链路与 reconciler 保留分支的回归测试，排入下一批次，本轮不动 `packages/herdsman-pi/src/wake.ts` 的唤醒语义。
 
 ## 建议后续动作
 

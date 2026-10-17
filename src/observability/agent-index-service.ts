@@ -30,6 +30,7 @@ import {
   type DegradedReason,
   EMPTY_TURN_ALERT_MESSAGE,
   EMPTY_TURN_ALERT_REASON,
+  PLAN_WAITING_HISTORY,
   parseAgentStatus,
   VALID_AGENT_EVENT_TYPES,
 } from "@/observability/contracts.js";
@@ -110,7 +111,7 @@ export type StatusEventPlan = {
   to: AgentStatus;
 };
 
-export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
+export { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
 
 /**
  * How many prior terminal rows the stale-baseline duplicate guard compares

@@ -1,5 +1,6 @@
 import { initTheme } from "@earendil-works/pi-coding-agent";
 import { beforeAll, describe, expect, test } from "vitest";
+import { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
 import {
   agentDisplayName,
   agentIdentityLabel,
@@ -117,7 +118,7 @@ describe("Herdsman Pi agent update UI", () => {
       [
         outcome(90, {
           kind: "failed",
-          reason: "PLAN_WAITING_HISTORY",
+          reason: PLAN_WAITING_HISTORY,
           text: "",
         }),
       ],
@@ -125,7 +126,7 @@ describe("Herdsman Pi agent update UI", () => {
     );
 
     expect(text).toContain("! Claude failed wB:p2");
-    expect(text).toContain("Last response  PLAN_WAITING_HISTORY");
+    expect(text).toContain(`Last response  ${PLAN_WAITING_HISTORY}`);
     expect(text).not.toContain("No final response");
   });
 
