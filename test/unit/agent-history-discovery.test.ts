@@ -6,6 +6,7 @@ import { afterEach, describe, expect, test, vi } from "vitest";
 import {
   discoverAgentHistory,
   historySourceFromSessionRef,
+  resolveAgySessionCandidates,
   safeAllowedSessionPath,
   safeOfficialSessionPath,
 } from "@/agent-history/discovery.js";
@@ -14,6 +15,7 @@ const tempDirs: string[] = [];
 
 afterEach(async () => {
   vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { force: true, recursive: true })));
 });
 
@@ -377,5 +379,132 @@ describe("agent history discovery", () => {
       path: join(conversations, `${otherId}.db`),
     });
     expect(warn).toHaveBeenCalledTimes(1);
+  });
+
+  test("resolves agy conversations across primary HOME and AGY_EXTRA_HOMES and tolerates missing extra homes", async () => {
+    const ultraHome = await tempHome("herdsman-agy-ultra-");
+    const proHome = await tempHome("herdsman-agy-pro-");
+    const missingHome = join(ultraHome, "nonexistent-extra-home");
+    const ultraConversations = await agyConversations(ultraHome);
+    const proConversations = await agyConversations(proHome);
+    const ultraId = "11111111-2222-4333-8444-555555555555";
+    const proId = "66666666-7777-4888-8999-aaaaaaaaaaaa";
+    const ultraDb = join(ultraConversations, `${ultraId}.db`);
+    const proDb = join(proConversations, `${proId}.db`);
+    await writeFile(ultraDb, "");
+    await writeFile(proDb, "");
+
+    vi.stubEnv("AGY_EXTRA_HOMES", `${missingHome}:${proHome}`);
+    await expect(agyLookup(ultraHome, ultraId)).resolves.toEqual({
+      kind: "agent_session",
+      path: ultraDb,
+      source: "antigravity-sqlite",
+      value: ultraId,
+    });
+    await expect(agyLookup(ultraHome, proId)).resolves.toEqual({
+      kind: "agent_session",
+      path: proDb,
+      source: "antigravity-sqlite",
+      value: proId,
+    });
+  });
+
+  test("deduplicates symlinked agy conversation stores by realpath and keeps Ultra priority", async () => {
+    const ultraHome = await tempHome("herdsman-agy-dedup-ultra-");
+    const proHome = await tempHome("herdsman-agy-dedup-pro-");
+    const ultraConversations = await agyConversations(ultraHome);
+    const proGemini = join(proHome, ".gemini", "antigravity-cli");
+    await mkdir(proGemini, { recursive: true });
+    symlinkSync(ultraConversations, join(proGemini, "conversations"));
+
+    const sharedId = "cccccccc-dddd-4eee-8fff-000000000001";
+    const ultraDb = join(ultraConversations, `${sharedId}.db`);
+    await writeFile(ultraDb, "");
+
+    const candidates = resolveAgySessionCandidates({
+      extraHomeDirs: [proHome],
+      homeDir: ultraHome,
+      id: sharedId,
+    });
+    expect(candidates.refs).toEqual([
+      {
+        kind: "agent_session",
+        path: ultraDb,
+        source: "antigravity-sqlite",
+        value: sharedId,
+      },
+    ]);
+    await expect(agyLookup(ultraHome, sharedId, { extraHomeDirs: [proHome] })).resolves.toEqual({
+      kind: "agent_session",
+      path: ultraDb,
+      source: "antigravity-sqlite",
+      value: sharedId,
+    });
+
+    // Independent directories with the same conversation id still prefer primary (Ultra) HOME.
+    const proIndependentHome = await tempHome("herdsman-agy-prio-pro-");
+    const proIndependentConversations = await agyConversations(proIndependentHome);
+    await writeFile(join(proIndependentConversations, `${sharedId}.db`), "");
+    await expect(
+      agyLookup(ultraHome, sharedId, { extraHomeDirs: [proIndependentHome] }),
+    ).resolves.toMatchObject({ path: ultraDb });
+  });
+
+  test("enforces file-safety gates on extra agy homes", async () => {
+    const ultraHome = await tempHome("herdsman-agy-extra-gate-ultra-");
+    const proHome = await tempHome("herdsman-agy-extra-gate-pro-");
+    await agyConversations(ultraHome);
+    const proConversations = await agyConversations(proHome);
+    const writableId = "cccccccc-dddd-4eee-8fff-000000000002";
+    const symlinkId = "cccccccc-dddd-4eee-8fff-000000000003";
+    const writableDb = join(proConversations, `${writableId}.db`);
+    await writeFile(writableDb, "");
+    chmodSync(writableDb, 0o664);
+
+    const targetDb = join(proHome, "outside.db");
+    await writeFile(targetDb, "");
+    symlinkSync(targetDb, join(proConversations, `${symlinkId}.db`));
+
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    await expect(
+      agyLookup(ultraHome, writableId, { extraHomeDirs: [proHome] }),
+    ).resolves.toBeNull();
+    await expect(agyLookup(ultraHome, symlinkId, { extraHomeDirs: [proHome] })).resolves.toBeNull();
+  });
+
+  test("invalidates negative cache when AGY_EXTRA_HOMES or extraHomeDirs changes within TTL", async () => {
+    const ultraHome = await tempHome("herdsman-agy-negcache-ultra-");
+    const proHome = await tempHome("herdsman-agy-negcache-pro-");
+    await agyConversations(ultraHome);
+    const proConversations = await agyConversations(proHome);
+    const negCacheId = "cccccccc-dddd-4eee-8fff-000000000004";
+    const proDb = join(proConversations, `${negCacheId}.db`);
+    await writeFile(proDb, "");
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    // Phase 1: with no extra homes configured, lookup misses and enters the negative cache.
+    vi.stubEnv("AGY_EXTRA_HOMES", "");
+    await expect(agyLookup(ultraHome, negCacheId, { paneId: "wA:p14" })).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+    await expect(agyLookup(ultraHome, negCacheId, { paneId: "wA:p14" })).resolves.toBeNull();
+    expect(warn).toHaveBeenCalledTimes(1);
+
+    // Phase 2: configuring extra homes (via extraHomeDirs or AGY_EXTRA_HOMES) within TTL
+    // without force immediately resolves because extra homes are part of discoveryLookupKey.
+    await expect(
+      agyLookup(ultraHome, negCacheId, { extraHomeDirs: [proHome], paneId: "wA:p14" }),
+    ).resolves.toEqual({
+      kind: "agent_session",
+      path: proDb,
+      source: "antigravity-sqlite",
+      value: negCacheId,
+    });
+    vi.stubEnv("AGY_EXTRA_HOMES", proHome);
+    await expect(agyLookup(ultraHome, negCacheId, { paneId: "wA:p14" })).resolves.toEqual({
+      kind: "agent_session",
+      path: proDb,
+      source: "antigravity-sqlite",
+      value: negCacheId,
+    });
   });
 });

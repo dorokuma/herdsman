@@ -9,8 +9,9 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
  *    official `agent_session.kind == "path"` value is used as-is after the
  *    file-safety gate (this is the generic path channel, not a pi-only branch).
  * 2. `agy` — Herdr reports only `kind == "id"`, and an agy conversation id is
- *    the name of its own conversation database, so the id resolves to exactly
- *    one candidate:
+ *    the name of its own conversation database, so the id resolves to one
+ *    deterministic candidate per configured agy home (primary `HOME` first,
+ *    followed by `AGY_EXTRA_HOMES` / `DEFAULT_AGY_EXTRA_HOMES`):
  *      - `agy` -> `<home>/.gemini/antigravity-cli/conversations/<id>.db`
  *
  * Every other agent — whether or not Herdr has an integration for it — is
@@ -21,10 +22,12 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
  * then `null`.
  */
 export const ALLOWED_SESSION_ROOTS = ["/tmp/herdr-role-sessions"] as const;
+export const DEFAULT_AGY_EXTRA_HOMES = ["/root/.agy-pro-home"] as const;
 
 export type AgentHistoryLookupInput = {
   agent: string | null;
   agentSession: AgentSessionRef | null;
+  extraHomeDirs?: readonly string[];
   herdrSessionName?: string;
   homeDir?: string;
   paneId?: string | null;
@@ -51,6 +54,38 @@ const DISCOVERY_FAILURE_CACHE_LIMIT = 512;
 const failedDiscoveryAt = new Map<string, number>();
 const warnedDiscoveryKeys = new Set<string>();
 
+export function resolveAgyExtraHomes(
+  extraHomeDirs?: readonly string[],
+  envValue = process.env.AGY_EXTRA_HOMES,
+): string[] {
+  const raw =
+    extraHomeDirs !== undefined
+      ? extraHomeDirs
+      : envValue !== undefined
+        ? envValue.split(":")
+        : DEFAULT_AGY_EXTRA_HOMES;
+  return raw.map((entry) => entry.trim()).filter(Boolean);
+}
+
+export function resolveAgyHomeDirs(
+  input: { extraHomeDirs?: readonly string[]; homeDir?: string } = {},
+): string[] {
+  const primary = (input.homeDir ?? process.env.HOME ?? "").trim();
+  const homes: string[] = [];
+  const seen = new Set<string>();
+  for (const candidate of [primary, ...resolveAgyExtraHomes(input.extraHomeDirs)]) {
+    if (!candidate) continue;
+    const normalized = normalize(candidate);
+    if (seen.has(normalized)) continue;
+    seen.add(normalized);
+    homes.push(candidate);
+  }
+  if (homes.length === 0) {
+    homes.push("");
+  }
+  return homes;
+}
+
 export function discoveryLookupKey(input: AgentHistoryLookupInput): string {
   return [
     input.agent ?? "",
@@ -58,6 +93,7 @@ export function discoveryLookupKey(input: AgentHistoryLookupInput): string {
     input.agentSession?.source ?? "",
     input.agentSession?.value ?? "",
     input.homeDir ?? process.env.HOME ?? "",
+    resolveAgyExtraHomes(input.extraHomeDirs).join(":"),
   ].join("\u0000");
 }
 
@@ -124,6 +160,7 @@ export async function discoverAgentHistory(
     };
   }
   const resolvedById = resolveSessionFileById({
+    ...(input.extraHomeDirs === undefined ? {} : { extraHomeDirs: input.extraHomeDirs }),
     ...(input.homeDir === undefined ? {} : { homeDir: input.homeDir }),
     session,
   });
@@ -132,10 +169,12 @@ export async function discoverAgentHistory(
 }
 
 /**
- * Deterministic id -> session file resolution for `agy`. It derives at most one
- * candidate path from the official id alone and then verifies it: the candidate
- * must be a regular file owned by herdsman inside the agent's own store root.
- * Nothing is ranked, filtered by cwd, or picked from candidates.
+ * Deterministic id -> session file resolution for `agy` across primary `HOME`
+ * and configured extra homes (`AGY_EXTRA_HOMES` / `DEFAULT_AGY_EXTRA_HOMES`).
+ * Each candidate home derives one path from the official id alone and verifies
+ * it through `containedFileRef` (`safeRegularFile` + `isInside`). Hits are
+ * deduplicated by `realpath` while preserving home priority (primary/Ultra
+ * first).
  *
  * An agent without a template here is not guessed. That splits in two, and the
  * warning has to say which one it is:
@@ -143,26 +182,63 @@ export async function discoverAgentHistory(
  *   id-based derivation for it, so this pane reports no history;
  * - an agent herdsman does not support at all.
  */
+export function resolveAgySessionCandidates(input: {
+  extraHomeDirs?: readonly string[];
+  homeDir?: string;
+  id: string;
+}): { detail: string; refs: AgentHistoryRef[] } {
+  if (!isUuidLike(input.id)) {
+    return { detail: `agy conversation id is not a uuid: ${input.id}`, refs: [] };
+  }
+  const homes = resolveAgyHomeDirs({
+    ...(input.extraHomeDirs === undefined ? {} : { extraHomeDirs: input.extraHomeDirs }),
+    ...(input.homeDir === undefined ? {} : { homeDir: input.homeDir }),
+  });
+  const refs: AgentHistoryRef[] = [];
+  const seenRealpaths = new Set<string>();
+  const hitDetails: string[] = [];
+  const missDetails: string[] = [];
+  for (const homeDir of homes) {
+    const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
+    const resolution = containedFileRef({
+      candidate: join(dir, `${input.id}.db`),
+      id: input.id,
+      label: "agy",
+      root: dir,
+      source: "antigravity-sqlite",
+    });
+    const resolvedPath = resolution.ref?.path;
+    if (resolution.ref && resolvedPath) {
+      if (!seenRealpaths.has(resolvedPath)) {
+        seenRealpaths.add(resolvedPath);
+        refs.push(resolution.ref);
+        hitDetails.push(resolution.detail);
+      }
+    } else {
+      missDetails.push(resolution.detail);
+    }
+  }
+  return {
+    detail: hitDetails[0] ?? missDetails.join("; "),
+    refs,
+  };
+}
+
 function resolveSessionFileById(input: {
+  extraHomeDirs?: readonly string[];
   homeDir?: string;
   session: AgentSessionRef;
 }): SessionFileResolution {
-  const homeDir = input.homeDir ?? process.env.HOME ?? "";
   const source = historySourceFromSessionRef(input.session);
   const id = input.session.value;
   const miss = (detail: string): SessionFileResolution => ({ detail, ref: null });
   if (source === "antigravity-sqlite") {
-    // agy conversation ids are uuids; anything else cannot name a conversation
-    // file, and a non-uuid must never be joined into the conversations path.
-    if (!isUuidLike(id)) return miss(`agy conversation id is not a uuid: ${id}`);
-    const dir = join(homeDir, ".gemini", "antigravity-cli", "conversations");
-    return containedFileRef({
-      candidate: join(dir, `${id}.db`),
+    const resolved = resolveAgySessionCandidates({
+      ...(input.extraHomeDirs === undefined ? {} : { extraHomeDirs: input.extraHomeDirs }),
+      ...(input.homeDir === undefined ? {} : { homeDir: input.homeDir }),
       id,
-      label: "agy",
-      root: dir,
-      source,
     });
+    return { detail: resolved.detail, ref: resolved.refs[0] ?? null };
   }
   if (source !== "unknown") {
     return miss(
