@@ -47,22 +47,14 @@ supersedes: ""
 
 ### 已知未闭环（逐条）
 
+> 注（2026-10-17）：已知未闭环项 2（关停 abort 消耗 plan 重试预算）、3（sqlite.close 补耗时）、4（启动失败清理链补预算）、5（SHUTDOWN_BUDGET_MS 校验）与 10（第二意见新增观察两项）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **`daemon-process-manager` 偶发 flake（与本批无关）**：`pnpm test` 中 `stress test: 200 rounds…`（5s 上限，起两个 tsx 子进程）偶发超时失败；复跑与单跑该文件均通过。未定位、未修。
-2. **关停 abort 会消耗 plan 重试预算（语义取「关停中断 ≈ 一次失败重试」，本批接受并记录风险）**：`abortPendingWaits()` 让 waiter 抛 `PlanWaitingHistoryError`，`StatusEventPlanStore.markRetry`（`src/db/status-event-plans.ts`）据此把 `attempts` 从当前值 `+1`（**每一次 `markRetry` 都累加一次 attempts**，不区分起因，关停中断照计）。`attempts >= STATUS_PLAN_MAX_ATTEMPTS`（8）时按 `last_error` 分流：`PLAN_WAITING_HISTORY` → `discarded` 终态，其他（如 `degraded`）→ `failed`。
-   - `discarded` **不是「静默丢弃、不补事件」**：它只是与 `failed` 并列的一个终态。行落到该终态后不再重试，也不再补发它原本要表达的那次状态迁移事件（例如 `working → done`）；但 drain 结束时 `#backfillDiscardedPlanEvents()` 会按幂等键 `agent.discarded:plan:<id>` 补写一条 `agent.discarded` 事件落库（`#appendPlanDiscardedEvent`），并有 `console.info("Herdsman status event plan discarded after max attempts")` 记录。准确表述是：**落库事件有（`agent.discarded`），但它按设计不触发下游 wake**（观察者放弃与 agent 崩溃解耦，详见 [20260917-status-event-plan-discarded-lifecycle.md](20260917-status-event-plan-discarded-lifecycle.md)）。
-   - 风险：若一天内重启 8 次且每次都撞上在飞 plan，这些 plan 会落到 `discarded`——原本的 `working → done` 状态迁移不会再有事件补上，观察者最多看到一条不触发唤醒的 `agent.discarded`。这是部署日频繁重启下的理论加速。
-   - 可选后续方案：在 `markRetry` 里区分「关停中断」并不计入 attempts（或不计入 discarded 判定）。
-3. **`sqlite.close()` 与 `finally` 段不在关停预算内**：两者都在 `runShutdownSteps()` 之后/之外，预算耗尽也一定执行（有意为之）。本机 `close()` 为 ms 级、WAL 有 autocheckpoint 上界，未测最坏情况。后续可给关停日志补 `sqlite.close()` 耗时（当前该段无耗时日志，`shutdown finished` 的 `elapsedMs` 不含它）。
-4. **启动失败 catch 分支的清理链仍是无预算 await**：`runObservabilityDaemonService` 的启动 catch 里依次 `await reconcileScheduler?.stop() / watchManager.stop() / server.stop()`，没有 `runShutdownSteps()` 的预算兜底；本批只给它加了 `shutdownController.abort()`。触发概率低，但某步卡住仍是无限等待。
-5. **`SHUTDOWN_BUDGET_MS` 硬编码，前提是本单元 `TimeoutStopSec=10s`**：代码里没有对 unit 的运行时校验。换机器、或加 drop-in 把 `TimeoutStopSec` 改小到接近预算 + `(步数-1) * SHUTDOWN_MIN_STEP_MS` 的 overshoot 时，预算不再安全。
 6. **测试里的步数手工同步**：`test/unit/daemon-service.test.ts` 按 4 步断言 overshoot 上界；将来加第 5 步不会被自动发现（没有从 `stop()` 的步骤数组导出的步数常量）。
 7. **2000ms 超时同样作用于常规刷新路径（不只关停）**：`HERDR_REQUEST_TIMEOUT_MS`（socket-client）与 `HERDR_SESSION_LIST_TIMEOUT_MS`（session-list）在正常运行时也生效。正常耗时有两个数量级余量，验证判据 = journal 中 `timed out after 2000ms` 的出现频率。降级行为安全（超时→失败→重连/重试），唯一例外是「迟到成功被当成功」，已由本批应修项「`execFile` 的 timeout 不是硬上限」堵掉。
    - **例外且致命：startup 路径上的 session-list 超时不是降级**。`watchManager.start()` → `rescanNow()` → `sessionList()`（`src/herdr/session-list.ts` 的 `execFile`）一旦超时即抛错，`start()` 的调用位于 `runObservabilityDaemonService` 的启动 `try` 内，于是走启动 catch 分支：清理（abort + watchManager.stop + server.stop + pid / 锁 / sqlite）后把错误 `throw` 出去，最终由 `src/cli/herdsman-daemon.ts` 的 `main().catch` 打错误并 `exit(1)`。也就是说，**2s 的 session-list 超时在启动路径上是致命失败（exit 1），systemd 会按 `Restart=on-failure` 重启**（表现为启动—失败—重启的循环），而不是运行时降级。只有 daemon 已启动之后的调用才落在「超时→失败→重连/重试」的降级语义里。
 8. **测试盲区**：缺「对端慢但会在超时前成功返回」的用例（超时值与真实耗时之间的余量没有被测试守护），也缺 `killSignal` 生效的用例（本批受「至多一条测试」约束，只加了 tick 错误分支的用例）。
 9. **`stop()` 的 `finally` 不 force-rm socket 文件**：`onSecondSignal` 才会 `rmSync()` socket；被预算截断（如 `server.stop()` 超时）时，socket 文件留给下次启动的 stale-socket 清理路径（已有测试覆盖）。这是有意取舍，不是遗漏。
-10. **第二意见新增观察项（可选改进，本批不改）**：
-    - **`raceShutdownStep` 超时后被放弃的步骤若随后抛错，彻底无日志**：`Promise.race` 已经对两侧 promise 挂了反应，步骤在超时后抛出的 rejection 被 race 吸收，不会触发 `unhandledRejection`，而关停日志里也只有「step timed out」一条，看不出该步骤其实是失败退出的（除非它自己在内部记录）。可选改进：给 `finished` 挂一个 `.catch`，在超时之后记录一条「abandoned step failed after timeout」并带上原始错误。
-    - **tick 失败日志可再补两点**：当前只记 `error.message`（丢了 `Error` 堆栈），且 `step` 恒为 `"active-revision-poll"`——`#tick()` 走 `full-rescan` 分支（`await this.rescanNow()`）失败时也是这个标签。可选改进：日志传 `Error` 对象本身以保留堆栈，并让 `step` 按分支取 `full-rescan` / `active-revision-poll`。
 11. **文案/一致性小疵（不影响行为，待后续统一）**：
     - `src/daemon/service.ts`：`SHUTDOWN_BUDGET_MS` 的注释写「a single wedged step cannot run the sequence past this ceiling」，与 `SHUTDOWN_MIN_STEP_MS` 的 min-step overshoot（最多 `(步数-1) * 250ms`）自相矛盾；实际语义是「允许小幅越过预算，但仍远低于 `TimeoutStopSec`」。
     - `src/observability/agent-index-service.ts`：`#throwIfShutdownAbort` 之前打 `skipping status event generation because … aborted`（debug），但关停路径的实际行为是「保持 pending、下次启动重试」（抛 `PlanWaitingHistoryError`），文案与语义不符。

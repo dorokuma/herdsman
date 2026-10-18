@@ -4756,11 +4756,13 @@ describe("pi invalidated-event wake-loop regression (independent coverage)", () 
     }
   });
 
-  test("retains local pending events beyond 100-event window when server response is truncated", async () => {
+  test("retains a local id past an exactly full pending page", async () => {
     vi.useFakeTimers();
     let extensionState: { pendingEvents: AgentEventWireRecord[] } | undefined;
     const client = createFakeClient();
 
+    // The daemon hard-caps the page at 100, so exactly 100 is indistinguishable
+    // from a longer page and must keep a higher local id.
     const server100Events: AgentEventWireRecord[] = Array.from({ length: 100 }, (_, i) =>
       event(i + 1, "term_agent"),
     );
@@ -5187,8 +5189,10 @@ function event(
   terminalId: string | null,
   options: {
     compactHistory?: Record<string, unknown>;
+    paneGeneration?: string | null;
     paneId?: string;
     payload?: Record<string, unknown>;
+    status?: AgentEventWireRecord["status"];
     type?: string;
     workspaceId?: string;
   } = {},
@@ -5196,8 +5200,10 @@ function event(
   return {
     compactHistory: options.compactHistory ?? { lastAssistantMessage: { text: "done" } },
     id,
+    ...(Object.hasOwn(options, "paneGeneration") ? { paneGeneration: options.paneGeneration } : {}),
     paneId: options.paneId ?? "wB:p-agent",
     payload: { agent: "claude", ...options.payload },
+    ...(options.status === undefined ? {} : { status: options.status }),
     terminalId,
     type: options.type ?? "agent.done",
     workspaceId: options.workspaceId ?? "wB",
@@ -5300,6 +5306,299 @@ function movedRoleChange() {
     current: { ...change.current, workspaceId: "wC" },
   };
 }
+
+async function settleUnconsumedWake(pi: FakePi, ctx: ReturnType<typeof fakeCtx>): Promise<void> {
+  await pi.emit("agent_start", {}, ctx);
+  await pi.emit("message_end", assistantMessage("error"), ctx);
+  await pi.emit("agent_settled", {}, ctx);
+}
+
+function refreshPending(
+  client: FakeClient,
+  events: AgentEventWireRecord[],
+  ackedEventId = 0,
+): void {
+  client.currentEvents.clear();
+  for (const item of events) client.currentEvents.set(item.id, item);
+  const originalResponse = client.response.bind(client);
+  client.response = (method, params) => {
+    const response = originalResponse(method, params) as {
+      ackedEventId?: number;
+      events?: AgentEventWireRecord[];
+      state?: { ackedEventId?: number };
+    };
+    if (method === "agent.orchestrator.get") {
+      response.events = events;
+      response.state = { ...response.state, ackedEventId };
+      response.ackedEventId = ackedEventId;
+    }
+    return response;
+  };
+}
+
+test("does not reap an unlisted watermark barrier that the server has not settled", async () => {
+  vi.useFakeTimers();
+  const client = createWakeClient();
+  const pi = createFakePi();
+  const ctx = fakeCtx({ idle: true });
+  const previous = withHerdrEnv();
+  const ackedIds = () =>
+    client.calls
+      .filter(([method]) => method === "agent.notifications.ack")
+      .map(([, params]) => (params as { eventId: number }).eventId);
+  let extensionState:
+    | {
+        pendingEvents: AgentEventWireRecord[];
+        unackedDelivered: Map<number, AgentEventWireRecord>;
+        wakeRetryableEventIds: Set<number>;
+      }
+    | undefined;
+  try {
+    await startExtension(client, pi, ctx, {
+      onStateExposed: (state) => {
+        extensionState = state as unknown as typeof extensionState;
+      },
+    });
+    client.emitStream({ method: "agent.event", params: { event: event(710, "term_agent") } });
+    await vi.advanceTimersByTimeAsync(500);
+    await settleUnconsumedWake(pi, ctx);
+    expect(extensionState?.wakeRetryableEventIds.has(710)).toBe(true);
+
+    refreshPending(client, [
+      event(711, "term_agent", {
+        compactHistory: { lastAssistantMessage: { text: "API Error: 429 rate_limit_error" } },
+      }),
+    ]);
+    await pi.command("status", ctx);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(ackedIds()).toEqual([]);
+    expect(extensionState?.unackedDelivered.has(710)).toBe(true);
+    expect(extensionState?.pendingEvents.some((item) => item.id === 710)).toBe(true);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    restoreEnv(previous);
+  }
+});
+
+test("reaps an unlisted barrier once the server reports it settled", async () => {
+  vi.useFakeTimers();
+  const client = createWakeClient();
+  const pi = createFakePi();
+  const ctx = fakeCtx({ idle: true });
+  const previous = withHerdrEnv();
+  let extensionState:
+    | {
+        pendingEvents: AgentEventWireRecord[];
+        unackedDelivered: Map<number, AgentEventWireRecord>;
+      }
+    | undefined;
+  try {
+    await startExtension(client, pi, ctx, {
+      onStateExposed: (state) => {
+        extensionState = state as unknown as typeof extensionState;
+      },
+    });
+    client.emitStream({ method: "agent.event", params: { event: event(710, "term_agent") } });
+    await vi.advanceTimersByTimeAsync(500);
+    await settleUnconsumedWake(pi, ctx);
+
+    refreshPending(client, [event(711, "term_agent")], 710);
+    await pi.command("status", ctx);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(extensionState?.unackedDelivered.has(710)).toBe(false);
+    expect(extensionState?.pendingEvents.some((item) => item.id === 710)).toBe(false);
+    expect(extensionState?.pendingEvents.some((item) => item.id === 711)).toBe(true);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    restoreEnv(previous);
+  }
+});
+
+test("reaps an unlisted barrier once the server cursor has settled it", async () => {
+  vi.useFakeTimers();
+  const client = createWakeClient();
+  const pi = createFakePi();
+  const ctx = fakeCtx({ idle: true });
+  const previous = withHerdrEnv();
+  let extensionState:
+    | {
+        pendingEvents: AgentEventWireRecord[];
+        unackedDelivered: Map<number, AgentEventWireRecord>;
+      }
+    | undefined;
+  try {
+    await startExtension(client, pi, ctx, {
+      onStateExposed: (state) => {
+        extensionState = state as unknown as typeof extensionState;
+      },
+    });
+    client.emitStream({ method: "agent.event", params: { event: event(710, "term_agent") } });
+    await vi.advanceTimersByTimeAsync(500);
+    await settleUnconsumedWake(pi, ctx);
+
+    refreshPending(client, [event(711, "term_agent")], 710);
+    await pi.command("status", ctx);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(extensionState?.unackedDelivered.has(710)).toBe(false);
+    expect(extensionState?.pendingEvents.some((item) => item.id === 710)).toBe(false);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    restoreEnv(previous);
+  }
+});
+
+test("does not reap an unlisted barrier from a higher failed row in the pending page", async () => {
+  vi.useFakeTimers();
+  const client = createWakeClient();
+  const pi = createFakePi();
+  const ctx = fakeCtx({ idle: true });
+  const previous = withHerdrEnv();
+  let extensionState:
+    | {
+        pendingEvents: AgentEventWireRecord[];
+        unackedDelivered: Map<number, AgentEventWireRecord>;
+      }
+    | undefined;
+  try {
+    await startExtension(client, pi, ctx, {
+      onStateExposed: (state) => {
+        extensionState = state as unknown as typeof extensionState;
+      },
+    });
+    client.emitStream({ method: "agent.event", params: { event: event(710, "term_agent") } });
+    await vi.advanceTimersByTimeAsync(500);
+    await settleUnconsumedWake(pi, ctx);
+
+    refreshPending(
+      client,
+      [event(711, "term_agent", { status: "failed", type: "agent.failed" })],
+      0,
+    );
+    await pi.command("status", ctx);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(extensionState?.unackedDelivered.has(710)).toBe(true);
+    expect(extensionState?.pendingEvents.some((item) => item.id === 710)).toBe(true);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    restoreEnv(previous);
+  }
+});
+
+test("keeps suppressing a fallback after its completed generation leaves the pending window", async () => {
+  vi.useFakeTimers();
+  const client = createWakeClient();
+  const pi = createFakePi();
+  const ctx = fakeCtx({ idle: true });
+  const previous = withHerdrEnv();
+  const wakeInjections = () =>
+    pi.hiddenMessages.filter(([message]) => message.customType === "herdsman-wake-context");
+  let extensionState: { completedPaneKeys: Set<string> } | undefined;
+  try {
+    await startExtension(client, pi, ctx, {
+      onStateExposed: (state) => {
+        extensionState = state as unknown as typeof extensionState;
+      },
+    });
+    client.emitStream({
+      method: "agent.event",
+      params: {
+        event: event(720, "term_agent", {
+          paneGeneration: "gen-1",
+          paneId: "wB:p-agent",
+        }),
+      },
+    });
+    await vi.advanceTimersByTimeAsync(500);
+    await pi.emit("message_end", assistantMessage("error"), ctx);
+    await pi.emit("agent_settled", {}, ctx);
+
+    expect(
+      (extensionState as unknown as { pendingEvents: AgentEventWireRecord[] }).pendingEvents.map(
+        (item) => item.id,
+      ),
+    ).toEqual([720]);
+    client.emitStream({
+      method: "agent.event",
+      params: {
+        event: event(820, "term_agent", {
+          paneGeneration: "gen-1",
+          paneId: "wB:p-agent",
+          payload: { fallbackOutcome: true, reason: "degraded" },
+          type: "agent.failed",
+        }),
+      },
+    });
+    client.emitStream({
+      method: "agent.event",
+      params: {
+        event: event(821, "term_other", {
+          paneGeneration: "gen-2",
+          paneId: "wB:p-agent",
+          payload: { fallbackOutcome: true, reason: "degraded" },
+          type: "agent.failed",
+        }),
+      },
+    });
+    await vi.advanceTimersByTimeAsync(500);
+
+    const injectedIds = wakeInjections().flatMap(
+      ([message]) => (message.details as { presentedEventIds?: number[] }).presentedEventIds ?? [],
+    );
+    expect(new Set(injectedIds)).toEqual(new Set([720, 821]));
+    expect(injectedIds).not.toContain(820);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    restoreEnv(previous);
+  }
+});
+
+test("keeps a local id past an exactly full pending page", async () => {
+  vi.useFakeTimers();
+  const client = createWakeClient();
+  const pi = createFakePi();
+  const ctx = fakeCtx({ idle: true });
+  const previous = withHerdrEnv();
+  let extensionState: { pendingEvents: AgentEventWireRecord[] } | undefined;
+  try {
+    await startExtension(client, pi, ctx, {
+      onStateExposed: (state) => {
+        extensionState = state;
+      },
+    });
+    // The completion is already in the orchestrator's hands, so it is a
+    // presentation guard only: it cannot be re-projected as unfinished work.
+    // It is still past the hard page cap, so a full page must not drop it.
+    client.emitStream({
+      method: "agent.event",
+      params: { event: event(901, "term_agent", { paneId: "wB:p-high" }) },
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    await pi.emit("message_end", wakeConsumptionEvidence([901]), ctx);
+
+    const page = Array.from({ length: 100 }, (_, index) =>
+      event(index + 1, "term_page", { paneId: `wB:p-${index + 1}` }),
+    );
+    refreshPending(client, page);
+    await pi.command("status", ctx);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(extensionState?.pendingEvents.map((item) => item.id)).toContain(901);
+    expect(extensionState?.pendingEvents).toHaveLength(101);
+  } finally {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    restoreEnv(previous);
+  }
+});
 
 function withHerdrEnv(options: { paneId?: string; workspaceId?: string } = {}) {
   const previous = {

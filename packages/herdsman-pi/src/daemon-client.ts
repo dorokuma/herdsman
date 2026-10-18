@@ -11,8 +11,10 @@ export type AgentEventWireRecord = {
   createdAt?: string;
   herdrSessionName?: string;
   id: number;
+  paneGeneration?: string | null;
   paneId?: string | null;
   payload: unknown;
+  status?: "pending" | "delivered" | "acked" | "invalidated" | "failed";
   terminalId?: string | null;
   type: string;
   workspaceId?: string | null;

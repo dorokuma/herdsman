@@ -4,22 +4,6 @@
 
 ## 非阻塞观察
 
-1. **`paneGeneration` 校验依赖上游必传**
-   - 代际守卫的**实际位置是 `AgentEventStore.#invalidatePaneCore`（`src/db/agent-events.ts:250-296`）**；`AgentStore` 只是通过 `invalidatePaneDirect`（`src/db/agent-events.ts:247`、调用点 `src/db/agents.ts:182`）在既存事务内触发它。原文曾把该位置误记为 `AgentStore.invalidatePaneDirect`，此处订正。
-   - 守卫语义：`input.paneGeneration !== null` 时步骤 1 只作废同代、更早代与 `pane_generation is null` 的行，不作废新代活跃事件；`paneGeneration == null`（legacy）时不加代际条件。
-   - 若上游调用方未来出现 `null`/`undefined` 混用，会退回到宽松的 legacy 作废分支（`1 = 1`）。
-   - 当前已知调用方均显式传参，风险可控。
-
-2. **`#retryWaitingPlanRow` 重试耗尽路径依赖 `lastError === "degraded"`**
-   - `#retryWaitingPlanRow`（`src/observability/agent-index-service.ts:324-427`）通过 `currentPlan.lastError === "degraded"`（`:350-352`）决定用 `new Error("degraded")` 还是 `PlanWaitingHistoryError` 继续重试。若未来新增其他降级错误码，需同步扩展此处判断。
-   - 当前与 `#runPlanRow`/`#drainPlanRow` 的 `markRetry` 调用一致，行为闭环。
-
-3. **`S4` 回归测试数据构造依赖 `payload.from === "working"`**
-   - 新增的 S4 测试通过显式传入 `payload: { from: "working" }` 构造 retainable outcome。若未来 `#invalidatePaneCore` 的保留条件变更，需同步更新测试数据。
-
-4. **`invalidatePaneDirect` 事务内直接更新路径**
-   - 为避免 SQLite 嵌套事务，新增了 `invalidatePaneDirect`（`src/db/agent-events.ts:233-247`）供 `AgentStore` 在事务内直接调用。该路径与 `invalidatePane` 的原子两步式语义等价，但依赖调用方已在事务中（已补 JSDoc 说明）。
-   - 当前仅 `AgentStore` 使用，风险可控。
 
 5. **（补记）`nextDeliverableAfter` 未传 `getAgent` 时的保留行过滤缺陷（本轮已修）**
    - 位置：`src/db/agent-events.ts:485-548`（`agentFilter` 在 `:497-511`，取件闸门在 `:524`，取件循环在 `:531-546`）。
@@ -58,15 +42,6 @@ d. **保留分支未排除交互式 pi agent 的 `agent.idle`**
    - 位置：`src/db/agent-events.ts:276-296`；对照 `isDeliverableAgentEvent` 的存活分支（`src/db/agent-events.ts:100`）里的 `isInteractivePiAgent` 排除。
    - 现状：未处理；只在关页窗口出现，合同未要求。
 
-e. **`last_error` 统一写成 `degraded`**
-   - 影响：第二轮为让阶段耗尽走 `failed`（带推送）分支，把多处 `last_error` 统一保留为 `degraded`（`src/observability/agent-index-service.ts:350-352,639-641,856-858,894-896,960-962`），因此 `last_error` 不再反映最后一次真实错误；且降级后因别的原因耗尽也会发 `fallbackOutcome: true`。
-   - 位置：上列五处 `markRetry` 调用点。
-   - 现状：仅影响诊断可读性，不影响投递语义。
-
-f. **`agent-event-delivery-lifecycle.test.ts` 的“deliverable 与 status 恒等”不变量已有洞**
-   - 影响：新设计允许 `status='invalidated' and deliverable=1`，既有不变量测试（`test/integration/agent-event-delivery-lifecycle.test.ts:464-482`）只在它自己走的那几个状态上取值，覆盖不到保留行。
-   - 位置：同上。
-   - 现状：测试未改动（本轮未授权改该用例），缺口记录在案。
 
 g. **保留行 `reserve→delivered→acked` 链路与 reconciler 保留分支缺测试**
    - 影响：`reservePending`（`src/db/agent-events.ts:554-592`）、`markAcked`（`src/db/agent-events.ts:657-672`）、`markRetainedInvalidated`（`src/db/agent-events.ts:307-319`）与 reconciler 的保留分支（`src/daemon/agent-event-reconciler.ts:143-158`）无对应用例；合同「补齐断言 1」只覆盖 drain 成功分支。
@@ -94,8 +69,6 @@ g. **保留行 `reserve→delivered→acked` 链路与 reconciler 保留分支�
 
 8. **两轮独立意见点出但尚未入档的事实**
    - ① 合同 §3.4 的“跨批次由 `presentedEventIds` 保障压制”与实现不符：`presentedEventIds` 是 **event id 键**的集合（`packages/herdsman-pi/src/index.ts:508,672-674`），只能阻止**同一个 id** 二次注入，无法压制不同 id 的事件。`completedPaneIds`（`wake.ts:72-92`）只作用于单次投影批次，因此同一 pane 上“真实完成事件”与“降级 fallback 失败事件”分属两批时会出现双唤醒（完成收到一次、失败再收一次）。噪音级、不会重复注入同一个 id，也不会丢事件。
-   - ② `src/db/schema.ts:113-114` 的注释“status is authoritative”已过时：新设计下 `status='invalidated' and deliverable=1` 是合法组合，对保留行而言 **`deliverable` 才权威**（`mapAgentEvent` 自第二轮起直接读 `deliverable` 列，见 `src/db/agent-events.ts:721`）。
-   - ③ reconciler 的 300s 新鲜度判定用 `Date.now()`（`src/daemon/agent-event-reconciler.ts:145-147`），与 store 的单调逻辑时钟 `AgentEventStore.#now()`（`src/db/agent-events.ts:165-180`，含抗回拨与持久化）混用；系统时钟回拨或跳变时，两套时间基准可能给出不一致的“新鲜度”。当前只影响保留/丢弃判定边界，未观察到线上影响。
    - ④ 既有“deliverable 与 status 恒等”不变量测试（`test/integration/agent-event-delivery-lifecycle.test.ts:464-483`）已成**同义反复**：它断言 `row.deliverable === (["pending","delivered"].includes(row.status) ? 1 : 0)`，而 `mapAgentEvent` 正是按该规则派生的旧语义的镜像；新设计允许 `invalidated + deliverable=1`，该用例既覆盖不到保留行，也不再提供独立证据。建议改名（如“非保留行的 deliverable 镜像”）或改为直接断言各状态组合的期望表。
 
 ## 已决（owner 接受）
@@ -114,6 +87,8 @@ g. **保留行 `reserve→delivered→acked` 链路与 reconciler 保留分支�
 2. **跨批次压制（上文第 6 项、第 8 项 ①，已裁定排期，2026-10-16）**：跨批次压制采纳新增 `paneGeneration` 维度去重，但前置条件是先补齐保留行 `reserve→delivered→acked` 主链路与 reconciler 保留分支的回归测试，排入下一批次，本轮不动 `packages/herdsman-pi/src/wake.ts` 的唤醒语义。
 
 ## 建议后续动作
+
+> 注（2026-10-17）：非阻塞观察项 1~4、e、f 及事实条目 ②、③ 经复核判定不做，已清理，原文见 git 历史/备份。
 
 - 监控 `paneGeneration` 字段的上游调用分布与命名宽度；若开始上报代际，先收紧（a）的词法上界与（b）的 legacy 全量作废。
 - 若新增降级错误码，同步更新 `#retryWaitingPlanRow` 的判断条件（第 2 项）。

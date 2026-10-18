@@ -97,12 +97,10 @@ supersedes: ""
 
 ## 观察项
 
-- **屏障日志 JSDoc 与内联注释仍不一致（第三轮观察）**：`packages/herdsman-pi/src/index.ts:1166`（`unconfirmedWatermarkBarrier` 的 JSDoc）仍写 `how many ids it holds back`，与 `:1221` 内联注释改成后的「how many ids form the barrier」口径不一致；该 JSDoc 不进日志，本轮不改。
-- **`get` / `register` 两处同型不可达的顶层兜底（第三轮观察）**：`packages/herdsman-pi/src/index.ts:984`（`get` 分支）与 `:1868`（`register` 分支）仍读 `response?.ackedEventId` / `response.ackedEventId` 作兜底，但真实 `#connectionState` 无顶层字段——属 `main` 既有、本轮刻意未动（与 ack 读取点同型；真要清是行为面，触发条件同收窄项）。
+> 注（2026-10-17）：观察项「屏障日志 JSDoc 不一致」、「get/register 顶层兜底」、「blocked= 语义歧义」、「假客户端 request() 水位读取顺序」及遗留面项 1、3、F、X-6、X-7 经复核判定不做，已清理，原文见 git 历史/备份。
+
 - **「不可达」只能有条件地写（第五轮订正）**：`test/unit/herdsman-pi-extension.test.ts` 的 `connectionResponse`（`:5160`）顶层 `ackedEventId` 只在调用方传入时出现、且与 `state.ackedEventId`（`:5171` 恒为 `options.ackedEventId ?? 0`）**同值**，而扩展侧读 `state.ackedEventId ?? 顶层`、`??` 在左值为数字（含 `0`）时**不求值右支**，所以现有响应（含喂 `ackedEventId: 651` 的那处、`createWakeClient` 的那两处）的顶层兜底右支**仍不会被求值**——真正的风险是将来若改成「顶层优先」，替身会与真实 daemon **分叉**而测试仍绿，**不是**「兜底现已可达」；单测侧因该 helper 仍带顶层字段、覆盖口径与真实 daemon 不同（真实 `#connectionState` 无顶层字段），对真实 daemon 的「不可达」仍只宜有条件地写。
 - **ack 替身的 `state` 只复制 `{ ackedEventId }`，不是全量 `toWireState` 形状**：真实 `toWireState`（`src/daemon/observability-server.ts:788-790`）是全量 state + ISO `updatedAt`，而 7 处替身一律只给 `{ ackedEventId: … }`。扩展当前只读该字段，**无风险**；未来若读 `state` 的其它字段，需先把替身补全，否则会出现「替身没这个字段、真实 daemon 有」的假绿（方向与最初的宽替身相反）。**不要为此改测试**（本轮无此需求）。
-- **`blocked=` 的语义歧义仍 open**：日志字段名恢复 `blocked=` 后，「成员数」与「被扣住的后续 id 数」仍可能被读混；真修是改口径（行为面），属 followups 建议②，触发条件写在遗留面。
-- **假客户端 `request()` 的水位读取顺序与扩展相反（第五轮观察）**：`test/unit/herdsman-pi-extension.test.ts` 假客户端 `request()`（`:5010-5011`）先读**顶层** `ackedEventId` 再落 `state`，与扩展的 `state` 优先相反；当前两者同值所以测不出分叉；ack 替身收紧后这条只影响测试替身自身的水位记账，**扩展不读它**。
 
 ## 已闭合 / 本轮无需动作（0.14.3 发布笔记的 5 条，逐条结论）
 
@@ -123,12 +121,7 @@ supersedes: ""
 以下全部**只记账、不动码**，统一处理时机 =「下次触及相关模块或大改时同批处理」。
 
 - **busy-wake 评审其余项**（源自 `20261005-busy-wake-delivery-review-followups.md`）：
-  - `pruneAcknowledgedEvents` 的 trio 水位清扫职责收敛（遗留项 1）：常态下被队列路径遮蔽的防御性兜底，收敛到 `dropUnackedDelivered` 单一 trio 删除入口。触发：下次大改 wake 记账清扫职责，或出现第二条不经队列的清扫路径。
-  - 三个 dead-letter 记账字段（`wakeRetryableEventIds` / `wakeDeadLetterAttempts` / `wakeDeadLetterRetryAt`）收敛为一张状态 Map（遗留项 3）：纯结构整洁度。触发：下次触及 trio 任一字段时顺手做，且必须与上一条同批。
   - 既有冻结面的 reap（oracle 收口轮 D）：关页把 id 置 ack 且不推进游标 → 会话 ack 水位永久冻结，只能靠 scope 重置 / 角色丢失解开。触发：OBS-1 现场定位，或再次出现水位停摆。候选方案（reap 或 daemon 侧在隐含 ack 时同步推进游标）已记在 D 项，本轮不实施。
-  - 屏障完备性前置约束（oracle 收口轮 F）：屏障依赖「集合 ⊆ 队列」不变量，Map 化重构若破坏它会让屏障静默失效。触发：与遗留项 3 的 Map 收敛同批，作为前置约束处理。
-  - `clearDeliveryBookkeeping` 只 carry `wakeAwaitingConsumption`（oracle X-6，理论级、单方来源、无复现路径）：Pi follow-up 队列中陈旧副本被跨 scope 排干时可能重复呈现一次。触发：OBS-1 现场复现，或 Pi 暴露 follow-up 队列查询能力。
-  - 注入失败 `catch` 静默（oracle X-7，理论级）：只清 `deliveredBatch` / `wakeRequested`，无日志、不重新武装 timer。触发：需要定位「wake 注入后既无注入记录也无下一轮」的现场。
 - **更早的路线图项**：关停预算（`20260929-daemon-shutdown-budget.md`）、终端事件交付台账（`20260930-terminal-event-delivery-h1.md` / `-open-items.md` / `-latency-observation.md`）、M2（`20261002-m2-disk-body-and-canary-read.md`）、Phase 2。统一口径：下次触及相关模块或大改时同批处理。
 - **流程性缺口（实地观察）**：本仓**没有统一的遗留项销账流程**——遗留项散落在各篇笔记的「遗留项记账」「open decisions」小节里，靠人工盘点汇总；本轮的主代理全仓只读盘点正是这个缺口的体现。是否建立统一台账属流程决策面，本轮不动。
 

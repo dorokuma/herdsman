@@ -101,10 +101,47 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
   if (event.type === "agent.idle" && payload.from === "working") return "completed";
   return undefined;
 }
+export type CompletedPaneKey = `${string}\u0000${string}`;
+
+/** A completion without a pane generation is not evidence for any generation. */
+export function completedPaneKey(
+  paneId: string,
+  paneGeneration: string | null | undefined,
+): CompletedPaneKey | undefined {
+  if (paneGeneration === null || paneGeneration === undefined || paneGeneration.length === 0) {
+    return undefined;
+  }
+  return `${paneId}\u0000${paneGeneration}`;
+}
+
+export type AgentOutcomeProjector = ((events: AgentEventWireRecord[]) => AgentOutcomeProjection) & {
+  completedPaneKeys(): readonly CompletedPaneKey[];
+  /** Drops completion evidence covered by the daemon's acknowledgement watermark. */
+  pruneCompletedPanes(ackedEventId: number | undefined): void;
+};
+
+function rememberCompletedPane(
+  completedPanes: Map<CompletedPaneKey, number>,
+  event: AgentEventWireRecord,
+): void {
+  if (!event.paneId) return;
+  if (
+    event.type !== "agent.done" &&
+    !(event.type === "agent.idle" && asRecord(event.payload).from === "working")
+  ) {
+    return;
+  }
+  const key = completedPaneKey(event.paneId, event.paneGeneration);
+  if (!key) return;
+  const current = completedPanes.get(key);
+  if (current === undefined || event.id > current) completedPanes.set(key, event.id);
+}
+
 function project(
   events: AgentEventWireRecord[],
   seen: Set<number>,
   config: WakeFilterConfig,
+  completedPanes: Map<CompletedPaneKey, number> = new Map(),
 ): AgentOutcomeProjection {
   const uniqueEvents = new Map<number, AgentEventWireRecord>();
   for (const event of events) if (!seen.has(event.id) && !uniqueEvents.has(event.id)) uniqueEvents.set(event.id, event);
@@ -112,26 +149,23 @@ function project(
   const outcomes: AgentOutcome[] = [];
   const suppressedEventIds: number[] = [];
 
-  // 维护单次扫描中已具备成功完成态的 pane 集合
-  const completedPaneIds = new Set<string>();
-  for (const event of rawEvents) {
-    if (
-      event.paneId &&
-      (event.type === "agent.done" || (event.type === "agent.idle" && asRecord(event.payload).from === "working"))
-    ) {
-      completedPaneIds.add(event.paneId);
-    }
-  }
+  // Completion evidence survives the current batch: a later fallback for the
+  // same pane and the same generation stays suppressed after the completion
+  // itself has left the pending window. A missing generation proves nothing.
+  for (const event of rawEvents) rememberCompletedPane(completedPanes, event);
 
   for (const event of rawEvents) {
     const kind = outcomeKind(event);
     if (!kind || !event.terminalId) continue;
     const payload = asRecord(event.payload);
     const paneId = event.paneId ?? null;
+    const completedKey = event.paneId
+      ? completedPaneKey(event.paneId, event.paneGeneration)
+      : undefined;
 
-    // 核心噪音门禁：若当前事件为 fallbackOutcome，但该 pane 存在任意成功的完成事件，直接压制
-    if (payload.fallbackOutcome === true && event.paneId && completedPaneIds.has(event.paneId)) {
-      continue; // 压制噪音，不产生 outcome
+    // A fallback is noise only when this exact pane generation already completed.
+    if (payload.fallbackOutcome === true && completedKey !== undefined && completedPanes.has(completedKey)) {
+      continue;
     }
 
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
@@ -157,8 +191,37 @@ function project(
   for (const outcome of outcomes) seen.add(outcome.eventId);
   return { outcomes, rawEvents, suppressedEventIds };
 }
-export function projectAgentOutcomes(events: AgentEventWireRecord[], config: WakeFilterConfig = DEFAULT_WAKE_FILTER_CONFIG): AgentOutcomeProjection { return project(events, new Set(), config); }
-export function createAgentOutcomeProjector(config: WakeFilterConfig = DEFAULT_WAKE_FILTER_CONFIG): (events: AgentEventWireRecord[]) => AgentOutcomeProjection { const seen = new Set<number>(); return (events) => project(events, seen, config); }
+export function projectAgentOutcomes(
+  events: AgentEventWireRecord[],
+  config: WakeFilterConfig = DEFAULT_WAKE_FILTER_CONFIG,
+  completedPanes?: Map<CompletedPaneKey, number>,
+): AgentOutcomeProjection {
+  return project(events, new Set(), config, completedPanes);
+}
+
+/** Drops completion evidence the daemon's acknowledgement watermark has covered. */
+export function pruneCompletedPanes(
+  completedPanes: Map<CompletedPaneKey, number>,
+  ackedEventId: number | undefined,
+): Map<CompletedPaneKey, number> {
+  if (ackedEventId === undefined) return completedPanes;
+  for (const [key, eventId] of completedPanes) {
+    if (eventId <= ackedEventId) completedPanes.delete(key);
+  }
+  return completedPanes;
+}
+
+export function createAgentOutcomeProjector(config: WakeFilterConfig = DEFAULT_WAKE_FILTER_CONFIG): AgentOutcomeProjector {
+  const seen = new Set<number>();
+  const completedPanes = new Map<CompletedPaneKey, number>();
+  const projector = ((events: AgentEventWireRecord[]) =>
+    project(events, seen, config, completedPanes)) as AgentOutcomeProjector;
+  projector.completedPaneKeys = () => [...completedPanes.keys()];
+  projector.pruneCompletedPanes = (ackedEventId) => {
+    pruneCompletedPanes(completedPanes, ackedEventId);
+  };
+  return projector;
+}
 export function formatAgentOutcomeUpdates(outcomes: AgentOutcome[]): string {
   const updates = outcomes.map((outcome) => {
     const identity = agentIdentityLabel({ agent: outcome.agent, name: outcome.name });

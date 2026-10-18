@@ -25,25 +25,13 @@ superseded: ""
 
 ## 观察项（逐条，非阻塞）
 
-1. **write-off notify 文案已陈旧（reviewer 建议）**
-   - 位置：`packages/herdsman-pi/src/index.ts` `writeOffStrandedWakeDelivery` 的 `ctx.ui.notify?.("… hand this workspace to another terminal …")`。
-   - 现状：write-off 已同步 ack，daemon 不会再重投该事件，「交给另一个终端让 daemon 重投」的说法失去依据。
-   - 后续：下个版本把文案简化为「read the agent directly」一侧的表述即可，不动逻辑。
+> 注（2026-10-17）：观察项 1（write-off notify 文案）、3（第 5 次续传升级正文注入）、4（#invalidatePaneCore 补日志）、7（dispatch-agent 测试 ERROR）经复核判定不做，已清理，原文见 git 历史/备份。
 
 2. **write-off ack 可能因更小 id pending 行而 ORCHESTRATOR_EVENT_OUT_OF_ORDER 失败（oracle 观察，需观察）**
    - 位置：`packages/herdsman-pi/src/index.ts` `writeOffStrandedWakeDelivery` → `acknowledgeEventIds(stranded, { notify: false }, ctx)` 的 catch 分支（`logHerdsmanPi("warn", … "wake write-off acknowledgement failed" …)`）。
    - 现状：若表中存在 id 更小的 pending 行，ack 会以 `ORCHESTRATOR_EVENT_OUT_OF_ORDER` 失败，退化为「永久静默 churn」——扩展侧已释放（不重投给本会话），daemon 侧仍 pending，每 300s 窗口继续重投，唯一信号是一行 warn。
    - 后续：上线后观察该 warn 是否出现；若出现，需评估 ack 顺序或补按序 ack，另立项。
 
-3. **第 5 次续传可升级为「携带内容注入 transcript 再 write-off」（oracle 建议，暂缓）**
-   - 位置：`packages/herdsman-pi/src/index.ts` `driveWakeContinuation` 预算耗尽分支（现为直接 `writeOffStrandedWakeDelivery`）。
-   - 现状：当前 write-off 丢弃的是「未被任何 turn 带出的更新」，证据只存在于 DB/agent 侧。
-   - 后续：上线观察 1–2 周；若 write-off warn 非零（说明丢弃真实发生），再把第 5 次续传升级为把正文注入 transcript 后再 write-off，确保证据不灭失后再放弃。
-
-4. **daemon 侧隐含消费 ack 完全静默（oracle 观察）**
-   - 位置：`src/db/agent-events.ts` `#invalidatePaneCore` 步骤 0（`acknowledgeDelivered` 分支）与 `src/observability/agent-index-service.ts` `pane.closed` 处理。
-   - 现状：显式关页的隐含消费 ack 无任何日志，线上无法确认该路径真的在生效。
-   - 后续：补一行 `console.warn`（或 daemon 既有日志设施）记录被隐含消费的 eventIds，低优先级。
 
 5. **部署身份错位：已部署字节曾与任何版本号对不上（oracle 观察）——已对齐**
    - 位置：生产部署面（本修复为应急部署，字节落在 commit 之前）。
@@ -56,10 +44,6 @@ superseded: ""
    - 现状：保留换行/缩进后，含大代码块的更新会全量进入 wake 投影文本，token 成本高于折叠为一行的旧行为。
    - 后续：暂不引入长度上限（那会重新制造「截断假象」）；观察实际 token 用量后再议。
 
-7. **体系遗留：dispatch-agent 测试既有 ERROR（双审过程发现，需另立项）**
-   - 位置：`test_pi_dry_runs_have_unique_safe_names_and_sessions`（dispatch-agent 测试面）。
-   - 现状：planner 默认 agy 未带 `--name`，该测试为既有 ERROR，与本修复无关。
-   - 后续：另行立项修复，不并入本幽灵唤醒修复的账。
 
 ## 被放弃/推迟的方案（必填）
 

@@ -183,6 +183,8 @@ supersedes: ""
 
 ## 遗留 / 观察项
 
+> 注（2026-10-17）：遗留项 4（抑制跨进程持久）、5（删 (no assistant message) 兜底）、8（抑制键解除判据收窄）、9（基线为空判定收窄）、11（emptyTurnAlertKey 区分 null）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **③ 待裁定**（见上节）：本批的 `pnpm check` 与提交都不含它；裁定后按同规格补一项 + 一条回归。
    **（本条已关闭：条目按历史记录关闭、不实现，见文末「条目③ … 已关闭（过时）」节，不再挂起。）**
 2. **① 的语义代价需要 canary**：degraded 轮次不再发 fallback `agent.failed`，编排者侧从「收到一条空正文的 failed」
@@ -192,40 +194,18 @@ supersedes: ""
 3. **① 只覆盖 `agent.failed` 事件本身**：计划行仍落 `failed`，`#backfillFailedPlanEvents` 对该类行**计入 `skipped`**
    （不是错误）。若将来有人按 `status_event_plans.status = 'failed'` 与 `agent_events.type = 'agent.failed'` 做对账，
    会看到这一类**有意的不配对**（本批在此登记）。
-4. **④ 的抑制是内存态**：daemon 重启后同一 pane 的空轮次会再告警一次（与 D1 的「每进程一次」告警同型）。
-   若需要跨重启抑制，得落持久状态（本批不做，属 owner 口径）。
-5. **`formatAgentOutcomeUpdates` 的 `(no assistant message)` 兜底仍在**：投影层已不再产生空 `completed` outcome，
-   因此 `kind !== "failed" && text === ""` 这条分支从生产路径上**已不可达**；它**没有任何用例钉住**
-   （`test/unit/herdsman-pi-wake.test.ts:104-126` 唯一那条空正文断言用的是 `kind: "failed"`，走的是 `reason`-only 分支），
-   本批**未删**——它是 `AgentOutcome` 类型层面的兜底而不是本项目标，删除会超出本批范围（如需清理请另开一轮）。
 6. **② 的静默 ack 会与水位屏障交互**：与上游错误族共用 `unconfirmedWatermarkBarrier` 逻辑（不改语义），
    但空 completed 从此**不再进入编排者上下文**——若运维希望在卡片上看到「某子代理跑了一轮但没产出」，
    只能看 daemon 日志（本批的有意取舍，登记于此）。
 7. **③ 的三个候选都需要独立复核 Herdr 语义**（C1/C2 会扩大唤醒面，C3 会缩小），且都应先确认「真实生产里
    Herdr 到底把哪些完成报成 `done` / `idle`」——本批只有 Herdr 源码与文档证据，**没有生产 journal 的 `agent.idle`
    与 `agent.done` 配对统计**（建议裁定前先只读统计一次）。**（条目 ③ 关闭后本条随之失效：三个候选都不落地，见文末节。）**
-8. **④ 抑制键的解除判据是「任何经 `#appendAndAckSelfEvent` 落库的带正文行」，不是「本轮交付正文的终态行」**
-   （`src/observability/agent-index-service.ts:3059-3063`；任务书记为 `:3056-3061`）：该方法是**通用追加漏斗**，
-   `agent.status.changed`（`:2861`）与补录型 `agent.failed` / `agent.discarded`（`:2989`、`:3031`）都从它落库，
-   携带的是**计划冻结基线**（可能是一轮前已交付的正文）。这些非本轮正文的落库同样会删掉该 pane 的抑制键
-   ⇒ 下一次空轮次**多打一行**告警（噪声方向，不影响交付语义）。就地注释措辞（“a round that appends a body ends
-   the pane's empty streak”）与该 funnel 语义不符；若要收窄，判据应落在「终态事件」的两条追加点上而不是 funnel 内
-   （本批不改，登记边界）。
-9. **① 的守卫判「基线为空」而非「本轮无内容」**（`src/observability/agent-index-service.ts:2968-2969`，注释在 `:2964-2967`）：
-   字面规格是「缺 assistant 内容禁判 `failed`」，实现判的是 `!hasNonEmptyAssistantMessage(input.compactHistory)`，
-   而这里的 `compactHistory` 是**计划行的冻结基线**。在降级臂（正文已被抹空）与首次终态轮上两者重合；
-   若某条降级结算携带的基线是**更早一轮的正文**，守卫不会拒绝——「本轮无内容」这个字面条件并没有被直接判据覆盖。
-   本批不改（无已知触达路径），登记为字面边界。
 10. **`PLAN_WAITING_HISTORY` 同族字面量未冻结**（**已裁定并实现，2026-10-16**）：原常量只存在于 `src/observability/agent-index-service.ts:113`，
     而 `src/db/status-event-plans.ts:276`（SQL 文本）与 `:346`（`markRetry` 比较；任务书记为 `:343`）、
     `packages/herdsman-pi/src/wake.ts:83`（兼容过滤）以及测试（`test/unit/herdsman-pi-agent-update-ui.test.ts:120`、`:483`）
     各自持有字面量。跨包（`src/` 与已发布的 `packages/herdsman-pi`）不能直接共享常量，所以「冻结」要么把它提到
     `contracts.ts`（本包内 import，pi 包侧另立同值常量 + 一条对拍测试），要么显式登记**不冻**理由。
     **已裁定（2026-10-16）**：`PLAN_WAITING_HISTORY` 已冻结进 `src/observability/contracts.ts:278`（`export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY"`，与既有 A2 metric key 契约同处，稳定性等级同为「取值字符串即契约」）；本轮实现位置：`src/observability/agent-index-service.ts`（`:33` 自 `contracts.ts` 导入、`:114` 重导出，`:145` 与 `:631` 引用）、`src/db/status-event-plans.ts`（`:280` `listWaitingHistory` SQL 参数化绑定与 `:350` `markRetry` 比较）、`packages/herdsman-pi/src/wake.ts`（跨独立发布包边界于 `:13` 另立同值常量并在 `:87` `outcomeKind` 兼容过滤中引用），以及 5 个测试文件（`test/unit/herdsman-pi-agent-update-ui.test.ts`、`test/unit/herdsman-pi-wake.test.ts`、`test/integration/startup-reconcile.test.ts`、`test/unit/status-event-plan-store.test.ts`、`test/integration/agent-index-service.test.ts`）的全部字面量统一改为引用该常量；属纯常量与字面量替换、行为零变化，按仓库测试纪律不新增测试。
-11. **`emptyTurnAlertKey` 的 `paneId` 空值共享键**（`src/observability/agent-index-service.ts:3240-3242`）：
-    键是 `${herdrSessionName}\0${paneId ?? ""}`，`paneId` 为 `null` 与空串折叠成同一个键 ⇒ 同一 session 内
-    「无 paneId」的结算行共享同一抑制状态（与 `paneIdentityKey` 的 `paneId` 必填 + `paneGeneration ?? ""` 处理不同）。
-    现役路径都带 paneId，故只登记（若要区分，键里加一个 `paneId === null` 的哨兵即可）。
 
 ## 来源
 

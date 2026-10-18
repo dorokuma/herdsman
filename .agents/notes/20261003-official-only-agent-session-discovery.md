@@ -121,12 +121,10 @@ fail-closed（把同一个 pane 的 id 换成不存在的 uuid）: historyRef nu
 
 ## 遗留 / 观察项
 
+> 注（2026-10-17）：遗留项 2（TOCTOU fd 改造）、4（omp 会话读取）、5（grok_home 遗留列）、6（occupiedSessionPaths 清理）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **支持面 = pi + agy**（2026-10-04 爸爸裁定）：pi = 官方 path 直用；agy = 官方 id + 单一模板；其余 agent（含 Herdr 官方支持的 claude / codex / opencode / grok 等）**明确不支持**，一律 `warn`（含 agent、官方值、候选路径）+ 空 history，不崩溃、不静默错。
-2. **闸门是 check-then-open 的 TOCTOU 残余（oracle 指出，本批如实记录、不改代码）**：`lstatSync` / `realpathSync` 与后续读取之间存在窗口——realpath 之后目标文件可被替换；且闸门只查**文件自身**的 mode/属主，**不检查父目录可写性**（父目录被他人改写 ⇒ 文件本身可被换掉）。在「会话目录属主即用户本人、同机不存在更低权限攻击者」的模型下没有可行攻击者，因此按现状保留；若将来要真正关掉这个窗口，需要 `O_NOFOLLOW` 打开 + `fstat` 同一 fd 的读法，属于接口级改动。
 3. **`pane_generation` / `creation_id` 在 Herdr 0.9.3 schema 中 0 次出现**：`paneGenerationOf` 恒 `null`、closed 事件恒走 `generation == null` 分支——既有事实，非本批引入。
-4. **omp 的缺口（本批未动，待裁）**：Herdr 对 omp 也给 `kind:"path"`，但 herdsman 没有 `herdr:omp` 源映射（`historySourceFromSessionRef` 返回 `unknown`，无 reader 能读）⇒ omp pane 实际报「无历史」。omp 是**唯一「官方给了 path、本可直读」却被排除**的 agent；其余本机官方列表里的 id-only agent（copilot / devin / droid / kimi / mastracode / hermes / qodercli / qwen / kilo / cursor / letta）同样无 reader ⇒ 报无历史。README 已不再声称 omp 可读；要不要接 omp（或 pi 等价 reader）请你裁。
-5. **`agents.grok_home` 列仍在 schema（恒 null）**：删列需要 migration，超出本批授权；代码侧已无读取方（`AgentIndexRecord.grokHome` 与 `resolveGrokHome` 均已删除），写入值恒为常量 `null`。
-6. **`occupiedSessionPaths` 语义已失效但代码保留**：仍被 `agent-index-service.ts` 的 `occupancyConflict` 脏检查引用，但 discovery 已不再「占用」文件；未删以免牵动 pi 注册协议。同一官方路径被两个 pane 共用时该检查恒真，会产生冗余重读（不影响正确性）。
 7. **负缓存的两个已知取舍**：窗口内（60s）同一个失败 key 在**后台刷新**里不会重新尝试，因此「pane 先报 id、会话文件几秒后才落盘」的场景要么等窗口自然过期，要么由操作员显式读取（`agent.get` / `agent.read`，总是重试一次）立即拿到；warn 只在该 key 首次失败时出现，后续重试（含强制重试）失败不再打日志（要更细的观察需临时调 `DISCOVERY_RETRY_AFTER_FAILURE_MS`）。
 8. **第 9 批遗留条目已闭环**：「`GeminiHistoryReader` 是待清理死代码」——本批删除 reader 文件、`gemini-json` 映射、注册项、类型联合成员与相关用例，条目关闭。
 9. **测试面净变化**：53 files / 861 tests（第 9 批）→ 52 files / 845 tests（第 10 批：删掉的全部是被测代码已不存在的用例）→ **52 files / 846 tests**（第 11 批：新增 1 条 RPC 级「窗口内修好文件后 `agent.read` 能取到历史」，并把 4 条「未解析 pane 也 `forceDiscovery: true`」的旧预期改为 `false`）。pi 与 agy 的覆盖未削弱。

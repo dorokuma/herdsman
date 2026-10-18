@@ -1,3 +1,13 @@
+---
+status: superseded # active | superseded
+superseded_by: "20260930-phase1-delivery-latency.md"
+supersedes: ""
+# 模块可选值: observability, daemon, cli, config, db, herdr, shared, herdsman-pi, herdsman-herdr-plugin, release
+模块: observability
+---
+
+> 已被 [20260930-phase1-delivery-latency.md](20260930-phase1-delivery-latency.md) 与 M2（[20261002-m2-disk-body-and-canary-read.md](20261002-m2-disk-body-and-canary-read.md)）取代。
+
 # 2026-07-23 fix/turn-completion-gate 决策记录
 
 ## 触发条件
@@ -35,8 +45,9 @@
 - 退避窗口行为
 
 ## 偏差与遗留
+
+> 注（2026-10-17）：「其他 reader 暂不填充 stopReason」条目经复核判定不做，已清理，原文见 git 历史/备份。
 - 仅 pi agent 路径受 stopReason gate 影响；其他 agent 的 lastAssistantMessage.stopReason 为 undefined，不影响现有逻辑。
-- 其他 history reader（claude/codex/gemini/grok/opencode/antigravity）暂不填充 stopReason，因为当前 bug 仅针对 pi agent；若未来需要可逐个 reader 扩展。
 
 ## 第三轮修补（oracle 第二轮阻断后）
 

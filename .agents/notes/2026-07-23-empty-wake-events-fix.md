@@ -1,3 +1,11 @@
+---
+status: active # active | superseded
+superseded_by: ""
+supersedes: ""
+# 模块可选值: observability, daemon, cli, config, db, herdr, shared, herdsman-pi, herdsman-herdr-plugin, release
+模块: observability
+---
+
 # 2026-07-23 empty-wake-events 修复记录
 
 ## 触发条件
@@ -119,8 +127,8 @@
 
 ### R5 双审残余风险清单（oracle 第二意见，2026-09-28；均不阻断提交）
 
-- 理论隐患：极端同毫秒——若某存量库 lastMigration.created_at 恰等于 0010 的 when（1790610020312），升级可能被跳过；概率极低，备查。
-- 理论隐患：并发启动时多个进程同时执行 applyMigrations（未加锁）可能重复执行或跳过；SQLite 迁移无跨进程事务保护（既有架构问题，非本次引入）。
+> 注（2026-10-17）：理论隐患「0010 迁移同毫秒跳过」与「SQLite 迁移跨进程锁」经复核判定不做，已清理，原文见 git 历史/备份。
+
 - 理论隐患：invalidated 行 1h TTL 与 acked/failed 7d TTL 的口径差异（既有设计，互见本笔记「第三轮 oracle 质疑处置」节）。
 - 观察项：markRunning 返回值在并发 drain 时的消费路径（已按 CAS/幂等处理）。
 - 观察项：degraded 事件在 DB 中仍保留 compact_history_json，但下游不投递（审计留存，按 TTL 清理）。
