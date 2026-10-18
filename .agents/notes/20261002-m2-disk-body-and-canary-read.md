@@ -133,11 +133,12 @@ journalctl -u herdsman.service --since <重启时刻> -o cat \
 
 ## 遗留登记
 
+> 注（2026-10-17）：遗留登记项 5（listRecentTerminalHistories 提取至 store）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **目标格（`confirmed=false` 且 mismatch）极稀**：可覆盖窗口（2026-09-29T01:50:07Z→2026-10-02T15:29Z，≈3.57 天）内 `confirmed=false` 仅 **1** 条（同期 `confirmed=true` 841 条），且该轮盘上有 6186 字非空终态正文、无 `degradedReason` ⇒ **不在目标格，M2 观测收益 = 0，影响面很小**；判读需 7 天量级窗口。
 2. **空正文大头未触及**：pi 空正文 24h **73/279 ≈26%**（2026-10-02T15:29Z），构成 `no_advance_from_input` **38**（含 acked 35 / invalidated 3）+ 无 reason **22** + `non_terminal_assistant` **13**；其中**无 reason 的 22 行是无 `degradedReason` 的「构成未解释的基线行」**（confirmed 轮 released 路径不写该字段），M2 是否影响它无法仅从该行判定。M2 只覆盖 mismatch 那一格；后续面向 `no_advance_from_input` 的设计另行评估。
 3. **守卫扩窗的合法上移**：journal ④ 的 `stale_baseline_duplicate` 组基线 **2/24h**，扩窗后过去被尺寸假确认、走 confirmed 放行的轮次会落进该组 ⇒ 该组**可能上移**，须与部署后自身基线比。
 4. **未加索引**：新守卫 SQL 走 `(agent_id, herdr_session_name, id)` 过滤 + `order by id desc limit 200`；`(agent_id, herdr_session_name, id)` 的**部分索引留待后续批次**，本批不加。
-5. **窗口查询内联在 service**：`AgentEventStore.listRecentTerminalHistories`（把该 SQL 沉淀到 store，与 `#stores` 分层一致）留待重构；本批为满足「只许改实现文件 + 测试」的范围约束而内联。
 6. **无 schema/migration、无扩展侧改动**：`src/**` 仅 `agent-index-service.ts`；`packages/**` 无源码改动；无 DB 迁移。
 7. **已知缺口（M2 mismatch 臂最终 `else`，`:2136-2138`）**：当 `staleBaselineDuplicate=true` 且 `advancedMatchesExpected=true`（含多行未上报 `expectedText` 的情形）且末尾为终态非空正文时，落入最终 `else { compactHistory = advanced; }`（`:2136-2138`），**守卫不生效**，旧正文仍可能被当本轮答案投出。故本条守卫只保证「unconfirmed + mismatch 时不重投」，**未封死**该组合。
 

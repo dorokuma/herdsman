@@ -6,6 +6,7 @@ import { emptyCompactHistory } from "@/agent-history/service.js";
 import { REDELIVERY_FRESHNESS_MS } from "@/db/agent-events.js";
 import { applyMigrations } from "@/db/apply-migrations.js";
 import { openSqlite } from "@/db/client.js";
+import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import {
   cleanupTempDirs,
   openObservabilityDbHarness,
@@ -825,6 +826,185 @@ describe("agent event delivery lifecycle", () => {
     ).toBe(true);
     harness.sqlite.close();
   });
+
+  test("pending applies reclaim, deliverability, and reservation to a retained row", () => {
+    const harness = prepareHarness();
+    harness.agentOrchestratorScopes.claim({
+      ackedEventId: 0,
+      herdrSessionName: "default",
+      paneId: "wA:owner",
+      terminalId: "term-owner",
+      workspaceId: "wA",
+    });
+    const agent = harness.agents.listForHerdrSession("default")[0];
+    if (!agent) throw new Error("Expected indexed agent");
+    const retained = harness.agentEvents.append({
+      agentId: agent.id,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "ref-retained", text: "retained result", timestamp: null },
+      },
+      herdrSessionName: "default",
+      paneGeneration: "gen-closed",
+      paneId: agent.paneId,
+      payload: { agent: "codex", from: "working" },
+      terminalId: agent.terminalId,
+      type: "agent.done",
+      workspaceId: "wA",
+    });
+    harness.agents.replaceForSession({
+      agents: [
+        {
+          agent: "codex",
+          agent_status: "working",
+          pane_generation: "gen-live",
+          pane_id: agent.paneId,
+          terminal_id: "term-agent-live",
+          workspace_id: "wA",
+        },
+      ],
+      herdrSessionName: "default",
+    });
+    const liveAgent = harness.agents.listForHerdrSession("default")[0];
+    if (!liveAgent) throw new Error("Expected reopened agent");
+    const backingOff = harness.agentEvents.append({
+      agentId: liveAgent.id,
+      compactHistory: {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: { ref: "ref-later", text: "later result", timestamp: null },
+      },
+      herdrSessionName: "default",
+      paneGeneration: "gen-live",
+      paneId: liveAgent.paneId,
+      payload: { agent: "codex", from: "working" },
+      terminalId: liveAgent.terminalId,
+      type: "agent.done",
+      workspaceId: "wA",
+    });
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'invalidated', deliverable = 1, invalidated_reason = 'RETAINED_OUTCOME_PANE_CLOSED' where id = ?",
+      )
+      .run(retained.id);
+    harness.sqlite
+      .prepare(
+        "update agent_events set status = 'delivered', deliverable = 1, delivery_attempts = 1, delivered_to_terminal_id = 'term-owner', last_attempt_at = ? where id = ?",
+      )
+      .run(Date.now() - 100_000, retained.id);
+    harness.sqlite
+      .prepare("update agent_events set next_attempt_at = ? where id = ?")
+      .run(Date.now() + 60_000, backingOff.id);
+
+    const orchestrator = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    const delivered = orchestrator.pending({
+      herdrSessionName: "default",
+      terminalId: "term-owner",
+      workspaceId: "wA",
+    });
+
+    expect(delivered).toEqual([]);
+    expect(harness.agentEvents.get(retained.id)).toMatchObject({
+      deliverable: 0,
+      invalidatedReason: "PANE_CLOSED_RECLAIM",
+      status: "invalidated",
+    });
+    expect(harness.agentEvents.get(backingOff.id)).toMatchObject({
+      deliverable: 1,
+      status: "pending",
+    });
+    harness.sqlite.close();
+  });
+
+  test("plugin reap keeps an unsettled barrier and drops one the server cursor covers", async () => {
+    vi.useFakeTimers();
+    const previous = {
+      HERDR_ENV: process.env.HERDR_ENV,
+      HERDR_PANE_ID: process.env.HERDR_PANE_ID,
+      HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
+      HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID,
+    };
+    process.env.HERDR_ENV = "1";
+    process.env.HERDR_PANE_ID = "wA:owner";
+    process.env.HERDR_SOCKET_PATH = "/tmp/herdr.sock";
+    process.env.HERDR_WORKSPACE_ID = "wA";
+    try {
+      const { createHerdsmanPiExtension } = (await import(
+        "../../packages/herdsman-pi/src/index.js"
+      )) as {
+        createHerdsmanPiExtension: (options?: {
+          clientFactory?: () => ReturnType<typeof pluginClient>;
+          onStateExposed?: (state: {
+            pendingEvents: Array<{ id: number; status?: string }>;
+            unackedDelivered: Map<number, { id: number }>;
+            wakeAwaitingConsumption: Set<number>;
+          }) => void;
+        }) => (pi: ReturnType<typeof pluginPi>) => void;
+      };
+      let extensionState:
+        | {
+            pendingEvents: Array<{ id: number; status?: string }>;
+            unackedDelivered: Map<number, { id: number }>;
+            wakeAwaitingConsumption: Set<number>;
+          }
+        | undefined;
+      const client = pluginClient();
+      const pi = pluginPi();
+      const ctx = pluginCtx();
+      createHerdsmanPiExtension({
+        clientFactory: () => client,
+        onStateExposed: (state) => {
+          extensionState = state;
+        },
+      })(pi);
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+
+      // 40 is handed to Pi and written off, so it is a watermark barrier.
+      // 41 arrives afterwards and is only an ordinary local copy.
+      client.page = [pluginEvent(40)];
+      client.emitStream({ method: "agent.event", params: { event: pluginEvent(40) } });
+      await vi.advanceTimersByTimeAsync(500);
+      expect(extensionState?.pendingEvents.map((item) => item.id)).toEqual([40]);
+      expect(extensionState?.wakeAwaitingConsumption.has(40)).toBe(true);
+      expect(extensionState?.unackedDelivered.has(40)).toBe(true);
+      expect(client.calls.map(([method]) => method)).toContain("agent.orchestrator.get");
+      client.emitStream({ method: "agent.event", params: { event: pluginEvent(41) } });
+      expect(extensionState?.pendingEvents.map((item) => item.id)).toEqual([40, 41]);
+
+      // A stale local acked/failed status must not reap the barrier. Only the
+      // server cursor does, and an ordinary local copy still leaves with the page.
+      const barrier = extensionState?.pendingEvents.find((item) => item.id === 40);
+      const ordinary = extensionState?.pendingEvents.find((item) => item.id === 41);
+      if (barrier) barrier.status = "acked";
+      if (ordinary) ordinary.status = "failed";
+      client.page = [pluginEvent(42)];
+      client.ackedEventId = 0;
+      await pi.command("status", ctx);
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(extensionState?.unackedDelivered.has(40)).toBe(true);
+      expect(extensionState?.pendingEvents.map((item) => item.id)).toEqual([40, 42]);
+
+      client.page = [pluginEvent(42)];
+      client.ackedEventId = 40;
+      await pi.command("status", ctx);
+      await vi.advanceTimersByTimeAsync(500);
+
+      expect(extensionState?.unackedDelivered.has(40)).toBe(false);
+      expect(extensionState?.pendingEvents.map((item) => item.id)).toEqual([42]);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
 });
 
 describe("empty database migration chain", () => {
@@ -871,3 +1051,115 @@ describe("empty database migration chain", () => {
     sqlite.close();
   });
 });
+
+function pluginEvent(id: number) {
+  return {
+    compactHistory: { lastAssistantMessage: { text: "done" } },
+    id,
+    paneId: "wA:p1",
+    payload: { agent: "codex" },
+    terminalId: "term-agent",
+    type: "agent.done",
+    workspaceId: "wA",
+  };
+}
+
+function pluginCtx() {
+  const runtime = { idle: true };
+  return {
+    abort() {},
+    isIdle: () => runtime.idle,
+    sessionManager: {
+      getSessionFile: () => "/tmp/pi-session.jsonl",
+      getSessionId: () => "pi-session",
+    },
+    ui: {
+      notify() {},
+      setStatus() {},
+      setWidget() {},
+      theme: {
+        bg: (_color: string, text: string) => text,
+        bold: (text: string) => text,
+        fg: (_color: string, text: string) => text,
+      },
+    },
+  };
+}
+
+function pluginPi() {
+  const handlers = new Map<string, (...args: unknown[]) => unknown>();
+  const commands = new Map<
+    string,
+    { handler: (args: string, ctx: ReturnType<typeof pluginCtx>) => Promise<void> }
+  >();
+  return {
+    appendEntry() {},
+    async command(args: string, ctx: ReturnType<typeof pluginCtx>) {
+      await commands.get("herdsman")?.handler(args, ctx);
+    },
+    emit: async (name: string, ...args: unknown[]) => handlers.get(name)?.(...args),
+    on: (name: string, handler: (...args: unknown[]) => unknown) => handlers.set(name, handler),
+    registerCommand(
+      name: string,
+      options: { handler: (args: string, ctx: ReturnType<typeof pluginCtx>) => Promise<void> },
+    ) {
+      commands.set(name, options);
+    },
+    registerMessageRenderer() {},
+    registerTool() {},
+    sendMessage() {},
+    setSessionName() {},
+  };
+}
+
+function pluginClient() {
+  let connected: (() => Promise<void> | void) | undefined;
+  let stream: ((message: { method: string; params?: unknown }) => void) | undefined;
+  const client = {
+    ackedEventId: 0,
+    calls: [] as Array<[string, unknown]>,
+    page: [] as ReturnType<typeof pluginEvent>[],
+    close() {},
+    async connect() {
+      await connected?.();
+    },
+    emitStream(message: { method: string; params?: unknown }) {
+      stream?.(message);
+    },
+    set onConnected(handler: (() => Promise<void> | void) | undefined) {
+      connected = handler;
+    },
+    set onDisconnected(_handler: ((error: Error) => void) | undefined) {},
+    set onStreamMessage(handler:
+      | ((message: { method: string; params?: unknown }) => void)
+      | undefined) {
+      stream = handler;
+    },
+    async request(method: string, params: unknown) {
+      client.calls.push([method, params]);
+      const state = {
+        ackedEventId: client.ackedEventId,
+        herdrSessionName: "default",
+        owner: { paneId: "wA:owner", terminalId: "term_pi" },
+        updatedAt: "2026-07-10T00:00:00.000Z",
+        workspaceId: "wA",
+      };
+      if (method === "agent.orchestrator.register" || method === "agent.orchestrator.get") {
+        return {
+          events: client.page,
+          presence: {
+            connectedAt: 1,
+            herdrSessionName: "default",
+            paneId: "wA:owner",
+            subscriberId: "pi-session",
+            terminalId: "term_pi",
+            workspaceId: "wA",
+          },
+          state,
+        };
+      }
+      return { acknowledged: true, state };
+    },
+  };
+  return client;
+}

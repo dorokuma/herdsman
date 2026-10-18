@@ -21,9 +21,11 @@ import {
   type HerdsmanFooterState,
 } from "./agent-update-ui.js";
 import {
-  projectAgentOutcomes,
   formatAgentOutcomeUpdates,
+  projectAgentOutcomes,
+  pruneCompletedPanes,
   type AgentOutcome,
+  type CompletedPaneKey,
   WAKE_SETTLE_MS,
 } from "./wake.js";
 import { loadWakeFilterConfig } from "./wake-filter-config.js";
@@ -241,6 +243,8 @@ type HerdsmanState = {
   wakeRequested: boolean;
   wakeRequestedThroughEventId: number;
   wakeTimer: ReturnType<typeof setTimeout> | undefined;
+  /** Completion evidence retained after its event leaves the pending window. */
+  completedPaneKeys: Set<string>;
 };
 
 type PiContext = {
@@ -476,6 +480,18 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       wakeRequestedThroughEventId: 0,
       wakeTimer: undefined,
       ackInFlight: false,
+      completedPaneKeys: new Set(),
+    };
+    // Completion evidence is the only part of the projection that must outlive a
+    // single batch; the dedup set stays per call exactly as before.
+    let completedPanes = new Map<CompletedPaneKey, number>();
+    const syncCompletedPaneKeys = () => {
+      state.completedPaneKeys = new Set(completedPanes.keys());
+    };
+    const projectPendingOutcomes = (events: AgentEventWireRecord[]) => {
+      const projection = projectAgentOutcomes(events, wakeFilter, completedPanes);
+      syncCompletedPaneKeys();
+      return projection;
     };
     options.onStateExposed?.(state);
     let activeContext: PiContext | undefined;
@@ -503,7 +519,11 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     const setHerdsmanUi = (ctx: PiContext | undefined) => {
       if (!ctx) return;
-      const pendingOutcomeCount = projectAgentOutcomes(state.pendingEvents, wakeFilter).outcomes.length;
+      const pendingOutcomeCount = projectAgentOutcomes(
+        state.pendingEvents,
+        wakeFilter,
+        new Map(completedPanes),
+      ).outcomes.length;
       const footerState: HerdsmanFooterState = state.reconnectingFromOn
         ? { kind: "reconnecting" }
         : state.isOrchestrator
@@ -667,6 +687,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       // set is bounded by the number of events presented per session and is
       // cleared on role loss, scope change, and shutdown.
       state.pendingEvents = state.pendingEvents.filter((event) => event.id > ackedEventId);
+      completedPanes = pruneCompletedPanes(completedPanes, ackedEventId);
+      syncCompletedPaneKeys();
       // The delivery queue follows the same watermark: an event covered by the
       // advanced acknowledgement cursor is confirmed even when its own ack was
       // superseded (the daemon acknowledges by watermark), so it leaves the
@@ -1370,7 +1392,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         // deferral there would let a second injection ride in behind it.
         return;
       }
-      const projection = projectAgentOutcomes(state.pendingEvents, wakeFilter);
+      const projection = projectPendingOutcomes(state.pendingEvents);
       const outcomes = projection.outcomes.filter(
         (outcome) =>
           outcome.eventId > state.failedWakeThroughEventId &&
@@ -1527,7 +1549,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           }
 
           const batchEvents = [...state.pendingEvents].sort((left, right) => left.id - right.id);
-          const batchProjection = projectAgentOutcomes(batchEvents, wakeFilter);
+          const batchProjection = projectPendingOutcomes(batchEvents);
           const batchSuppressedIds = new Set(batchProjection.suppressedEventIds);
           const projectableBatchOutcomes = batchProjection.outcomes.filter(
             (outcome) =>
@@ -1741,6 +1763,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       state.failedWakeThroughEventId = 0;
       state.pendingEvents = [];
       clearDeliveryBookkeeping();
+      completedPanes = new Map();
+      syncCompletedPaneKeys();
       setHerdsmanUi(ctx);
     };
 
@@ -1754,7 +1778,8 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
         // on every orchestrator.get; treating one as new would cancel the in-flight
         // wake (wakeGeneration++) on every get and stall the whole stream forever.
         if (!previous && event.id > state.failedWakeThroughEventId) addedNewEvent = true;
-        byId.set(event.id, previous ? { ...event, ...previous } : event);
+        // Server fields win; the local snapshot only fills keys the page omitted.
+        byId.set(event.id, previous ? { ...previous, ...event } : event);
       }
       state.pendingEvents = [...byId.values()]
         .filter((event) => event.id > state.failedWakeThroughEventId)
@@ -1767,10 +1792,14 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     const syncPendingEventsFromServer = (
       serverEvents: AgentEventWireRecord[],
       ctx: PiContext | undefined,
+      serverAckedEventId = 0,
     ) => {
       const serverEventById = new Map(serverEvents.map((event) => [event.id, event]));
       const inFlightIds = new Set(state.deliveredBatch?.events.map((event) => event.id) ?? []);
       const previousById = new Map(state.pendingEvents.map((event) => [event.id, event]));
+      // The daemon's pending page is hard-capped at 100, so a page of exactly
+      // 100 cannot tell "exhausted" from "more remain". Keep any higher local id
+      // rather than drop it: a later shorter page is what proves the stream ended.
       const isTruncated = serverEvents.length >= 100;
       const maxServerEventId = serverEvents.reduce((max, event) => Math.max(max, event.id), 0);
 
@@ -1780,14 +1809,29 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       for (const serverEvent of serverEvents) {
         const previous = previousById.get(serverEvent.id);
         if (!previous && serverEvent.id > state.failedWakeThroughEventId) addedNewEvent = true;
-        nextPending.push(previous ? { ...serverEvent, ...previous } : serverEvent);
+        // Server fields win; the local snapshot only fills keys the page omitted.
+        nextPending.push(previous ? { ...previous, ...serverEvent } : serverEvent);
       }
 
       for (const [previousId, previousEvent] of previousById) {
         if (serverEventById.has(previousId)) continue;
-        if (inFlightIds.has(previousId)) {
+        const barrier =
+          state.unackedDelivered.has(previousId) &&
+          (state.wakeAwaitingConsumption.has(previousId) ||
+            state.wakeRetryableEventIds.has(previousId));
+        // Only the server cursor settles an absent barrier. A local status of
+        // acked/failed is a stale snapshot (and, when merged, the server's own
+        // status wins), so it must not reap a watermark barrier by itself.
+        const settledByServer = previousId <= serverAckedEventId;
+        // Absence from pending() is not settlement: generation, reclaim, and
+        // backoff filters hide events that are still deliverable. A local
+        // watermark barrier stays until the server cursor covers it.
+        if (barrier && !settledByServer) {
           nextPending.push(previousEvent);
-        } else if (isTruncated && previousId > maxServerEventId) {
+          continue;
+        }
+        if (settledByServer) continue;
+        if (inFlightIds.has(previousId) || (isTruncated && previousId > maxServerEventId)) {
           nextPending.push(previousEvent);
         }
       }
@@ -1864,8 +1908,14 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       }
       applyOwnerContext(response);
       setHerdsmanUi(ctx);
-      syncPendingEventsFromServer(response.events ?? [], ctx);
+      // The watermark first: a barrier the server has already settled is reaped
+      // inside the sync instead of being kept as a barrier by it.
       pruneAcknowledgedEvents(response.state?.ackedEventId ?? response.ackedEventId);
+      syncPendingEventsFromServer(
+        response.events ?? [],
+        ctx,
+        response.state?.ackedEventId ?? response.ackedEventId ?? 0,
+      );
       if (state.pendingEvents.length === 0 && state.wakeTimer) cancelWakeTimer();
       setHerdsmanUi(ctx);
       scheduleWake(ctx);

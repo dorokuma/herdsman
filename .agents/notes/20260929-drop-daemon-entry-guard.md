@@ -35,8 +35,9 @@ supersedes: "20260929-remove-cli-daemon-lifecycle"
 
 ## 遗留清单（第二意见的建议 / 观察项，未在本轮处理）
 
+> 注（2026-10-17）：遗留清单项 2（Restart=always 评估）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **`herdsman daemon status` 不报"被谁托管"**：它只给 pid 文件 + socket 的探测结果，不查 cgroup/supervisor，所以无法区分"systemd 托管"与"脱管进程"。事故复盘时曾因此误判；这是信息不足，不是错误，等需要时再加字段。
-2. **`Restart=on-failure` 与 `StartLimit*` 的关系**：单元当前 `RestartSec=5`、`StartLimitIntervalUSec=10s`、`StartLimitBurst=5`、`StartLimitAction=none`，即 10 秒内连续 5 次失败后不再自动拉起。要实现用户要求的"永远保持启动"的强语义，需评估 `Restart=always` 与 `StartLimitAction`；本轮只记录，不动单元文件。
 3. **`.husky/pre-commit` 不含 package 检查**：它只跑 lint-staged / typecheck / test / lint / format:check / db:check，不含 `package:check`、`pi-package:check`、`herdr-plugin:check`。这三项的覆盖由 `AGENTS.md` 铁律 1（改 CLI/package 时另跑 `pnpm build` + `pnpm package:check`）承担，属有意分层；本轮未改。
 4. **锁测试的"竞争者是否阻塞在 flock"判据依赖内核与架构**：主判据 `/proc/<pid>/wchan` = `locks_lock_inode_wait`，备用判据是 `/proc/<pid>/syscall` 的 flock 号按 `process.arch` 查表（x64=73、arm64=32）。非 Linux 或不导出 wchan 符号的宿主会走备用判据；两者都拿不到时该用例会确定性超时失败（不会静默放行）。若后续换宿主，可改用竞争者自己写的"已进 flock"标记等更稳的信号。
 5. **`expect(elapsed).toBeLessThan(70)` 仍是时间断言**：本意是"不得忙等 1 秒级的锁释放"，理论极端调度抖动下可能抖动。它是本次的回归哨兵，故有意保持原阈值未放宽；若将来抖动，应先查 `release()` 是否真的在等锁释放，而不是调大阈值。

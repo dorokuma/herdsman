@@ -14,6 +14,7 @@ function event(
   type: string,
   payload: Record<string, unknown>,
   options: {
+    paneGeneration?: string | null;
     paneId?: string | null;
     terminalId?: string | null;
     text?: string;
@@ -24,6 +25,7 @@ function event(
       lastAssistantMessage: { text: options.text ?? `assistant result ${id}` },
     },
     id,
+    ...(Object.hasOwn(options, "paneGeneration") ? { paneGeneration: options.paneGeneration } : {}),
     paneId: options.paneId === undefined ? "wB:p2" : options.paneId,
     payload: { agent: "claude", ...payload },
     terminalId: options.terminalId === undefined ? "term_agent" : options.terminalId,
@@ -171,13 +173,23 @@ describe("Pi agent wake projection", () => {
     // pane 级 fallback 压制不变：同批次已有该 pane 的成功完成态时，fallback 失败被压制。
     expect(
       projectAgentOutcomes([
-        event(70, "agent.done", { from: "working", to: "done" }, { terminalId: null }),
-        event(71, "agent.discarded", {
-          fallbackOutcome: true,
-          from: "working",
-          reason: "discarded",
-          to: "failed",
-        }),
+        event(
+          70,
+          "agent.done",
+          { from: "working", to: "done" },
+          { paneGeneration: "gen-1", terminalId: null },
+        ),
+        event(
+          71,
+          "agent.discarded",
+          {
+            fallbackOutcome: true,
+            from: "working",
+            reason: "discarded",
+            to: "failed",
+          },
+          { paneGeneration: "gen-1" },
+        ),
       ]).outcomes,
     ).toEqual([]);
     // 上游模型错误压制不变：discarded 的 reason 是上游错误时同样被抑制（不产生 outcome）。
@@ -470,15 +482,20 @@ describe("Pi agent wake projection", () => {
       60,
       "agent.done",
       { from: "working", to: "done" },
-      { terminalId: null },
+      { paneGeneration: "gen-1", terminalId: null },
     );
-    const fallbackFailure = event(61, "agent.failed", {
-      fallbackOutcome: true,
-      from: "working",
-      name: "worker",
-      reason: "degraded",
-      to: "failed",
-    });
+    const fallbackFailure = event(
+      61,
+      "agent.failed",
+      {
+        fallbackOutcome: true,
+        from: "working",
+        name: "worker",
+        reason: "degraded",
+        to: "failed",
+      },
+      { paneGeneration: "gen-1" },
+    );
     const projection = projectAgentOutcomes([presentedCompletion, fallbackFailure]);
     expect(projection.outcomes).toHaveLength(0);
     expect(projection.rawEvents.map(({ id }) => id)).toEqual([60, 61]);
@@ -500,15 +517,100 @@ describe("Pi agent wake projection", () => {
     // fallback 仍被压制，因此客户端不会出现“完成 + 降级失败”的双唤醒。
     expect(
       projectAgentOutcomes([
-        event(63, "agent.done", { from: "working", to: "done" }),
-        event(64, "agent.failed", {
-          fallbackOutcome: true,
-          from: "working",
-          reason: "degraded",
-          to: "failed",
-        }),
+        event(63, "agent.done", { from: "working", to: "done" }, { paneGeneration: "gen-1" }),
+        event(
+          64,
+          "agent.failed",
+          {
+            fallbackOutcome: true,
+            from: "working",
+            reason: "degraded",
+            to: "failed",
+          },
+          { paneGeneration: "gen-1" },
+        ),
       ]).outcomes.map(({ eventId }) => eventId),
     ).toEqual([63]);
+  });
+
+  test("does not let a generation-less completion suppress any fallback", () => {
+    const projector = createAgentOutcomeProjector();
+    const generationlessCompletion = event(
+      80,
+      "agent.done",
+      { from: "working", to: "done" },
+      { paneGeneration: null, terminalId: null },
+    );
+    const samePaneFallback = event(
+      81,
+      "agent.failed",
+      {
+        fallbackOutcome: true,
+        from: "working",
+        reason: "degraded",
+        to: "failed",
+      },
+      { paneGeneration: "gen-2" },
+    );
+    const omittedGenerationFallback = event(
+      82,
+      "agent.failed",
+      {
+        fallbackOutcome: true,
+        from: "working",
+        reason: "degraded",
+        to: "failed",
+      },
+      { paneId: "wB:p3" },
+    );
+
+    expect(
+      projector([
+        generationlessCompletion,
+        samePaneFallback,
+        omittedGenerationFallback,
+      ]).outcomes.map(({ eventId }) => eventId),
+    ).toEqual([81, 82]);
+  });
+
+  test("suppresses a later fallback only when its pane generation matches the completed one", () => {
+    const projector = createAgentOutcomeProjector();
+    expect(
+      projector([
+        event(
+          83,
+          "agent.done",
+          { from: "working", to: "done" },
+          { paneGeneration: "gen-1", terminalId: null },
+        ),
+      ]).outcomes,
+    ).toEqual([]);
+
+    const sameGeneration = event(
+      84,
+      "agent.failed",
+      {
+        fallbackOutcome: true,
+        from: "working",
+        reason: "degraded",
+        to: "failed",
+      },
+      { paneGeneration: "gen-1" },
+    );
+    const nextGeneration = event(
+      85,
+      "agent.failed",
+      {
+        fallbackOutcome: true,
+        from: "working",
+        reason: "degraded",
+        to: "failed",
+      },
+      { paneId: "wB:p3", paneGeneration: "gen-2" },
+    );
+    expect(
+      projector([sameGeneration, nextGeneration]).outcomes.map(({ eventId }) => eventId),
+    ).toEqual([85]);
   });
 });
 

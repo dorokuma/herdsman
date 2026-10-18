@@ -60,6 +60,8 @@ pi 终态分支把「刷新快照与计划行基线相同」当作「历史未�
 
 ## 遗留 / 观察项
 
+> 注（2026-10-17）：遗留项 3（staleSnapshot 生产消费）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **pi 扩展侧 `expectedText` 系统性不一致（可能是下一大来源）→ 单独立项**：`packages/herdsman-pi/src/turn-signal.ts:89` 用 `size > initialSize`（文件字节数变大）作为「新内容已落盘」的确认，属**尺寸级**确认而非**文本级**确认——尺寸变大不等于本轮最终 assistant 文本可读，于是 daemon 侧 `expectedText` 与磁盘正文经常不一致（生产 45/48 命中 `textMatches=false`）。本项目前只作为「是否进入 `#waitForHistoryAdvance`」的分支判据，不再被当成放行条件（见被放弃方案第 3 条）；补齐办法是让它做文本级确认（例如 tail 窗口内含 `expectedText` 才算 confirmed）。**本批不改 pi 扩展。**
 2. **判据三的覆盖面缺口（守卫只覆盖一条路径）**：`staleBaselineDuplicate` 只在「收到 turn signal + 非 retry + `!historyHasAdvanced(advanced, input.compactHistory, { requireAssistantChange: true })`」这一条分支里生效（`:2017-2031`）。以下路径未被覆盖，在**「转换（`working → done`/`blocked`）在工具阶段被处理 + 5s 内收到信号 + `expectedText` 缺失（或后缀巧合）」**时，仍可能把最近一条终态行的正文当作本轮结果再交付一次：
    - 判据一快路径（`:1960-1966`）：`fresh` 本身就等于最近一条终态行的内容；
@@ -67,7 +69,6 @@ pi 终态分支把「刷新快照与计划行基线相同」当作「历史未�
    - `else` 里 `historyHasAdvanced(advanced, input.compactHistory, { … })` 为真的分支（`:2032-2044`）：`advanced` 与「本轮 in-memory 快照」不同、但与「最近一条终态行」相同；
    - 无信号分支的 `else`（超时 else，`:2088-2090`）：结构同上，区别是额外有 `console.warn("…without a turn completion signal after 5000ms")` 可见。
    生产库只读复核的同类样本（本轮用 `node:sqlite`（`readOnly: true`）取回；形态都是「同 `ref` 同文的多条 `agent.done`」）：`44300` / `44315`（ref `…/2026-09-28T13-42-26-359Z_01a0e840-a736-7292-b168-4f476edf3621.jsonl#entry=b7be4457`，284 字、text sha256 前 12 位 `74480e3c9271`；中间夹着 `44304`（oracle idle）与 `44307`（agy done），故不相邻）；`44913` / `44952` / `44958`（ref `…/2026-09-28T16-04-36-591Z_01a0e8c2-d06f-7699-aff0-253aaa13156c.jsonl#entry=e5e3bba1`，94 字、sha `c98d7ef7d497`；其中 `44952 → 44958` 相邻，是全库唯一一对「相邻 `agent.done` 且同 ref 同文」）。样本取自 2026-09-28、早于本批守卫落地，只作形态证据，不据此断言因果。
-3. **`staleSnapshot` 全仓只有写、0 个读取方**：`src` 内 5 处写（`:1955`、`:1958`、`:2025`、`:2078`、`:2086`），除测试断言外没有生产读取。本批维持 log-only、不加 payload 字段；若将来要能定期扫出这类轮次，再另批立项。
 4. **canary 验收：陈旧重复一条已按实测改口径**：
    - ① 空正文数下降（用「数字口径」表里的口径 B，带 cutoff 对比）；
    - ② 新增 warn 的 `degradedReason` 分布只含预期几类（`no_advance_from_input` / `stale_baseline_duplicate` / `expected_text_mismatch` / `non_terminal_assistant`）；

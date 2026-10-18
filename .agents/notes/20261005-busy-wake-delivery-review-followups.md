@@ -28,13 +28,7 @@ reviewer 判定分支可以收口、无 must fix / should fix，仅余 3 条建�
 
 ## 遗留项（逐条，非阻塞）
 
-### 1. `pruneAcknowledgedEvents` 的 trio 水位清扫是被队列路径遮蔽的双重兜底（reviewer 建议）
-
-- **来源角色**：reviewer（本轮收口评审的建议级发现）。
-- **位置**：reviewer 引用 `packages/herdsman-pi/src/index.ts:652-663`。HEAD 核对：`pruneAcknowledgedEvents`（`:623`）尾部的 trio 水位清扫——`wakeRetryableEventIds` 循环 `:662-664` 与 `wakeDeadLetterAttempts` / `wakeDeadLetterRetryAt` 循环 `:668-673`；遮蔽它们的路径是同一函数内的队列循环 `:638-640`，把 ≤ ack 水位的 id 路由进 `dropUnackedDelivered`（定义 `:567-575`，trio 删除 `:572-574`）。该遮蔽关系在源码注释 `:659-661` 里已写明。
-- **为什么不阻断**：常态路径下，≤ ack 水位的 id 必在 `unackedDelivered` 里——awaiting 与 dead-lettered 的 id 都留在队列内等 daemon 水位推进（后者是刻意的 ack 水位屏障）——队列循环先把它们全部送进 `dropUnackedDelivered`，同一批字段已在那里删除；`:662-673` 的成组清扫因此在常态下不可达，是防御性对称。它防的是未来出现第二条不经队列的清扫路径时漏清这三个字段，收益在未来。当前保留现状不增加风险，注释已把关系写明，不存在「读者误以为此处是主路径」的问题。
-- **后续怎么收敛**：下一次大改 wake 记账的清扫职责时，统一收敛到单一删除入口——只保留 `dropUnackedDelivered` 一条 trio 删除路径、删掉 `pruneAcknowledgedEvents` 内的重复回路（与遗留项 3 的字段收敛天然同批）；若先出现第二条不经队列的清扫路径，则重新评估这对回路是否仍只是纯防御。
-
+> 注（2026-10-17）：遗留项 1（pruneAcknowledgedEvents trio 清扫）与遗留项 3（三个 wake 记账集合收敛 Map）经复核判定不做，已清理，原文见 git 历史/备份。
 ### 2. OBS-1 边界下写 off 事件离队缺观测锚点：建议 `clearDeliveryBookkeeping` 补一条 info 日志（reviewer 建议）
 
 - **来源角色**：reviewer（本轮收口评审的建议级发现）。
@@ -43,12 +37,6 @@ reviewer 判定分支可以收口、无 must fix / should fix，仅余 3 条建�
 - **为什么不阻断**：这是纯观测缺口、零行为争议——不改 OBS-1 本身的结论。复现链依赖 Pi 内部 follow-up 队列行为，扩展侧没有观测点，`createFakePi` 又只记录 `sendMessage` 入参、没有 follow-up 队列模型，能写出的测试只能断言「重置后重投的 id 又被注入了一次」，而这正是当前契约的预期行为（写 off 的语义就是内容没进 transcript、重投是唯一补救），修前修后都过，锁不住任何缺陷。缺口不构成对分支正确性的怀疑，只是可观测性欠一行。
 - **后续怎么收敛**：在 `clearDeliveryBookkeeping` 对随 `:614` 清出的写 off id 补一条与 carriedOver 同形状的 info 日志（`eventIds=…`，一次一条、不刷屏），零行为变化、只补锚点。触发时机：需要现场定位「写 off 的 id 到底有没有被重投、是否撞上 scope 重置」时（OBS-1 的复现尝试正需要这个锚点），连同日志形状按 observability 惯例过审一起做。
 
-### 3. 三个 wake 记账集合分散维护，建议收敛为一张状态 Map（reviewer 建议，纯结构整洁度）
-
-- **来源角色**：reviewer（本轮收口评审的建议级发现）。
-- **位置**：reviewer 引用 `packages/herdsman-pi/src/index.ts:253-255`。HEAD 核对：三个字段的声明在 `:224`（`wakeRetryableEventIds: Set<number>`）、`:232`（`wakeDeadLetterAttempts: Map<number, number>`）、`:234`（`wakeDeadLetterRetryAt: Map<number, number>`），初始化在 `:455-457`。
-- **为什么不阻断**：纯重构项，不改变任何行为，就没有回归收益可为它单独开一轮；trio 的语义（可否再投递 / 已花费预算 / 下次重投时点）在注释里已按成组维护，现状无正确性风险。删除点分布不齐（`dropUnackedDelivered` `:572-574` 删齐 trio、注入后批次清理 `:1465-1466` 只删两项、消费确认清理 `:1998` 只删一键）恰说明收敛有收益，但收益在未来、不在本轮。
-- **后续怎么收敛**：下一次触及 trio 任一字段时，顺手收敛为一张状态 Map（`Map<eventId, { attempts: number; retryAt: number }>`，retryable 作键门控），与遗留项 1 的清扫收口、遗留项 2 的日志并入同一轮「wake 记账收敛」，不单独为重构返工。完整的删除点 / 只读点清点（含 `pruneAcknowledgedEvents` 水位循环与 `writeOffStrandedWakeDelivery` warn 日志两处后续补录项）见 `20261005-busy-wake-review-leftovers.md` 遗留项 3；收敛时须注意：消费确认路径现状只删一次键，Map 化后该路径仍只删一次键。
 
 ## X-1 补修轮（主代理决策后的落地记录）
 
@@ -74,11 +62,6 @@ reviewer 判定分支可以收口、无 must fix / should fix，仅余 3 条建�
 - **节流策略**：同一状态（`blocked eventId : reason : blocked 条数` 组成 key）在 60s 窗口内只记一条；状态变化立即重记；跨窗后同状态再记一条，长期卡死不会永久沉默。日志沿用既有形状（参考 `writeOffStrandedWakeDelivery` 的 warn 与 `noteSkippedWakeInjection` 的 info）：`[herdsman-pi] wake acknowledgement held eventId=<最小阻塞 id> reason=<dead-letter-budget-exhausted|dead-letter-backoff|awaiting-consumption> blocked=<条数> · the daemon confirms by watermark (id <= ?), so no larger id may be acknowledged while this one is unconfirmed; the held update stays pending in the daemon and recoverable`。
 - **最小可行版本的如实说明**：「长期无进展」无法在扩展侧可观测地判定——一个即将释放的屏障与一个永不开锁的屏障在扩展侧形态完全相同。最小可行版本因此定义为：在「因屏障而拒绝一笔本可发出的确认」这个**决策点**上记录（而不是在某个计时器到点时记录），字段为最小阻塞 id + 阻塞原因 + 被阻塞条数。「等 idle」这一路不重复造日志：busy 降级已有 `herdsman-wake` 状态行（`Herdsman · waiting for the current turn to end`，`setHerdsmanUi`）作为既有观测锚点，新日志只覆盖 daemon 水位屏障（死信预算耗尽 / 退避中 / awaiting-consumption）。
 - **回归测试**：第二条 X-1 测试同场覆盖——预算耗尽场景下连续 3 次 settlement 重取同一决策，`wake acknowledgement held` 恰好 1 行（`eventId=93 reason=dead-letter-budget-exhausted blocked=1`），证明去重生效、不刷屏。
-
-### X-6 / X-7（理论级观察，只落盘不改码）
-
-- **X-6（理论）**：`clearDeliveryBookkeeping` 只把 awaiting id carry 进 `wakeSuppressedEventIds`，retryable / dead-letter id 不进（`packages/herdsman-pi/src/index.ts:605` 的 carriedOver 只取 `wakeAwaitingConsumption`）。Pi follow-up 队列中陈旧副本之后被排干 + 跨 scope 重置时，同一更新可能被重复呈现一次。只有 reviewer 单方来源、无复现路径（依赖 Pi 内部 follow-up 队列行为，`createFakePi` 无该模型），归观察项；触发条件：OBS-1 现场复现或 Pi 暴露 follow-up 队列查询能力时复核。
-- **X-7（理论）**：注入失败处的 `catch`（`:1642-1649` 一带）只清 `deliveredBatch` / `wakeRequested`，无日志、无重新武装 timer。空操作路径在断连/拒绝场景下可观测性为零；同样是纯观测缺口，零行为争议，归观察项；触发条件：需要定位「wake 注入后既无注入记录也无下一轮」的现场时，补一条 warn 并以 `scheduleWake` 重新武装。
 
 ## 决策
 
@@ -109,14 +92,6 @@ reviewer 判定分支可以收口、无 must fix / should fix，仅余 3 条建�
 - **reviewer**：判定可收口、**0 条发现**（无 must fix / should fix）。
 - **oracle**：判定**可 commit 并合入 main**——在客户端 ack 出口上找不到绕过新屏障的反例，X-1 在 diff 覆盖范围内闭合；并用不变量论证了屏障对本地队列无遗漏态。附 **3 条建议级（B / C / H）** + **D 记账项** + **4 条反问**。
 
-### B（建议级·文案/字段语义）：`blocked=` 是屏障集合成员数，不是被扣住的 id 数 —— open
-
-- **来源角色**：oracle（本轮收口评审，建议级）。
-- **位置**：HEAD 核对（开工工作树）：`packages/herdsman-pi/src/index.ts:1168-1169` 的注释（「How many ids the barrier holds back: awaiting consumption, or still owed a dead-letter recovery (the two sets this walk checks).」）与 `:1170-1173` 的 `blocked` 计算（`new Set([...state.wakeAwaitingConsumption, ...state.wakeRetryableEventIds]).size`，位于 `unconfirmedWatermarkBarrier` 内，定义 `:1165`）；日志文本 `:1228`（`noteWakeWatermarkHoldBack` 的 info 行，含 `blocked=${barrier.blocked}`）。
-- **问题**：注释与日志都写「barrier holds back 多少条」，但实际 `blocked=` 取的是屏障集合成员数（awaiting ∪ retryable 的大小），**不是**被扣住的 id 数；长停摆时读数会低估（屏障 91 后面挂着 N 个已消费未 ack 的 id 时，`blocked` 仍是 1）。
-- **测试固化点**：HEAD 核对 `test/unit/herdsman-pi-extension.test.ts:4069`（第二条 X-1/X-3 回归，断言 held log 行含 `blocked=1`）——改名或改口径都需同步该断言。
-- **oracle 建议（二选一）**：① 字段改名 `blockingIds=`（纯文案、零行为）；② 改为「队列中 ≥ 屏障 id 的条数」（更贴调试、但节流 key 会更易抖动）。
-- **状态**：**待定，记为 open item**（本轮不改；见文末 open decisions 反问 1）。
 
 ### C（建议级·测试替身忠实度）：fake ack 替身比真实 daemon 宽松 —— open
 
@@ -140,12 +115,6 @@ reviewer 判定分支可以收口、无 must fix / should fix，仅余 3 条建�
 - **节流 key 含 `blocked` 计数**：「稳态 60s 一条」只在状态完全不变时成立；一批事件陆续到达会让计数逐个变化 → 每次变化立即出一条（每 pass 至多 1 行，突发 N 条最多 N 行）。
 - **纯冻结且无 pass 时静默**——本笔记「X-3」节已如实说明，不重复。
 
-### F（观察项·屏障规则稳健性）
-
-- **来源角色**：oracle（观察项）。
-- **依赖的不变量**：屏障 id 完全由队列遍历得出，其完备性依赖「集合 ⊆ 队列」。
-- **风险面**：本笔记遗留项 3 计划把三个集合收敛重写；重构若出现「加了队列条目没入集合」或「清了集合没清队列」，会让屏障**静默失效**（`unconfirmedWatermarkBarrier` `return undefined` → 静默路径放行所有 due suppressed）。
-- **oracle 建议**：屏障取 `min(集合最小值, 队列中第一个非 observed 的 id)`（不变量成立时二者等价，不成立时偏保守）。
 
 ### H（建议级·笔记行号口径）
 
@@ -163,6 +132,8 @@ reviewer 判定分支可以收口、无 must fix / should fix，仅余 3 条建�
 4. **反问 4**：`next_attempt_at` 未来值使 daemon `#ack` 守卫失明的盲区是否独立跟踪（当前惰性，无生产写入点）。
 
 ## 决策（追加：oracle 收口轮落盘范围）
+
+> 注（2026-10-17）：B 项（blocked= 改名/改口径）、F 项（屏障规则稳健性）、X-6、X-7 经复核判定不做，已清理，原文见 git 历史/备份。
 
 本轮为 docs-only 落盘 + 提交合并轮：B / C 记 open item（零行为成本，留待 follow-up 一并处置）；D 按 oracle 要求记账并挂 follow-up（触发器 = OBS-1 现场定位或再次水位停摆）；E / F 归观察项（E 已在 X-3 节如实说明；F 作为遗留项 3 重构的前置约束）；H 已按建议限定行号口径。4 条反问全部留档，不作为放宽或加严任何结论的依据。双审结论：reviewer 可收口、0 条发现；oracle 可 commit 并合入 main。
 

@@ -132,6 +132,8 @@ pi 终态回合出现「正文为空的 `agent.done`」有两条并存的根因�
 
 ## 遗留 / 观察项
 
+> 注（2026-10-17）：遗留项 8（formatHiddenAgentUpdates 补 (pre-round)）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **`staleBaselineDuplicate` 覆盖面不足**：守卫只比对**最近一条未失效终态行**；按**实际代码路径**，错轮投递需三条件同时成立：**（i）尾部 200 字符与 8KB tail 内某条旧消息的尾部相同；（ii）daemon 读到的 `advanced` 恰是那条旧消息；（iii）那条旧正文从未被投递过（故不在 `latestTerminal` 里）**。（原写的「转换在工具阶段被处理 + 5s 内收到信号」与代码不符，已删。）当前样本里未测到反例。建议**最小硬化** = 扩展为「该 agent 是否**曾投递过**同 `ref` 的终态行」，**本批不做**。
 2. **`inMemorySnapshot` 不落库**：③ 的降级快照只是内存态，tombstone 期间可能**重复 refresh 与 warn 刷日志**。行为正确（无落库、无连坐），列 canary 观察项。
 3. **`failed` 正文来源标注已修**：`last assistant (pre-round): …`，无正文时逐字不变。遗留一个语义缺口：wire 记录不带 assistant `ref`，无法在扩展侧判定「基线 ref 与失败轮 ref 相同」的同源情形；`(pre-round)` 是保守但诚实的标注（如需同源优化，需要在 daemon 侧扩 payload，本批不做）。
@@ -139,7 +141,6 @@ pi 终态回合出现「正文为空的 `agent.done`」有两条并存的根因�
 5. **payload 里暂无「mismatch 但采信」的持久标记**：该事实只活在 journal warn，**跨重启不可查** ⇒ 记为候选改进（例如在 payload 增设只读诊断位）。
 6. **历史残留（与本批无关）**：`docs/plans/2026-07-14-herdsman-test-dogfooding.md:32` 的 wrapper 描述（"installed `herdsman` wrapper executes this checkout's `dist/src/cli/herdsman.js`"）已过时；该条**已在** `.agents/notes/20261001-production-install-channel-npm-registry.md`（遗留 ⑦）登记，**此处不重复，仅指向**。
 7. **never-match 轮次现在要付满 3s 确认超时**：文本级确认（②）在 never-match 时必须**等满 3s 才回 `confirmed: false`**（旧实现一有尺寸增长即返回）⇒ 这类轮次比改前**多约 3s** 延迟，且会体现在「重试→补投」**P95** 里。**读 canary 时别把这 3s 当回归**，尤其别只看 P95 单点。
-8. **`formatHiddenAgentUpdates` 会原样复发误读（遗留，本批不改）**：`packages/herdsman-pi/src/index.ts:1551`（函数，实际跨度 `:1551-1568`；渲染行为 `:1563`）对 `failed` / `discarded` 事件**仍无条件渲染不带标注的 `last assistant:`**（与 ④ 已在 `wake.ts` 加的 `(pre-round)` 口径不一致），且当前**无生产调用者**（`rg` 全 `src` 与 `packages/herdsman-pi/src` 仅 `:1551` 定义；只有 `test/unit/herdsman-pi-extension.test.ts` 引用）。将来若被接线，会原样复发「把计划基线快照读成本轮产出」的误读。
 9. **canary 查询不要用 `deliverable` 列做「是否已投递给编排者」的过滤**：`agent_events.deliverable` 在 ack 后被**清零**，**终态行（`done`/`blocked`）全时段仅 2 行；全表实测 45 行，多为未 ack 的 `agent.status.changed`（28）与 `agent.idle`（14）pending 行，最早可追溯到 2026-08-27** ⇒ 用它筛会几乎筛空。判断投递状态请用 ack / 投递相关字段或 journal 文案，不要用 `deliverable`。
 10. **批外待回填：老笔记仍把该不可复现数字当事实引用**：`.agents/notes/20261001-pi-confirmed-turn-frozen-baseline-empty-body.md:57,63` 仍直接引用「45/48 命中 `textMatches=false`」且未带口径标注；建议日后修订为「口径不可复现、勿直接引用」或改为指向本篇笔记。**不影响运行时行为，本批不回填。**
 

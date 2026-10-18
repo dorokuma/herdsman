@@ -85,13 +85,14 @@ PATH=<nvm v22.23.1 bin>:$PATH npm install --global @dorokuma/herdsman@0.13.2
 
 ## 遗留 / 观察项
 
+> 注（2026-10-17）：遗留项 7（docs/plans wrapper 描述过时）经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **`CHANGELOG.md` 里三处「本地 tarball 安装」的历史陈述不追溯改写**：0.13.2 段已封在 tag `v0.13.2` 与 GitHub Release 中，改写会让仓库历史与已发布产物不一致。新口径只对后续生效。
 2. **全局安装无 `_resolved` / `_from`、无全局 lock**：来源只能靠**内容比对**（逐文件 sha256）证明，不能靠 npm 元数据。这也是验收第 1 条采用逐文件比对的原因。
 3. **`@ryonakae` 空目录**：与本轮无关，未触碰。
 4. **生产此前无任何部署脚本、无 `docs/deploying.md`**：部署知识一度只存在于 `AGENTS.md` 与 `/tmp` 一次性目录；本笔记与 `AGENTS.md` 的改写是该知识第一次落进版本控制。
 5. **发布流程中的 `npm pack` 不受影响**：`docs/releasing.md` 的 `npm pack`（打包验证、产物指纹）是发布流程的一部分，不是生产安装路径，保持不动。
 6. **「版本号即部署身份」只覆盖包自身 237 个文件，不含依赖树**：`package.json` 的依赖为 caret 范围、tarball 内无 lock。本轮**不做常规依赖快照**（不新增部署步骤）；需要复现当时的依赖解析时，临时按下列命令生成：`(cd /root/.nvm/versions/node/v22.23.1/lib/node_modules/@dorokuma/herdsman && npm ls --all --omit=dev --json)`（该形式实测 exit 0、含依赖全树；`npm ls -g --all` 在本机只出 2 行或混入其它全局包而报 invalid）。
-7. **`docs/plans/2026-07-14-herdsman-test-dogfooding.md:32` 已过时（仅登记，本批不改）**：该处写 "installed `herdsman` wrapper executes this checkout's `dist/...`"，但实测 wrapper 指向 `lib/node_modules/@dorokuma/herdsman/dist/...`（即 registry 副本），并非本 checkout。
 8. **两个默认口径（用户未另行指示，按默认写入，可改）**：① **部署前置条件 = 两包（root + `packages/herdsman-pi`）都已发布且远端 tag 已推**；半发布状态（root 已发、pi 缺席、tag 未推）的版本**不部署到生产**，**例外须用户决策**。校验命令：`npm view @dorokuma/herdsman@<version> version`、`npm view @dorokuma/herdsman-pi@<version> version`、`git ls-remote --tags --exit-code origin "refs/tags/v<version>"`（`--exit-code` 不可省：缺 tag 时 `git ls-remote` 默认 exit 0 + 空输出会静默通过，加上后缺失为 exit 非 0）。② **依赖树不引入 shrinkwrap**（属发布侧决策、影响所有用户，另行评估），本轮**不做常规依赖快照**，只在需要复现依赖解析时临时生成（见第 6 条）。
 
 ## 被放弃的方案（必填）

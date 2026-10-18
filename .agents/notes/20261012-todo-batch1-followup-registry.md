@@ -38,12 +38,7 @@ supersedes: ""
 - **触发条件**：下次触及守卫比较函数或 M2 测试文件时同批补。
 - **已实现（已销账）**：`test/m2-guard-different-ref` 在 `test/integration/turn-completion-signal.test.ts:2586-2677` 的 M2 守卫测试块内新增反向回归用例「`M2 guard: an unconfirmed matching tail with a new ref and the same text as a delivered row is released as a new round`」（见文末「追加销账（分支 test/m2-guard-different-ref：遗留 b 反向回归用例 + consider 1/2 注释修正）」节）。
 
-### c) 规则目录待办：`test_pi_override_of_non_pi_role_requires_model` 依赖真实 frontmatter 执行器分布
-
-- **位置**：`/root/.pi/agent/scripts/test_dispatch_agent.py:374`（本仓之外，**挂规则目录待办**，本笔记只留指针，不在本仓动作）。
-- **脆弱点**：该用例遍历 `ROLES`（`scout/planner/researcher/worker/verifier/reviewer/oracle`），对每个角色读**真实** `agents/<role>.md` frontmatter 的 `executor:`（`_frontmatter_executor`，`:32-41`），据默认执行器分流：默认 `pi` 的角色要求 `--executor pi --print-resolved` 返回 0 并回 `executor=pi`；非 pi 的角色要求返回 2 并回 `--executor pi overriding a non-pi role requires --model …`；最后断言「至少一个 pi 默认角色」（`saw_pi`）与「至少一个非 pi 角色」（`saw_non_pi`）。
-- **后果**：判据与被测对象**同一份数据**——只要有人把角色文件的 `executor:` 分布改动（例如把全部角色改成 `pi`，或把最后一个非 pi 角色改成 pi），用例会**假红**（`saw_non_pi` 断言失败）或**假绿**（分支不再被覆盖）；新增 / 删除角色文件（`ROLES` 元组不同步）同样如此。加固方向是让用例自己造 fixture 角色文件（或对分布做显式前置断言并给出清晰失败信息），但那是规则目录自身的改动。
-- **触发条件**：规则目录下次批量改角色文件（`executor:` / `model:` / 角色增删）前后各跑一次该用例；或该用例出现红且失败信息指向分布而非被测逻辑时。
+> 注（2026-10-17）：遗留 c（规则目录待办 test_dispatch_agent.py 脆弱测试）与 3) consider #2（源码三处注释硬编码 500）经复核判定不做，已清理，原文见 git 历史/备份。
 
 ### d) 审查项处置记账
 
@@ -113,7 +108,6 @@ supersedes: ""
 
 **3) 本轮（`test/m2-guard-different-ref`）双审 consider 与观察项登记（不动当前 `src/` / `test/` 代码，后续触及时收敛）：**
 
-- **源码三处注释硬编码 `500`（reviewer consider #2）**：`src/observability/agent-index-service.ts` 的三处守卫饱和注释（`#guardWindowSaturatedAgents` JSDoc `:208-210`、`#noteGuardWindowSaturated` JSDoc `:2197-2202`、窗口查询饱和分支内联注释 `:2544-2549`）中硬编码了字面量 `500`（`limit 500`、`scanned >= 500`、500/501 行）。为保持当前 `src/` 零改动与行号稳定，本轮不改源码；后续触及该区域时可改为 `STALE_DUPLICATE_GUARD_SCAN_LIMIT（当前 500）`，防常量调整后注释漂移。
 - **「遗留 a」段内历史行号系上一分支树坐标（reviewer consider #3 / oracle should fix #1 观察项）**：上一节「遗留销账（`chore/leftover-close-and-window-warn`）」中 `ITEM-109` 与「遗留 a」原记的 `:2469-2481`、`:2482-2495`、`:2176`、`:3364-3366` 系 `chore/leftover-close-and-window-warn` 初版（补 `#noteSalvageWindowSaturated` 及本分支扩写注释前）的历史分支树坐标；现已同步更新为现役准确行号（窗口查询 `:2532-2542`、饱和分支调用点 `:2543-2558`、`#noteGuardWindowSaturated` `:2208`、`sameTerminalAssistantContent` 的 pi ref 比较 `:3426-3428`［含 `:3426` 注释，if 语句为 `:3427-3428`］），并保留「本批注释扩写前为…」（窗口查询 `:2529-2539`、饱和分支 `:2540-2553`、`#noteGuardWindowSaturated` `:2205`、pi ref 比较 `:3421-3423`［含 `:3421` 注释，if 语句为 `:3422-3423`］）及初版历史坐标供对照。
 
 ## 被放弃的方案（必填）

@@ -200,9 +200,7 @@ if (!agent) {
    本批的未推进臂放行**只覆盖其中一类**：142 那类（无更早 acked done ⇒ `!hasDeliveredTerminalRow` 成立 ⇒ 放行）；222 那类里 unconfirmed 轮**仍降级**（结构约束就是防它），confirmed 轮由返工第 1 条放行——但注意这 364 条降级行全部是 unconfirmed 轮写的（confirmed 轮在旧码里走 soften 空放、不留 `degradedReason`，实测这些行 payload 无一含 `confirmed` 字段），所以「confirmed 放行」的收益体现为**少一条空 `agent.done`**，不体现在这 364 的计数里。快路径（`confirmed && textMatches`）**根本不经该约束**。
    同时按 M2 遗留 3 的口径提醒：该组读数必须与**部署后自身基线**比，且 A 会让「曾靠 confirmed 放行的轮次」改走新 warn 签名，`no_advance_from_input` 组预期下移、新签名组从 0 起量。
 2. **A 的收窄/放行效应需 canary 观察**：两类轮次的 journal 都需要观察——(a) unconfirmed + 有既有已投递终态行 + 未推进：仍降级（本批安全底线，生产量级未测）；(b) confirmed + 有既有已投递终态行 + 未推进：由「抹空 → 空 `agent.done`」改为「放行 + warn」（返工第 1 条，生产量级未测）。观察量：journal `Herdsman released a pi status event from a frozen baseline that already holds the on-disk answer` 与 `Herdsman emitted degraded status event { degradedReason: 'no_advance_from_input' }` 两组同窗对比，以及 `Herdsman released a confirmed pi status event with no deliverable text`（空放 warn，返工后应随 confirmed 抹空消失而降为 0）。
-3. **C 的 failed 形状是有损语义**：挽救行是 `agent.failed`，编排者看到的是「failed + reason + (pre-round) 正文」而不是「completed + 正文」。**触发条件**：若运维反馈「子代理明明完成，编排者却看到 failed」，就把该形状升级为「终态类型 + 保留态 invalidated」并同步改投递闸门（需要单独一轮 + 测试，本批不做）。
 4. **`#runPlanRow` 执行中关页：本批已纳入同一挽救（返工第 6 条，原登记项关闭）**：`PLAN_CANCELLED`（append 时 agent 行已消失）、`undefined && isPaneClosed`、catch 的 `isPaneClosed` 三处原为 `markCancelled`，本批全部改走 `#salvageOrCancelMissingAgentPlan`；原钉死旧行为的用例 `appending a terminal plan whose agent row is gone cancels the plan and appends nothing` 已改为 `:3009`「无内容仍取消」+ `:3050`「有内容挽救」两条。**剩余边界**：`executeStatusEventPlan` 无 store 的直通路径（`planId: undefined`）没有计划行可挽救，只能取消——该路径只在 store 未注入时出现。
-5. **会话文件尾巴在 `agents` 行被删后不可达**：C 的第二来源只能取 pane 自己记录的事件史。**触发条件**：若要把 C 做成真正的「重读会话文件」，需要先解决「agent 行删除后如何找回 `agent_session`」（例如 tombstone 表扩列），属 schema 变更，须先回报。
 6. **A 的窗口成本（订正后）**：`staleBaselineDuplicate` 的**内容重复判据**受 `STALE_DUPLICATE_GUARD_SCAN_LIMIT = 200` 限制——比窗口（最新 200 条 delivered/acked 终态行）更旧的正文可能不被认成重复；`hasDeliveredTerminalRow` 的**存在性判据不受 200 限制**（窗口内有任意已投递行即 `> 0`）。**触发条件**：实测出现「旧正文被当新答案重投」（即 `>200` 行的旧投递绕过内容判据）的实证，再评估加索引/扩窗（须先回报，涉及 migration）。
 7. **挽救的范围边界（返工第 4 条派生）**：scope 拼不出时 plan 保持取消。**触发条件**：出现「计划 cancelled、该 pane 在 DB 里有未投递终态正文、但 pane 事件史在 `created_at <= plan.createdAt` 前为空」的实证（即 stitch 不到的挽救），再评估「把 scope 快照进 plan 行」（需要 schema 变更，须先回报）；当前用 warn 可见。
 8. **`agent.failed` 挽救行的语义折扣（返工登记）**：编排者侧渲染是 `last assistant (pre-round): …`（`packages/herdsman-pi/src/wake.ts` 的 `formatAgentOutcomeUpdates`）——这是**主动告诉模型这段正文不是本轮产出**，所以 C 只是「库里还有一份」，不等于「编排者会当作完成结果用」。**跟随项是扩展侧按该 `reason` 改渲染**（把 `pane_closed_before_delivery` 呈现为本轮答案而不是 pre-round），**不是本轮新造行形状/改闸门**。
@@ -265,13 +263,14 @@ if (!agent) {
 
 ### A. 用户当次决定（照写，语义未改写）
 
+> 注（2026-10-17）：遗留项 3、5、11、13、15、16、17 经复核判定不做，已清理，原文见 git 历史/备份。
+
 1. **`agent.failed` + `pre-round` 折扣：接受。** 本批只保证「正文进了 wake」；`wake.ts:151` 对所有 failed 正文都标 `last assistant (pre-round)`、reason 印成 `pane_closed_before_delivery`，模型有理由把它当旧上下文。扩展侧按该 reason 改渲染是**单独一批**的跟随项，本批不改闸门、不新造行形状。（即 ⑦ 遗留 3 / 8 的升级触发器本次**不触发**，维持 `agent.failed` + H1 通道现状。）
 2. **来源② `limit 20`：补一条遗留（第 13 条，触发条件见该条），本轮不改。**
 3. **catch 宽谓词：本轮维持现状 + 记账（第 15 条，触发条件见该条），不现在收窄。**
 
 ### B. reviewer 发现（来源标注 reviewer w18:p1S）
 
-**遗留 11｜`#salvageableTerminalBody` 的 delivered 窗口缺 `pane_generation` 过滤**：来源② recorded 查询（`:819-828`）经 `generationClause`（`:811-812`）带了 `pane_generation` 条件，delivered 窗口查询（`:829-842`，配 `alreadyDelivered` 判据 `:849-858`）却只按 `(herdr_session_name, pane_id, created_at)`——两侧不对称。跨 generation 复用 `pane_id` 时，旧代**已投递**正文会被判 `alreadyDelivered` 而**退回取消**：**丢失方向（该救的没救），不是重复方向**。**触发条件**：本库出现 pane 跨 agent 复用（当前只读计数为 0，见 ⑧）。**不改放行判据本身**；处置 = 给 delivered 查询补 `pane_generation` 条件，或以注释声明该不对称（单独一轮，须先回报）。
 
 **遗留 12｜`markCompleted` 在 append 成功后的抛错极端路径（`:1006`）**：`#salvageOrCancelMissingAgentPlan` 先由 `#salvageOrphanTerminalEvent` append + 落库成功，再 `store.markCompleted(row.id)`（`:1006`）；若这个 markCompleted 抛错，catch 只记账，计划留 `pending`，下次 drain 经幂等键 `agent.failed:plan:<id>` 取回**同一行**重试 → 同一事件**二次推送**。reviewer 判为**无行为缺口**（自愈：下次 drain 重试后计划最终 completed），且 SQLite 本地近乎不可达。处置 = **可不改**（无新触发条件；markCompleted 失败若进入观测视野再评估）。
 
@@ -279,15 +278,9 @@ if (!agent) {
 
 ### C. oracle 发现（来源标注 oracle w18:p1T）
 
-**遗留 13｜来源② `limit 20` 在 `delivery_attempts` 过滤之前截断（用户决定 A2：本轮不改）**：来源② SQL（`:823`）仍是 `order by id desc limit 20`——先截断 20 行，再在循环里过滤 `delivery_attempts !== 0`（`:867`）。**触发条件**：关页后 plan 基线不可用（或与已投递同文），且 pane **未投递的终态正文落在最近 20 行之外** → 编排者拿不到。主路径是来源①（plan 基线快照，无 20 限制），故可推迟；触发后处置 = 按「终态非空且未投递」在窗口内条件取样再截断，或带触发条件扩深（单开一轮，须先回报）。
 
 **遗留 14｜内容守卫超 200 行漏拦：量级补记**：与 ⑦ 遗留 6 同项，补记生产量级——单 pane acked `agent.done` 最多 **245** 条（oracle 本轮只读复核，见遗留 19），该 pane 确有大段超出 `STALE_DUPLICATE_GUARD_SCAN_LIMIT`（`:126`）200 行的更旧投递；与「超窗漏拦是接受代价」的既定口径一致。触发条件沿用遗留 6（实测「>200 行的旧投递绕过内容判据被当新答案重投」再评估，须先回报）。
 
-**遗留 15｜catch 谓词偏宽：`AbortError` / `message.includes("aborted")` 被当成关页（用户决定 A3：维持现状 + 记账）**：`:1452-1459` 的 `isPaneClosed` 把 `err?.name === "AbortError" || err?.message?.includes("aborted")` 与真实 `agents.isPaneClosed` 并列，命中即走挽救/取消（`:1460-1464`）。**触发条件**：**开着的 pane** 在执行中被判成关页 → agent 行还在时 `#resolvePlanOutcomeAgent`（`:2809`）拿到活 agent → 写出**带 `agent_id`** 的 `agent.failed` 并 `markCompleted`，而 reason 仍是 `pane_closed_before_delivery`。**现状**：暂未找到会把 `"Herdr request aborted"` 打进 `#runPlanRow` 的调用（`sessionSnapshot()` 不传 abort signal），属**潜伏**；shutdown 等待仍由 `#throwIfShutdownAbort`（`:1999`）转成 `PlanWaitingHistoryError`、计划保持可重试，S11 契约未被覆盖。触发后处置 = 收窄谓词并补用例。
-
-**遗留 16｜挽救行 `payload.agent` 为 null：唤醒身份退到 `paneId`**：`#minimalAgentFromLatestEvent`（`:729`）不恢复 kind，唤醒身份取自 `wake.ts:126` 的 `stringValue(payload.agent) ?? stringValue(event.agentId) ?? paneId ?? event.terminalId`，退到 `paneId`；与来源②的**去重 kind**（`agentKindFromPayloadJson`，`:3124`，即 ⑦ 遗留 10）不是一回事，**不挡投递**。**触发条件**：出现「同 pane 多 agent、唤醒归错身份」的实证再评估（当前无证据）。
-
-**遗留 17｜来源②不按 `status` 过滤：潜在第二条 `agent.failed`**：来源②循环（`:866-872`）只要求 `delivery_attempts = 0` + 终态非空 + 未命中已投递窗口，**不看 `status`**——`invalidated` 且 `delivery_attempts=0`、正文仍是非空终态的行，可能被救成**第二条 `agent.failed`**。本批形态受限：降级抹空的行过不了 `hasNonEmptyAssistantMessage`（`:869`）。**触发条件**：出现「同 plan 已挽救写过一条 `agent.failed`、pane 上另有 invalidated 未投递非空终态行」的实证，再评估补 `status` 条件（须先回报）。
 
 **遗留 18｜canary 口径补充**：⑦ 遗留 1/2 的两组 journal 对比必须与**部署后自身基线**比，**不要和这 364 条历史行比**；当前缺的是**观察时长与数值阈值**（不挡合并）。
 

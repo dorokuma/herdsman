@@ -1,6 +1,6 @@
 ---
-status: active # active | superseded
-superseded_by: ""
+status: superseded # active | superseded
+superseded_by: "20261006-leftover-disposition.md"
 supersedes: ""
 # 模块可选值: observability, daemon, cli, config, db, herdr, shared, herdsman-pi, herdsman-herdr-plugin, release
 模块: herdsman-pi
