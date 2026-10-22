@@ -64,6 +64,7 @@ export type PiPresence = AgentScope & {
   connectedAt: number;
   paneId: string;
   subscriberId: string;
+  subscriberKind?: "pi" | "agy";
   terminalId: string;
 };
 
@@ -79,6 +80,11 @@ type IntervalHandle = ReturnType<typeof setInterval>;
 
 type GraceTimer = {
   handle: TimerHandle;
+};
+
+type AgyTerminalLease = {
+  paneGeneration: string | null;
+  presence: PiPresence;
 };
 
 export class ObservabilityRpcServer {
@@ -99,6 +105,7 @@ export class ObservabilityRpcServer {
   readonly #now: () => number;
   readonly #orchestrator: AgentOrchestratorService;
   readonly #peerPidOf: (socket: Socket) => number | undefined;
+  readonly #agyPresenceByTerminal = new Map<string, AgyTerminalLease>();
   readonly #piPresenceBySocket = new Map<Socket, PiPresence>();
   readonly #socketsByTerminal = new Map<string, Set<Socket>>();
   readonly #registerPiSessionRef: (input: {
@@ -208,6 +215,7 @@ export class ObservabilityRpcServer {
     this.#clearGraceTimers(this.#startupTimers);
     for (const socket of this.#sockets) socket.destroy();
     this.#sockets.clear();
+    this.#agyPresenceByTerminal.clear();
     this.#piPresenceBySocket.clear();
     this.#socketsByTerminal.clear();
     this.#connectionOrderBySocket.clear();
@@ -290,6 +298,51 @@ export class ObservabilityRpcServer {
         ...presence,
         paneId: agent.paneId,
         workspaceId: agent.workspaceId,
+      });
+    }
+
+    for (const [key, lease] of this.#agyPresenceByTerminal) {
+      const { presence } = lease;
+      if (presence.herdrSessionName !== input.herdrSessionName) continue;
+      const agent = byTerminal.get(presence.terminalId);
+      if (!agent) {
+        if (
+          this.#stores.agents.isPaneClosedSince({
+            herdrSessionName: presence.herdrSessionName,
+            paneId: presence.paneId,
+            paneGeneration: lease.paneGeneration,
+            sinceMs: presence.connectedAt,
+          })
+        ) {
+          this.#agyPresenceByTerminal.delete(key);
+          if ((this.#socketsByTerminal.get(key)?.size ?? 0) === 0) {
+            this.#releaseCurrentOwnersForTerminal({
+              herdrSessionName: input.herdrSessionName,
+              reason: "disconnected",
+              terminalId: presence.terminalId,
+            });
+          }
+        }
+        continue;
+      }
+      if (agent.agent !== null && agent.agent !== "agy") {
+        this.#agyPresenceByTerminal.delete(key);
+        if ((this.#socketsByTerminal.get(key)?.size ?? 0) === 0) {
+          this.#releaseCurrentOwnersForTerminal({
+            herdrSessionName: input.herdrSessionName,
+            reason: "disconnected",
+            terminalId: presence.terminalId,
+          });
+        }
+        continue;
+      }
+      this.#agyPresenceByTerminal.set(key, {
+        paneGeneration: agent.paneGeneration ?? lease.paneGeneration,
+        presence: {
+          ...presence,
+          paneId: agent.paneId,
+          workspaceId: agent.workspaceId,
+        },
       });
     }
 
@@ -406,22 +459,49 @@ export class ObservabilityRpcServer {
       }
       case "agent.orchestrator.register": {
         assertSchema(agentOrchestratorRegisterInputSchema, params);
+        const registrationInput = params as PiPresenceRegistration;
         const previous = this.#piPresenceBySocket.get(socket);
-        const presence = await this.#resolvePiPresence(socket, params as PiPresenceRegistration);
+        const presence = await this.#resolvePiPresence(socket, registrationInput);
         if (previous) this.#unregisterTerminalSocket(socket, previous);
         this.#piPresenceBySocket.set(socket, presence);
         this.#registerTerminalSocket(socket, presence);
-        this.#lastActivityByTerminal.set(terminalPresenceKey(presence), this.#now());
-        this.#cancelGraceForTerminal(presence);
-        if (previous && terminalPresenceKey(previous) !== terminalPresenceKey(presence)) {
+        const presenceKey = terminalPresenceKey(presence);
+        const currentOwner = this.#orchestrator.status(presence)?.owner;
+        if (presence.subscriberKind !== "agy") {
+          this.#agyPresenceByTerminal.delete(presenceKey);
+          this.#cancelGraceForTerminal(presence);
+        } else if (
+          currentOwner?.terminalId === presence.terminalId &&
+          !this.#isPiTerminal(presence)
+        ) {
+          this.#agyPresenceByTerminal.set(presenceKey, {
+            paneGeneration: this.#resolvePaneGeneration(presence),
+            presence,
+          });
+          this.#cancelGraceForTerminal(presence);
+        }
+        this.#lastActivityByTerminal.set(presenceKey, this.#now());
+        if (
+          previous &&
+          terminalPresenceKey(previous) !== presenceKey &&
+          previous.subscriberKind !== "agy"
+        ) {
           this.#scheduleDisconnect(previous);
         }
-        const registration = await this.#registerPiSessionRef({
-          herdrSessionName: presence.herdrSessionName,
-          sessionRef: (params as PiPresenceRegistration).sessionRef,
-          terminalId: presence.terminalId,
-        });
-        for (const scope of registration.contextChangedScopes) this.publishAgentContext(scope);
+        if (
+          presence.subscriberKind !== "agy" ||
+          (registrationInput.sessionRef.kind === "id" &&
+            registrationInput.sessionRef.source !== "agy-subagent" &&
+            isUuidLikeSessionId(registrationInput.sessionRef.value) &&
+            !this.#isPiTerminal(presence))
+        ) {
+          const registration = await this.#registerPiSessionRef({
+            herdrSessionName: presence.herdrSessionName,
+            sessionRef: registrationInput.sessionRef,
+            terminalId: presence.terminalId,
+          });
+          for (const scope of registration.contextChangedScopes) this.publishAgentContext(scope);
+        }
         return this.#connectionState(presence);
       }
       case "agent.orchestrator.get": {
@@ -439,9 +519,17 @@ export class ObservabilityRpcServer {
             ? this.#hasTerminalPresence({ ...presence, terminalId: current.owner.terminalId })
             : false;
           const change = this.#orchestrator.claim({ ...presence, ownerConnected });
+          if (presence.subscriberKind === "agy" && !this.#isPiTerminal(presence)) {
+            this.#agyPresenceByTerminal.set(terminalPresenceKey(presence), {
+              paneGeneration: this.#resolvePaneGeneration(presence),
+              presence,
+            });
+            this.#cancelGraceForTerminal(presence);
+          }
           changed = !sameOwner(change.current.owner, change.previous.owner);
           if (changed) this.#publishOrchestratorChange(toWireChange(change));
         } else {
+          this.#agyPresenceByTerminal.delete(terminalPresenceKey(presence));
           const change = this.#orchestrator.release({
             ...presence,
             reason: "released",
@@ -491,11 +579,12 @@ export class ObservabilityRpcServer {
       paneId: input.paneId,
     });
     if (indexed?.workspaceId === input.workspaceId && indexed.terminalId) {
-      const presence = {
+      const presence: PiPresence = {
         connectedAt: this.#now(),
         herdrSessionName: session.name,
         paneId: indexed.paneId,
         subscriberId: input.subscriberId,
+        subscriberKind: input.subscriberKind,
         terminalId: indexed.terminalId,
         workspaceId: indexed.workspaceId,
       };
@@ -511,11 +600,12 @@ export class ObservabilityRpcServer {
         paneId: input.paneId,
         socketPath: session.socketPath,
       });
-      const presence = {
+      const presence: PiPresence = {
         connectedAt: this.#now(),
         herdrSessionName: session.name,
         paneId: live.paneId,
         subscriberId: input.subscriberId,
+        subscriberKind: input.subscriberKind,
         terminalId: live.terminalId,
         workspaceId: live.workspaceId,
       };
@@ -617,8 +707,11 @@ export class ObservabilityRpcServer {
     this.#piPresenceBySocket.delete(socket);
     if (presence) this.#unregisterTerminalSocket(socket, presence);
     // A socket that closes is no longer a trusted connected terminal. The
-    // grace timer remains only to tolerate a same-terminal reconnect.
-    if (!this.#stopping && presence) this.#scheduleDisconnect(presence);
+    // grace timer remains only to tolerate a same-terminal reconnect; active
+    // non-pi terminals that leased ownership are preserved by #hasTerminalPresence.
+    if (!this.#stopping && presence) {
+      this.#scheduleDisconnect(presence);
+    }
   }
 
   #scheduleDisconnect(presence: PiPresence): void {
@@ -639,6 +732,24 @@ export class ObservabilityRpcServer {
     for (const state of this.#orchestrator.persistedOwners()) {
       if (!state.owner) continue;
       const key = terminalPresenceKey({ ...state, terminalId: state.owner.terminalId });
+      const indexed = this.#stores.agents.findByTerminal({
+        herdrSessionName: state.herdrSessionName,
+        terminalId: state.owner.terminalId,
+      });
+      if (indexed?.agent === "agy") {
+        this.#agyPresenceByTerminal.set(key, {
+          paneGeneration: indexed.paneGeneration ?? null,
+          presence: {
+            connectedAt: this.#now(),
+            herdrSessionName: state.herdrSessionName,
+            paneId: indexed.paneId,
+            subscriberId: `agy:${state.owner.terminalId}`,
+            subscriberKind: "agy",
+            terminalId: state.owner.terminalId,
+            workspaceId: state.workspaceId,
+          },
+        });
+      }
       const handle = this.#setTimeout(() => {
         this.#startupTimers.delete(key);
         if (
@@ -685,8 +796,71 @@ export class ObservabilityRpcServer {
     this.#cancelTimer(this.#startupTimers, key);
   }
 
+  #resolvePaneGeneration(
+    presence: Pick<PiPresence, "herdrSessionName" | "paneId" | "terminalId">,
+  ): string | null {
+    const indexed =
+      this.#stores.agents.findByTerminal({
+        herdrSessionName: presence.herdrSessionName,
+        terminalId: presence.terminalId,
+      }) ??
+      this.#stores.agents.findByPane({
+        herdrSessionName: presence.herdrSessionName,
+        paneId: presence.paneId,
+      });
+    return indexed?.paneGeneration ?? null;
+  }
+
+  #isPiTerminal(presence: Pick<PiPresence, "herdrSessionName" | "paneId" | "terminalId">): boolean {
+    const indexed =
+      this.#stores.agents.findByTerminal({
+        herdrSessionName: presence.herdrSessionName,
+        terminalId: presence.terminalId,
+      }) ??
+      this.#stores.agents.findByPane({
+        herdrSessionName: presence.herdrSessionName,
+        paneId: presence.paneId,
+      });
+    if (indexed?.agent === "pi") return true;
+    const sockets = this.#socketsByTerminal.get(terminalPresenceKey(presence));
+    if (!sockets) return false;
+    for (const socket of sockets) {
+      if (this.#piPresenceBySocket.get(socket)?.subscriberKind === "pi") return true;
+    }
+    return false;
+  }
+
   #hasTerminalPresence(input: { herdrSessionName: string; terminalId: string }): boolean {
-    return (this.#socketsByTerminal.get(terminalPresenceKey(input))?.size ?? 0) > 0;
+    const key = terminalPresenceKey(input);
+    if ((this.#socketsByTerminal.get(key)?.size ?? 0) > 0) return true;
+    const lease = this.#agyPresenceByTerminal.get(key);
+    if (!lease) return false;
+    const { presence } = lease;
+    const indexed =
+      this.#stores.agents.findByTerminal({
+        herdrSessionName: presence.herdrSessionName,
+        terminalId: presence.terminalId,
+      }) ??
+      this.#stores.agents.findByPane({
+        herdrSessionName: presence.herdrSessionName,
+        paneId: presence.paneId,
+      });
+    if (indexed?.paneGeneration) {
+      lease.paneGeneration = indexed.paneGeneration;
+    }
+    if (
+      (indexed && indexed.agent !== null && indexed.agent !== "agy") ||
+      this.#stores.agents.isPaneClosedSince({
+        herdrSessionName: presence.herdrSessionName,
+        paneId: presence.paneId,
+        paneGeneration: lease.paneGeneration,
+        sinceMs: presence.connectedAt,
+      })
+    ) {
+      this.#agyPresenceByTerminal.delete(key);
+      return false;
+    }
+    return true;
   }
 
   #registerTerminalSocket(socket: Socket, presence: PiPresence): void {
@@ -814,4 +988,8 @@ function sameOwner(
 
 function terminalPresenceKey(input: { herdrSessionName: string; terminalId: string }): string {
   return `${input.herdrSessionName}\0${input.terminalId}`;
+}
+
+function isUuidLikeSessionId(value: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(value);
 }

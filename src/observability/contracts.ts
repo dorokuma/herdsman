@@ -205,7 +205,7 @@ export type PiPresenceRegistration = {
   paneId: string;
   sessionRef: AgentSessionRef;
   subscriberId: string;
-  subscriberKind: "pi";
+  subscriberKind: "pi" | "agy";
   workspaceId: string;
 };
 

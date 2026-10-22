@@ -5602,11 +5602,15 @@ test("keeps a local id past an exactly full pending page", async () => {
 
 function withHerdrEnv(options: { paneId?: string; workspaceId?: string } = {}) {
   const previous = {
+    CTXMODE_ROLE: process.env.CTXMODE_ROLE,
     HERDR_ENV: process.env.HERDR_ENV,
     HERDR_PANE_ID: process.env.HERDR_PANE_ID,
     HERDR_SOCKET_PATH: process.env.HERDR_SOCKET_PATH,
     HERDR_WORKSPACE_ID: process.env.HERDR_WORKSPACE_ID,
+    HERDSMAN_AUTO_ON: process.env.HERDSMAN_AUTO_ON,
   };
+  delete process.env.CTXMODE_ROLE;
+  delete process.env.HERDSMAN_AUTO_ON;
   process.env.HERDR_ENV = "1";
   process.env.HERDR_PANE_ID = options.paneId ?? "wB:p1";
   process.env.HERDR_SOCKET_PATH = "/tmp/herdr.sock";
@@ -5769,4 +5773,138 @@ describe("herdsman-pi turn completion signal", () => {
     // ~3s is intrinsic: TURN_SIGNAL_TIMEOUT_MS = 3_000 (packages/herdsman-pi/src/turn-signal.ts:3)
     // and this case's expectedText="" makes the candidate.length > 0 guard always false.
   }, 30_000);
+
+  test("auto-claims workspace ownership on startup when HERDSMAN_AUTO_ON=1 and workspace has no owner", async () => {
+    const client = createFakeClient();
+    client.response = (method) => {
+      if (method === "agent.orchestrator.register") {
+        return connectionResponse({ ownerTerminalId: null });
+      }
+      return connectionResponse({ ownerTerminalId: "term_pi" });
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true, sessionFile: "/root/.pi/agent/sessions/main.jsonl" });
+    const previous = withHerdrEnv();
+    const prevAutoOn = process.env.HERDSMAN_AUTO_ON;
+    process.env.HERDSMAN_AUTO_ON = "1";
+    try {
+      await startExtension(client, pi, ctx);
+      expect(client.calls).toContainEqual(["agent.orchestrator.set", { enabled: true }]);
+      expect(ctx.statuses.get("herdsman")).toBeDefined();
+    } finally {
+      if (prevAutoOn === undefined) delete process.env.HERDSMAN_AUTO_ON;
+      else process.env.HERDSMAN_AUTO_ON = prevAutoOn;
+      restoreEnv(previous);
+    }
+  });
+
+  test("does not steal ownership on startup when HERDSMAN_AUTO_ON=1 and workspace is already owned", async () => {
+    const client = createFakeClient();
+    client.response = () => connectionResponse({ ownerTerminalId: "term_other_owner" });
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true, sessionFile: "/root/.pi/agent/sessions/main.jsonl" });
+    const previous = withHerdrEnv();
+    const prevAutoOn = process.env.HERDSMAN_AUTO_ON;
+    process.env.HERDSMAN_AUTO_ON = "1";
+    try {
+      await startExtension(client, pi, ctx);
+      expect(client.calls.filter(([method]) => method === "agent.orchestrator.set")).toEqual([]);
+      expect(ctx.statuses.get("herdsman")).toBeUndefined();
+    } finally {
+      if (prevAutoOn === undefined) delete process.env.HERDSMAN_AUTO_ON;
+      else process.env.HERDSMAN_AUTO_ON = prevAutoOn;
+      restoreEnv(previous);
+    }
+  });
+
+  test("does not auto-claim when HERDSMAN_AUTO_ON=1 for a dispatched role session", async () => {
+    const client = createFakeClient();
+    client.response = () => connectionResponse({ ownerTerminalId: null });
+    const pi = createFakePi();
+    const ctx = fakeCtx({
+      idle: true,
+      sessionFile: "/tmp/herdr-role-sessions/default/role-scout-abc123/session.jsonl",
+    });
+    const previous = withHerdrEnv();
+    const prevAutoOn = process.env.HERDSMAN_AUTO_ON;
+    process.env.HERDSMAN_AUTO_ON = "1";
+    try {
+      await startExtension(client, pi, ctx);
+      expect(client.calls.filter(([method]) => method === "agent.orchestrator.set")).toEqual([]);
+    } finally {
+      if (prevAutoOn === undefined) delete process.env.HERDSMAN_AUTO_ON;
+      else process.env.HERDSMAN_AUTO_ON = prevAutoOn;
+      restoreEnv(previous);
+    }
+  });
+
+  test("does not auto-claim when HERDSMAN_AUTO_ON is unset or when CTXMODE_ROLE is set, and does not re-claim on reconnect after /herdsman off", async () => {
+    const client = createFakeClient();
+    let ownerTerminalId: string | null = null;
+    client.response = (method, params) => {
+      if (method === "agent.orchestrator.set") {
+        const enabled = (params as { enabled?: boolean })?.enabled === true;
+        ownerTerminalId = enabled ? "term_pi" : null;
+        return { ...connectionResponse({ ownerTerminalId }), changed: true };
+      }
+      return connectionResponse({ ownerTerminalId });
+    };
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true, sessionFile: "/root/.pi/agent/sessions/main.jsonl" });
+    const previous = withHerdrEnv();
+    const prevAutoOn = process.env.HERDSMAN_AUTO_ON;
+    const prevRole = process.env.CTXMODE_ROLE;
+    try {
+      delete process.env.HERDSMAN_AUTO_ON;
+      await startExtension(client, pi, ctx);
+      expect(client.calls.filter(([method]) => method === "agent.orchestrator.set")).toEqual([]);
+
+      client.calls.length = 0;
+      process.env.HERDSMAN_AUTO_ON = "1";
+      process.env.CTXMODE_ROLE = "worker";
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+      expect(client.calls.filter(([method]) => method === "agent.orchestrator.set")).toEqual([]);
+
+      client.calls.length = 0;
+      delete process.env.CTXMODE_ROLE;
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+      expect(client.calls.filter(([method]) => method === "agent.orchestrator.set")).toEqual([
+        ["agent.orchestrator.set", { enabled: true }],
+      ]);
+
+      await pi.commands.get("herdsman")?.handler("off", ctx);
+      expect(ownerTerminalId).toBeNull();
+      client.calls.length = 0;
+
+      // Reconnect within the same session must not auto-claim again after manual off.
+      await client.connect();
+      expect(client.calls.filter(([method]) => method === "agent.orchestrator.set")).toEqual([]);
+    } finally {
+      if (prevAutoOn === undefined) delete process.env.HERDSMAN_AUTO_ON;
+      else process.env.HERDSMAN_AUTO_ON = prevAutoOn;
+      if (prevRole === undefined) delete process.env.CTXMODE_ROLE;
+      else process.env.CTXMODE_ROLE = prevRole;
+      restoreEnv(previous);
+    }
+  });
+
+  test("does not auto-claim when HERDSMAN_AUTO_ON=1 in a non-p1 pane", async () => {
+    const client = createFakeClient();
+    client.response = () => connectionResponse({ ownerTerminalId: null });
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true, sessionFile: "/root/.pi/agent/sessions/main.jsonl" });
+    const previous = withHerdrEnv({ paneId: "wB:p2" });
+    const prevAutoOn = process.env.HERDSMAN_AUTO_ON;
+    process.env.HERDSMAN_AUTO_ON = "1";
+    try {
+      await startExtension(client, pi, ctx);
+      expect(client.calls.filter(([method]) => method === "agent.orchestrator.set")).toEqual([]);
+    } finally {
+      if (prevAutoOn === undefined) delete process.env.HERDSMAN_AUTO_ON;
+      else process.env.HERDSMAN_AUTO_ON = prevAutoOn;
+      restoreEnv(previous);
+    }
+  });
 });

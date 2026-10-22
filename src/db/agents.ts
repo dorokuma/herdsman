@@ -285,6 +285,35 @@ export class AgentStore {
   }
 
   /**
+   * True when the pane is recorded as closed for the given generation, or when
+   * no generation was known at lease registration time and any tombstone for
+   * the pane was recorded at or after `sinceMs`.
+   */
+  isPaneClosedSince(input: {
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+    sinceMs: number;
+  }): boolean {
+    if (input.paneGeneration != null) {
+      return this.isPaneClosed({
+        herdrSessionName: input.herdrSessionName,
+        paneId: input.paneId,
+        paneGeneration: input.paneGeneration,
+      });
+    }
+    const row = this.#sqlite
+      .prepare(
+        `select 1 from agent_pane_tombstones
+         where herdr_session_name = ? and pane_id = ?
+           and (pane_generation is null or closed_at >= ?)
+         limit 1`,
+      )
+      .get(input.herdrSessionName, input.paneId, input.sinceMs);
+    return row !== undefined;
+  }
+
+  /**
    * Drops the legacy (generation-less) tombstone for a pane. A live pane that
    * reports a pane_generation proves the pane is open again, so an earlier
    * LEGACY_CLOSE_WITHOUT_GENERATION tombstone must not keep blocking it

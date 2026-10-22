@@ -83,12 +83,25 @@ export function peerBoundToPanePid(peerPid: number, panePid: number): boolean {
   return isAncestorPid(panePid, peerPid);
 }
 
+const MAX_CWD_ANCESTOR_DEPTH = 4;
+
 export function peerBoundToPaneCwd(peerPid: number, paneCwd: string): boolean {
   if (!Number.isInteger(peerPid) || peerPid <= 1) return false;
   if (typeof paneCwd !== "string" || paneCwd.length === 0) return false;
-  const peerCwd = processCwd(peerPid);
-  if (!peerCwd) return false;
-  return sameCwd(peerCwd, paneCwd);
+  let current: number | undefined = peerPid;
+  for (
+    let step = 0;
+    step <= MAX_CWD_ANCESTOR_DEPTH && current !== undefined && current > 1;
+    step += 1
+  ) {
+    const currentCwd = processCwd(current);
+    if (!currentCwd) break;
+    if (sameCwd(currentCwd, paneCwd)) return true;
+    const parent = parentPid(current);
+    if (parent === undefined || parent <= 1 || parent === current) break;
+    current = parent;
+  }
+  return false;
 }
 
 function processCwd(pid: number): string | undefined {

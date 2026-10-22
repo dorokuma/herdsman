@@ -1,8 +1,9 @@
 #!/usr/bin/env node
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
-import { argv, exit } from "node:process";
+import { argv, exit, stdin as processStdin } from "node:process";
 import { fileURLToPath } from "node:url";
+import { type AgyHookEventName, runAgyHook } from "@/agy/hook.js";
 import { resolveRuntime, runtimePathsFromRecordOrDefault } from "@/config/runtime.js";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
 import {
@@ -11,10 +12,17 @@ import {
   isSystemdHerdsmanManaged,
   readDaemonRuntimeRecord,
 } from "@/daemon/process-manager.js";
-import type { AgentGetResult, AgentListItem, AgentReadResult } from "@/observability/contracts.js";
+import type {
+  AgentGetResult,
+  AgentListItem,
+  AgentOrchestratorWireState,
+  AgentReadResult,
+} from "@/observability/contracts.js";
 
 const CURRENT_HERDR_WORKSPACE_ERROR =
   "agent command requires HERDR_ENV=1 with HERDR_WORKSPACE_ID, --workspace <id>, --session <name>, or --all.";
+const CURRENT_HERDR_PANE_ERROR =
+  "orchestrator command requires HERDR_ENV=1 with HERDR_SOCKET_PATH, HERDR_PANE_ID, and HERDR_WORKSPACE_ID.";
 
 type DaemonAction = "status";
 
@@ -24,19 +32,38 @@ type AgentScope = {
   workspaceId?: string;
 };
 
+type HerdrPaneIdentityEnv = {
+  herdrSocketPath: string;
+  paneId: string;
+  workspaceId: string;
+};
+
 export type CliCommand =
   | { action: DaemonAction; command: "daemon"; text: boolean }
   | ({ command: "agent-list"; json: boolean } & AgentScope)
   | ({ command: "agent-get"; json: boolean; target: string } & AgentScope)
   | ({ command: "agent-read"; json: boolean; limit?: number; target: string } & AgentScope)
+  | ({
+      action: "on" | "off" | "status";
+      command: "orchestrator";
+      ifUnowned?: boolean;
+      json: boolean;
+    } & HerdrPaneIdentityEnv)
+  | { command: "agy-hook"; hookEventName: AgyHookEventName }
   | { command: "help" };
 
 type RpcClientLike = Pick<ObservabilityRpcClient, "close" | "request">;
 
 type RunCliDeps = {
-  connect(socketPath: string): Promise<RpcClientLike>;
+  connect(
+    socketPath: string,
+    onNotification?: (method: string, params: unknown) => void,
+  ): Promise<RpcClientLike>;
+  environment?: NodeJS.ProcessEnv;
   output(line: string): void;
   socketPath: string;
+  stateDir?: string;
+  stdin?: string;
 };
 
 export function parseCliArgs(
@@ -60,7 +87,52 @@ export function parseCliArgs(
     return parseAgentCommand(rest, environment);
   }
 
+  if (command === "on" || command === "off" || command === "status") {
+    return parseOrchestratorCommand(command, rest, environment);
+  }
+
+  if (command === "agy-hook") {
+    const [hookEventName, ...extra] = rest;
+    if (
+      hookEventName !== "PreInvocation" &&
+      hookEventName !== "Stop" &&
+      hookEventName !== "WakeWaiter"
+    ) {
+      throw new Error("agy-hook requires PreInvocation, Stop, or WakeWaiter");
+    }
+    rejectExtra(extra);
+    return { command: "agy-hook", hookEventName };
+  }
+
   throw new Error(`Unknown command: ${command}`);
+}
+
+function parseOrchestratorCommand(
+  action: "on" | "off" | "status",
+  args: string[],
+  environment: NodeJS.ProcessEnv,
+): CliCommand {
+  const rest = [...args];
+  const json = takeFlag(rest, "--json");
+  const ifUnowned = action === "on" ? takeFlag(rest, "--if-unowned") : false;
+  rejectExtra(rest);
+  if (
+    environment.HERDR_ENV !== "1" ||
+    !environment.HERDR_SOCKET_PATH ||
+    !environment.HERDR_PANE_ID ||
+    !environment.HERDR_WORKSPACE_ID
+  ) {
+    throw new Error(CURRENT_HERDR_PANE_ERROR);
+  }
+  return {
+    action,
+    command: "orchestrator",
+    herdrSocketPath: environment.HERDR_SOCKET_PATH,
+    ...(ifUnowned ? { ifUnowned: true } : {}),
+    json,
+    paneId: environment.HERDR_PANE_ID,
+    workspaceId: environment.HERDR_WORKSPACE_ID,
+  };
 }
 
 function parseAgentCommand(args: string[], environment: NodeJS.ProcessEnv): CliCommand {
@@ -129,10 +201,14 @@ function scopedOrCurrent(scope: AgentScope, environment: NodeJS.ProcessEnv): Age
 
 export function helpText(): string {
   return `Usage:
+  herdsman on [--if-unowned] [--json]
+  herdsman off [--json]
+  herdsman status [--json]
   herdsman daemon status [--text]
   herdsman agent list [--all] [--workspace <id>] [--session <name>] [--json]
   herdsman agent get <target> [--workspace <id>] [--session <name>] [--json]
   herdsman agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]
+  herdsman agy-hook <PreInvocation|Stop|WakeWaiter>
   herdsman help
 
 Notes:
@@ -152,6 +228,18 @@ export async function runCliCommand(command: CliCommand, deps: RunCliDeps): Prom
     return;
   }
   if (command.command === "daemon") throw new Error("daemon command is handled by main");
+  if (command.command === "agy-hook") {
+    const rawStdin =
+      deps.stdin ?? (command.hookEventName === "WakeWaiter" ? "" : await readAllStdin());
+    const output = await runAgyHook(command.hookEventName, rawStdin, {
+      connect: (socketPath, onNotification) => deps.connect(socketPath, onNotification),
+      ...(deps.environment ? { environment: deps.environment } : {}),
+      socketPath: deps.socketPath,
+      ...(deps.stateDir ? { stateDir: deps.stateDir } : {}),
+    });
+    deps.output(JSON.stringify(output));
+    return;
+  }
   const client = await deps.connect(deps.socketPath);
   try {
     const result = await dispatchRpcCommand(command, client);
@@ -162,9 +250,46 @@ export async function runCliCommand(command: CliCommand, deps: RunCliDeps): Prom
 }
 
 async function dispatchRpcCommand(
-  command: Exclude<CliCommand, { command: "daemon" | "help" }>,
+  command: Exclude<CliCommand, { command: "agy-hook" | "daemon" | "help" }>,
   client: RpcClientLike,
 ) {
+  if (command.command === "orchestrator") {
+    const registered = (await client.request("agent.orchestrator.register", {
+      herdrSocketPath: command.herdrSocketPath,
+      paneId: command.paneId,
+      sessionRef: {
+        agent: "agy",
+        kind: "id",
+        source: "herdsman-cli",
+        value: "herdsman-cli",
+      },
+      subscriberId: `cli:${command.paneId}`,
+      subscriberKind: "agy",
+      workspaceId: command.workspaceId,
+    })) as {
+      presence: {
+        herdrSessionName: string;
+        paneId: string;
+        terminalId: string;
+        workspaceId: string;
+      };
+      state: AgentOrchestratorWireState | null;
+    };
+    if (command.action === "status") {
+      return registered;
+    }
+    if (command.action === "on") {
+      if (
+        command.ifUnowned &&
+        registered.state?.owner &&
+        registered.state.owner.terminalId !== registered.presence.terminalId
+      ) {
+        return { ...registered, changed: false };
+      }
+      return client.request("agent.orchestrator.set", { enabled: true });
+    }
+    return client.request("agent.orchestrator.set", { enabled: false });
+  }
   if (command.command === "agent-list") {
     return client.request("agent.list", scopeParams(command));
   }
@@ -195,12 +320,50 @@ function printResult(command: CliCommand, result: unknown, output: (line: string
 }
 
 function formatHumanResult(command: CliCommand, result: unknown): string {
+  if (command.command === "orchestrator") {
+    return formatOrchestratorStatus(
+      result as {
+        presence: {
+          herdrSessionName: string;
+          paneId: string;
+          terminalId: string;
+          workspaceId: string;
+        };
+        state: AgentOrchestratorWireState | null;
+      },
+    );
+  }
   if (command.command === "agent-list")
     return formatAgentList(result as { agents?: AgentListItem[] });
   if (command.command === "agent-get") return formatAgentGet(result as { agent?: AgentGetResult });
   if (command.command === "agent-read")
     return formatAgentRead(result as { agent?: AgentReadResult });
   return JSON.stringify(result);
+}
+
+function formatOrchestratorStatus(result: {
+  presence: {
+    herdrSessionName: string;
+    paneId: string;
+    terminalId: string;
+    workspaceId: string;
+  };
+  state: AgentOrchestratorWireState | null;
+}): string {
+  const scope = `${result.presence.herdrSessionName}/${result.presence.workspaceId}`;
+  const owner = result.state?.owner;
+  if (
+    owner &&
+    owner.terminalId === result.presence.terminalId &&
+    result.state?.herdrSessionName === result.presence.herdrSessionName &&
+    result.state?.workspaceId === result.presence.workspaceId
+  ) {
+    return `Herdsman is watching agent updates · ${scope} · ${owner.paneId}`;
+  }
+  if (owner) {
+    return `Herdsman is off · owned by ${owner.paneId} (${scope})`;
+  }
+  return `Herdsman is off (${scope})`;
 }
 
 function formatAgentList(result: { agents?: AgentListItem[] }): string {
@@ -308,7 +471,13 @@ async function main(): Promise<void> {
     return;
   }
   await runCliCommand(command, {
-    connect: (socketPath) => Promise.resolve(new ObservabilityRpcClient({ socketPath })),
+    connect: (socketPath, onNotification) =>
+      Promise.resolve(
+        new ObservabilityRpcClient({
+          ...(onNotification ? { onNotification } : {}),
+          socketPath,
+        }),
+      ),
     output: (line) => console.log(line),
     socketPath: runtime.paths.socketPath,
   });
@@ -388,6 +557,15 @@ function realpathOrUndefined(path: string | undefined): string | undefined {
   } catch {
     return undefined;
   }
+}
+
+async function readAllStdin(): Promise<string> {
+  if (processStdin.isTTY) return "";
+  const chunks: Buffer[] = [];
+  for await (const chunk of processStdin) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk)));
+  }
+  return Buffer.concat(chunks).toString("utf8");
 }
 
 const modulePath = fileURLToPath(import.meta.url);

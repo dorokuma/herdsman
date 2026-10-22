@@ -97,6 +97,7 @@ type DeliveredBatch = {
 };
 
 type HerdsmanState = {
+  autoClaimAttempted: boolean;
   client: HerdsmanDaemonClient | undefined;
   connected: boolean;
   currentScope: CurrentScope | undefined;
@@ -450,6 +451,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
     const wakeFilter = options.wakeFilter ?? loadWakeFilterConfig();
 
     const state: HerdsmanState = {
+      autoClaimAttempted: false,
       client: undefined,
       connected: false,
       currentScope: undefined,
@@ -2021,10 +2023,32 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           subscriberKind: "pi",
           workspaceId: state.currentScope?.workspaceId ?? launchIdentity.workspaceId,
         })
-        .then((response) => {
+        .then(async (rawResponse) => {
           state.connected = true;
           startKeepalive(client);
-          applyConnectionStateResponse(response as ConnectionStateResponse, ctx, {
+          let response = rawResponse as ConnectionStateResponse;
+          const currentPaneId = state.currentScope?.paneId ?? launchIdentity.paneId;
+          if (
+            process.env.HERDSMAN_AUTO_ON === "1" &&
+            !state.autoClaimAttempted &&
+            isMainOrchestratorPane(currentPaneId) &&
+            !isDispatchedRoleSession(sessionRef.value, process.env)
+          ) {
+            state.autoClaimAttempted = true;
+            if (!isLocalOwner(response) && !response.state?.owner) {
+              try {
+                state.roleMutationInFlight = true;
+                response = (await client.request("agent.orchestrator.set", {
+                  enabled: true,
+                })) as ConnectionStateResponse;
+              } catch {
+                // Ignore race if another terminal claimed the workspace concurrently.
+              } finally {
+                state.roleMutationInFlight = false;
+              }
+            }
+          }
+          applyConnectionStateResponse(response, ctx, {
             notifyReconnectLoss: true,
           });
         })
@@ -2095,6 +2119,7 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
 
     pi.on("session_start", (_event: unknown, ctx: PiContext) => {
       activeContext = ctx;
+      state.autoClaimAttempted = false;
       state.subscriberId = ctx.sessionManager.getSessionId();
       state.sessionRef = {
         agent: "pi",
@@ -2436,6 +2461,17 @@ function herdrLaunchIdentity(environment: NodeJS.ProcessEnv): LaunchIdentity | u
   const workspaceId = stringValue(environment.HERDR_WORKSPACE_ID);
   if (!herdrSocketPath || !paneId || !workspaceId) return undefined;
   return { herdrSocketPath, paneId, workspaceId };
+}
+
+function isMainOrchestratorPane(paneId: string): boolean {
+  return paneId.trim().endsWith(":p1");
+}
+
+function isDispatchedRoleSession(sessionPath: string, environment: NodeJS.ProcessEnv): boolean {
+  if (typeof environment.CTXMODE_ROLE === "string" && environment.CTXMODE_ROLE.trim().length > 0) {
+    return true;
+  }
+  return sessionPath.startsWith("/tmp/herdr-role-sessions/");
 }
 
 

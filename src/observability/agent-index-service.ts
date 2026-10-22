@@ -1885,19 +1885,17 @@ export class AgentIndexService {
       });
       const scopes = new Map<string, AgentScope>();
       const closedTerminalId = stringValue(event.terminal_id) ?? stringValue(event.terminalId);
-      if (closedTerminalId) {
-        for (const agent of retired) {
-          const scope = scopeOf(agent);
+      for (const agent of retired) {
+        const scope = scopeOf(agent);
+        const terminalIdToRelease = closedTerminalId ?? agent.terminalId ?? undefined;
+        if (terminalIdToRelease) {
           const change = this.#stores.agentOrchestratorScopes?.releaseIfOwnerIdentity({
             ...scope,
             paneId,
-            terminalId: closedTerminalId,
+            terminalId: terminalIdToRelease,
           });
           if (change?.changed) addScope(scopes, scope);
         }
-      }
-      for (const agent of retired) {
-        const scope = scopeOf(agent);
         addScope(scopes, scope);
       }
       return {
@@ -2845,8 +2843,29 @@ export class AgentIndexService {
         }
 
         if (!isReadyNonPi(compactHistory)) {
+          const waitStartedAt = Date.now() - TURN_SIGNAL_WAIT_MS;
           for (let attempt = 0; attempt < 8; attempt += 1) {
-            await this.#sleep(500, controller.signal);
+            if (this.#turnCompletions && input.agent.terminalId) {
+              const turnWaitController = new AbortController();
+              const onParentAbort = () => turnWaitController.abort();
+              controller.signal.addEventListener("abort", onParentAbort, { once: true });
+              try {
+                await Promise.race([
+                  this.#sleep(500, controller.signal),
+                  this.#turnCompletions.waitForSignal({
+                    herdrSessionName: input.agent.herdrSessionName,
+                    recordedAfterMs: waitStartedAt,
+                    signal: turnWaitController.signal,
+                    terminalId: input.agent.terminalId,
+                  }),
+                ]);
+              } finally {
+                controller.signal.removeEventListener("abort", onParentAbort);
+                turnWaitController.abort();
+              }
+            } else {
+              await this.#sleep(500, controller.signal);
+            }
             if (
               controller.signal.aborted ||
               this.#stores.agents.isPaneClosed({

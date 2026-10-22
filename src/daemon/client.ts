@@ -6,16 +6,23 @@ type Pending = { reject(error: Error): void; resolve(value: unknown): void };
 type RpcResponse = {
   error?: { code?: string; message?: string; retryable?: boolean };
   id?: number | string;
+  method?: string;
+  params?: unknown;
   result?: unknown;
 };
 
 export class ObservabilityRpcClient {
   readonly #decoder = new JsonLineDecoder();
+  readonly #onNotification: ((method: string, params: unknown) => void) | undefined;
   readonly #pending = new Map<string, Pending>();
   readonly #socket: Socket;
   #nextId = 1;
 
-  constructor(options: { socketPath: string }) {
+  constructor(options: {
+    onNotification?: (method: string, params: unknown) => void;
+    socketPath: string;
+  }) {
+    this.#onNotification = options.onNotification;
     this.#socket = createConnection(options.socketPath);
     this.#socket.on("data", (chunk) => this.#handleData(chunk));
     this.#socket.on("error", (error) => this.#rejectAll(error));
@@ -39,6 +46,9 @@ export class ObservabilityRpcClient {
     for (const message of this.#decoder.push(chunk.toString("utf8"))) {
       const response = message as RpcResponse;
       if (response.id === undefined) {
+        if (response.method && this.#onNotification) {
+          this.#onNotification(response.method, response.params);
+        }
         continue;
       }
       const pending = this.#pending.get(String(response.id));

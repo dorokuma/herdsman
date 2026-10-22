@@ -48,15 +48,26 @@ export const agentEventsInputSchema = Type.Object(
   { additionalProperties: false },
 );
 
-const piPresenceSessionRefSchema = Type.Object(
-  {
-    agent: Type.Literal("pi"),
-    kind: Type.Literal("path"),
-    source: Type.String({ minLength: 1 }),
-    value: Type.String({ minLength: 1 }),
-  },
-  { additionalProperties: false },
-);
+const piPresenceSessionRefSchema = Type.Union([
+  Type.Object(
+    {
+      agent: Type.Literal("pi"),
+      kind: Type.Literal("path"),
+      source: Type.String({ minLength: 1 }),
+      value: Type.String({ minLength: 1 }),
+    },
+    { additionalProperties: false },
+  ),
+  Type.Object(
+    {
+      agent: Type.Literal("agy"),
+      kind: Type.Union([Type.Literal("id"), Type.Literal("path")]),
+      source: Type.String({ minLength: 1 }),
+      value: Type.String({ minLength: 1 }),
+    },
+    { additionalProperties: false },
+  ),
+]);
 
 export const agentOrchestratorRegisterInputSchema = Type.Object(
   {
@@ -64,7 +75,7 @@ export const agentOrchestratorRegisterInputSchema = Type.Object(
     paneId: Type.String({ minLength: 1 }),
     sessionRef: piPresenceSessionRefSchema,
     subscriberId: Type.String({ minLength: 1 }),
-    subscriberKind: Type.Literal("pi"),
+    subscriberKind: Type.Union([Type.Literal("pi"), Type.Literal("agy")]),
     workspaceId: Type.String({ minLength: 1 }),
   },
   { additionalProperties: false },

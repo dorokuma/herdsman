@@ -18,6 +18,19 @@ herdsman daemon status
 
 If the JSON response has `state: "stopped"`, the daemon is not running. Herdsman has no CLI start/stop command. On a production host the daemon is managed by the systemd unit `herdsman.service` and is meant to stay running (`systemctl restart herdsman.service`); for a development or throwaway environment, run the daemon entrypoint in the foreground with an explicit temporary data directory (`HERDSMAN_HOME=/tmp/<name> node <package>/dist/src/cli/herdsman-daemon.js`) instead of the production one. Do not stop or restart a daemon that is already running unless the user asks.
 
+## Workspace orchestrator ownership (`on` / `off` / `status`)
+
+Inside a Herdr pane (`HERDR_ENV=1`, `HERDR_SOCKET_PATH`, `HERDR_PANE_ID`, `HERDR_WORKSPACE_ID`), you can inspect or toggle whether the current terminal is the active Herdsman orchestrator owner for its workspace:
+
+```bash
+herdsman status
+herdsman on
+herdsman on --if-unowned
+herdsman off
+```
+
+When `HERDSMAN_AUTO_ON=1` is set on main-agent startup (`pi` or `agy`), the session automatically claims workspace ownership if the workspace does not already have an active owner.
+
 ## Select the scope
 
 Use the current workspace only when both `HERDR_ENV=1` and `HERDR_WORKSPACE_ID` are set:
