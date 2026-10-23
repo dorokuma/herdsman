@@ -1,5 +1,19 @@
 ## [Unreleased]
 
+## 0.15.0
+
+- agy 编排者支持与独立 WakeWaiter（`src/agy/hook.ts`、`src/daemon/service.ts`，`acb3acd`）：为 agy 运行环境增加编排者集成与分离式唤醒等待机制。
+- agy plan 模式等待历史收敛与投递修复（`src/observability/agent-index-service.ts`、`src/observability/contracts.ts`、`src/db/status-event-plans.ts`、`src/db/agent-events.ts`、`src/agent-history/antigravity-proto.ts`、`src/agent-history/antigravity-reader.ts`、`packages/herdsman-pi/src/wake.ts`，`d988344`）：
+  - 新增 `PLAN_STALLED` 收敛原因，使计划停滞判死可观测与可上报；
+  - working 期间等待历史豁免与周期 drain 对齐，防止执行中被提前判死；
+  - pi 与 agy 两端投影器门控统一；
+  - 孤儿与 interactive 事件投递修复；
+  - discarded 推送判据在三条执行路径统一收敛；
+  - 会话元数据时间戳解码修复，以及 WakeWaiter 重试容错。
+- 测试：测试用例由 892 增至 903（`test/integration/agent-index-service.test.ts`、`test/unit/agy-hook-and-cli.test.ts`、`test/unit/antigravity-reader.test.ts`、`test/unit/herdsman-pi-wake.test.ts`）。
+- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.15.0；`README.md` 与 `packages/herdsman-herdr-plugin/README.md` 的 Herdr 安装 tag 同步至 `v0.15.0`。
+- 范围：本版本包含 `v0.14.9` 之后的全部内容——`acb3acd`（agy 编排者支持与 WakeWaiter）及合并提交中引入的 `d988344`（agy plan 模式等待历史误判修复与配套测试）；`src/**` 与 `packages/herdsman-pi/src/**` 均有改动，`packages/herdsman-herdr-plugin` 无源码改动；无 schema 变更、无迁移。
+
 ## 0.14.9
 
 - 唤醒投递水位屏障只由服务端 cursor 收割与服务端状态优先合并（`packages/herdsman-pi/src/index.ts`、`packages/herdsman-pi/src/daemon-client.ts`，`473c37c`，合并 `3387afb`）：`syncPendingEventsFromServer` 改为仅依据调用方显式传入的 `serverAckedEventId`（`response.state?.ackedEventId ?? response.ackedEventId ?? 0`，缺省 `0` 为 fail-closed）判定未出现在当页的本地水位屏障是否已由服务端结算（`settledByServer = previousId <= serverAckedEventId`），不再将页内事件的 `status`（`pending` / `delivered` / `failed`）或本地缓存的陈旧 `acked` / `failed` 状态当作屏障回收依据；`applyConnectionStateResponse` 恢复顺序调整为先以同一服务端游标执行 `pruneAcknowledgedEvents`、再调用 `syncPendingEventsFromServer`，避免同轮已被水位裁剪的屏障在同步时被重新保留；服务端事件合并改为服务端字段优先（`{ ...previous, ...event }` / `{ ...previous, ...serverEvent }`），本地快照仅补齐页内省略的键；满页截断判定固定为 `serverEvents.length >= 100`，页长恰好为 100 时保守保留高于 `maxServerEventId` 的本地事件 id；`daemon-client.ts` 的 `AgentEventWireRecord` 补充可选字段 `paneGeneration?: string | null` 与 `status?: "pending" | "delivered" | "acked" | "invalidated" | "failed"`，与服务端 `mapAgentEvent` 下发结构对齐。留痕 `.agents/notes/2026-10-18-wake-delivery-watermark-fixes.md` 并更新 `.agents/notes/wake-delivery-r4f1-remaining-risks.md` 等关联笔记。
