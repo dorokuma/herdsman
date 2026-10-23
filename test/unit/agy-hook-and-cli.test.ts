@@ -1,15 +1,21 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { createAgentHistoryService } from "@/agent-history/service.js";
-import { runAgyHook } from "@/agy/hook.js";
+import { isPeerActiveOrSettling, runAgyHook } from "@/agy/hook.js";
 import { parseCliArgs, runCliCommand } from "@/cli/herdsman.js";
 import { ObservabilityRpcServer } from "@/daemon/observability-server.js";
+import { isDeliverableAgentEvent } from "@/db/agent-events.js";
 import { AgentContextService } from "@/observability/agent-context-service.js";
 import { AgentIndexService } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
-import type { AgentEventRecord } from "@/observability/contracts.js";
+import {
+  type AgentEventRecord,
+  type AgentListItem,
+  PLAN_STALLED,
+  PLAN_WAITING_HISTORY,
+} from "@/observability/contracts.js";
 import {
   cleanupTempDirs,
   openObservabilityDbHarness,
@@ -915,6 +921,661 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
     } finally {
       warnSpy.mockRestore();
       vi.useRealTimers();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("Stop detects unsettled peer turn and WakeWaiter stays alive across settleGraceMs to wake main pane when selfAgentStatus is done", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-22T12:00:00.000Z"));
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-settle-done-"));
+    const sessionId = "77777777-2222-3333-4444-555555555555";
+    let pendingEvents: AgentEventRecord[] = [];
+    let pushNotification: ((method: string, params: unknown) => void) | undefined;
+    const spawnedWaiters: Array<{ waiterEpoch: number }> = [];
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    let peerLastAssistantMessage: { ref: string; text: string; timestamp: string | null } | null =
+      null;
+
+    const connect = async (
+      _socketPath: string,
+      onNotification?: (method: string, params: unknown) => void,
+    ) => {
+      if (onNotification) pushNotification = onNotification;
+      return {
+        close: () => undefined,
+        request: async (method: string) => {
+          if (method === "agent.list") {
+            return {
+              agents: [
+                {
+                  agent: "agy",
+                  agentStatus: "done",
+                  firstSeenAt: "2026-10-22T11:50:00.000Z",
+                  herdrSessionName: "default",
+                  history: {
+                    lastAssistantMessage: {
+                      ref: "self-asst-1",
+                      text: "Dispatched subagent.",
+                      timestamp: null,
+                    },
+                    lastUserMessage: {
+                      ref: "self-user-1",
+                      text: "Dispatch subagent.",
+                      timestamp: null,
+                    },
+                    source: "antigravity-sqlite",
+                    updatedAt: null,
+                  },
+                  id: "ag_self",
+                  paneId: "wB:p1",
+                  terminalId: "term_self",
+                  workspaceId: "wB",
+                },
+                {
+                  agent: "agy",
+                  agentStatus: "done",
+                  firstSeenAt: "2026-10-22T11:55:00.000Z",
+                  herdrSessionName: "default",
+                  history: {
+                    lastAssistantMessage: peerLastAssistantMessage,
+                    lastUserMessage: {
+                      ref: "peer-user-1",
+                      text: "Verify the implementation",
+                      timestamp: "2026-10-22T11:59:30.000Z",
+                    },
+                    source: "antigravity-sqlite",
+                    updatedAt: null,
+                  },
+                  id: "ag_peer",
+                  paneId: "wB:p2",
+                  terminalId: "term_peer",
+                  workspaceId: "wB",
+                },
+              ],
+            };
+          }
+          return {
+            events: pendingEvents,
+            presence: {
+              herdrSessionName: "default",
+              paneId: "wB:p1",
+              subscriberId: `agy:${sessionId}`,
+              terminalId: "term_self",
+              workspaceId: "wB",
+            },
+            state: {
+              ackedEventId: 0,
+              herdrSessionName: "default",
+              owner: { paneId: "wB:p1", terminalId: "term_self" },
+              updatedAt: "2026-10-22T12:00:00.000Z",
+              workspaceId: "wB",
+            },
+          };
+        },
+      };
+    };
+
+    try {
+      // 1. Peer is already "done" and older than newAgentGraceMs (5m > 15s), but lastAssistantMessage is null while lastUserMessage exists.
+      // Stop recognizes the unsettled turn, marks awaitingNextTurn, and spawns WakeWaiter.
+      await runAgyHook("Stop", JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }), {
+        connect,
+        environment: HERDR_ENV,
+        socketPath: "/tmp/herdsman.sock",
+        spawnWakeWaiter: (input) => {
+          spawnedWaiters.push({ waiterEpoch: input.waiterEpoch });
+          return { pid: process.pid };
+        },
+        stateDir: dir,
+      });
+      expect(spawnedWaiters).toEqual([{ waiterEpoch: 1 }]);
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"))).toMatchObject({
+        awaitingNextTurn: true,
+        turnEpoch: 1,
+        waiterEpoch: 1,
+        waiterPid: process.pid,
+      });
+
+      // 2. Peer assistant response flushes to SQLite (timestamp: null), so hasActivePeers becomes false before daemon emits agent.done.
+      // WakeWaiter stays alive during settleGraceMs and wakes main pane (even though selfAgentStatus === "done") once agent.event arrives.
+      peerLastAssistantMessage = {
+        ref: "peer-asst-1",
+        text: "All checks green.",
+        timestamp: null,
+      };
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 100,
+        settleGraceMs: 500,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await vi.advanceTimersByTimeAsync(150);
+      expect(wakePrompts).toEqual([]);
+      pendingEvents = [makeDoneEvent(50, "All checks green.")];
+      pushNotification?.("agent.event", { event: pendingEvents[0] });
+      await vi.advanceTimersByTimeAsync(20);
+
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+
+      // 3. Next turn PreInvocation with invocationNum > 1 still advances turnEpoch because awaitingNextTurn was set by Stop.
+      const preOut = await runAgyHook(
+        "PreInvocation",
+        JSON.stringify({ invocationNum: 4, sessionId }),
+        { connect, environment: HERDR_ENV, socketPath: "/tmp/herdsman.sock", stateDir: dir },
+      );
+      expect(preOut.injectSteps?.[0]?.ephemeralMessage).toContain("All checks green.");
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"))).toMatchObject({
+        turnEpoch: 2,
+      });
+
+      // 4. When settleGraceMs expires with no events, WakeWaiter clears waiterPid and exits cleanly.
+      pendingEvents = [];
+      writeFileSync(
+        join(dir, `${sessionId}.json`),
+        JSON.stringify({ turnEpoch: 2, waiterEpoch: 2, waiterPid: process.pid }),
+      );
+      const expiringWaiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "2",
+        },
+        pollIntervalMs: 100,
+        settleGraceMs: 300,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await vi.advanceTimersByTimeAsync(350);
+      expect(await expiringWaiterPromise).toEqual({});
+      expect(wakePrompts).toHaveLength(1);
+      const stateAfterExpire = JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"));
+      expect(stateAfterExpire.waiterPid).toBeUndefined();
+    } finally {
+      vi.useRealTimers();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("resets settleDeadline without 0ms busy-loop when selfAgentStatus becomes working, cleans waiterPid on timeout/error, and validates peer/subagent/orphan-event edge cases", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-10-22T12:00:00.000Z"));
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-f1-regression-"));
+    const sessionId = "88888888-2222-3333-4444-555555555555";
+    let selfStatus: "done" | "working" = "done";
+    let agentListCalls = 0;
+    let failNextList = false;
+
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string) => {
+        if (method === "agent.list") {
+          agentListCalls += 1;
+          if (failNextList) {
+            failNextList = false;
+            throw new Error("transient daemon busy");
+          }
+          return {
+            agents: [
+              {
+                agent: "agy",
+                agentStatus: selfStatus,
+                firstSeenAt: "2026-10-22T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_self",
+                paneId: "wB:p1",
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              {
+                agent: "pi",
+                agentStatus: "done",
+                firstSeenAt: "2026-10-22T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_peer",
+                paneId: "wB:p2",
+                terminalId: "term_peer",
+                workspaceId: "wB",
+              },
+            ],
+          };
+        }
+        return {
+          events: [],
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId: 0,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-22T12:00:00.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    try {
+      // 1. F1 regression + transient RPC retry + finally waiterPid cleanup on timeout
+      writeFileSync(
+        join(dir, `${sessionId}.json`),
+        JSON.stringify({ turnEpoch: 1, waiterEpoch: 1, waiterPid: process.pid }),
+      );
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 100,
+        settleGraceMs: 200,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        waitTimeoutMs: 550,
+      });
+
+      // First tick arms settleDeadline = t + 200ms while selfStatus === "done".
+      await vi.advanceTimersByTimeAsync(50);
+      expect(agentListCalls).toBe(1);
+
+      // Before settleDeadline expires, selfStatus becomes "working" and one transient RPC error occurs.
+      selfStatus = "working";
+      failNextList = true;
+      await vi.advanceTimersByTimeAsync(300);
+      expect(warnSpy).toHaveBeenCalledWith(
+        expect.stringContaining("Herdsman agy WakeWaiter transient RPC error (attempt 1/3)"),
+      );
+      // Must NOT spin in a 0ms busy-loop after passing the original 200ms settleDeadline.
+      expect(agentListCalls).toBeLessThanOrEqual(6);
+
+      await vi.advanceTimersByTimeAsync(300);
+      expect(await waiterPromise).toEqual({});
+      const stateAfterTimeout = JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"));
+      expect(stateAfterTimeout.waiterPid).toBeUndefined();
+
+      // 2. Subagent (CTXMODE_ROLE) receiving USER_CANCELED in Stop must not write session state.
+      const subSessionId = "subagent-user-canceled";
+      await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId: subSessionId, terminationReason: "USER_CANCELED" }),
+        {
+          connect,
+          environment: { ...HERDR_ENV, CTXMODE_ROLE: "worker" },
+          socketPath: "/tmp/herdsman.sock",
+          stateDir: dir,
+        },
+      );
+      expect(existsSync(join(dir, `${subSessionId}.json`))).toBe(false);
+
+      // 3. isPeerActiveOrSettling checks userMs > assistantMs, ref step fallback on null timestamps, and stopReason: "toolUse".
+      const nowMs = Date.parse("2026-10-22T12:00:00.000Z");
+      const basePeer = {
+        agent: "agy",
+        agentSession: null,
+        agentStatus: "done",
+        cwd: "/repo",
+        firstSeenAt: new Date("2026-10-22T11:55:00.000Z"),
+        focused: false,
+        foregroundCwd: "/repo",
+        herdrSessionName: "default",
+        id: "ag_peer",
+        lastSeenAt: new Date("2026-10-22T12:00:00.000Z"),
+        name: "worker",
+        paneId: "wB:p2",
+        paneRevision: 1,
+        tabId: "wB:t1",
+        terminalId: "term_peer",
+        workspaceId: "wB",
+      } satisfies Omit<AgentListItem, "history">;
+
+      expect(
+        isPeerActiveOrSettling(
+          {
+            ...basePeer,
+            history: {
+              lastAssistantMessage: {
+                ref: "conv.db:3:0",
+                text: "old",
+                timestamp: "2026-10-22T11:58:00.000Z",
+              },
+              lastUserMessage: {
+                ref: "conv.db:4:0",
+                text: "new",
+                timestamp: "2026-10-22T11:59:00.000Z",
+              },
+              source: "antigravity-sqlite",
+              updatedAt: null,
+            },
+          },
+          nowMs,
+          15_000,
+          12_000,
+        ),
+      ).toBe(true);
+
+      expect(
+        isPeerActiveOrSettling(
+          {
+            ...basePeer,
+            history: {
+              lastAssistantMessage: { ref: "conv.db:3:0", text: "old", timestamp: null },
+              lastUserMessage: { ref: "conv.db:5:0", text: "new", timestamp: null },
+              source: "antigravity-sqlite",
+              updatedAt: null,
+            },
+          },
+          nowMs,
+          15_000,
+          12_000,
+        ),
+      ).toBe(true);
+
+      expect(
+        isPeerActiveOrSettling(
+          {
+            ...basePeer,
+            history: {
+              lastAssistantMessage: {
+                ref: "conv.db:5:0",
+                stopReason: "toolUse",
+                text: "calling tool",
+                timestamp: null,
+              },
+              lastUserMessage: { ref: "conv.db:5:0", text: "new", timestamp: null },
+              source: "pi-jsonl",
+              updatedAt: null,
+            },
+          },
+          nowMs,
+          15_000,
+          12_000,
+        ),
+      ).toBe(true);
+
+      // 4. isDeliverableAgentEvent allows orphan deliverable agent.done in both pending and delivered states.
+      const orphanDone: AgentEventRecord = {
+        ...makeDoneEvent(77, "Completed before pane closed."),
+        agentId: null,
+        deliverable: 1,
+        deliveredToTerminalId: "term_self",
+        status: "pending",
+      };
+      const scope = { herdrSessionName: "default", workspaceId: "wB" };
+      expect(isDeliverableAgentEvent(orphanDone, undefined, scope, "term_self")).toBe(true);
+      expect(
+        isDeliverableAgentEvent(
+          { ...orphanDone, status: "delivered" },
+          undefined,
+          scope,
+          "term_self",
+        ),
+      ).toBe(true);
+      expect(
+        isDeliverableAgentEvent(
+          { ...orphanDone, deliverable: 0, status: "invalidated" },
+          undefined,
+          scope,
+          "term_self",
+        ),
+      ).toBe(false);
+
+      // 5. In plan mode, intermediate PLAN_WAITING_HISTORY is suppressed, while genuine failure is surfaced.
+      const testEvents: AgentEventRecord[] = [
+        {
+          ...makeDoneEvent(88, "", "term_peer"),
+          type: "agent.failed",
+          payload: {
+            agent: "agy",
+            reason: PLAN_WAITING_HISTORY,
+          },
+        },
+        {
+          ...makeDoneEvent(89, "", "term_peer"),
+          type: "agent.failed",
+          payload: {
+            agent: "agy",
+            reason: "typecheck failed: 2 errors",
+          },
+        },
+      ];
+      const planConn = async () => ({
+        close: () => undefined,
+        request: async (method: string) => {
+          if (method === "agent.notifications.ack") return {};
+          return {
+            events: testEvents,
+            presence: {
+              herdrSessionName: "default",
+              paneId: "wB:p1",
+              subscriberId: `agy:${sessionId}`,
+              terminalId: "term_self",
+              workspaceId: "wB",
+            },
+            state: {
+              ackedEventId: 0,
+              herdrSessionName: "default",
+              owner: { paneId: "wB:p1", terminalId: "term_self" },
+              updatedAt: "2026-10-22T12:00:00.000Z",
+              workspaceId: "wB",
+            },
+          };
+        },
+      });
+
+      const planPreOut = await runAgyHook(
+        "PreInvocation",
+        JSON.stringify({ invocationNum: 1, sessionId }),
+        {
+          connect: planConn,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          stateDir: dir,
+        },
+      );
+      const injected = planPreOut.injectSteps?.[0]?.ephemeralMessage ?? "";
+      expect(injected).not.toContain("PLAN_WAITING_HISTORY");
+      expect(injected).toContain("typecheck failed: 2 errors");
+    } finally {
+      warnSpy.mockRestore();
+      vi.useRealTimers();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("suppresses agent.discarded with PLAN_WAITING_HISTORY from failed notification while retaining real agent.failed and non-waiting discarded", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-discard-"));
+    const sessionId = "sess_discard_test";
+    const testEvents: AgentEventRecord[] = [
+      {
+        ...makeDoneEvent(101, "", "term_peer"),
+        type: "agent.discarded",
+        payload: {
+          agent: "agy",
+          reason: PLAN_WAITING_HISTORY,
+        },
+      },
+      {
+        ...makeDoneEvent(102, "", "term_peer"),
+        type: "agent.failed",
+        payload: {
+          agent: "agy",
+          reason: "syntax error: unexpected token",
+        },
+      },
+      {
+        ...makeDoneEvent(103, "", "term_peer"),
+        type: "agent.discarded",
+        payload: {
+          agent: "agy",
+          reason: "user_aborted_operation",
+        },
+      },
+    ];
+
+    try {
+      const conn = async () => ({
+        close: () => undefined,
+        request: async (method: string) => {
+          if (method === "agent.notifications.ack") return {};
+          return {
+            events: testEvents,
+            presence: {
+              herdrSessionName: "default",
+              paneId: "wB:p1",
+              subscriberId: `agy:${sessionId}`,
+              terminalId: "term_self",
+              workspaceId: "wB",
+            },
+            state: {
+              ackedEventId: 0,
+              herdrSessionName: "default",
+              owner: { paneId: "wB:p1", terminalId: "term_self" },
+              updatedAt: "2026-10-22T12:00:00.000Z",
+              workspaceId: "wB",
+            },
+          };
+        },
+      });
+
+      const out = await runAgyHook(
+        "PreInvocation",
+        JSON.stringify({ invocationNum: 1, sessionId }),
+        {
+          connect: conn,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          stateDir: dir,
+        },
+      );
+      const injected = out.injectSteps?.[0]?.ephemeralMessage ?? "";
+      expect(injected).not.toContain("PLAN_WAITING_HISTORY");
+      expect(injected).toContain("syntax error: unexpected token");
+      expect(injected).toContain("user_aborted_operation");
+      expect(injected).toMatch(/- failed \S+ \S+\s+reason: syntax error: unexpected token/);
+      expect(injected).toMatch(/- failed \S+ \S+\s+reason: user_aborted_operation/);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("Fix A & Fix B: agy hook outcomeKind wakes on PLAN_STALLED and pi agent PLAN_WAITING_HISTORY, while agy or empty agent with PLAN_WAITING_HISTORY is exempted", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-fix-ab-"));
+    const sessionId = "sess_fix_ab_test";
+    const testEvents: AgentEventRecord[] = [
+      {
+        ...makeDoneEvent(201, "", "term_peer1"),
+        type: "agent.discarded",
+        payload: {
+          agent: "agy",
+          reason: PLAN_STALLED,
+        },
+      },
+      {
+        ...makeDoneEvent(202, "", "term_peer2"),
+        type: "agent.discarded",
+        payload: {
+          agent: "pi",
+          reason: PLAN_WAITING_HISTORY,
+        },
+      },
+      {
+        ...makeDoneEvent(203, "", "term_peer3"),
+        type: "agent.discarded",
+        payload: {
+          agent: "agy",
+          reason: PLAN_WAITING_HISTORY,
+        },
+      },
+      {
+        ...makeDoneEvent(204, "", "term_peer4"),
+        type: "agent.discarded",
+        payload: {
+          reason: PLAN_WAITING_HISTORY,
+        },
+      },
+      {
+        ...makeDoneEvent(205, "", "term_peer5"),
+        type: "agent.discarded",
+        payload: {
+          agent: null,
+          reason: PLAN_WAITING_HISTORY,
+        },
+      },
+    ];
+
+    try {
+      const conn = async () => ({
+        close: () => undefined,
+        request: async (method: string) => {
+          if (method === "agent.notifications.ack") return {};
+          return {
+            events: testEvents,
+            presence: {
+              herdrSessionName: "default",
+              paneId: "wB:p1",
+              subscriberId: `agy:${sessionId}`,
+              terminalId: "term_self",
+              workspaceId: "wB",
+            },
+            state: {
+              ackedEventId: 0,
+              herdrSessionName: "default",
+              owner: { paneId: "wB:p1", terminalId: "term_self" },
+              updatedAt: "2026-10-22T12:00:00.000Z",
+              workspaceId: "wB",
+            },
+          };
+        },
+      });
+
+      const out = await runAgyHook(
+        "PreInvocation",
+        JSON.stringify({ invocationNum: 1, sessionId }),
+        {
+          connect: conn,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          stateDir: dir,
+        },
+      );
+      const injected = out.injectSteps?.[0]?.ephemeralMessage ?? "";
+      // PLAN_STALLED must be injected as failed
+      expect(injected).toContain("reason: PLAN_STALLED");
+      // pi agent with PLAN_WAITING_HISTORY must be injected as failed
+      expect(injected).toContain("reason: PLAN_WAITING_HISTORY");
+      // Events 203, 204, 205 (agy or empty/null with PLAN_WAITING_HISTORY) must NOT be present
+      expect(injected).not.toContain("event: 203");
+      expect(injected).not.toContain("event: 204");
+      expect(injected).not.toContain("event: 205");
+    } finally {
       rmSync(dir, { force: true, recursive: true });
     }
   });

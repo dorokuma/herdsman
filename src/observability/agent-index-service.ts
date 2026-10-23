@@ -36,6 +36,7 @@ import {
 } from "@/observability/contracts.js";
 import type { TurnCompletionRegistry } from "@/observability/turn-completion.js";
 import { TURN_SIGNAL_WAIT_MS } from "@/observability/turn-completion.js";
+import { isInteractivePiAgent } from "./interactive-pi.js";
 
 export function historyHasAdvanced(
   current: CompactAgentHistory,
@@ -139,6 +140,8 @@ export { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
  * That is the accepted cost of bounding the scan instead of walking every row.
  */
 export const STALE_DUPLICATE_GUARD_SCAN_LIMIT = 500;
+export const WORKING_PLAN_MAX_STALL_ATTEMPTS = 18;
+export const WORKING_PLAN_MAX_WAIT_MS = 30 * 60 * 1000;
 
 export class PlanWaitingHistoryError extends Error {
   constructor() {
@@ -245,7 +248,12 @@ export class AgentIndexService {
   readonly #sleep: (ms: number, signal?: AbortSignal) => Promise<void>;
   readonly #turnCompletions: TurnCompletionRegistry | undefined;
   readonly #waitingHistoryTimers = new Map<number, unknown>();
+  readonly #planProgressTrackers = new Map<
+    number,
+    { firstSeenAt: number; lastProgressFingerprint: string; stallAttempts: number }
+  >();
   readonly #now: () => number;
+  readonly #maxWorkingPlanWaitMs: number;
   readonly #onAgentEvent?: (event: AgentEventRecord) => void;
 
   constructor(options: {
@@ -255,6 +263,7 @@ export class AgentIndexService {
     }) => Pick<HerdrSocketClient, "close" | "sessionSnapshot">;
     context?: AgentContextService;
     history?: AgentHistoryService;
+    maxWorkingPlanWaitMs?: number;
     now?: () => number;
     scheduleRetry?: (callback: () => void, delayMs: number) => unknown;
     /**
@@ -276,6 +285,7 @@ export class AgentIndexService {
     this.#shutdownSignal = options.shutdownSignal;
     this.#shutdownSignal?.addEventListener("abort", () => this.abortPendingWaits(), { once: true });
     this.#now = options.now ?? (() => Date.now());
+    this.#maxWorkingPlanWaitMs = options.maxWorkingPlanWaitMs ?? WORKING_PLAN_MAX_WAIT_MS;
     this.#stores = options.stores;
     this.#turnCompletions = options.turnCompletions;
     this.#onAgentEvent = options.onAgentEvent ?? (() => {});
@@ -372,6 +382,11 @@ export class AgentIndexService {
       this.#clearRetry(timer);
     }
     this.#waitingHistoryTimers.clear();
+    this.#planProgressTrackers.clear();
+  }
+
+  hasPlanProgressTracker(planId: number): boolean {
+    return this.#planProgressTrackers.has(planId);
   }
 
   /**
@@ -395,16 +410,116 @@ export class AgentIndexService {
     await Promise.allSettled(tails);
   }
 
-  #clearWaitingTimer(planId: number): void {
+  #clearWaitingTimer(planId: number, options?: { keepTracker?: boolean }): void {
     const existing = this.#waitingHistoryTimers.get(planId);
     if (existing !== undefined) {
       this.#clearRetry(existing);
       this.#waitingHistoryTimers.delete(planId);
     }
+    if (!options?.keepTracker) {
+      this.#planProgressTrackers.delete(planId);
+    }
+  }
+
+  #findLiveAgent(agent: {
+    id: string;
+    herdrSessionName: string;
+    paneId: string;
+    paneGeneration?: string | null;
+  }): AgentIndexRecord | undefined {
+    if (
+      this.#stores.agents.isPaneClosed({
+        herdrSessionName: agent.herdrSessionName,
+        paneId: agent.paneId,
+        paneGeneration: agent.paneGeneration ?? null,
+      })
+    ) {
+      return undefined;
+    }
+    const byPane = this.#stores.agents.findByPane({
+      herdrSessionName: agent.herdrSessionName,
+      paneId: agent.paneId,
+      paneGeneration: agent.paneGeneration ?? null,
+    });
+    if (byPane) return byPane;
+    try {
+      return this.#stores.agents.get(agent.id);
+    } catch {
+      return undefined;
+    }
+  }
+
+  #computeProgressFingerprint(
+    liveAgent: AgentIndexRecord | undefined,
+    compactHistory: CompactAgentHistory | undefined,
+  ): string {
+    if (!compactHistory && !liveAgent) return "";
+    return [
+      compactHistory?.updatedAt ?? "",
+      compactHistory?.messageCount ?? 0,
+      compactHistory?.lastToolResult?.ref ?? "",
+      compactHistory?.lastToolResult?.text?.length ?? 0,
+      compactHistory?.lastAssistantMessage?.ref ?? "",
+      compactHistory?.lastAssistantMessage?.text ?? "",
+      liveAgent?.paneRevision ?? "",
+    ].join("|");
+  }
+
+  #markPlanRetry(
+    planId: number,
+    plan: StatusEventPlan,
+    error: unknown,
+    compactHistory?: CompactAgentHistory,
+    options?: { allowWorkingExemption?: boolean; isDrain?: boolean },
+  ): StatusEventPlanRecord | null {
+    const store = this.#stores.statusEventPlans;
+    if (!store) return null;
+    const isDrain = options?.isDrain ?? false;
+    const allowWorkingExemption = !isDrain || (options?.allowWorkingExemption ?? false);
+    const liveAgent = this.#findLiveAgent(plan.agent);
+    const isAgy =
+      plan.agent.agent === "agy" ||
+      liveAgent?.agent === "agy" ||
+      compactHistory?.source === "antigravity-sqlite";
+    const isTargetWorking = allowWorkingExemption && isAgy && liveAgent?.agentStatus === "working";
+    let stallDetected = false;
+    if (isTargetWorking) {
+      const currentFingerprint = this.#computeProgressFingerprint(liveAgent, compactHistory);
+      let tracker = this.#planProgressTrackers.get(planId);
+      if (!tracker) {
+        tracker = {
+          firstSeenAt: this.#now(),
+          lastProgressFingerprint: currentFingerprint,
+          stallAttempts: 0,
+        };
+        this.#planProgressTrackers.set(planId, tracker);
+      } else if (tracker.lastProgressFingerprint !== currentFingerprint) {
+        tracker.lastProgressFingerprint = currentFingerprint;
+        tracker.stallAttempts = 0;
+      } else {
+        tracker.stallAttempts += 1;
+      }
+      const attemptsStalled = tracker.stallAttempts >= WORKING_PLAN_MAX_STALL_ATTEMPTS;
+      const timeStalled = this.#now() - tracker.firstSeenAt >= this.#maxWorkingPlanWaitMs;
+      stallDetected = attemptsStalled || timeStalled;
+    } else {
+      this.#planProgressTrackers.delete(planId);
+    }
+    const updated = store.markRetry(planId, error, { isTargetWorking, stallDetected });
+    if (
+      updated &&
+      (updated.status === "completed" ||
+        updated.status === "cancelled" ||
+        updated.status === "failed" ||
+        updated.status === "discarded")
+    ) {
+      this.#planProgressTrackers.delete(planId);
+    }
+    return updated;
   }
 
   #scheduleWaitingHistoryRetry(planId: number, plan: StatusEventPlan): void {
-    this.#clearWaitingTimer(planId);
+    this.#clearWaitingTimer(planId, { keepTracker: true });
     const timer = this.#scheduleRetry(async () => {
       try {
         const store = this.#stores.statusEventPlans;
@@ -479,7 +594,12 @@ export class AgentIndexService {
         currentPlan.lastError === DEGRADED_PLAN_ERROR
           ? new Error(DEGRADED_PLAN_ERROR)
           : new PlanWaitingHistoryError();
-      const updated = store.markRetry(planId, retryError);
+      // Design invariant: retryWaitingPlanRow executes as part of the live runtime
+      // retry ring when the daemon is running normally and agent data is fresh.
+      // Unlike startup drain (which does not exempt because on-disk agent records
+      // might be stale), the live retry ring always maintains working exemption
+      // (options omitted => allowWorkingExemption defaults to true).
+      const updated = this.#markPlanRetry(planId, plan, retryError, plan.compactHistory);
       if (!updated) {
         this.#clearWaitingTimer(planId);
         return;
@@ -498,7 +618,7 @@ export class AgentIndexService {
           to: plan.to,
           herdrSessionName: plan.agent.herdrSessionName,
         });
-        this.#appendPlanDiscardedEvent({
+        const discardedEvent = this.#appendPlanDiscardedEvent({
           agent: plan.agent,
           attempts: updated.attempts,
           compactHistory: plan.compactHistory,
@@ -508,6 +628,9 @@ export class AgentIndexService {
           reason: updated.lastError,
           to: plan.to,
         });
+        if (discardedEvent && VALID_AGENT_EVENT_TYPES.has(discardedEvent.type)) {
+          this.#onAgentEvent?.(discardedEvent);
+        }
       } else if (updated.status === "failed") {
         this.#clearWaitingTimer(planId);
         console.warn("Herdsman status event plan failed after max attempts", {
@@ -578,14 +701,20 @@ export class AgentIndexService {
     return result;
   }
 
-  async drainPendingPlans(): Promise<void> {
+  async drainPendingPlans(options?: {
+    allowWorkingExemption?: boolean;
+    reason?: "startup" | "periodic" | "shutdown";
+  }): Promise<void> {
     const store = this.#stores.statusEventPlans;
     if (!store) return;
     store.resetRunningToPending();
     const rows = store.listUnfinished();
+    const allowWorkingExemption = options?.allowWorkingExemption ?? options?.reason === "periodic";
     const tasks = rows.map((row) => {
       try {
-        return this.#enqueueAgentPlan(row.agentId, () => this.#drainPlanRow(row));
+        return this.#enqueueAgentPlan(row.agentId, () =>
+          this.#drainPlanRow(row, { allowWorkingExemption, isDrain: true }),
+        );
       } catch (_error) {
         // A row whose agent cannot even be resolved must never take down the
         // daemon boot drain (that failure mode used to boot-loop systemd). Its
@@ -969,9 +1098,10 @@ export class AgentIndexService {
     // Same orphan construction H1 uses for plan outcomes: resolve the pane's own
     // metadata from its event history, keep `agent_id = null` when the `agents`
     // row is gone, and leave the original id / pane / session in the payload. The
-    // row is written as an orphan terminal event (`agent.failed`), which is the
-    // one shape the delivery gate still lets through without a live agent row;
-    // an orphan `agent.done` would be written and then never delivered.
+    // row is written as an orphan terminal event (`agent.failed`). Note that while
+    // the delivery gate now also admits orphan completion events (`isOrphanOutcome`),
+    // unrecoverable missing-agent plan outcomes without explicit success remain routed
+    // through `agent.failed` to surface the anomaly.
     const orphanAgent: AgentIndexRecord = {
       agent: null,
       agentSession: null,
@@ -1075,6 +1205,7 @@ export class AgentIndexService {
     store: StatusEventPlanStore,
     row: StatusEventPlanRecord,
   ): AgentEventRecord | null {
+    this.#planProgressTrackers.delete(row.id);
     let salvaged: AgentEventRecord | null = null;
     try {
       salvaged = this.#salvageOrphanTerminalEvent(row);
@@ -1125,7 +1256,10 @@ export class AgentIndexService {
     }
   }
 
-  async #drainPlanRow(row: StatusEventPlanRecord): Promise<void> {
+  async #drainPlanRow(
+    row: StatusEventPlanRecord,
+    options?: { allowWorkingExemption?: boolean; isDrain?: boolean },
+  ): Promise<void> {
     const store = this.#stores.statusEventPlans;
     if (!store) return;
     let current: StatusEventPlanRecord | null;
@@ -1177,7 +1311,21 @@ export class AgentIndexService {
         current.lastError === DEGRADED_PLAN_ERROR
           ? new Error(DEGRADED_PLAN_ERROR)
           : new PlanWaitingHistoryError();
-      const updated = store.markRetry(current.id, retryError);
+      const plan: StatusEventPlan = {
+        agent,
+        attempts: current.attempts,
+        compactHistory: current.compactHistory,
+        from: current.fromStatus,
+        to: current.toStatus,
+        ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
+      };
+      const updated = this.#markPlanRetry(
+        current.id,
+        plan,
+        retryError,
+        current.compactHistory,
+        options,
+      );
       if (!updated) {
         this.#clearWaitingTimer(current.id);
         return;
@@ -1192,13 +1340,7 @@ export class AgentIndexService {
         // PlanWaitingHistoryError; a degraded row stays pending for the next
         // refresh to drain instead of spinning this callback again.
         if (retryRingAuthorized(retryError)) {
-          this.#scheduleWaitingHistoryRetry(current.id, {
-            agent,
-            compactHistory: current.compactHistory,
-            from: current.fromStatus,
-            to: current.toStatus,
-            ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
-          });
+          this.#scheduleWaitingHistoryRetry(current.id, plan);
         }
       } else if (updated.status === "discarded") {
         this.#clearWaitingTimer(current.id);
@@ -1209,7 +1351,7 @@ export class AgentIndexService {
           to: current.toStatus,
           reason: updated.lastError,
         });
-        this.#appendPlanDiscardedEvent({
+        const discardedEvent = this.#appendPlanDiscardedEvent({
           agent,
           attempts: updated.attempts,
           compactHistory: current.compactHistory,
@@ -1219,6 +1361,14 @@ export class AgentIndexService {
           reason: updated.lastError,
           to: current.toStatus,
         });
+        // 下游投影器（agy 侧为 src/agy/hook.ts 的 outcomeKind 经 projectAgyOutcomes 调用、
+        // pi 侧为 packages/herdsman-pi/src/wake.ts 的 outcomeKind 经 project 调用）
+        // 负责具体的抑制与噪声控制：agy 侧的常规读取失败（PLAN_WAITING_HISTORY / degraded）
+        // 会被投影器返回 undefined 静默，而 agy 的 PLAN_STALLED 与 pi 的各类 discarded 会被
+        // 正确上报。因此此处统一为无条件推送，与重试环及 runPlanRow 路径判据保持一致。
+        if (discardedEvent && VALID_AGENT_EVENT_TYPES.has(discardedEvent.type)) {
+          this.#onAgentEvent?.(discardedEvent);
+        }
       } else if (updated.status === "failed") {
         this.#clearWaitingTimer(current.id);
         console.warn("Herdsman plan marked failed", {
@@ -1252,7 +1402,7 @@ export class AgentIndexService {
       to: current.toStatus,
       ...(current.herdrEventKey ? { herdrEventKey: current.herdrEventKey } : {}),
     };
-    const event = await this.#runPlanRow(current, plan);
+    const event = await this.#runPlanRow(current, plan, options ?? { isDrain: true });
     if (event && VALID_AGENT_EVENT_TYPES.has(event.type)) {
       this.#onAgentEvent?.(event);
     }
@@ -1277,6 +1427,7 @@ export class AgentIndexService {
   async #runPlanRow(
     row: StatusEventPlanRecord,
     plan: StatusEventPlan,
+    options?: { allowWorkingExemption?: boolean; isDrain?: boolean },
   ): Promise<AgentEventRecord | undefined> {
     const store = this.#stores.statusEventPlans;
     if (!store) return undefined;
@@ -1329,7 +1480,7 @@ export class AgentIndexService {
           row.lastError === DEGRADED_PLAN_ERROR
             ? new Error(DEGRADED_PLAN_ERROR)
             : new PlanWaitingHistoryError();
-        const updated = store.markRetry(row.id, retryError);
+        const updated = this.#markPlanRetry(row.id, plan, retryError, plan.compactHistory, options);
         if (!updated) {
           this.#clearWaitingTimer(row.id);
           return undefined;
@@ -1416,7 +1567,6 @@ export class AgentIndexService {
         if (salvaged) this.#publishSalvagedEvent(salvaged);
         return undefined;
       }
-      this.#clearWaitingTimer(row.id);
       const eventPayload = event?.payload;
       const isDegraded =
         !!event &&
@@ -1428,9 +1578,17 @@ export class AgentIndexService {
           this.#stores.agentEvents.invalidateById(event.id, "degraded_retry");
           Object.assign(event, { status: "invalidated", deliverable: 0 });
         }
+        this.#clearWaitingTimer(row.id, { keepTracker: true });
         const degradedError = new Error(DEGRADED_PLAN_ERROR);
-        const updated = store.markRetry(row.id, degradedError);
+        const updated = this.#markPlanRetry(
+          row.id,
+          plan,
+          degradedError,
+          activePlan.compactHistory,
+          options,
+        );
         if (!updated) {
+          this.#clearWaitingTimer(row.id);
           return undefined;
         }
         if (updated.status === "pending") {
@@ -1468,13 +1626,20 @@ export class AgentIndexService {
         }
         return undefined;
       }
+      this.#clearWaitingTimer(row.id);
       store.markCompleted(row.id);
       return event;
     } catch (error) {
       if (error instanceof PlanWaitingHistoryError) {
         const retryError =
           row.lastError === DEGRADED_PLAN_ERROR ? new Error(DEGRADED_PLAN_ERROR) : error;
-        const updated = store.markRetry(row.id, retryError);
+        const updated = this.#markPlanRetry(
+          row.id,
+          plan,
+          retryError,
+          activePlan.compactHistory,
+          options,
+        );
         if (!updated) {
           this.#clearWaitingTimer(row.id);
           return undefined;
@@ -1547,11 +1712,18 @@ export class AgentIndexService {
         if (salvaged) this.#publishSalvagedEvent(salvaged);
         return undefined;
       }
-      this.#clearWaitingTimer(row.id);
+      this.#clearWaitingTimer(row.id, { keepTracker: true });
       const retryError =
         row.lastError === DEGRADED_PLAN_ERROR ? new Error(DEGRADED_PLAN_ERROR) : error;
-      const updated = store.markRetry(row.id, retryError);
+      const updated = this.#markPlanRetry(
+        row.id,
+        plan,
+        retryError,
+        activePlan.compactHistory,
+        options,
+      );
       if (!updated) {
+        this.#clearWaitingTimer(row.id);
         return undefined;
       }
       // Invariant: only a genuine PlanWaitingHistoryError re-arms the retry ring,
@@ -1559,6 +1731,7 @@ export class AgentIndexService {
       // either the synthetic `degraded` reason or an unrelated failure, so no
       // spin is scheduled: a still-pending row is drained by the next refresh.
       if (updated.status === "discarded") {
+        this.#clearWaitingTimer(row.id);
         console.info("Herdsman status event plan discarded after max attempts", {
           planId: row.id,
           agentId: row.agentId,
@@ -1579,6 +1752,7 @@ export class AgentIndexService {
         });
       }
       if (updated.status === "failed") {
+        this.#clearWaitingTimer(row.id);
         console.warn("Herdsman status event plan failed after max attempts", {
           planId: row.id,
           agentId: row.agentId,
@@ -3147,6 +3321,7 @@ export class AgentIndexService {
         terminalId: agent.terminalId,
         to: input.to,
         workspaceId: agent.workspaceId,
+        ...(isInteractivePiAgent(agent) ? { interactive: true } : {}),
       },
       terminalId: agent.terminalId,
       type: "agent.failed",
@@ -3187,6 +3362,7 @@ export class AgentIndexService {
         terminalId: agent.terminalId,
         to: input.to,
         workspaceId: agent.workspaceId,
+        ...(isInteractivePiAgent(agent) ? { interactive: true } : {}),
       },
       terminalId: agent.terminalId,
       type: "agent.discarded",
@@ -3321,6 +3497,7 @@ function statusEventType(
 }
 
 function payload(agent: AgentIndexRecord, from: AgentStatus, to: AgentStatus) {
+  const interactive = isInteractivePiAgent(agent);
   return {
     agent: agent.agent,
     from,
@@ -3330,6 +3507,7 @@ function payload(agent: AgentIndexRecord, from: AgentStatus, to: AgentStatus) {
     terminalId: agent.terminalId,
     to,
     workspaceId: agent.workspaceId,
+    ...(interactive ? { interactive: true } : {}),
   };
 }
 

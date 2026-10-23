@@ -40,6 +40,7 @@ export type AgyHookOutput = AgyPreInvocationOutput & AgyStopOutput;
 
 type AgySessionHookState = {
   autoClaimAttempted?: boolean;
+  awaitingNextTurn?: boolean;
   deliveredEventIds?: number[];
   presentedEventIds?: number[];
   turnEpoch?: number;
@@ -71,13 +72,16 @@ type AgyOutcome = {
 };
 
 const DEFAULT_WAIT_TIMEOUT_MS = 24 * 60 * 60_000;
-const DEFAULT_REQUEST_TIMEOUT_MS = 30_000;
+const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_SETTIMEOUT_MS = 2_147_483_647;
 const DEFAULT_POLL_INTERVAL_MS = 1_500;
 const DEFAULT_NEW_AGENT_GRACE_MS = 15_000;
+const DEFAULT_SETTLE_GRACE_MS = 12_000;
+const UNSETTLED_TURN_MAX_AGE_MS = 10 * 60_000;
 const MAX_WAKE_PROMPT_ATTEMPTS = 3;
 const WAKE_PROMPT_TEXT = "[herdsman-wake]";
 const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
+export const PLAN_STALLED = "PLAN_STALLED";
 
 function defaultStateDir(environment: NodeJS.ProcessEnv): string {
   const home = nonEmptyString(environment.HERDSMAN_HOME) ?? join(homedir(), ".herdsman");
@@ -106,6 +110,7 @@ export type RunAgyHookOptions = {
   now?: () => number;
   pollIntervalMs?: number;
   requestTimeoutMs?: number;
+  settleGraceMs?: number;
   socketPath: string;
   spawnWakeWaiter?: (input: {
     cwd: string;
@@ -152,12 +157,14 @@ export async function runAgyHook(
     if (isDispatchedSubagent(env)) return {};
     const sessionState = readSessionState(stateDir, sessionId);
     if (
+      sessionState.awaitingNextTurn === true ||
       sessionState.waiterPid !== undefined ||
       sessionState.turnEpoch === undefined ||
       payload.invocationNum === undefined ||
       payload.invocationNum === 1
     ) {
       sessionState.turnEpoch = (sessionState.turnEpoch ?? 0) + 1;
+      delete sessionState.awaitingNextTurn;
       delete sessionState.waiterPid;
       delete sessionState.waiterEpoch;
       writeSessionState(stateDir, sessionId, sessionState);
@@ -243,12 +250,16 @@ export async function runAgyHook(
       const waitTimeoutMs = options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
       const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
       const newAgentGraceMs = options.newAgentGraceMs ?? DEFAULT_NEW_AGENT_GRACE_MS;
+      const settleGraceMs = options.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
       const triggerWakePrompt = options.triggerWakePrompt ?? defaultTriggerWakePrompt;
       const deadline = now() + waitTimeoutMs;
       let isFirstIteration = true;
       let isFirstEventCheck = true;
       let retryWakePending = false;
       let wakePromptFailures = 0;
+      let rpcFailures = 0;
+      let sawActivePeers = false;
+      let settleDeadline: number | undefined;
 
       while (now() < deadline) {
         const sessionState = readSessionState(stateDir, sessionId);
@@ -262,84 +273,134 @@ export async function runAgyHook(
         }
         isFirstIteration = false;
 
-        const { hasActivePeers, selfAgentStatus } = await inspectWorkspaceAgents(
-          activeClient,
-          connState.presence,
-          now(),
-          newAgentGraceMs,
-        );
-        const selfReadyToWake = selfAgentStatus === undefined || selfAgentStatus === "idle";
+        let hasActivePeers = false;
+        let hasPeers = false;
+        let selfAgentStatus: AgentListItem["agentStatus"] | undefined;
         let hasWakeBatch = false;
 
-        if (
-          selfReadyToWake &&
-          (isFirstEventCheck || hasPushNotification || retryWakePending || !hasActivePeers)
-        ) {
-          isFirstEventCheck = false;
-          hasPushNotification = false;
-          retryWakePending = false;
-
-          const latestState = (await activeClient.request(
-            "agent.orchestrator.get",
-            {},
-          )) as OrchestratorConnectionState;
-          if (!isLocalOwner(latestState)) return {};
-
-          hasWakeBatch = await peekNextWakeBatch(
+        try {
+          ({ hasActivePeers, hasPeers, selfAgentStatus } = await inspectWorkspaceAgents(
             activeClient,
-            latestState,
-            sessionState,
-            stateDir,
-            sessionId,
-          );
-          if (hasWakeBatch) {
-            const preTriggerState = readSessionState(stateDir, sessionId);
-            if (
-              preTriggerState.turnEpoch !== undefined &&
-              preTriggerState.turnEpoch !== waiterEpoch
-            ) {
-              return {};
-            }
-            try {
-              await triggerWakePrompt({
-                paneId: launch.paneId,
-                promptText: WAKE_PROMPT_TEXT,
-              });
-              const postTriggerState = readSessionState(stateDir, sessionId);
+            connState.presence,
+            now(),
+            newAgentGraceMs,
+            settleGraceMs,
+          ));
+          if (hasActivePeers) {
+            sawActivePeers = true;
+            settleDeadline = undefined;
+          }
+          const selfReadyToWake =
+            selfAgentStatus === undefined ||
+            selfAgentStatus === "idle" ||
+            selfAgentStatus === "done";
+
+          if (
+            selfReadyToWake &&
+            (isFirstEventCheck || hasPushNotification || retryWakePending || !hasActivePeers)
+          ) {
+            const latestState = (await activeClient.request(
+              "agent.orchestrator.get",
+              {},
+            )) as OrchestratorConnectionState;
+            if (!isLocalOwner(latestState)) return {};
+
+            hasWakeBatch = await peekNextWakeBatch(
+              activeClient,
+              latestState,
+              sessionState,
+              stateDir,
+              sessionId,
+            );
+            isFirstEventCheck = false;
+            hasPushNotification = false;
+            retryWakePending = false;
+
+            if (hasWakeBatch) {
+              const preTriggerState = readSessionState(stateDir, sessionId);
               if (
-                postTriggerState.turnEpoch !== undefined &&
-                postTriggerState.turnEpoch !== waiterEpoch
+                preTriggerState.turnEpoch !== undefined &&
+                preTriggerState.turnEpoch !== waiterEpoch
               ) {
+                return {};
+              }
+              try {
+                await triggerWakePrompt({
+                  paneId: launch.paneId,
+                  promptText: WAKE_PROMPT_TEXT,
+                });
+                const postTriggerState = readSessionState(stateDir, sessionId);
+                if (
+                  postTriggerState.turnEpoch !== undefined &&
+                  postTriggerState.turnEpoch !== waiterEpoch
+                ) {
+                  console.warn(
+                    `Herdsman agy wake prompt raced with a new turn (waiterEpoch=${waiterEpoch}, turnEpoch=${postTriggerState.turnEpoch})`,
+                  );
+                  return {};
+                }
+                if (postTriggerState.waiterPid === process.pid) {
+                  delete postTriggerState.waiterPid;
+                  writeSessionState(stateDir, sessionId, postTriggerState);
+                }
+                return {};
+              } catch (error) {
+                wakePromptFailures += 1;
                 console.warn(
-                  `Herdsman agy wake prompt raced with a new turn (waiterEpoch=${waiterEpoch}, turnEpoch=${postTriggerState.turnEpoch})`,
+                  `Herdsman agy wake prompt failed (attempt ${wakePromptFailures}/${MAX_WAKE_PROMPT_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
                 );
-                return {};
+                if (wakePromptFailures >= MAX_WAKE_PROMPT_ATTEMPTS) {
+                  return {};
+                }
+                retryWakePending = true;
               }
-              if (postTriggerState.waiterPid === process.pid) {
-                delete postTriggerState.waiterPid;
-                writeSessionState(stateDir, sessionId, postTriggerState);
-              }
-              return {};
-            } catch (error) {
-              wakePromptFailures += 1;
-              console.warn(
-                `Herdsman agy wake prompt failed (attempt ${wakePromptFailures}/${MAX_WAKE_PROMPT_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
-              );
-              if (wakePromptFailures >= MAX_WAKE_PROMPT_ATTEMPTS) {
-                return {};
-              }
-              retryWakePending = true;
             }
           }
+          rpcFailures = 0;
+        } catch (rpcError) {
+          rpcFailures += 1;
+          if (rpcFailures >= MAX_WAKE_PROMPT_ATTEMPTS) {
+            throw rpcError;
+          }
+          console.warn(
+            `Herdsman agy WakeWaiter transient RPC error (attempt ${rpcFailures}/${MAX_WAKE_PROMPT_ATTEMPTS}): ${rpcError instanceof Error ? rpcError.message : String(rpcError)}`,
+          );
+          const remainingAfterErrMs = deadline - now();
+          if (remainingAfterErrMs <= 0) break;
+          await waitForNotificationOrTimeout(
+            Math.min(pollIntervalMs, Math.max(1, remainingAfterErrMs)),
+            (wake) => {
+              notifyWakeWaiter = wake;
+            },
+          );
+          notifyWakeWaiter = undefined;
+          continue;
         }
 
-        if (!hasActivePeers && !hasWakeBatch && selfAgentStatus !== "working") {
-          return {};
+        const selfReadyToWake =
+          selfAgentStatus === undefined || selfAgentStatus === "idle" || selfAgentStatus === "done";
+        if (!hasActivePeers && !hasWakeBatch && selfReadyToWake && !retryWakePending) {
+          if ((sawActivePeers || hasPeers) && settleGraceMs > 0) {
+            settleDeadline ??= now() + settleGraceMs;
+            if (now() >= settleDeadline) {
+              clearOwnWaiterPid(stateDir, sessionId);
+              return {};
+            }
+          } else {
+            clearOwnWaiterPid(stateDir, sessionId);
+            return {};
+          }
+        } else {
+          settleDeadline = undefined;
         }
 
         const remainingMs = deadline - now();
         if (remainingMs <= 0) break;
-        await waitForNotificationOrTimeout(Math.min(pollIntervalMs, remainingMs), (wake) => {
+        const settleRemainingMs =
+          settleDeadline !== undefined ? Math.max(0, settleDeadline - now()) : remainingMs;
+        const sleepMs = Math.min(pollIntervalMs, remainingMs, settleRemainingMs);
+        if (sleepMs <= 0) continue;
+        await waitForNotificationOrTimeout(sleepMs, (wake) => {
           notifyWakeWaiter = wake;
         });
         notifyWakeWaiter = undefined;
@@ -353,20 +414,25 @@ export async function runAgyHook(
     } finally {
       notifyWakeWaiter = undefined;
       client?.close();
+      try {
+        clearOwnWaiterPid(stateDir, sessionId);
+      } catch {}
     }
   }
 
   // Stop hook
   if (payload.terminationReason && payload.terminationReason !== "NO_TOOL_CALL") {
+    if (isDispatchedSubagent(env)) return {};
     const sessionState = readSessionState(stateDir, sessionId);
+    sessionState.awaitingNextTurn = true;
     const unacked = new Set(sessionState.deliveredEventIds ?? []);
     if (unacked.size > 0) {
       sessionState.presentedEventIds = (sessionState.presentedEventIds ?? []).filter(
         (id) => !unacked.has(id),
       );
       sessionState.deliveredEventIds = [];
-      writeSessionState(stateDir, sessionId, sessionState);
     }
+    writeSessionState(stateDir, sessionId, sessionState);
     return {};
   }
 
@@ -395,6 +461,7 @@ export async function runAgyHook(
     }
 
     const sessionState = readSessionState(stateDir, sessionId);
+    sessionState.awaitingNextTurn = true;
     if (
       env.HERDSMAN_AUTO_ON === "1" &&
       isMainOrchestratorPane(launch.paneId) &&
@@ -414,6 +481,7 @@ export async function runAgyHook(
     }
 
     if (!isLocalOwner(connState)) {
+      writeSessionState(stateDir, sessionId, sessionState);
       return {};
     }
 
@@ -432,6 +500,7 @@ export async function runAgyHook(
       sessionId,
     );
     if (immediateBatch) {
+      writeSessionState(stateDir, sessionId, sessionState);
       return {
         decision: "continue",
         reason: immediateBatch,
@@ -439,13 +508,16 @@ export async function runAgyHook(
     }
 
     const newAgentGraceMs = options.newAgentGraceMs ?? DEFAULT_NEW_AGENT_GRACE_MS;
+    const settleGraceMs = options.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
     const { hasActivePeers } = await inspectWorkspaceAgents(
       activeClient,
       connState.presence,
       now(),
       newAgentGraceMs,
+      settleGraceMs,
     );
     if (!hasActivePeers) {
+      writeSessionState(stateDir, sessionId, sessionState);
       return {};
     }
 
@@ -720,6 +792,116 @@ async function takeNextWakeBatch(
   return formatAgyOutcomeUpdates(outcomes);
 }
 
+function clearOwnWaiterPid(stateDir: string, sessionId: string): void {
+  const sessionState = readSessionState(stateDir, sessionId);
+  if (sessionState.waiterPid === process.pid) {
+    delete sessionState.waiterPid;
+    writeSessionState(stateDir, sessionId, sessionState);
+  }
+}
+
+function parseTimestampMs(value: unknown): number {
+  if (value instanceof Date) return value.getTime();
+  if (typeof value === "string") return Date.parse(value);
+  if (typeof value === "number") return value;
+  return Number.NaN;
+}
+
+function parseRefStepIndex(ref: unknown): number {
+  if (typeof ref !== "string" || ref.length === 0) return Number.NaN;
+  const colonMatch = /:(\d+):\d+$/.exec(ref);
+  if (colonMatch?.[1]) return Number(colonMatch[1]);
+  const entryMatch = /#(?:entry|line)=(\d+)$/.exec(ref);
+  if (entryMatch?.[1]) return Number(entryMatch[1]);
+  const tailMatch = /[:#=_.-](\d+)$/.exec(ref);
+  if (tailMatch?.[1]) return Number(tailMatch[1]);
+  return Number.NaN;
+}
+
+export function isPeerActiveOrSettling(
+  peer: AgentListItem,
+  nowMs: number,
+  newAgentGraceMs: number,
+  settleGraceMs: number,
+): boolean {
+  if (peer.agentStatus === "working") return true;
+
+  const firstSeenMs = parseTimestampMs(peer.firstSeenAt);
+  if (
+    Number.isFinite(firstSeenMs) &&
+    nowMs - firstSeenMs >= 0 &&
+    nowMs - firstSeenMs < newAgentGraceMs
+  ) {
+    return true;
+  }
+
+  if (settleGraceMs > 0 && peer.history) {
+    const updatedAtMs = parseTimestampMs(peer.history.updatedAt);
+    if (
+      Number.isFinite(updatedAtMs) &&
+      nowMs - updatedAtMs >= 0 &&
+      nowMs - updatedAtMs < settleGraceMs
+    ) {
+      return true;
+    }
+
+    const assistantMs = parseTimestampMs(peer.history.lastAssistantMessage?.timestamp);
+    if (
+      Number.isFinite(assistantMs) &&
+      nowMs - assistantMs >= 0 &&
+      nowMs - assistantMs < settleGraceMs
+    ) {
+      return true;
+    }
+
+    const userMs = parseTimestampMs(peer.history.lastUserMessage?.timestamp);
+    const withinUnsettledMaxAge =
+      (Number.isFinite(userMs) &&
+        nowMs - userMs >= 0 &&
+        nowMs - userMs < UNSETTLED_TURN_MAX_AGE_MS) ||
+      (!Number.isFinite(userMs) &&
+        Number.isFinite(firstSeenMs) &&
+        nowMs - firstSeenMs >= 0 &&
+        nowMs - firstSeenMs < UNSETTLED_TURN_MAX_AGE_MS);
+
+    if (
+      peer.history.lastUserMessage &&
+      !peer.history.lastAssistantMessage &&
+      withinUnsettledMaxAge
+    ) {
+      return true;
+    }
+
+    if (
+      peer.history.lastAssistantMessage?.stopReason &&
+      peer.history.lastAssistantMessage.stopReason !== "stop" &&
+      peer.history.lastAssistantMessage.stopReason !== "endTurn" &&
+      withinUnsettledMaxAge
+    ) {
+      return true;
+    }
+
+    if (
+      Number.isFinite(userMs) &&
+      Number.isFinite(assistantMs) &&
+      userMs > assistantMs &&
+      withinUnsettledMaxAge
+    ) {
+      return true;
+    }
+
+    if ((!Number.isFinite(userMs) || !Number.isFinite(assistantMs)) && withinUnsettledMaxAge) {
+      const userStep = parseRefStepIndex(peer.history.lastUserMessage?.ref);
+      const assistantStep = parseRefStepIndex(peer.history.lastAssistantMessage?.ref);
+      if (Number.isFinite(userStep) && Number.isFinite(assistantStep) && userStep > assistantStep) {
+        return true;
+      }
+    }
+  }
+
+  return false;
+}
+
 async function inspectWorkspaceAgents(
   client: Pick<ObservabilityRpcClient, "request">,
   presence: {
@@ -730,8 +912,10 @@ async function inspectWorkspaceAgents(
   },
   nowMs: number,
   newAgentGraceMs: number,
+  settleGraceMs: number,
 ): Promise<{
   hasActivePeers: boolean;
+  hasPeers: boolean;
   selfAgentStatus: AgentListItem["agentStatus"] | undefined;
 }> {
   const response = (await client.request("agent.list", {
@@ -741,26 +925,12 @@ async function inspectWorkspaceAgents(
   const agents = response.agents ?? [];
   const selfAgent = agents.find((agent) => agent.paneId === presence.paneId);
   const peers = agents.filter((agent) => agent.terminalId !== presence.terminalId);
-  const hasActivePeers = peers.some((peer) => {
-    if (peer.agentStatus === "working") return true;
-    if (peer.agentStatus === "unknown" || peer.agentStatus === "idle") {
-      const firstSeenRaw = peer.firstSeenAt as unknown;
-      const firstSeenMs =
-        firstSeenRaw instanceof Date
-          ? firstSeenRaw.getTime()
-          : typeof firstSeenRaw === "string"
-            ? Date.parse(firstSeenRaw)
-            : typeof firstSeenRaw === "number"
-              ? firstSeenRaw
-              : Number.NaN;
-      if (Number.isFinite(firstSeenMs) && nowMs - firstSeenMs < newAgentGraceMs) {
-        return true;
-      }
-    }
-    return false;
-  });
+  const hasActivePeers = peers.some((peer) =>
+    isPeerActiveOrSettling(peer, nowMs, newAgentGraceMs, settleGraceMs),
+  );
   return {
     hasActivePeers,
+    hasPeers: peers.length > 0,
     selfAgentStatus: selfAgent?.agentStatus,
   };
 }
@@ -841,7 +1011,18 @@ function outcomeKind(event: AgentEventRecord): AgyOutcome["kind"] | undefined {
     }
     return "failed";
   }
-  if (event.type === "agent.discarded") return "failed";
+  if (event.type === "agent.discarded") {
+    const payload = asRecord(event.payload);
+    const agent = nonEmptyString(payload.agent);
+    const isAgyOrEmpty = agent === undefined || agent === "agy";
+    if (isAgyOrEmpty) {
+      const reason = nonEmptyString(payload.reason);
+      if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
+        return payload.fallbackOutcome === true ? "failed" : undefined;
+      }
+    }
+    return "failed";
+  }
   if (event.type === "agent.idle" && asRecord(event.payload).from === "working") {
     return "completed";
   }

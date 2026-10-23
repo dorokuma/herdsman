@@ -2,6 +2,7 @@ import type { DatabaseSync } from "node:sqlite";
 import {
   type AgentStatus,
   type CompactAgentHistory,
+  PLAN_STALLED,
   PLAN_WAITING_HISTORY,
 } from "@/observability/contracts.js";
 
@@ -332,7 +333,14 @@ export class StatusEventPlanStore {
       .run(lastError, now, id);
   }
 
-  markRetry(id: number, error: unknown): StatusEventPlanRecord | null {
+  markRetry(
+    id: number,
+    error: unknown,
+    options?: {
+      isTargetWorking?: boolean;
+      stallDetected?: boolean;
+    },
+  ): StatusEventPlanRecord | null {
     const current = this.get(id);
     if (
       current.status === "completed" ||
@@ -344,17 +352,29 @@ export class StatusEventPlanStore {
     }
     const now = Date.now();
     const errorMessage = error instanceof Error ? error.message : String(error);
+    const isTargetWorking = options?.isTargetWorking ?? false;
+    const stallDetected = options?.stallDetected ?? false;
+    const isWaitingHistory = errorMessage === PLAN_WAITING_HISTORY;
+
     const attempts = current.attempts + 1;
     let newStatus: StatusEventPlanStatus = "pending";
-    if (attempts >= STATUS_PLAN_MAX_ATTEMPTS) {
-      newStatus = errorMessage === PLAN_WAITING_HISTORY ? "discarded" : "failed";
+
+    if (stallDetected || attempts >= STATUS_PLAN_MAX_ATTEMPTS) {
+      if (isTargetWorking && !stallDetected) {
+        newStatus = "pending";
+      } else {
+        newStatus = isWaitingHistory ? "discarded" : "failed";
+      }
     }
+
+    const isStallClose = stallDetected && newStatus !== "pending";
+    const finalError = isStallClose ? PLAN_STALLED : errorMessage;
 
     const result = this.#sqlite
       .prepare(
         "update status_event_plans set attempts = ?, status = ?, last_error = ?, updated_at = ? where id = ? and status in ('pending', 'running')",
       )
-      .run(attempts, newStatus, errorMessage, now, id);
+      .run(attempts, newStatus, finalError, now, id);
     if (Number(result.changes) === 0) {
       return null;
     }

@@ -277,6 +277,13 @@ export const DEGRADED_PLAN_ERROR = "degraded";
  */
 export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
 
+/**
+ * The synthetic plan-row error marker for a status-event plan that stalled
+ * because the agent's progress fingerprint did not advance for too many attempts
+ * or exceeded the maximum total waiting duration.
+ */
+export const PLAN_STALLED = "PLAN_STALLED";
+
 export type AgentTurnCompletedInput = {
   confirmed: boolean;
   expectedText?: string;
