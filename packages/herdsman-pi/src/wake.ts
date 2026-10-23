@@ -11,6 +11,7 @@ export const WAKE_SETTLE_MS = 0;
 // value is the contract; duplicated here because `@dorokuma/herdsman-pi` ships
 // standalone `src/` without root `src/`).
 export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
+export const PLAN_STALLED = "PLAN_STALLED";
 
 export type AgentOutcome = {
   agent: string;
@@ -93,8 +94,18 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
     return "failed";
   }
   if (event.type === "agent.discarded") {
-    // 观察者放弃等待也是终态失败：结果永远不会到达，必须能在编排者对话里被唤醒。
-    // 压制/死信语义保持既有实现（上游错误抑制、pane 级 fallback 压制、seen 去重）。
+    const payload = asRecord(event.payload);
+    const agent = stringValue(payload.agent);
+    const isAgyOrEmpty = agent === undefined || agent === "agy";
+    if (isAgyOrEmpty) {
+      const reason = stringValue(payload.reason);
+      if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
+        if (payload.fallbackOutcome === true) {
+          return "failed";
+        }
+        return undefined;
+      }
+    }
     return "failed";
   }
   const payload = asRecord(event.payload);

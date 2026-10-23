@@ -45,6 +45,10 @@ export function isDeliverableAgentEvent(
 ): boolean {
   const failed = event.type === "agent.failed" || event.type === "agent.discarded";
   const isRetainedInvalidated = event.status === "invalidated" && event.deliverable === 1;
+  const isOrphanOutcome =
+    event.agentId === null &&
+    event.deliverable === 1 &&
+    (event.type === "agent.done" || event.type === "agent.idle");
 
   // 1. 状态放行：允许 pending、delivered 以及关页保留的 invalidated 行
   const statusAllowed =
@@ -80,9 +84,12 @@ export function isDeliverableAgentEvent(
 
   // 5. 核心：解耦对 live agent 表记录的依赖
   // 当 pane 被关闭，retirePane 物理清除了 agents 表记录，此时 agent === undefined。
-  // 若该事件已被标记为保留作废态 (isRetainedInvalidated) 或 failed，直接从事件自身元数据验证有效性
-  if (failed || isRetainedInvalidated) {
+  // 若该事件已被标记为保留作废态 (isRetainedInvalidated)、孤儿完成态 (isOrphanOutcome) 或 failed，直接从事件自身元数据验证有效性
+  if (failed || isRetainedInvalidated || isOrphanOutcome) {
     const payload = asRecord(event.payload);
+    if (payload.interactive === true && event.type === "agent.idle") {
+      return false;
+    }
     const agentKind = typeof payload.agent === "string" ? payload.agent : "pi";
     if (
       agentKind !== "pi" &&
@@ -548,7 +555,7 @@ export class AgentEventStore {
     // because otherwise the cursor ack (`markAcked(id <= cursor)`) would silently
     // swallow an event that was never delivered. Every other row keeps the
     // original "the agent is still indexed" check.
-    const orphanTerminalFilter = `or type in ('agent.failed', 'agent.discarded')`;
+    const orphanTerminalFilter = `or type in ('agent.failed', 'agent.discarded') or (agent_id is null and deliverable = 1 and type in ('agent.done', 'agent.idle'))`;
     const agentFilter = input.getAgent
       ? ""
       : `and (
@@ -592,15 +599,16 @@ export class AgentEventStore {
         // the only remaining source of truth).
         const retained = event.status === "invalidated" && event.deliverable === 1;
         const orphanTerminal = event.type === "agent.failed" || event.type === "agent.discarded";
-        if (agentId === null && !retained && !orphanTerminal) continue;
+        const orphanOutcome =
+          agentId === null &&
+          event.deliverable === 1 &&
+          (event.type === "agent.done" || event.type === "agent.idle");
+        if (agentId === null && !retained && !orphanTerminal && !orphanOutcome) continue;
+        const liveAgent = agentId === null ? undefined : input.getAgent?.(agentId);
+        const shouldValidate = input.getAgent !== undefined || agentId === null;
         if (
-          !input.getAgent ||
-          isDeliverableAgentEvent(
-            event,
-            agentId === null ? undefined : input.getAgent(agentId),
-            scope,
-            input.ownerTerminalId,
-          )
+          !shouldValidate ||
+          isDeliverableAgentEvent(event, liveAgent, scope, input.ownerTerminalId)
         )
           return event;
       }

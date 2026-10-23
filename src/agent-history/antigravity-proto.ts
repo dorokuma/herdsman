@@ -28,6 +28,48 @@ export function decodeAntigravityMessage(value: unknown): AntigravityDecodedMess
   return null;
 }
 
+/** Decode the largest valid google.protobuf.Timestamp embedded in a step metadata protobuf blob. */
+export function decodeAntigravityMetadataTimestamp(value: unknown): string | null {
+  if (!Buffer.isBuffer(value) && !(value instanceof Uint8Array)) return null;
+  const fields = parseFields(Buffer.from(value));
+  let maxMs: number | null = null;
+  for (const field of fields) {
+    if (field.wireType !== 2) continue;
+    const subBytes = Buffer.from(field.value as Uint8Array);
+    if (subBytes.length < 6 || subBytes.length > 16) continue;
+    const subFields = parseFields(subBytes);
+    if (subFields.length === 0) continue;
+    let seconds: number | undefined;
+    let nanos = 0;
+    let valid = true;
+    for (const sub of subFields) {
+      if (sub.number === 1 && sub.wireType === 0 && seconds === undefined) {
+        seconds = sub.value as number;
+      } else if (sub.number === 2 && sub.wireType === 0) {
+        nanos = sub.value as number;
+      } else {
+        valid = false;
+        break;
+      }
+    }
+    if (
+      !valid ||
+      seconds === undefined ||
+      seconds < 1_000_000_000 ||
+      seconds > 10_000_000_000 ||
+      nanos < 0 ||
+      nanos >= 1_000_000_000
+    ) {
+      continue;
+    }
+    const ms = seconds * 1000 + Math.floor(nanos / 1_000_000);
+    if (maxMs === null || ms > maxMs) {
+      maxMs = ms;
+    }
+  }
+  return maxMs === null ? null : new Date(maxMs).toISOString();
+}
+
 function parseFields(bytes: Buffer): WireField[] {
   const result: WireField[] = [];
   let offset = 0;

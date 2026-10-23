@@ -87,4 +87,74 @@ describe("AntigravityHistoryReader readCompact", () => {
     expect(compact.lastAssistantMessage).toMatchObject({ text: "second answer" });
     expect(compact.lastUserMessage).toMatchObject({ text: "second question" });
   });
+
+  test("decodes ISO timestamps from steps.metadata protobuf blobs when created_at/timestamp columns are absent", async () => {
+    const dir = await mkdtemp(join(tmpdir(), "herdsman-agy-metadata-ts-"));
+    tempDirs.push(dir);
+    const dbPath = join(dir, "conversation.sqlite");
+    const sqlite = new DatabaseSync(dbPath);
+    sqlite.exec(`
+      create table steps (
+        idx integer primary key autoincrement,
+        role text not null,
+        payload text not null,
+        metadata blob
+      );
+    `);
+
+    const encodeVarint = (value: number): number[] => {
+      const bytes: number[] = [];
+      let current = BigInt(value);
+      while (current >= 128n) {
+        bytes.push(Number((current & 127n) | 128n));
+        current >>= 7n;
+      }
+      bytes.push(Number(current));
+      return bytes;
+    };
+    const encodeMetadataTimestamp = (fieldNumber: number, seconds: number, nanos = 0): Buffer => {
+      const tsBytes = [
+        0x08,
+        ...encodeVarint(seconds),
+        ...(nanos > 0 ? [0x10, ...encodeVarint(nanos)] : []),
+      ];
+      return Buffer.from([
+        ...encodeVarint((fieldNumber << 3) | 2),
+        ...encodeVarint(tsBytes.length),
+        ...tsBytes,
+      ]);
+    };
+
+    const userSec = Math.floor(Date.parse("2026-10-22T12:00:00.000Z") / 1000);
+    const asstSec = Math.floor(Date.parse("2026-10-22T12:00:05.000Z") / 1000);
+    const insert = sqlite.prepare("insert into steps (role, payload, metadata) values (?, ?, ?)");
+    insert.run("user", "inspect worker status", encodeMetadataTimestamp(1, userSec, 250_000_000));
+    insert.run(
+      "assistant",
+      "worker completed all tasks",
+      Buffer.concat([
+        encodeMetadataTimestamp(1, asstSec - 1, 0),
+        encodeMetadataTimestamp(7, asstSec, 500_000_000),
+      ]),
+    );
+    sqlite.close();
+
+    const reader = new AntigravityHistoryReader();
+    const compact = await reader.readCompact({
+      kind: "agent_session",
+      path: dbPath,
+      source: "antigravity-sqlite",
+      value: dbPath,
+    });
+
+    expect(compact.lastUserMessage).toMatchObject({
+      text: "inspect worker status",
+      timestamp: "2026-10-22T12:00:00.250Z",
+    });
+    expect(compact.lastAssistantMessage).toMatchObject({
+      text: "worker completed all tasks",
+      timestamp: "2026-10-22T12:00:05.500Z",
+    });
+    expect(compact.updatedAt).toBe("2026-10-22T12:00:05.500Z");
+  });
 });

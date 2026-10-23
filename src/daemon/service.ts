@@ -442,7 +442,7 @@ export async function runObservabilityDaemonService(
     await server.start();
     writeDaemonPidFile(runtime.paths.pidPath, currentPid);
     await reconciler.reconcile({ releaseStaleOwners: false });
-    await index.drainPendingPlans();
+    await index.drainPendingPlans({ reason: "startup" });
     // Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
     // daemons; the in-flight guard inside the scheduler prevents overlapping runs.
     reconcileScheduler = new PeriodicReconcileScheduler({
@@ -457,7 +457,7 @@ export async function runObservabilityDaemonService(
       // path that the startup-only drain leaves open.
       run: async () => {
         await reconciler.reconcile({ releaseStaleOwners: false });
-        await index.drainPendingPlans();
+        await index.drainPendingPlans({ reason: "periodic" });
       },
       ...(input.reconcileSetInterval === undefined
         ? {}

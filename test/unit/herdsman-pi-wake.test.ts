@@ -1,5 +1,5 @@
 import { describe, expect, test } from "vitest";
-import { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
+import { PLAN_STALLED, PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
 import type { AgentEventWireRecord } from "../../packages/herdsman-pi/src/daemon-client.js";
 import type { AgentOutcome } from "../../packages/herdsman-pi/src/wake.js";
 import {
@@ -167,6 +167,100 @@ describe("Pi agent wake projection", () => {
       expect.objectContaining({ eventId: 22, kind: "failed", reason: "TIMEOUT_DISCARD" }),
     ]);
     expect(projection.rawEvents).toHaveLength(1);
+  });
+
+  test("projects agy agent.discarded with PLAN_WAITING_HISTORY as intermediate state without wake outcome, while genuine failure still wakes", () => {
+    // 1. agy 子代理带有 PLAN_WAITING_HISTORY 时作为中间态不上报 failed
+    const intermediateProjection = projectAgentOutcomes([
+      event(23, "agent.discarded", {
+        agent: "agy",
+        from: "working",
+        name: "worker",
+        paneId: "wB:p4",
+        reason: PLAN_WAITING_HISTORY,
+        to: "done",
+      }),
+    ]);
+    expect(intermediateProjection.outcomes).toHaveLength(0);
+    expect(intermediateProjection.rawEvents).toHaveLength(1);
+
+    // 2. agy 子代理的真实失败原因依然上报 failed
+    const genuineFailureProjection = projectAgentOutcomes([
+      event(24, "agent.discarded", {
+        agent: "agy",
+        from: "working",
+        name: "worker",
+        paneId: "wB:p4",
+        reason: "COMMAND_EXITED_WITH_ERROR",
+        to: "failed",
+      }),
+    ]);
+    expect(genuineFailureProjection.outcomes).toEqual([
+      expect.objectContaining({
+        eventId: 24,
+        kind: "failed",
+        reason: "COMMAND_EXITED_WITH_ERROR",
+      }),
+    ]);
+    expect(genuineFailureProjection.rawEvents).toHaveLength(1);
+  });
+
+  test("Fix A & Fix B: projects PLAN_STALLED as failed outcome, while pi agent.discarded with PLAN_WAITING_HISTORY wakes and agy or empty payload.agent stays silent", () => {
+    // 1. Fix A: PLAN_STALLED produces wakeable failed outcome for agy agent
+    const stallAgy = projectAgentOutcomes([
+      event(25, "agent.discarded", {
+        agent: "agy",
+        from: "working",
+        name: "worker",
+        paneId: "wB:p4",
+        reason: PLAN_STALLED,
+        to: "done",
+      }),
+    ]);
+    expect(stallAgy.outcomes).toEqual([
+      expect.objectContaining({ eventId: 25, kind: "failed", reason: PLAN_STALLED }),
+    ]);
+
+    // 2. Fix B: pi agent with PLAN_WAITING_HISTORY is NOT exempted and wakes as failed
+    const piWaiting = projectAgentOutcomes([
+      event(26, "agent.discarded", {
+        agent: "pi",
+        from: "working",
+        name: "pi-worker",
+        paneId: "wB:p5",
+        reason: PLAN_WAITING_HISTORY,
+        to: "done",
+      }),
+    ]);
+    expect(piWaiting.outcomes).toEqual([
+      expect.objectContaining({ eventId: 26, kind: "failed", reason: PLAN_WAITING_HISTORY }),
+    ]);
+
+    // 3. Fix B: empty payload.agent with PLAN_WAITING_HISTORY is exempted (silent)
+    const emptyAgentWaiting = projectAgentOutcomes([
+      event(27, "agent.discarded", {
+        agent: undefined,
+        from: "working",
+        paneId: "wB:p6",
+        reason: PLAN_WAITING_HISTORY,
+        to: "done",
+      }),
+    ]);
+    expect(emptyAgentWaiting.outcomes).toHaveLength(0);
+    expect(emptyAgentWaiting.rawEvents).toHaveLength(1);
+
+    // 4. Fix B: null payload.agent with PLAN_WAITING_HISTORY is exempted (silent)
+    const nullAgentWaiting = projectAgentOutcomes([
+      event(28, "agent.discarded", {
+        agent: null,
+        from: "working",
+        paneId: "wB:p7",
+        reason: PLAN_WAITING_HISTORY,
+        to: "done",
+      }),
+    ]);
+    expect(nullAgentWaiting.outcomes).toHaveLength(0);
+    expect(nullAgentWaiting.rawEvents).toHaveLength(1);
   });
 
   test("keeps the existing suppression semantics for agent.discarded outcomes", () => {

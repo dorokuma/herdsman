@@ -1,6 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
 import type { AgentHistoryMessage, AgentHistoryRef } from "@/observability/contracts.js";
-import { decodeAntigravityMessage } from "./antigravity-proto.js";
+import {
+  decodeAntigravityMessage,
+  decodeAntigravityMetadataTimestamp,
+} from "./antigravity-proto.js";
 import { type AgentHistoryReader, compactFromMessages, limitMessages } from "./readers.js";
 import { messageRef, timestampFrom } from "./text.js";
 
@@ -38,11 +41,18 @@ export class AntigravityHistoryReader implements AgentHistoryReader {
         : names.has("timestamp")
           ? "timestamp"
           : null;
+      const metadataColumn = names.has("metadata") ? "metadata" : null;
       const rows = db
         .prepare(
-          `select ${quote(idColumn)} as id, ${roleColumn ? `${quote(roleColumn)} as role,` : ""} ${quote(payloadColumn)} as payload${timeColumn ? `, ${quote(timeColumn)} as time` : ""} from ${quote(table)} order by rowid`,
+          `select ${quote(idColumn)} as id, ${roleColumn ? `${quote(roleColumn)} as role,` : ""} ${quote(payloadColumn)} as payload${timeColumn ? `, ${quote(timeColumn)} as time` : ""}${metadataColumn ? `, ${quote(metadataColumn)} as metadata` : ""} from ${quote(table)} order by rowid`,
         )
-        .all() as { id: string | number; role?: unknown; payload: unknown; time?: unknown }[];
+        .all() as {
+        id: string | number;
+        metadata?: unknown;
+        payload: unknown;
+        role?: unknown;
+        time?: unknown;
+      }[];
       const messages: AgentHistoryMessage[] = rows.flatMap((row) => {
         const explicitRole: AgentHistoryMessage["role"] | null =
           row.role === "user" || row.role === "assistant" ? row.role : null;
@@ -55,7 +65,7 @@ export class AntigravityHistoryReader implements AgentHistoryReader {
             ref: messageRef(ref.path as string, String(row.id), 0),
             role: decoded.role,
             text: decoded.text,
-            timestamp: timestampFrom(row.time),
+            timestamp: timestampFrom(row.time) ?? decodeAntigravityMetadataTimestamp(row.metadata),
           },
         ];
       });

@@ -3,21 +3,37 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryService } from "@/agent-history/service.js";
 import { emptyCompactHistory } from "@/agent-history/service.js";
-import { AgentEventStore } from "@/db/agent-events.js";
+import { AgentEventStore, isDeliverableAgentEvent } from "@/db/agent-events.js";
 import { STATUS_PLAN_MAX_ATTEMPTS } from "@/db/status-event-plans.js";
 import {
   AgentIndexService,
   STALE_DUPLICATE_GUARD_SCAN_LIMIT,
   type StatusEventPlan,
+  WORKING_PLAN_MAX_STALL_ATTEMPTS,
+  WORKING_PLAN_MAX_WAIT_MS,
 } from "@/observability/agent-index-service.js";
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import {
   type AgentEventRecord,
   type CompactAgentHistory,
+  PLAN_STALLED,
   PLAN_WAITING_HISTORY,
 } from "@/observability/contracts.js";
 import { TurnCompletionRegistry } from "@/observability/turn-completion.js";
+import type { AgentEventWireRecord } from "../../packages/herdsman-pi/src/daemon-client.js";
+import { projectAgentOutcomes } from "../../packages/herdsman-pi/src/wake.js";
 import { cleanupTempDirs, openObservabilityDbHarness } from "./observability-db-harness.js";
+
+const toWireRecord = (e: AgentEventRecord): AgentEventWireRecord => ({
+  agentId: e.agentId,
+  compactHistory: e.compactHistory,
+  id: e.id,
+  paneGeneration: e.paneGeneration ?? null,
+  paneId: e.paneId,
+  payload: e.payload,
+  terminalId: e.terminalId,
+  type: e.type,
+});
 
 const doneEvent = {
   event: { agent_status: "done", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
@@ -5406,4 +5422,968 @@ describe("agy late startup idle supersession (p76 regression)", () => {
 
     harness.sqlite.close();
   }, 20_000);
+
+  test("plan waiting history stays pending and never transitions to discarded or failed while agy agent remains working, settling only after leaving working or on real stall", async () => {
+    const harness = openObservabilityDbHarness();
+    const scheduledCallbacks = new Map<unknown, () => Promise<void> | void>();
+    let nextTimerId = 1;
+    const scheduleRetryMock = vi.fn((callback: () => void, _delayMs: number) => {
+      const id = nextTimerId++;
+      scheduledCallbacks.set(id, callback);
+      return id;
+    });
+    const clearRetryMock = vi.fn((id: unknown) => {
+      scheduledCallbacks.delete(id);
+    });
+
+    let currentToolCount = 0;
+    const index = new AgentIndexService({
+      clearRetry: clearRetryMock,
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: null,
+              messageCount: currentToolCount,
+              lastToolResult:
+                currentToolCount > 0
+                  ? {
+                      compaction: {
+                        mode: "truncated_passthrough",
+                        originalChars: 10,
+                        returnedChars: 10,
+                      },
+                      isError: false,
+                      ref: `tool_${currentToolCount}`,
+                      text: `result_${currentToolCount}`,
+                      toolName: "ctxmode",
+                    }
+                  : null,
+              updatedAt: new Date(1700000000000 + currentToolCount * 1000).toISOString(),
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: scheduleRetryMock,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+    expect(agent.agentStatus).toBe("working");
+
+    const planRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+
+    // Initial plan execution: fails history check and schedules waiting retry
+    await index.executeStatusEventPlan({
+      agent,
+      compactHistory: undefined,
+      from: "working",
+      planId: planRow.id,
+      to: "done",
+    });
+
+    // Verify initial retry scheduled
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+    expect(scheduleRetryMock).toHaveBeenCalledTimes(1);
+
+    // Simulate 12 retries (exceeding STATUS_PLAN_MAX_ATTEMPTS = 8) while agent is actively working with tools
+    for (let attempt = 1; attempt <= 12; attempt++) {
+      currentToolCount = attempt; // Activity: history advances with each MCP tool call
+      const latestTimerId =
+        scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+      const callback = scheduledCallbacks.get(latestTimerId);
+      if (!callback) throw new Error(`expected callback for timer ${latestTimerId}`);
+      await callback();
+
+      const plan = harness.statusEventPlans.get(planRow.id);
+      // Invariant: plan must NEVER drop to discarded or failed while agent is working
+      expect(plan.status).toBe("pending");
+      expect(plan.lastError).toBe(PLAN_WAITING_HISTORY);
+    }
+
+    // Zero agent.discarded and zero agent.failed events must have been appended for this plan
+    const allEvents = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    expect(allEvents.filter((e) => e.type === "agent.discarded")).toHaveLength(0);
+    expect(allEvents.filter((e) => e.type === "agent.failed")).toHaveLength(0);
+
+    // Now simulate agent leaving working state (becomes idle)
+    harness.agents.updateStatus({
+      agentStatus: "idle",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+    });
+    expect(
+      harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" })?.agentStatus,
+    ).toBe("idle");
+
+    // Next retry after leaving working should now settle under existing budget
+    const latestTimerId =
+      scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+    const finalCallback = scheduledCallbacks.get(latestTimerId);
+    if (!finalCallback) throw new Error("expected callback after leaving working");
+    await finalCallback();
+
+    const settledPlan = harness.statusEventPlans.get(planRow.id);
+    expect(settledPlan.status).toBe("discarded");
+    expect(settledPlan.lastError).toBe(PLAN_WAITING_HISTORY);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("stall branch: plan keeps pending while working until stallAttempts reaches WORKING_PLAN_MAX_STALL_ATTEMPTS, then settles to discarded", async () => {
+    const harness = openObservabilityDbHarness();
+    let timerSequence = 0;
+    const scheduledCallbacks = new Map<unknown, () => Promise<void> | void>();
+    const scheduleRetryMock = vi.fn((callback: () => void, _delayMs: number) => {
+      timerSequence += 1;
+      scheduledCallbacks.set(timerSequence, callback);
+      return timerSequence;
+    });
+
+    const frozenHistory: CompactAgentHistory = {
+      ...emptyCompactHistory("antigravity-sqlite"),
+      lastAssistantMessage: null,
+      messageCount: 1,
+      lastToolResult: null,
+      source: "antigravity-sqlite",
+      updatedAt: new Date(1700000000000).toISOString(),
+    };
+
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: frozenHistory,
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: scheduleRetryMock,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+    expect(agent.agentStatus).toBe("working");
+
+    const planRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+
+    await index.executeStatusEventPlan({
+      agent,
+      compactHistory: frozenHistory,
+      from: "working",
+      planId: planRow.id,
+      to: "done",
+    });
+
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+    expect(scheduleRetryMock).toHaveBeenCalledTimes(1);
+
+    for (let attempt = 1; attempt < WORKING_PLAN_MAX_STALL_ATTEMPTS; attempt++) {
+      const latestTimerId =
+        scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+      const callback = scheduledCallbacks.get(latestTimerId);
+      if (!callback) throw new Error(`expected callback for timer ${latestTimerId}`);
+      await callback();
+
+      const plan = harness.statusEventPlans.get(planRow.id);
+      expect(plan.status).toBe("pending");
+      expect(plan.lastError).toBe(PLAN_WAITING_HISTORY);
+
+      const allEvents = harness.agentEvents.listAfter({
+        herdrSessionName: "default",
+        workspaceId: "wJ",
+      });
+      expect(allEvents.filter((e) => e.type === "agent.discarded")).toHaveLength(0);
+      expect(allEvents.filter((e) => e.type === "agent.failed")).toHaveLength(0);
+    }
+
+    const stallTimerId =
+      scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+    const stallCallback = scheduledCallbacks.get(stallTimerId);
+    if (!stallCallback) throw new Error("expected stall callback");
+    await stallCallback();
+
+    const settledPlan = harness.statusEventPlans.get(planRow.id);
+    expect(settledPlan.status).toBe("discarded");
+    expect(settledPlan.lastError).toBe(PLAN_STALLED);
+
+    const eventsAfterStall = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const discardedEvents = eventsAfterStall.filter((e) => e.type === "agent.discarded");
+    expect(discardedEvents).toHaveLength(1);
+    expect(discardedEvents[0]?.payload).toMatchObject({
+      reason: PLAN_STALLED,
+    });
+    expect(eventsAfterStall.filter((e) => e.type === "agent.failed")).toHaveLength(0);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("drain branch: attempts-exhausted plan keeps pending during periodic drain while working, but settles during startup or shutdown drain", async () => {
+    const harness = openObservabilityDbHarness();
+
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              source: "antigravity-sqlite",
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+    expect(agent.agentStatus).toBe("working");
+
+    const planRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    harness.sqlite
+      .prepare("update status_event_plans set attempts = ?, last_error = ? where id = ?")
+      .run(STATUS_PLAN_MAX_ATTEMPTS, PLAN_WAITING_HISTORY, planRow.id);
+    expect(harness.statusEventPlans.get(planRow.id).attempts).toBe(STATUS_PLAN_MAX_ATTEMPTS);
+
+    // 1. 周期 drain：运行在正常运行时且 live agent 持续 working，保留 working 豁免，应保持 pending
+    await index.drainPendingPlans({ reason: "periodic" });
+    const planAfterPeriodic = harness.statusEventPlans.get(planRow.id);
+    expect(planAfterPeriodic.status).toBe("pending");
+    expect(planAfterPeriodic.lastError).toBe(PLAN_WAITING_HISTORY);
+
+    // 2. 启动/关停 drain：agents 表可能陈旧不可信，不享有 working 豁免，应收口为 discarded
+    await index.drainPendingPlans({ reason: "startup" });
+    const planAfterStartup = harness.statusEventPlans.get(planRow.id);
+    expect(planAfterStartup.status).toBe("discarded");
+    expect(planAfterStartup.lastError).toBe(PLAN_WAITING_HISTORY);
+
+    const discardedEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(discardedEvents).toHaveLength(1);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("interactive suppression applies to orphan agent.idle events", async () => {
+    const harness = openObservabilityDbHarness();
+
+    const interactiveSnapshot = snapshot(
+      [
+        agent({
+          agent: "pi",
+          agent_session: {
+            agent: "pi",
+            kind: "path",
+            source: "pi-jsonl",
+            value: "/root/.pi/agent/sessions/interactive.jsonl",
+          },
+          agent_status: "working",
+          cwd: "/tmp/project",
+          pane_id: "wJ:p2",
+          revision: 10,
+          terminal_id: "term_2",
+          workspace_id: "wJ",
+        }),
+      ],
+      [{ pane_id: "wJ:p2", revision: 10 }],
+    );
+
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return interactiveSnapshot;
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: emptyCompactHistory("pi-jsonl"),
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agentRecord = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agentRecord) throw new Error("expected agent");
+
+    harness.agents.updateStatus({
+      agentStatus: "idle",
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+    });
+
+    await index.executeStatusEventPlan({
+      agent: agentRecord,
+      compactHistory: emptyCompactHistory("pi-jsonl"),
+      from: "working",
+      to: "idle",
+    });
+
+    const events = harness.agentEvents.listAfter({
+      herdrSessionName: "default",
+      workspaceId: "wJ",
+    });
+    const idleEvent = events.find((e) => e.type === "agent.idle");
+    expect(idleEvent).toBeDefined();
+    expect((idleEvent?.payload as Record<string, unknown>).interactive).toBe(true);
+
+    harness.agents.retirePane({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+    });
+    expect(
+      harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" }),
+    ).toBeUndefined();
+
+    const scope = { herdrSessionName: "default", workspaceId: "wJ" };
+    if (!idleEvent) throw new Error("expected idleEvent");
+    const deliverable = isDeliverableAgentEvent(idleEvent, undefined, scope, "owner_term");
+    expect(deliverable).toBe(false);
+
+    const nextDeliverable = harness.agentEvents.nextDeliverableAfter({
+      afterEventId: 0,
+      herdrSessionName: "default",
+      ownerTerminalId: "owner_term",
+      workspaceId: "wJ",
+    });
+    expect(nextDeliverable).toBeUndefined();
+
+    harness.sqlite.close();
+  });
+
+  test("Fix C: working agy encountering generic runtime error enjoys working exemption instead of early failure", async () => {
+    const harness = openObservabilityDbHarness();
+    const readyHistory = {
+      ...emptyCompactHistory("antigravity-sqlite"),
+      lastAssistantMessage: { ref: "ref-new", text: "completed output", timestamp: null },
+      source: "antigravity-sqlite",
+    };
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: readyHistory,
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+    expect(agent.agentStatus).toBe("working");
+
+    const row = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: readyHistory,
+      from: "working",
+      to: "done",
+    });
+
+    // Advance attempts to 7 so next attempt hits STATUS_PLAN_MAX_ATTEMPTS (8)
+    for (let i = 0; i < 7; i += 1) {
+      harness.statusEventPlans.markRetry(row.id, new Error("generic disk failure"), {
+        isTargetWorking: true,
+      });
+    }
+    expect(harness.statusEventPlans.get(row.id).attempts).toBe(7);
+
+    // Mock agentEvents.append to throw a generic Error (not PlanWaitingHistoryError)
+    harness.agentEvents.append = () => {
+      throw new Error("simulated generic db write error");
+    };
+
+    // When executeStatusEventPlan runs #runPlanRow, generic error catch routes to #markPlanRetry
+    // Because agy is working and not stalled, attempts reach 8 but row is EXEMPTED (status stays pending)
+    // and #runPlanRow rethrows the error preserving throw timing
+    await expect(
+      index.executeStatusEventPlan({
+        agent,
+        compactHistory: readyHistory,
+        from: "working",
+        planId: row.id,
+        to: "done",
+      }),
+    ).rejects.toThrow("simulated generic db write error");
+
+    const planAfter = harness.statusEventPlans.get(row.id);
+    expect(planAfter.attempts).toBe(8);
+    expect(planAfter.status).toBe("pending"); // Exempted! Not failed!
+    expect(planAfter.lastError).toBe("simulated generic db write error");
+
+    harness.sqlite.close();
+  });
+
+  test("Fix F: plan waiting history times out and settles to discarded with PLAN_STALLED when total wait exceeds maxWorkingPlanWaitMs even with continuous progress", async () => {
+    const harness = openObservabilityDbHarness();
+    let nowMs = 1_000_000;
+    let step = 0;
+
+    // Use a short maxWorkingPlanWaitMs: 300ms (production default is 30m)
+    expect(WORKING_PLAN_MAX_WAIT_MS).toBe(30 * 60 * 1000);
+    const shortMaxWaitMs = 300;
+
+    let timerSequence = 0;
+    const scheduledCallbacks = new Map<unknown, () => Promise<void> | void>();
+    const scheduleRetryMock = vi.fn((callback: () => void, _delayMs: number) => {
+      timerSequence += 1;
+      scheduledCallbacks.set(timerSequence, callback);
+      return timerSequence;
+    });
+
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          step += 1;
+          // Progress fingerprint continuously advances every round (different tool result)
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: null,
+              lastToolResult: {
+                compaction: { mode: "unknown", originalChars: 10, returnedChars: 10 },
+                isError: false,
+                ref: `tool-${step}`,
+                text: `progress step ${step}`,
+                toolName: "bash",
+              },
+              source: "antigravity-sqlite",
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      maxWorkingPlanWaitMs: shortMaxWaitMs,
+      now: () => nowMs,
+      scheduleRetry: scheduleRetryMock,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const planRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+
+    // Initial plan run (waiting history, has no assistant message yet)
+    await index.executeStatusEventPlan({
+      agent,
+      compactHistory: {
+        ...emptyCompactHistory("antigravity-sqlite"),
+        lastAssistantMessage: null,
+        lastToolResult: {
+          compaction: { mode: "unknown", originalChars: 10, returnedChars: 10 },
+          isError: false,
+          ref: "tool-0",
+          text: "progress step 0",
+          toolName: "bash",
+        },
+        source: "antigravity-sqlite",
+      },
+      from: "working",
+      planId: planRow.id,
+      to: "done",
+    });
+
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+
+    // Advance time within limit: progress changes, stallAttempts resets, plan stays pending
+    nowMs += 100;
+    const timer1 = scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+    const cb1 = scheduledCallbacks.get(timer1);
+    if (!cb1) throw new Error("expected callback 1");
+    await cb1();
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+
+    nowMs += 100; // total 200ms < 300ms
+    const timer2 = scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+    const cb2 = scheduledCallbacks.get(timer2);
+    if (!cb2) throw new Error("expected callback 2");
+    await cb2();
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+
+    // Now advance time past maxWorkingPlanWaitMs: total elapsed = 350ms >= 300ms
+    nowMs += 150;
+    const timer3 = scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+    const cb3 = scheduledCallbacks.get(timer3);
+    if (!cb3) throw new Error("expected callback 3");
+    await cb3();
+
+    const settledPlan = harness.statusEventPlans.get(planRow.id);
+    expect(settledPlan.status).toBe("discarded");
+    expect(settledPlan.lastError).toBe(PLAN_STALLED);
+
+    const discardedEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(discardedEvents).toHaveLength(1);
+    expect(discardedEvents[0]?.payload).toMatchObject({
+      reason: PLAN_STALLED,
+    });
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("Fix E: salvage or cancel missing-agent plan clears #planProgressTrackers", async () => {
+    const harness = openObservabilityDbHarness();
+    const waitingHistory = {
+      ...emptyCompactHistory("antigravity-sqlite"),
+      lastAssistantMessage: null,
+      source: "antigravity-sqlite",
+    };
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: waitingHistory,
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: () => 1,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const planRow = harness.statusEventPlans.insertPending({
+      agent,
+      compactHistory: waitingHistory,
+      from: "working",
+      to: "done",
+    });
+
+    // Execute plan: since history has no assistant message, it enters waiting history retry and initializes tracker
+    await index.executeStatusEventPlan({
+      agent,
+      compactHistory: waitingHistory,
+      from: "working",
+      planId: planRow.id,
+      to: "done",
+    });
+
+    // Verify tracker exists in index
+    expect(index.hasPlanProgressTracker(planRow.id)).toBe(true);
+
+    // Now delete agent row simulating missing agent before next drain
+    harness.agents.retirePane({
+      herdrSessionName: "default",
+      paneId: "wJ:p2",
+    });
+
+    // Next drain will invoke #salvageOrCancelMissingAgentPlan
+    await index.drainPendingPlans();
+
+    // Verify tracker has been cleaned up
+    expect(index.hasPlanProgressTracker(planRow.id)).toBe(false);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("generic catch preserves progress tracker across retries so time-based stall closes plan to failed with PLAN_STALLED", async () => {
+    const harness = openObservabilityDbHarness();
+    let nowMs = 1_000_000;
+    let step = 0;
+    const shortMaxWaitMs = 300;
+
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return oneAgent("working", 10 + step, "agy");
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          step += 1;
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: {
+                ref: `asst-${step}`,
+                text: `assistant message step ${step}`,
+                timestamp: null,
+              },
+              lastToolResult: {
+                compaction: { mode: "unknown", originalChars: 10, returnedChars: 10 },
+                isError: false,
+                ref: `tool-${step}`,
+                text: `progress step ${step}`,
+                toolName: "bash",
+              },
+              source: "antigravity-sqlite",
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      maxWorkingPlanWaitMs: shortMaxWaitMs,
+      now: () => nowMs,
+      scheduleRetry: () => 1,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+
+    const planRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+
+    // Mock harness.agentEvents.append to throw a generic error for standard status events,
+    // but allow agent.failed (the stall outcome event) to succeed.
+    const realAppend = harness.agentEvents.append.bind(harness.agentEvents);
+    vi.spyOn(harness.agentEvents, "append").mockImplementation((input) => {
+      if (input.type !== "agent.failed") {
+        throw new Error("simulated generic db write boom");
+      }
+      return realAppend(input);
+    });
+
+    // Round 1: first drain throws generic error in appendStatusEvents. Plan stays pending.
+    await index.drainPendingPlans({ allowWorkingExemption: true });
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+    expect(harness.statusEventPlans.get(planRow.id).attempts).toBe(1);
+
+    // Round 2: time advances 100ms (< 300ms). Progress changes, plan stays pending.
+    nowMs += 100;
+    await index.drainPendingPlans({ allowWorkingExemption: true });
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+    expect(harness.statusEventPlans.get(planRow.id).attempts).toBe(2);
+
+    // Round 3: time advances another 100ms (total 200ms < 300ms). Progress changes, plan stays pending.
+    nowMs += 100;
+    await index.drainPendingPlans({ allowWorkingExemption: true });
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+    expect(harness.statusEventPlans.get(planRow.id).attempts).toBe(3);
+
+    // Round 4: time advances 150ms (total 350ms >= 300ms).
+    // Because tracker was preserved on the generic catch path, total elapsed exceeds maxWorkingPlanWaitMs,
+    // so stallDetected triggers and plan closes as failed with PLAN_STALLED.
+    nowMs += 150;
+    await index.drainPendingPlans({ allowWorkingExemption: true });
+
+    const settledPlan = harness.statusEventPlans.get(planRow.id);
+    expect(settledPlan.status).toBe("failed");
+    expect(settledPlan.lastError).toBe(PLAN_STALLED);
+
+    const failedEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.failed");
+    expect(failedEvents).toHaveLength(1);
+    expect(failedEvents[0]?.payload).toMatchObject({
+      reason: PLAN_STALLED,
+    });
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  test("drain refresh failure pushes discarded events unconditionally: agy PLAN_WAITING_HISTORY is suppressed by projector while pi wakes, and PLAN_STALLED wakes", async () => {
+    const harness = openObservabilityDbHarness();
+    const pushedEvents: AgentEventRecord[] = [];
+    let failRefresh = false;
+    let nowMs = 1_000;
+    const shortMaxWaitMs = 300;
+
+    const initialSnapshot = snapshot(
+      [
+        agent({
+          agent: "agy",
+          agent_status: "working",
+          pane_id: "wJ:p2",
+          revision: 10,
+          terminal_id: "term_agy",
+          workspace_id: "wJ",
+        }),
+        agent({
+          agent: "pi",
+          agent_status: "working",
+          pane_id: "wJ:p3",
+          revision: 10,
+          terminal_id: "term_pi",
+          workspace_id: "wJ",
+        }),
+      ],
+      [
+        { pane_id: "wJ:p2", revision: 10 },
+        { pane_id: "wJ:p3", revision: 10 },
+      ],
+    );
+
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return initialSnapshot;
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          if (failRefresh) {
+            throw new Error("simulated refresh failure during drain");
+          }
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              source: "antigravity-sqlite",
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      maxWorkingPlanWaitMs: shortMaxWaitMs,
+      now: () => nowMs,
+      onAgentEvent: (event) => {
+        pushedEvents.push(event);
+      },
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInput());
+    const agyAgent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    const piAgent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p3" });
+    if (!agyAgent || !piAgent) throw new Error("expected agents");
+    expect(agyAgent.agentStatus).toBe("working");
+    expect(agyAgent.agent).toBe("agy");
+    expect(piAgent.agentStatus).toBe("working");
+    expect(piAgent.agent).toBe("pi");
+
+    // Enable simulated refresh failure so #drainPlanRow goes into the catch branch
+    failRefresh = true;
+
+    // 1. Positive case: periodic drain with working agy stalling closes as discarded with PLAN_STALLED and pushes
+    const planRowAgyStall = harness.statusEventPlans.insertPending({
+      agent: agyAgent,
+      from: "working",
+      to: "done",
+    });
+
+    // Round 1: tracker initialized, progress not yet stalled, stays pending
+    await index.drainPendingPlans({ reason: "periodic" });
+    const plan1 = harness.statusEventPlans.get(planRowAgyStall.id);
+    expect(plan1.status).toBe("pending");
+    expect(pushedEvents).toHaveLength(0);
+
+    // Advance time beyond shortMaxWaitMs so timeStalled becomes true
+    nowMs += 350;
+    await index.drainPendingPlans({ reason: "periodic" });
+
+    const settledStallPlan = harness.statusEventPlans.get(planRowAgyStall.id);
+    expect(settledStallPlan.status).toBe("discarded");
+    expect(settledStallPlan.lastError).toBe(PLAN_STALLED);
+
+    // Assert that the PLAN_STALLED discarded event was written to db
+    const discardedInDb = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(discardedInDb).toHaveLength(1);
+    expect(discardedInDb[0]?.payload).toMatchObject({
+      reason: PLAN_STALLED,
+    });
+
+    // Positive assertion: verify that the PLAN_STALLED discarded event was indeed pushed to onAgentEvent
+    const discardedPushed = pushedEvents.filter((e) => e.type === "agent.discarded");
+    expect(discardedPushed).toHaveLength(1);
+    expect(discardedPushed[0]?.payload).toMatchObject({
+      reason: PLAN_STALLED,
+    });
+    expect(discardedPushed[0]?.id).toBe(discardedInDb[0]?.id);
+
+    // Assert downstream projector behavior for PLAN_STALLED: wakes as failed
+    const firstDiscardedPushed = discardedPushed[0];
+    if (!firstDiscardedPushed) throw new Error("expected pushed stall event");
+    const stallProjection = projectAgentOutcomes([toWireRecord(firstDiscardedPushed)]);
+    expect(stallProjection.outcomes).toEqual([
+      expect.objectContaining({
+        kind: "failed",
+        reason: PLAN_STALLED,
+      }),
+    ]);
+
+    // 2. agy conventional PLAN_WAITING_HISTORY discarded on this path is pushed unconditionally,
+    // and downstream projector suppresses it (returns undefined / 0 outcomes, does not wake)
+    const planRowAgyWaiting = harness.statusEventPlans.insertPending({
+      agent: agyAgent,
+      from: "working",
+      to: "done",
+    });
+    // Set attempts to STATUS_PLAN_MAX_ATTEMPTS and lastError to PLAN_WAITING_HISTORY
+    harness.sqlite
+      .prepare("update status_event_plans set attempts = ?, last_error = ? where id = ?")
+      .run(STATUS_PLAN_MAX_ATTEMPTS, PLAN_WAITING_HISTORY, planRowAgyWaiting.id);
+
+    const pushedCountBeforeAgyWaiting = pushedEvents.length;
+    // Startup drain has allowWorkingExemption = false, so attempts >= MAX closes as discarded with PLAN_WAITING_HISTORY
+    await index.drainPendingPlans({ reason: "startup" });
+
+    const planAgyWaitingSettled = harness.statusEventPlans.get(planRowAgyWaiting.id);
+    expect(planAgyWaitingSettled.status).toBe("discarded");
+    expect(planAgyWaitingSettled.lastError).toBe(PLAN_WAITING_HISTORY);
+
+    // Verify DB received the second discarded event
+    const allDiscardedInDb = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(allDiscardedInDb).toHaveLength(2);
+
+    // Unconditional push: verify the discarded event was pushed to onAgentEvent (exactly once)
+    expect(pushedEvents.length).toBe(pushedCountBeforeAgyWaiting + 1);
+    const agyWaitingDiscarded = pushedEvents[pushedEvents.length - 1];
+    if (!agyWaitingDiscarded) throw new Error("expected pushed agy waiting event");
+    expect(agyWaitingDiscarded.payload).toMatchObject({
+      agent: "agy",
+      reason: PLAN_WAITING_HISTORY,
+    });
+
+    // Downstream projector assertion: agy PLAN_WAITING_HISTORY discarded produces no wake (0 outcomes)
+    const agyProjection = projectAgentOutcomes([toWireRecord(agyWaitingDiscarded)]);
+    expect(agyProjection.outcomes).toHaveLength(0);
+
+    // 3. pi conventional PLAN_WAITING_HISTORY discarded on this path is pushed unconditionally,
+    // and pi projector projects it as failed (wakes orchestrator)
+    const planRowPiWaiting = harness.statusEventPlans.insertPending({
+      agent: piAgent,
+      from: "working",
+      to: "done",
+    });
+    harness.sqlite
+      .prepare("update status_event_plans set attempts = ?, last_error = ? where id = ?")
+      .run(STATUS_PLAN_MAX_ATTEMPTS, PLAN_WAITING_HISTORY, planRowPiWaiting.id);
+
+    const pushedCountBeforePiWaiting = pushedEvents.length;
+    await index.drainPendingPlans({ reason: "startup" });
+
+    const planPiWaitingSettled = harness.statusEventPlans.get(planRowPiWaiting.id);
+    expect(planPiWaitingSettled.status).toBe("discarded");
+    expect(planPiWaitingSettled.lastError).toBe(PLAN_WAITING_HISTORY);
+
+    // Verify DB received the third discarded event
+    const allDiscardedInDbAfterPi = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(allDiscardedInDbAfterPi).toHaveLength(3);
+
+    // Unconditional push: verify pi discarded event was pushed to onAgentEvent (exactly once)
+    expect(pushedEvents.length).toBe(pushedCountBeforePiWaiting + 1);
+    const piWaitingDiscarded = pushedEvents[pushedEvents.length - 1];
+    if (!piWaitingDiscarded) throw new Error("expected pushed pi waiting event");
+    expect(piWaitingDiscarded.payload).toMatchObject({
+      agent: "pi",
+      reason: PLAN_WAITING_HISTORY,
+    });
+
+    // Downstream projector assertion: pi PLAN_WAITING_HISTORY discarded wakes as failed
+    const piProjection = projectAgentOutcomes([toWireRecord(piWaitingDiscarded)]);
+    expect(piProjection.outcomes).toEqual([
+      expect.objectContaining({
+        agent: "pi",
+        kind: "failed",
+        reason: PLAN_WAITING_HISTORY,
+      }),
+    ]);
+
+    index.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
 });
