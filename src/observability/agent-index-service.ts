@@ -2831,12 +2831,27 @@ export class AgentIndexService {
             // guard: (i) it now looks at a window, because a body delivered before
             // the current latest terminal row would otherwise slip through and, now
             // that M2 accepts unconfirmed rounds, be re-released as this round's
-            // answer; (ii) it only counts rows in `delivered`/`acked`, because a
-            // never-deliverable row (`agent.idle` from a non-`working` status, per
-            // `isDeliverableAgentEvent`; ~50% of ref-bearing `agent.idle` rows for a
-            // given agent (47/94 in a 7-day sample) carry the same ref as a `done` row
-            // of that agent; they are never deliverable) can sit in the window and must
-            // not blank a deliverable round; the tightened guard is not a strict
+            // answer; (ii) it only counts rows in `delivered`/`acked` that represent
+            // a deliverable terminal *round*. A never-deliverable row (`agent.idle`
+            // from a non-`working` status, per `isDeliverableAgentEvent`; ~50% of
+            // ref-bearing `agent.idle` rows for a given agent (47/94 in a 7-day
+            // sample) carry the same ref as a `done` row of that agent; they are
+            // never deliverable) can sit in the window and must not blank a
+            // deliverable round. `status in ('delivered', 'acked')` alone does not
+            // exclude them: sub-agents dispatched in the same batch share a
+            // workspace, and acking a sibling's terminal row runs `markAcked(id,
+            // scope)`, which sweeps every earlier row of that workspace (`id <= ?`
+            // on herdr_session_name + workspace_id) — including this agent's
+            // never-deliverable `unknown -> idle` / `done -> idle` / `blocked -> idle`
+            // rows, which then look acked in the table precisely because they never
+            // became deliverable. The type/`from` restriction below therefore has to
+            // be explicit and match `isDeliverableAgentEvent` (`agent.done`,
+            // `agent.blocked`, or `agent.idle` with `$.from = 'working'`, using the
+            // same `agent.idle` SQL predicate as `#invalidatePaneCore`'s
+            // retained-outcome clause and `latestCompletedTurnEvent` in
+            // `src/db/agent-events.ts`) — otherwise a swept startup idle row reads as
+            // "this agent already delivered a terminal row" and blanks a first
+            // round's on-disk answer. The tightened guard is not a strict
             // superset of the old one (its window is narrower than "every terminal
             // row", and the same window now also answers the no-advance release
             // question below — "did this agent ever deliver a terminal row?" —
@@ -2850,7 +2865,8 @@ export class AgentIndexService {
               .prepare(
                 `select compact_history_json from agent_events
                  where agent_id = ? and herdr_session_name = ?
-                   and type in ('agent.idle', 'agent.done', 'agent.blocked')
+                   and (type in ('agent.done', 'agent.blocked')
+                        or (type = 'agent.idle' and json_extract(payload_json, '$.from') = 'working'))
                    and status in ('delivered', 'acked')
                  order by id desc limit ?`,
               )
