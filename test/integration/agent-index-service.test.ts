@@ -15,6 +15,7 @@ import {
 import { AgentOrchestratorService } from "@/observability/agent-orchestrator-service.js";
 import {
   type AgentEventRecord,
+  type AgentStatus,
   type CompactAgentHistory,
   PLAN_STALLED,
   PLAN_WAITING_HISTORY,
@@ -1256,17 +1257,20 @@ describe("AgentIndexService non-pi completed event generation", () => {
     harness.sqlite.close();
   });
 
-  test("C5: fake timers 8x4s + 7x10s = 102s exhausts retry budget to discarded with attempts=8, zero agent.failed events, no drainPendingPlans called", async () => {
+  test("C5: fake timers 8x4s + 255s exponential backoff = 287s exhausts non-agy retry budget to discarded with attempts=8, zero agent.failed events, no drainPendingPlans called", async () => {
     vi.useFakeTimers();
     try {
       const harness = openObservabilityDbHarness();
       const drainSpy = vi.spyOn(AgentIndexService.prototype, "drainPendingPlans");
 
+      let currentAssistantMsg: { ref: string; text: string; timestamp: string | null } | null =
+        null;
+      let paneStatus = "working";
       const index = new AgentIndexService({
         clientFactory: () => ({
           close() {},
           async sessionSnapshot() {
-            return oneAgent("working", 10, "agy");
+            return oneAgent(paneStatus, 10, "agy");
           },
         }),
         history: {
@@ -1274,13 +1278,19 @@ describe("AgentIndexService non-pi completed event generation", () => {
             return {
               compactHistory: {
                 ...emptyCompactHistory("antigravity-sqlite"),
-                lastAssistantMessage: null,
+                lastAssistantMessage: currentAssistantMsg,
               },
               historyRef: null,
               sourceFingerprint: null,
             };
           },
         } as unknown as AgentHistoryService,
+        statusPlansConfig: {
+          initial_backoff_ms: 5_000,
+          max_backoff_ms: 60_000,
+          backoff_factor: 2,
+          total_window_ms: 250_000,
+        },
         stores: harness,
       });
 
@@ -1304,9 +1314,10 @@ describe("AgentIndexService non-pi completed event generation", () => {
         status: "pending",
       });
 
-      // Advance remaining 7 retry intervals (10s timer + 4s wait each = 14s each, total 7 x 14s = 98s)
-      for (let retry = 2; retry <= 8; retry += 1) {
-        await vi.advanceTimersByTimeAsync(10_000);
+      // Advance remaining 7 retry intervals with exponential backoff (5s, 10s, 20s, 40s, 60s, 60s, 60s + 4s wait each)
+      const backoffDelays = [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000];
+      for (const delay of backoffDelays) {
+        await vi.advanceTimersByTimeAsync(delay);
         await vi.advanceTimersByTimeAsync(4_000);
       }
 
@@ -1325,14 +1336,354 @@ describe("AgentIndexService non-pi completed event generation", () => {
       expect(discardedEvents).toHaveLength(1);
       expect(discardedEvents[0]?.payload).toMatchObject({
         attempts: 8,
+        fallbackOutcome: true,
         from: "working",
         paneId: "wJ:p2",
         reason: PLAN_WAITING_HISTORY,
         to: "idle",
       });
 
+      // M2: agent.discarded is inserted with status pending and deliverable 1, and can be reserved
+      const firstDiscardedInC5 = discardedEvents[0];
+      expect(firstDiscardedInC5).toBeDefined();
+      if (!firstDiscardedInC5) {
+        throw new Error("expected discardedEvents[0] in C5 to be defined");
+      }
+      expect(firstDiscardedInC5.status).toBe("pending");
+      expect(firstDiscardedInC5.deliverable).toBe(1);
+      const reserved = harness.agentEvents.reservePending("term_orchestrator");
+      expect(reserved.map((e) => e.id)).toContain(firstDiscardedInC5.id);
+
+      // 新需求 1: stalled 之后迟到回复的补发（走正常 completed 语义，按 ref 去重只发一次）
+      // 此时 pane 已结算回 idle（M1：只有 idle/done 才允许补发）。
+      paneStatus = "idle";
+      currentAssistantMsg = { ref: "late-ref-1", text: "Finished late work", timestamp: null };
+      const lateRefreshResult = await index.refreshHerdrSession(sessionInput());
+      const lateEvents = lateRefreshResult.events.filter(
+        (e) => e.type === "agent.idle" || e.type === "agent.done",
+      );
+      expect(lateEvents).toHaveLength(1);
+      const lateEvent = lateEvents[0];
+      expect(lateEvent).toBeDefined();
+      if (!lateEvent) {
+        throw new Error("expected lateEvents[0] to be defined");
+      }
+      expect(lateEvent.type).toBe("agent.idle");
+      expect(lateEvent.payload).toMatchObject({
+        from: "working",
+        lateCompletion: true,
+        to: "idle",
+      });
+      expect(lateEvent.compactHistory?.lastAssistantMessage?.ref).toBe("late-ref-1");
+
+      // 幂等：同一 ref 再次刷新历史不会重复产生完成事件
+      const lateRefreshResult2 = await index.refreshHerdrSession(sessionInput());
+      const secondLateEvents = lateRefreshResult2.events.filter(
+        (e) => e.type === "agent.idle" || e.type === "agent.done",
+      );
+      expect(secondLateEvents).toHaveLength(0);
+
       // Proves drainPendingPlans was never called during retry loop
       expect(drainSpy).not.toHaveBeenCalled();
+
+      index.stopWaitingHistoryRetries();
+      harness.sqlite.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("M3: suspected false idle stays pending throughout the total window and is discarded only upon window expiration, with working time deducted", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = openObservabilityDbHarness();
+      let liveAgentStatus: AgentStatus = "working";
+      let historyReads = 0;
+
+      const index = new AgentIndexService({
+        clientFactory: () => ({
+          close() {},
+          async sessionSnapshot() {
+            return oneAgent(liveAgentStatus, 10, "agy");
+          },
+        }),
+        history: {
+          async resolveCompactHistory() {
+            // The pane keeps making progress on disk while it works, so the
+            // progress fingerprint advances and the stall fallback
+            // (`WORKING_PLAN_MAX_STALL_ATTEMPTS`) never fires. What is under test
+            // here is the *window* accounting, not the stall accounting.
+            historyReads += 1;
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("antigravity-sqlite"),
+                lastAssistantMessage: null,
+                lastToolResult: {
+                  compaction: { mode: "unknown", originalChars: 10, returnedChars: 10 },
+                  isError: false,
+                  ref: `progress-${historyReads}`,
+                  text: `progress step ${historyReads}`,
+                  toolName: "bash",
+                },
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          },
+        } as unknown as AgentHistoryService,
+        statusPlansConfig: {
+          backoff_factor: 2,
+          initial_backoff_ms: 5_000,
+          max_backoff_ms: 60_000,
+          total_window_ms: 900_000, // 生产默认 15 分钟窗口
+        },
+        stores: harness,
+      });
+
+      await index.refreshHerdrSession(sessionInput());
+      // The waiting plan is the only plan under test; a real `working` phase also
+      // inserts an `idle -> working` row through the event path, so plans are
+      // selected by transition instead of by position.
+      const waitingPlan = () =>
+        harness.statusEventPlans
+          .listUnfinished()
+          .find((row) => row.fromStatus === "working" && row.toStatus === "idle");
+
+      // 1. Herdr 报 agent 变为 idle，但历史上没有新 assistant 消息（疑似假 idle）
+      liveAgentStatus = "idle";
+      const handlePromise = index.handleHerdrEvent({
+        event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInput(),
+      });
+
+      // 推进首次 ready wait (8 x 500ms = 4000ms)
+      await vi.advanceTimersByTimeAsync(4000);
+      await handlePromise;
+
+      const planRecord = waitingPlan();
+      if (!planRecord) throw new Error("expected pending plan");
+
+      // 2. 推进前 7 次重试 (5s, 10s, 20s, 40s, 60s, 60s, 60s)
+      const backoffDelays = [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000];
+      for (const delay of backoffDelays) {
+        await vi.advanceTimersByTimeAsync(delay);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+
+      // 此时已经达到了 8 次 attempts，但时间只过了 4s + 255s + 28s = 287s，远小于 900s 窗口！
+      // 核心断言：疑似假 idle 在窗口期内严禁被 discard，必须保持 pending！
+      const planAtAttempt8 = harness.statusEventPlans.get(planRecord.id);
+      expect(planAtAttempt8.attempts).toBe(8);
+      expect(planAtAttempt8.status).toBe("pending");
+
+      // 3. 模拟 agent 重新转入 working：走真实事件路径把 working 写进 agents 表，
+      //    这样 `#markPlanRetry` 的 `#findLiveAgent` 才能真的看到 live working
+      //    （旧版用例只改 sessionSnapshot 返回值，agents 表从未变 working，
+      //    `isLiveWorking` 全程为假，working 豁免根本没被行使）。
+      liveAgentStatus = "working";
+      await index.handleHerdrEventFast({
+        event: { agent_status: "working", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInput(),
+      });
+      const liveWorkingAgent = harness.agents.findByPane({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+      });
+      expect(liveWorkingAgent?.agentStatus).toBe("working");
+
+      // working 期间推进 5 个 tick（5 x (60s 退避上限 + 4s ready wait) = 320s），
+      // 这段时间不应计入窗口：每个 tick 都会把 idle 锚点重置为当前时刻。
+      for (let i = 0; i < 5; i += 1) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+
+      // 4. agent 再次回到 idle（同样走真实事件路径）
+      liveAgentStatus = "idle";
+      await index.handleHerdrEventFast({
+        event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInput(),
+      });
+      expect(
+        harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" })?.agentStatus,
+      ).toBe("idle");
+
+      // 4a. 先推进 8 个 idle tick（8 x 64s = 512s）。此时总墙钟已达
+      //     287 + 320 + 512 = 1119s > 900s，但扣除 working 的 320s 后有效 idle
+      //     只有 512s < 900s：计划必须仍然 pending。
+      for (let i = 0; i < 8; i += 1) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+      const planAfterWorking = harness.statusEventPlans.get(planRecord.id);
+      expect(planAfterWorking.status).toBe("pending");
+      expect(planAfterWorking.lastError).toBe(PLAN_WAITING_HISTORY);
+
+      // 5. 再推进 8 个 idle tick（512s），有效 idle 达到 1024s > 900s，
+      //    plan 真正转为 discarded。
+      for (let i = 0; i < 8; i += 1) {
+        await vi.advanceTimersByTimeAsync(60_000);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+
+      // 此时有效 idle 时间耗尽，plan 真正转为 discarded！
+      const expiredPlan = harness.statusEventPlans.get(planRecord.id);
+      expect(expiredPlan.status).toBe("discarded");
+      expect(expiredPlan.lastError).toBe(PLAN_WAITING_HISTORY);
+      expect(expiredPlan.attempts).toBeGreaterThan(8);
+
+      const discardedEvents = harness.agentEvents
+        .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+        .filter((e) => e.type === "agent.discarded");
+      expect(discardedEvents).toHaveLength(1);
+      const firstDiscarded = discardedEvents[0];
+      expect(firstDiscarded).toBeDefined();
+      if (!firstDiscarded) {
+        throw new Error("expected discardedEvents[0] to be defined");
+      }
+      expect(firstDiscarded.payload).toMatchObject({
+        fallbackOutcome: true,
+        reason: PLAN_WAITING_HISTORY,
+      });
+
+      index.stopWaitingHistoryRetries();
+      harness.sqlite.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  test("F1: one late completion is published exactly once (returned events carry it, no extra onAgentEvent push)", async () => {
+    // F1: `#reconcileLateCompletion` used to push through `#onAgentEvent` itself
+    // while all three of its callers also put the event into the `events` array
+    // they return, and `HerdrSessionWatchManager#publishResult` ->
+    // `publishAgentEvent` pushes that array with no id-level dedupe. The same
+    // `agent.event` therefore reached the socket twice.
+    vi.useFakeTimers();
+    try {
+      const harness = openObservabilityDbHarness();
+      const pushed: AgentEventRecord[] = [];
+      let currentAssistantMsg: { ref: string; text: string; timestamp: string | null } | null =
+        null;
+      let paneStatus = "working";
+
+      const index = new AgentIndexService({
+        clientFactory: () => ({
+          close() {},
+          async sessionSnapshot() {
+            return oneAgent(paneStatus, 10, "agy");
+          },
+        }),
+        history: {
+          async resolveCompactHistory() {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("antigravity-sqlite"),
+                lastAssistantMessage: currentAssistantMsg,
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          },
+        } as unknown as AgentHistoryService,
+        onAgentEvent: (event) => {
+          pushed.push(event);
+        },
+        statusPlansConfig: {
+          backoff_factor: 2,
+          initial_backoff_ms: 5_000,
+          max_backoff_ms: 60_000,
+          total_window_ms: 60_000,
+        },
+        stores: harness,
+      });
+
+      await index.refreshHerdrSession(sessionInput());
+      const handlePromise = index.handleHerdrEvent({
+        event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInput(),
+      });
+      await vi.advanceTimersByTimeAsync(4000);
+      await handlePromise;
+
+      // 5s + 10s + 20s + 40s = 75s > 60s 窗口：计划结算为 discarded。
+      for (const delay of [5_000, 10_000, 20_000, 40_000]) {
+        await vi.advanceTimersByTimeAsync(delay);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+
+      const stallDiscard = harness.agentEvents
+        .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+        .filter((e) => e.type === "agent.discarded");
+      expect(stallDiscard).toHaveLength(1);
+      expect(stallDiscard[0]?.payload).toMatchObject({
+        fallbackOutcome: true,
+        reason: PLAN_WAITING_HISTORY,
+      });
+      // The stall discard itself is pushed once by the retry ring (its only
+      // caller) — the reference behaviour the replay has to match.
+      expect(pushed).toHaveLength(1);
+
+      // The orchestrator-side projector turns that discard into the
+      // self-readable `stalled` outcome (C4: merged from the former
+      // `exercise:` case instead of keeping a near-duplicate scenario).
+      expect(
+        projectAgentOutcomes([toWireRecord(stallDiscard[0] as AgentEventRecord)]).outcomes,
+      ).toEqual([expect.objectContaining({ kind: "stalled", reason: PLAN_WAITING_HISTORY })]);
+
+      // The late answer lands; the next refresh must replay it exactly once. The
+      // pane has settled back to `idle` by then — a replay is only allowed for a
+      // settled pane (M1), never mid-round.
+      await vi.advanceTimersByTimeAsync(100_000);
+      paneStatus = "idle";
+      currentAssistantMsg = {
+        ref: "late-f1-turn",
+        text: "late answer for the stalled round",
+        timestamp: null,
+      };
+      const replay = await index.refreshHerdrSession(sessionInput());
+      const replayed = replay.events.filter(
+        (e) => e.type === "agent.idle" || e.type === "agent.done",
+      );
+      expect(replayed).toHaveLength(1);
+      expect(replayed[0]?.payload).toMatchObject({ lateCompletion: true });
+      expect(
+        projectAgentOutcomes([toWireRecord(replayed[0] as AgentEventRecord)]).outcomes,
+      ).toEqual([
+        expect.objectContaining({
+          kind: "completed",
+          text: "late answer for the stalled round",
+        }),
+      ]);
+
+      // Model the real publication path: `HerdrSessionWatchManager#publishResult`
+      // forwards every event the refresh returned through the same
+      // `publishAgentEvent` channel the service pushes on internally. The late
+      // completion must appear exactly once across both.
+      const published = [...pushed, ...replay.events];
+      const latePublications = published.filter(
+        (e) => (e.payload as Record<string, unknown>).lateCompletion === true,
+      );
+      expect(latePublications).toHaveLength(1);
+      expect(latePublications[0]?.id).toBe(replayed[0]?.id);
+      // …and the service itself must not have pushed it a second time.
+      expect(
+        pushed.filter((e) => (e.payload as Record<string, unknown>).lateCompletion === true),
+      ).toHaveLength(0);
+      expect(pushed).toHaveLength(1);
+
+      // 数据库里同样只有一行（idempotencyKey 生效）。
+      const dbLateRows = harness.agentEvents
+        .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+        .filter((e) => (e.payload as Record<string, unknown>).lateCompletion === true);
+      expect(dbLateRows).toHaveLength(1);
+
+      // 第二轮刷新静默，且不产生任何额外推送。
+      const second = await index.refreshHerdrSession(sessionInput());
+      expect(
+        second.events.filter((e) => e.type === "agent.idle" || e.type === "agent.done"),
+      ).toHaveLength(0);
+      expect(pushed).toHaveLength(1);
 
       index.stopWaitingHistoryRetries();
       harness.sqlite.close();
@@ -5437,6 +5788,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     });
 
     let currentToolCount = 0;
+    let nowMs = Date.now();
     const index = new AgentIndexService({
       clearRetry: clearRetryMock,
       clientFactory: () => ({
@@ -5473,8 +5825,12 @@ describe("agy late startup idle supersession (p76 regression)", () => {
           };
         },
       } as unknown as AgentHistoryService,
+      now: () => nowMs,
       scheduleRetry: scheduleRetryMock,
       sleep: async () => {},
+      statusPlansConfig: {
+        total_window_ms: 100_000,
+      },
       stores: harness,
     });
 
@@ -5535,7 +5891,8 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" })?.agentStatus,
     ).toBe("idle");
 
-    // Next retry after leaving working should now settle under existing budget
+    // Next retry after leaving working and window expiring should now settle to discarded
+    nowMs += 500_000;
     const latestTimerId =
       scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
     const finalCallback = scheduledCallbacks.get(latestTimerId);
@@ -6177,7 +6534,7 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     harness.sqlite.close();
   });
 
-  test("drain refresh failure pushes discarded events unconditionally: agy PLAN_WAITING_HISTORY is suppressed by projector while pi wakes, and PLAN_STALLED wakes", async () => {
+  test("drain refresh failure pushes discarded events unconditionally: agy PLAN_WAITING_HISTORY is suppressed by projector while pi wakes, and agy PLAN_STALLED wakes as stalled", async () => {
     const harness = openObservabilityDbHarness();
     const pushedEvents: AgentEventRecord[] = [];
     let failRefresh = false;
@@ -6290,13 +6647,20 @@ describe("agy late startup idle supersession (p76 regression)", () => {
     });
     expect(discardedPushed[0]?.id).toBe(discardedInDb[0]?.id);
 
-    // Assert downstream projector behavior for PLAN_STALLED: wakes as failed
+    // Assert downstream projector behavior for PLAN_STALLED: agy stall wakes as stalled
+    // (F6: the jitter-shaped false idle must stay self-readable, not read as a plain failure)
     const firstDiscardedPushed = discardedPushed[0];
     if (!firstDiscardedPushed) throw new Error("expected pushed stall event");
+    // The stall discard carries the fallback marker, which is what arms the replay.
+    expect(firstDiscardedPushed.payload).toMatchObject({
+      agent: "agy",
+      fallbackOutcome: true,
+      reason: PLAN_STALLED,
+    });
     const stallProjection = projectAgentOutcomes([toWireRecord(firstDiscardedPushed)]);
     expect(stallProjection.outcomes).toEqual([
       expect.objectContaining({
-        kind: "failed",
+        kind: "stalled",
         reason: PLAN_STALLED,
       }),
     ]);
@@ -6336,9 +6700,14 @@ describe("agy late startup idle supersession (p76 regression)", () => {
       reason: PLAN_WAITING_HISTORY,
     });
 
-    // Downstream projector assertion: agy PLAN_WAITING_HISTORY discarded produces no wake (0 outcomes)
+    // Downstream projector assertion: agy PLAN_WAITING_HISTORY discarded with fallbackOutcome projects as stalled
     const agyProjection = projectAgentOutcomes([toWireRecord(agyWaitingDiscarded)]);
-    expect(agyProjection.outcomes).toHaveLength(0);
+    expect(agyProjection.outcomes).toEqual([
+      expect.objectContaining({
+        kind: "stalled",
+        reason: PLAN_WAITING_HISTORY,
+      }),
+    ]);
 
     // 3. pi conventional PLAN_WAITING_HISTORY discarded on this path is pushed unconditionally,
     // and pi projector projects it as failed (wakes orchestrator)
@@ -6385,5 +6754,650 @@ describe("agy late startup idle supersession (p76 regression)", () => {
 
     index.stopWaitingHistoryRetries();
     harness.sqlite.close();
+  });
+});
+
+describe("agy late completion replay: third-round & M1 regressions (F4/F6/F7/M1)", () => {
+  const frozenAgyHistory: CompactAgentHistory = {
+    ...emptyCompactHistory("antigravity-sqlite"),
+    lastAssistantMessage: null,
+    lastToolResult: {
+      compaction: { mode: "unknown", originalChars: 10, returnedChars: 10 },
+      isError: false,
+      ref: "frozen-fingerprint",
+      text: "frozen progress fingerprint",
+      toolName: "bash",
+    },
+    messageCount: 1,
+    source: "antigravity-sqlite",
+    updatedAt: new Date(1700000000000).toISOString(),
+  };
+
+  const sessionInputF4 = () => ({
+    herdrSessionName: "default",
+    sessionDir: "/tmp/herdr",
+    socketPath: "/tmp/herdr.sock",
+  });
+
+  const agyPane = (status: string) =>
+    snapshot(
+      [
+        agent({
+          agent: "agy",
+          agent_status: status,
+          name: "worker",
+          pane_generation: "gen-f4",
+          pane_id: "wJ:p2",
+          revision: 10,
+          terminal_id: "term_agy",
+          workspace_id: "wJ",
+        }),
+      ],
+      [{ pane_id: "wJ:p2", revision: 10 }],
+    );
+
+  /**
+   * F4: the `pane.closed` salvage path must hand the orchestrator the round that
+   * stalled and only landed after the window expired, and the row must survive
+   * the pane-close invalidation as a retained outcome.
+   */
+  test("F4: pane.closed after a stall replays the late completion and retains it for delivery", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = openObservabilityDbHarness();
+      let currentAssistantMsg: { ref: string; text: string; timestamp: string | null } | null =
+        null;
+
+      const index = new AgentIndexService({
+        clientFactory: () => ({
+          close() {},
+          async sessionSnapshot() {
+            return agyPane("working");
+          },
+        }),
+        history: {
+          async resolveCompactHistory() {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("antigravity-sqlite"),
+                lastAssistantMessage: currentAssistantMsg,
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          },
+        } as unknown as AgentHistoryService,
+        statusPlansConfig: {
+          backoff_factor: 2,
+          initial_backoff_ms: 5_000,
+          max_backoff_ms: 60_000,
+          total_window_ms: 60_000,
+        },
+        stores: harness,
+      });
+
+      await index.refreshHerdrSession(sessionInputF4());
+      const handlePromise = index.handleHerdrEvent({
+        event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInputF4(),
+      });
+      await vi.advanceTimersByTimeAsync(4000);
+      await handlePromise;
+      for (const delay of [5_000, 10_000, 20_000, 40_000]) {
+        await vi.advanceTimersByTimeAsync(delay);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+
+      const stalledDiscard = harness.agentEvents
+        .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+        .filter((e) => e.type === "agent.discarded");
+      expect(stalledDiscard).toHaveLength(1);
+      expect(stalledDiscard[0]?.payload).toMatchObject({
+        fallbackOutcome: true,
+        reason: PLAN_WAITING_HISTORY,
+      });
+
+      // The answer only lands now, and the orchestrator closes the pane right
+      // after: `pane.closed` has to salvage it before retiring the pane.
+      currentAssistantMsg = {
+        ref: "late-f4-turn",
+        text: "answer that arrived after the pane was closed",
+        timestamp: null,
+      };
+      const closed = await index.handleHerdrEvent({
+        event: { pane_generation: "gen-f4", pane_id: "wJ:p2", type: "pane.closed" },
+        ...sessionInputF4(),
+      });
+      const lateEvents = closed.events.filter(
+        (e) => e.type === "agent.idle" || e.type === "agent.done",
+      );
+      expect(lateEvents).toHaveLength(1);
+      expect(lateEvents[0]?.payload).toMatchObject({
+        from: "working",
+        lateCompletion: true,
+        to: "idle",
+      });
+
+      // The row survives the close as a retained outcome: invalidated, but still
+      // deliverable, with the pane-close retention reason.
+      const retained = harness.agentEvents
+        .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+        .find((e) => e.id === lateEvents[0]?.id);
+      expect(retained?.status).toBe("invalidated");
+      expect(retained?.deliverable).toBe(1);
+      expect(retained?.invalidatedReason).toBe("RETAINED_OUTCOME_PANE_CLOSED");
+
+      // …and the shared delivery predicate lets it through for the pane's owner,
+      // even though the `agents` row is gone by now.
+      expect(
+        isDeliverableAgentEvent(
+          retained as AgentEventRecord,
+          undefined,
+          { herdrSessionName: "default", workspaceId: "wJ" },
+          "term_owner",
+        ),
+      ).toBe(true);
+
+      index.stopWaitingHistoryRetries();
+      harness.sqlite.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * F6: Herdr jitters `idle <-> working`, so every retry tick sees a live
+   * `working` pane and resets the idle anchor — the 15 minute window never
+   * accumulates and the pre-existing stall fallback settles the plan as
+   * `PLAN_STALLED`. That discard must arm the late replay and must project as
+   * the self-readable `stalled`, not as a plain `failed`.
+   */
+  test("F6: an idle/working jitter settles through the stall branch as a fallback-armed, stalled-projected discard", async () => {
+    const harness = openObservabilityDbHarness();
+    let timerSequence = 0;
+    const scheduledCallbacks = new Map<unknown, () => Promise<void> | void>();
+    const scheduleRetryMock = vi.fn((callback: () => void) => {
+      timerSequence += 1;
+      scheduledCallbacks.set(timerSequence, callback);
+      return timerSequence;
+    });
+
+    // Live Herdr status the fake client reports. The replay is only allowed for a
+    // settled pane (M1), so the tests pin it to `idle` once the answer lands.
+    let paneStatus = "working";
+
+    const index = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return agyPane(paneStatus);
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          // Frozen fingerprint: no progress is ever observed.
+          return {
+            compactHistory: frozenAgyHistory,
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: scheduleRetryMock,
+      sleep: async () => {},
+      stores: harness,
+    });
+
+    await index.refreshHerdrSession(sessionInputF4());
+    const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+    if (!agent) throw new Error("expected agent");
+    expect(agent.agentStatus).toBe("working");
+
+    const planRow = harness.statusEventPlans.insertPending({
+      agent,
+      from: "working",
+      to: "done",
+    });
+    await index.executeStatusEventPlan({
+      agent,
+      compactHistory: frozenAgyHistory,
+      from: "working",
+      planId: planRow.id,
+      to: "done",
+    });
+    expect(harness.statusEventPlans.get(planRow.id).status).toBe("pending");
+
+    const waitingPlan = () =>
+      harness.statusEventPlans
+        .listUnfinished()
+        .find((row) => row.fromStatus === "working" && row.toStatus === "done");
+    const latestCallback = (): (() => Promise<void> | void) => {
+      const id = scheduleRetryMock.mock.results[scheduleRetryMock.mock.results.length - 1]?.value;
+      const callback = scheduledCallbacks.get(id);
+      if (!callback) throw new Error(`expected callback for timer ${String(id)}`);
+      return callback;
+    };
+    /** Jitter: every tick flips the agents row, as Herdr does in the field. */
+    const jitterFlip = async (attempt: number): Promise<void> => {
+      await index.handleHerdrEventFast({
+        event: {
+          agent_status: attempt % 2 === 1 ? "working" : "idle",
+          pane_id: "wJ:p2",
+          type: "pane.agent_status_changed",
+        },
+        ...sessionInputF4(),
+      });
+    };
+
+    for (let attempt = 1; attempt < WORKING_PLAN_MAX_STALL_ATTEMPTS; attempt += 1) {
+      await jitterFlip(attempt);
+      await latestCallback()();
+      const plan = waitingPlan();
+      expect(plan?.status).toBe("pending");
+      expect(plan?.lastError).toBe(PLAN_WAITING_HISTORY);
+    }
+
+    // 第 18 次 tick：stallAttempts 达到 WORKING_PLAN_MAX_STALL_ATTEMPTS，结算为 stall。
+    await jitterFlip(WORKING_PLAN_MAX_STALL_ATTEMPTS);
+    await latestCallback()();
+
+    const settled = harness.statusEventPlans.get(planRow.id);
+    expect(settled.status).toBe("discarded");
+    expect(settled.lastError).toBe(PLAN_STALLED);
+
+    const discardEvents = harness.agentEvents
+      .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+      .filter((e) => e.type === "agent.discarded");
+    expect(discardEvents).toHaveLength(1);
+    const stallDiscard = discardEvents[0];
+    if (!stallDiscard) throw new Error("expected the stall discard event");
+    // ① fallbackOutcome 武装补发；② 编排侧投影为 stalled，而不是 failed。
+    expect(stallDiscard.payload).toMatchObject({
+      agent: "agy",
+      fallbackOutcome: true,
+      reason: PLAN_STALLED,
+    });
+    expect(projectAgentOutcomes([toWireRecord(stallDiscard)]).outcomes).toEqual([
+      expect.objectContaining({ kind: "stalled", reason: PLAN_STALLED }),
+    ]);
+
+    // 抖动结束后迟到的 assistant 仍能补发一次。
+    // The jitter has settled: the pane is idle again when the answer lands.
+    paneStatus = "idle";
+    const jitterAssistant = {
+      ref: "late-f6-turn",
+      text: "answer that landed after the jitter stalled the plan",
+      timestamp: null,
+    };
+    const lateIndex = new AgentIndexService({
+      clientFactory: () => ({
+        close() {},
+        async sessionSnapshot() {
+          return agyPane(paneStatus);
+        },
+      }),
+      history: {
+        async resolveCompactHistory() {
+          return {
+            compactHistory: {
+              ...emptyCompactHistory("antigravity-sqlite"),
+              lastAssistantMessage: jitterAssistant,
+            },
+            historyRef: null,
+            sourceFingerprint: null,
+          };
+        },
+      } as unknown as AgentHistoryService,
+      scheduleRetry: scheduleRetryMock,
+      sleep: async () => {},
+      stores: harness,
+    });
+    const replay = await lateIndex.refreshHerdrSession(sessionInputF4());
+    const replayed = replay.events.filter(
+      (e) => e.type === "agent.idle" || e.type === "agent.done",
+    );
+    expect(replayed).toHaveLength(1);
+    expect(replayed[0]?.payload).toMatchObject({
+      from: "working",
+      lateCompletion: true,
+      to: "idle",
+    });
+    const secondReplay = await lateIndex.refreshHerdrSession(sessionInputF4());
+    expect(
+      secondReplay.events.filter((e) => e.type === "agent.idle" || e.type === "agent.done"),
+    ).toHaveLength(0);
+
+    index.stopWaitingHistoryRetries();
+    lateIndex.stopWaitingHistoryRetries();
+    harness.sqlite.close();
+  });
+
+  /**
+   * F7: the arming judgement reads the plan record, so an `agent.failed` (or a
+   * status change, or a discard without the fallback marker) landing between the
+   * stall and the late answer must not disarm the replay.
+   */
+  test("F7: an intervening agent.failed does not disarm the late completion replay", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = openObservabilityDbHarness();
+      let currentAssistantMsg: { ref: string; text: string; timestamp: string | null } | null =
+        null;
+      // Live Herdr status the fake client reports; the pane is settled (`idle`) by
+      // the time the late answer lands, which is what M1 requires for a replay.
+      let paneStatus = "working";
+
+      const index = new AgentIndexService({
+        clientFactory: () => ({
+          close() {},
+          async sessionSnapshot() {
+            return agyPane(paneStatus);
+          },
+        }),
+        history: {
+          async resolveCompactHistory() {
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("antigravity-sqlite"),
+                lastAssistantMessage: currentAssistantMsg,
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          },
+        } as unknown as AgentHistoryService,
+        statusPlansConfig: {
+          backoff_factor: 2,
+          initial_backoff_ms: 5_000,
+          max_backoff_ms: 60_000,
+          total_window_ms: 60_000,
+        },
+        stores: harness,
+      });
+
+      await index.refreshHerdrSession(sessionInputF4());
+      const stalledAgent = harness.agents.findByPane({
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+      });
+      if (!stalledAgent) throw new Error("expected agent");
+
+      const handlePromise = index.handleHerdrEvent({
+        event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInputF4(),
+      });
+      await vi.advanceTimersByTimeAsync(4000);
+      await handlePromise;
+      for (const delay of [5_000, 10_000, 20_000, 40_000]) {
+        await vi.advanceTimersByTimeAsync(delay);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+      expect(
+        harness.agentEvents
+          .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+          .filter((e) => e.type === "agent.discarded"),
+      ).toHaveLength(1);
+
+      // An unrelated round of the same pane fails in between, and a plain status
+      // change is recorded too: neither may look like "the pane moved on".
+      harness.agentEvents.append({
+        agentId: stalledAgent.id,
+        herdrSessionName: "default",
+        idempotencyKey: "agent.failed:f7-intervening",
+        paneGeneration: "gen-f4",
+        paneId: "wJ:p2",
+        payload: {
+          agent: "agy",
+          attempts: 8,
+          from: "working",
+          reason: "unrelated runtime failure",
+          to: "done",
+        },
+        terminalId: "term_agy",
+        type: "agent.failed",
+        workspaceId: "wJ",
+      });
+      harness.agentEvents.append({
+        agentId: stalledAgent.id,
+        herdrSessionName: "default",
+        idempotencyKey: "agent.status.changed:f7-intervening",
+        paneGeneration: "gen-f4",
+        paneId: "wJ:p2",
+        payload: { agent: "agy", from: "idle", to: "working" },
+        terminalId: "term_agy",
+        type: "agent.status.changed",
+        workspaceId: "wJ",
+      });
+
+      paneStatus = "idle";
+      currentAssistantMsg = {
+        ref: "late-f7-turn",
+        text: "answer that landed after an unrelated failure",
+        timestamp: null,
+      };
+      const replay = await index.refreshHerdrSession(sessionInputF4());
+      const replayed = replay.events.filter(
+        (e) => e.type === "agent.idle" || e.type === "agent.done",
+      );
+      expect(replayed).toHaveLength(1);
+      expect(replayed[0]?.payload).toMatchObject({
+        from: "working",
+        lateCompletion: true,
+        to: "idle",
+      });
+      expect(
+        projectAgentOutcomes([toWireRecord(replayed[0] as AgentEventRecord)]).outcomes,
+      ).toEqual([expect.objectContaining({ kind: "completed" })]);
+
+      const second = await index.refreshHerdrSession(sessionInputF4());
+      expect(
+        second.events.filter((e) => e.type === "agent.idle" || e.type === "agent.done"),
+      ).toHaveLength(0);
+
+      index.stopWaitingHistoryRetries();
+      harness.sqlite.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * M1 (disarm): once the replay fired, the stale `discarded` plan row must stop
+   * arming it. Before the disarm conditions every 10s inspection treated the pane
+   * as still stalled and re-read sqlite with `forceRefresh: true` for the whole
+   * 7-day settled-event TTL.
+   */
+  test("M1: a landed replay disarms the stalled plan instead of forcing a re-read on every inspection", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = openObservabilityDbHarness();
+      let currentAssistantMsg: { ref: string; text: string; timestamp: string | null } | null =
+        null;
+      let paneStatus = "working";
+      // `forceRefresh: true` is how the stalled judgement reaches the history
+      // reader (the retry ring uses the same flag), so the counter is reset after
+      // the stall to isolate the inspections.
+      const forceRefreshReads: Array<boolean | undefined> = [];
+
+      const index = new AgentIndexService({
+        clientFactory: () => ({
+          close() {},
+          async sessionSnapshot() {
+            return agyPane(paneStatus);
+          },
+        }),
+        history: {
+          async resolveCompactHistory(_lookup: unknown, options?: { forceRefresh?: boolean }) {
+            forceRefreshReads.push(options?.forceRefresh);
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("antigravity-sqlite"),
+                lastAssistantMessage: currentAssistantMsg,
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          },
+        } as unknown as AgentHistoryService,
+        statusPlansConfig: {
+          backoff_factor: 2,
+          initial_backoff_ms: 5_000,
+          max_backoff_ms: 60_000,
+          total_window_ms: 60_000,
+        },
+        stores: harness,
+      });
+
+      // 1. The round stalls: the plan exhausts the elastic window and is discarded
+      //    with the fallback marker, which arms the replay.
+      await index.refreshHerdrSession(sessionInputF4());
+      const handlePromise = index.handleHerdrEvent({
+        event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInputF4(),
+      });
+      await vi.advanceTimersByTimeAsync(4000);
+      await handlePromise;
+      for (const delay of [5_000, 10_000, 20_000, 40_000]) {
+        await vi.advanceTimersByTimeAsync(delay);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+      const discarded = harness.agentEvents
+        .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+        .filter((e) => e.type === "agent.discarded");
+      expect(discarded).toHaveLength(1);
+      expect(discarded[0]?.payload).toMatchObject({
+        fallbackOutcome: true,
+        reason: PLAN_WAITING_HISTORY,
+      });
+      forceRefreshReads.length = 0;
+
+      // 2. The answer lands while the pane is settled (`idle`): replayed exactly
+      //    once, and the still-armed replay forces the read.
+      paneStatus = "idle";
+      currentAssistantMsg = { ref: "ref-1", text: "first round answer", timestamp: null };
+      const replay = await index.refreshHerdrSession(sessionInputF4());
+      const replayed = replay.events.filter(
+        (e) => e.type === "agent.idle" || e.type === "agent.done",
+      );
+      expect(replayed).toHaveLength(1);
+      expect(replayed[0]?.payload).toMatchObject({ from: "working", lateCompletion: true });
+      expect(forceRefreshReads.filter(Boolean)).toHaveLength(1);
+
+      // 3. Disarmed: the next inspection neither replays again nor forces another
+      //    history read for the stalled pane.
+      const second = await index.refreshHerdrSession(sessionInputF4());
+      expect(
+        second.events.filter((e) => e.type === "agent.idle" || e.type === "agent.done"),
+      ).toHaveLength(0);
+      expect(forceRefreshReads.filter(Boolean)).toHaveLength(1);
+
+      index.stopWaitingHistoryRetries();
+      harness.sqlite.close();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  /**
+   * M1 (round boundary): a replay is only allowed for a settled (`idle`/`done`)
+   * pane. While the pane reports `working` — the next round of the same pane — the
+   * intermediate assistant body on disk must not be replayed as a fake
+   * `working -> idle` completion, and the stalled branch must not force a re-read
+   * either. The round's real end is then settled by the ordinary plan path.
+   */
+  test("M1: a working round is never replayed as a late completion", async () => {
+    vi.useFakeTimers();
+    try {
+      const harness = openObservabilityDbHarness();
+      let currentAssistantMsg: { ref: string; text: string; timestamp: string | null } | null =
+        null;
+      let paneStatus = "working";
+      const forceRefreshReads: Array<boolean | undefined> = [];
+
+      const index = new AgentIndexService({
+        clientFactory: () => ({
+          close() {},
+          async sessionSnapshot() {
+            return agyPane(paneStatus);
+          },
+        }),
+        history: {
+          async resolveCompactHistory(_lookup: unknown, options?: { forceRefresh?: boolean }) {
+            forceRefreshReads.push(options?.forceRefresh);
+            return {
+              compactHistory: {
+                ...emptyCompactHistory("antigravity-sqlite"),
+                lastAssistantMessage: currentAssistantMsg,
+              },
+              historyRef: null,
+              sourceFingerprint: null,
+            };
+          },
+        } as unknown as AgentHistoryService,
+        statusPlansConfig: {
+          backoff_factor: 2,
+          initial_backoff_ms: 5_000,
+          max_backoff_ms: 60_000,
+          total_window_ms: 60_000,
+        },
+        stores: harness,
+      });
+
+      // 1. The round stalls and arms the replay.
+      await index.refreshHerdrSession(sessionInputF4());
+      const handlePromise = index.handleHerdrEvent({
+        event: { agent_status: "idle", pane_id: "wJ:p2", type: "pane.agent_status_changed" },
+        ...sessionInputF4(),
+      });
+      await vi.advanceTimersByTimeAsync(4000);
+      await handlePromise;
+      for (const delay of [5_000, 10_000, 20_000, 40_000]) {
+        await vi.advanceTimersByTimeAsync(delay);
+        await vi.advanceTimersByTimeAsync(4000);
+      }
+      expect(
+        harness.agentEvents
+          .listAfter({ herdrSessionName: "default", workspaceId: "wJ" })
+          .filter((e) => e.type === "agent.discarded"),
+      ).toHaveLength(1);
+      forceRefreshReads.length = 0;
+
+      // 2. The pane is working again (the round resumed) and the body on disk is an
+      //    intermediate one: no completion may be emitted, and the stalled branch
+      //    must not force a re-read mid-round.
+      paneStatus = "working";
+      currentAssistantMsg = {
+        ref: "ref-2",
+        text: "intermediate body of the resumed round",
+        timestamp: null,
+      };
+      const working = await index.refreshHerdrSession(sessionInputF4());
+      expect(
+        working.events.filter((e) => e.type === "agent.idle" || e.type === "agent.done"),
+      ).toHaveLength(0);
+      expect(
+        working.events.filter(
+          (e) => (e.payload as Record<string, unknown>).lateCompletion === true,
+        ),
+      ).toHaveLength(0);
+      expect(forceRefreshReads.filter(Boolean)).toHaveLength(0);
+
+      // 3. The round really ends: `idle` with the final body `ref-3` settles as an
+      //    ordinary completed round, not as a late completion.
+      paneStatus = "idle";
+      currentAssistantMsg = { ref: "ref-3", text: "resumed round final answer", timestamp: null };
+      const settled = await index.refreshHerdrSession(sessionInputF4());
+      const completions = settled.events.filter(
+        (e) => e.type === "agent.idle" || e.type === "agent.done",
+      );
+      expect(completions).toHaveLength(1);
+      expect(completions[0]?.payload).toMatchObject({ from: "working", to: "idle" });
+      expect((completions[0]?.payload as Record<string, unknown>).lateCompletion).toBeUndefined();
+
+      index.stopWaitingHistoryRetries();
+      harness.sqlite.close();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

@@ -4,6 +4,7 @@ import { createInterface } from "node:readline";
 import type {
   AgentHistoryMessage,
   AgentHistoryRef,
+  AgentHistoryUnreadyReason,
   CompactAgentHistory,
 } from "@/observability/contracts.js";
 import { sanitizeText } from "./text.js";
@@ -111,6 +112,24 @@ export function compactFromMessages(
   const lastUser = lastByRole(messages, "user");
   const lastAssistant = lastByRole(messages, "assistant");
   const lastTool = [...messages].reverse().find((message) => message.role === "tool_result");
+
+  let unreadyReason: AgentHistoryUnreadyReason | null = null;
+  if (!lastAssistant) {
+    if (messages.length === 0) {
+      unreadyReason = "empty_history";
+    } else if (!lastUser) {
+      unreadyReason = "no_user_message";
+    } else {
+      const lastUserIndex = messages.findLastIndex((m) => m.role === "user");
+      const hasAnyAssistant = messages.some((m) => m.role === "assistant");
+      if (hasAnyAssistant && lastUserIndex !== -1) {
+        unreadyReason = "assistant_only_before_last_user";
+      } else {
+        unreadyReason = "no_assistant_message";
+      }
+    }
+  }
+
   return {
     historyRef: ref,
     lastAssistantMessage: lastAssistant ? excerpt(lastAssistant) : null,
@@ -118,6 +137,7 @@ export function compactFromMessages(
     lastUserMessage: lastUser ? excerpt(lastUser) : null,
     messageCount: messages.length,
     source: ref.source,
+    ...(unreadyReason ? { unreadyReason } : {}),
     updatedAt: [...messages].reverse().find((message) => message.timestamp)?.timestamp ?? null,
   };
 }

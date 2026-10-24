@@ -5,10 +5,13 @@ import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify, stripVTControlCharacters } from "node:util";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
-import type {
-  AgentEventRecord,
-  AgentListItem,
-  AgentOrchestratorWireState,
+import {
+  type AgentEventRecord,
+  type AgentListItem,
+  type AgentOrchestratorWireState,
+  DEGRADED_PLAN_ERROR,
+  PLAN_STALLED,
+  PLAN_WAITING_HISTORY,
 } from "@/observability/contracts.js";
 
 const execFileAsync = promisify(execFile);
@@ -63,7 +66,7 @@ type OrchestratorConnectionState = {
 type AgyOutcome = {
   agent: string;
   eventId: number;
-  kind: "blocked" | "completed" | "failed";
+  kind: "blocked" | "completed" | "failed" | "stalled";
   name: string | null;
   paneId: string | null;
   reason?: string;
@@ -80,8 +83,11 @@ const DEFAULT_SETTLE_GRACE_MS = 12_000;
 const UNSETTLED_TURN_MAX_AGE_MS = 10 * 60_000;
 const MAX_WAKE_PROMPT_ATTEMPTS = 3;
 const WAKE_PROMPT_TEXT = "[herdsman-wake]";
-const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
-export const PLAN_STALLED = "PLAN_STALLED";
+// `PLAN_WAITING_HISTORY` / `PLAN_STALLED` / `DEGRADED_PLAN_ERROR` are imported
+// from `@/observability/contracts.js` above: the string values are the contract
+// and the projection below has to stay in sync with `STALLED_PLAN_ERRORS` there
+// and with the copy in `packages/herdsman-pi/src/wake.ts` (standalone package,
+// cannot import `@/`). Change all three places together.
 
 function defaultStateDir(environment: NodeJS.ProcessEnv): string {
   const home = nonEmptyString(environment.HERDSMAN_HOME) ?? join(homedir(), ".herdsman");
@@ -971,7 +977,8 @@ function projectAgyOutcomes(events: AgentEventRecord[]): {
       continue;
     }
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
-    const reason = kind === "failed" ? normalizeExcerpt(payload.reason) : undefined;
+    const reason =
+      kind === "failed" || kind === "stalled" ? normalizeExcerpt(payload.reason) : undefined;
     if (isUpstreamErrorText(text) || (reason !== undefined && isUpstreamErrorText(reason))) {
       suppressedEventIds.push(event.id);
       continue;
@@ -1006,7 +1013,7 @@ function outcomeKind(event: AgentEventRecord): AgyOutcome["kind"] | undefined {
   if (event.type === "agent.failed") {
     const payload = asRecord(event.payload);
     const reason = nonEmptyString(payload.reason);
-    if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
+    if (reason === PLAN_WAITING_HISTORY || reason === DEGRADED_PLAN_ERROR) {
       return payload.fallbackOutcome === true ? "failed" : undefined;
     }
     return "failed";
@@ -1017,8 +1024,16 @@ function outcomeKind(event: AgentEventRecord): AgyOutcome["kind"] | undefined {
     const isAgyOrEmpty = agent === undefined || agent === "agy";
     if (isAgyOrEmpty) {
       const reason = nonEmptyString(payload.reason);
-      if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
-        return payload.fallbackOutcome === true ? "failed" : undefined;
+      // A stalled plan has *settled*, which makes it unlike PLAN_WAITING_HISTORY
+      // / degraded ("still waiting, nothing happened yet"): the round's outcome is
+      // gone and the orchestrator has to see that. With the fallback marker it
+      // projects as the self-readable `stalled`; a legacy row written before the
+      // marker existed still wakes as a plain `failed` rather than vanishing.
+      if (reason === PLAN_STALLED) {
+        return payload.fallbackOutcome === true ? "stalled" : "failed";
+      }
+      if (reason === PLAN_WAITING_HISTORY || reason === DEGRADED_PLAN_ERROR) {
+        return payload.fallbackOutcome === true ? "stalled" : undefined;
       }
     }
     return "failed";
@@ -1041,6 +1056,12 @@ export function formatAgyOutcomeUpdates(outcomes: AgyOutcome[]): string {
         const body =
           outcome.text.length > 0 ? `\n  last assistant (pre-round): ${outcome.text}` : "";
         return `- failed ${identity} ${pane}\n  reason: ${reason}${body}`;
+      }
+      if (outcome.kind === "stalled") {
+        const reason = outcome.reason && outcome.reason.length > 0 ? outcome.reason : "(unknown)";
+        const body =
+          outcome.text.length > 0 ? `\n  last assistant (pre-round): ${outcome.text}` : "";
+        return `- stalled ${identity} ${pane}\n  reason: ${reason} (结果未取到，需自读 pane)${body}`;
       }
       const excerpt = outcome.text.length > 0 ? outcome.text : "(no assistant message)";
       return `- ${outcome.kind} ${identity} ${pane}\n  last assistant: ${excerpt}\n  event: ${outcome.eventId}`;

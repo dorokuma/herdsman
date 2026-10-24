@@ -18,6 +18,16 @@ import { statSourceFingerprint } from "./source-fingerprint.js";
 
 export const agentHistoryFormatterVersion = "agent-history-v3";
 
+let piEmptyAssistantCount = 0;
+
+export function getPiEmptyAssistantCount(): number {
+  return piEmptyAssistantCount;
+}
+
+export function resetPiEmptyAssistantCount(): void {
+  piEmptyAssistantCount = 0;
+}
+
 type CacheLike = Pick<AgentHistoryCacheStore, "getFresh" | "put">;
 type Discovery = (
   input: AgentHistoryLookupInput,
@@ -89,12 +99,24 @@ export function createAgentHistoryService(
     try {
       const compactHistory = await reader.readCompact(historyRef);
       if (compactHistory.lastAssistantMessage === null) {
-        console.warn("Herdsman history read produced no assistant message", {
-          path,
-          source: historyRef.source,
-          size: sourceFingerprint.size,
-          mtimeMs: sourceFingerprint.mtimeMs,
-        });
+        if (historyRef.source === "pi-jsonl") {
+          piEmptyAssistantCount += 1;
+          console.debug("Herdsman history read produced no assistant message", {
+            path,
+            source: historyRef.source,
+            size: sourceFingerprint.size,
+            mtimeMs: sourceFingerprint.mtimeMs,
+            reason: compactHistory.unreadyReason,
+          });
+        } else {
+          console.warn("Herdsman history read produced no assistant message", {
+            path,
+            source: historyRef.source,
+            size: sourceFingerprint.size,
+            mtimeMs: sourceFingerprint.mtimeMs,
+            reason: compactHistory.unreadyReason,
+          });
+        }
         return { compactHistory, historyRef, sourceFingerprint };
       }
       options.cache?.put({

@@ -3,7 +3,7 @@ import { dirname, resolve } from "node:path";
 import { env, exit } from "node:process";
 import { fileURLToPath } from "node:url";
 import { createAgentHistoryService } from "@/agent-history/service.js";
-import { resolveRuntime } from "@/config/runtime.js";
+import { resolveRuntime, resolveStatusPlansConfig } from "@/config/runtime.js";
 import {
   acquireDaemonLock,
   daemonInstanceLockPath,
@@ -274,6 +274,7 @@ export async function runObservabilityDaemonService(
     context: daemonServices.context,
     onAgentEvent: (event) => publishEvent(event), // 闭包注入
     shutdownSignal: shutdownController.signal,
+    statusPlansConfig: resolveStatusPlansConfig(runtime.config, runtime.environment),
     stores: {
       agentEvents,
       agentHistoryCache,

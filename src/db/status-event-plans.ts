@@ -338,7 +338,10 @@ export class StatusEventPlanStore {
     error: unknown,
     options?: {
       isTargetWorking?: boolean;
+      isWindowExpired?: boolean;
+      maxAttempts?: number;
       stallDetected?: boolean;
+      totalWindowMs?: number;
     },
   ): StatusEventPlanRecord | null {
     const current = this.get(id);
@@ -359,8 +362,15 @@ export class StatusEventPlanStore {
     const attempts = current.attempts + 1;
     let newStatus: StatusEventPlanStatus = "pending";
 
-    if (stallDetected || attempts >= STATUS_PLAN_MAX_ATTEMPTS) {
-      if (isTargetWorking && !stallDetected) {
+    const elapsedMs = now - current.createdAt.getTime();
+    const isWindowExpired =
+      options?.isWindowExpired ??
+      (options?.totalWindowMs !== undefined ? elapsedMs >= options.totalWindowMs : false);
+    const maxAttempts = options?.maxAttempts ?? STATUS_PLAN_MAX_ATTEMPTS;
+    const attemptsExhausted = attempts >= maxAttempts;
+
+    if (stallDetected || isWindowExpired || attemptsExhausted) {
+      if (isTargetWorking && !stallDetected && !isWindowExpired) {
         newStatus = "pending";
       } else {
         newStatus = isWaitingHistory ? "discarded" : "failed";
