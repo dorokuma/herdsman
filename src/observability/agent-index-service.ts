@@ -6,6 +6,8 @@ import {
   sessionPathAllowedByShape,
 } from "@/agent-history/discovery.js";
 import { type AgentHistoryService, createAgentHistoryService } from "@/agent-history/service.js";
+import { DEFAULT_STATUS_PLAN_CONFIG } from "@/config/runtime.js";
+import type { StatusPlansConfig } from "@/config/schema.js";
 import { type AgentEventStore, hasNonEmptyAssistantMessage } from "@/db/agent-events.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentOrchestratorScopeStore } from "@/db/agent-orchestrator-scopes.js";
@@ -32,6 +34,7 @@ import {
   EMPTY_TURN_ALERT_REASON,
   PLAN_WAITING_HISTORY,
   parseAgentStatus,
+  STALLED_PLAN_ERRORS,
   VALID_AGENT_EVENT_TYPES,
 } from "@/observability/contracts.js";
 import type { TurnCompletionRegistry } from "@/observability/turn-completion.js";
@@ -113,6 +116,17 @@ export type StatusEventPlan = {
 };
 
 export { PLAN_WAITING_HISTORY } from "@/observability/contracts.js";
+
+/**
+ * Re-exported from the contract layer, which owns the definition of the "this
+ * round's outcome was lost while waiting" plan-error set. It stays exported
+ * from this module because the observability call sites and tests import it
+ * from here.
+ */
+export { STALLED_PLAN_ERRORS };
+
+/** `?` placeholders for the `last_error in (...)` filter over that set. */
+const STALLED_PLAN_ERROR_FILTER = STALLED_PLAN_ERRORS.map(() => "?").join(", ");
 
 /**
  * How many prior terminal rows the stale-baseline duplicate guard compares
@@ -252,8 +266,10 @@ export class AgentIndexService {
     number,
     { firstSeenAt: number; lastProgressFingerprint: string; stallAttempts: number }
   >();
+  readonly #planWindowTrackers = new Map<number, { idleStartedAt: number }>();
   readonly #now: () => number;
   readonly #maxWorkingPlanWaitMs: number;
+  readonly #statusPlansConfig: Required<StatusPlansConfig>;
   readonly #onAgentEvent?: (event: AgentEventRecord) => void;
 
   constructor(options: {
@@ -266,6 +282,7 @@ export class AgentIndexService {
     maxWorkingPlanWaitMs?: number;
     now?: () => number;
     scheduleRetry?: (callback: () => void, delayMs: number) => unknown;
+    statusPlansConfig?: Required<StatusPlansConfig> | StatusPlansConfig;
     /**
      * Aborted when the daemon starts shutting down. In-flight status waits
      * (history-advance window, turn completion, readiness polling) are aborted
@@ -286,6 +303,17 @@ export class AgentIndexService {
     this.#shutdownSignal?.addEventListener("abort", () => this.abortPendingWaits(), { once: true });
     this.#now = options.now ?? (() => Date.now());
     this.#maxWorkingPlanWaitMs = options.maxWorkingPlanWaitMs ?? WORKING_PLAN_MAX_WAIT_MS;
+    this.#statusPlansConfig = {
+      backoff_factor:
+        options.statusPlansConfig?.backoff_factor ?? DEFAULT_STATUS_PLAN_CONFIG.backoff_factor,
+      initial_backoff_ms:
+        options.statusPlansConfig?.initial_backoff_ms ??
+        DEFAULT_STATUS_PLAN_CONFIG.initial_backoff_ms,
+      max_backoff_ms:
+        options.statusPlansConfig?.max_backoff_ms ?? DEFAULT_STATUS_PLAN_CONFIG.max_backoff_ms,
+      total_window_ms:
+        options.statusPlansConfig?.total_window_ms ?? DEFAULT_STATUS_PLAN_CONFIG.total_window_ms,
+    };
     this.#stores = options.stores;
     this.#turnCompletions = options.turnCompletions;
     this.#onAgentEvent = options.onAgentEvent ?? (() => {});
@@ -383,6 +411,10 @@ export class AgentIndexService {
     }
     this.#waitingHistoryTimers.clear();
     this.#planProgressTrackers.clear();
+    // The window tracker holds the same per-plan idle anchor as the progress
+    // tracker; leaving it behind leaked a stale `idleStartedAt` for a plan id
+    // that can never be retried again.
+    this.#planWindowTrackers.clear();
   }
 
   hasPlanProgressTracker(planId: number): boolean {
@@ -418,6 +450,7 @@ export class AgentIndexService {
     }
     if (!options?.keepTracker) {
       this.#planProgressTrackers.delete(planId);
+      this.#planWindowTrackers.delete(planId);
     }
   }
 
@@ -481,7 +514,52 @@ export class AgentIndexService {
       plan.agent.agent === "agy" ||
       liveAgent?.agent === "agy" ||
       compactHistory?.source === "antigravity-sqlite";
-    const isTargetWorking = allowWorkingExemption && isAgy && liveAgent?.agentStatus === "working";
+    const isLiveWorking = allowWorkingExemption && isAgy && liveAgent?.agentStatus === "working";
+
+    // Invariant: When Herdr reports idle/done for an agy agent, but the on-disk
+    // history has not produced any assistant message newer than the latest delivered
+    // completed turn ref, this is a suspected false idle (the assistant response is
+    // written at the very end of the turn in conversation sqlite). We treat this
+    // as still working/in-progress and continue waiting within the total window
+    // instead of entering premature discard countdown.
+    const latestDeliveredRef =
+      this.#stores.agentEvents.latestCompletedTurnEvent(plan.agent.id, plan.agent.herdrSessionName)
+        ?.compactHistory?.lastAssistantMessage?.ref ?? null;
+    const currentAssistantRef = compactHistory?.lastAssistantMessage?.ref ?? null;
+    const hasNewAssistantMessage =
+      currentAssistantRef !== null && currentAssistantRef !== latestDeliveredRef;
+    const isSuspectedFalseIdle =
+      allowWorkingExemption &&
+      isAgy &&
+      (plan.to === "idle" ||
+        plan.to === "done" ||
+        liveAgent?.agentStatus === "idle" ||
+        liveAgent?.agentStatus === "done") &&
+      !hasNewAssistantMessage;
+
+    const currentPlan = store.get(planId);
+    const now = this.#now();
+    let windowTracker = this.#planWindowTrackers.get(planId);
+    if (!windowTracker) {
+      windowTracker = {
+        idleStartedAt: currentPlan?.createdAt?.getTime() ?? now,
+      };
+      this.#planWindowTrackers.set(planId, windowTracker);
+    }
+
+    if (isLiveWorking) {
+      // 当 agent 处于 live working 时，重置/暂停 idle 窗口倒计时，不消耗 15 分钟预算
+      windowTracker.idleStartedAt = now;
+    }
+
+    const elapsedIdleMs = Math.max(0, now - windowTracker.idleStartedAt);
+    const isWindowExpired = elapsedIdleMs >= this.#statusPlansConfig.total_window_ms;
+
+    // Both genuine working status and suspected false idle are exempt from premature discard,
+    // but suspected false idle is bounded by the total elastic waiting window (default 15m).
+    // Genuine working is exempt from the window entirely (countdown reset/paused during working).
+    const isTargetWorking = isLiveWorking || (isSuspectedFalseIdle && !isWindowExpired);
+
     let stallDetected = false;
     if (isTargetWorking) {
       const currentFingerprint = this.#computeProgressFingerprint(liveAgent, compactHistory);
@@ -505,7 +583,12 @@ export class AgentIndexService {
     } else {
       this.#planProgressTrackers.delete(planId);
     }
-    const updated = store.markRetry(planId, error, { isTargetWorking, stallDetected });
+    const updated = store.markRetry(planId, error, {
+      isTargetWorking,
+      isWindowExpired,
+      stallDetected,
+      totalWindowMs: this.#statusPlansConfig.total_window_ms,
+    });
     if (
       updated &&
       (updated.status === "completed" ||
@@ -514,12 +597,33 @@ export class AgentIndexService {
         updated.status === "discarded")
     ) {
       this.#planProgressTrackers.delete(planId);
+      this.#planWindowTrackers.delete(planId);
     }
     return updated;
   }
 
+  #computeBackoffMs(attempts: number): number {
+    const config = this.#statusPlansConfig;
+    if (attempts <= 1) return config.initial_backoff_ms;
+    const exponential = config.initial_backoff_ms * config.backoff_factor ** (attempts - 1);
+    return Math.min(config.max_backoff_ms, exponential);
+  }
+
   #scheduleWaitingHistoryRetry(planId: number, plan: StatusEventPlan): void {
     this.#clearWaitingTimer(planId, { keepTracker: true });
+    const store = this.#stores.statusEventPlans;
+    let attempts = 1;
+    if (store) {
+      try {
+        attempts = store.get(planId).attempts;
+      } catch (error) {
+        console.warn("Herdsman failed to read plan attempts for backoff; using initial backoff", {
+          error: error instanceof Error ? error.message : String(error),
+          planId,
+        });
+      }
+    }
+    const delayMs = this.#computeBackoffMs(attempts);
     const timer = this.#scheduleRetry(async () => {
       try {
         const store = this.#stores.statusEventPlans;
@@ -556,7 +660,7 @@ export class AgentIndexService {
           }
         }
       }
-    }, 10_000);
+    }, delayMs);
     this.#waitingHistoryTimers.set(planId, timer);
   }
 
@@ -1206,6 +1310,9 @@ export class AgentIndexService {
     row: StatusEventPlanRecord,
   ): AgentEventRecord | null {
     this.#planProgressTrackers.delete(row.id);
+    // Same leak as `stopWaitingHistoryRetries`: the plan is settled here for
+    // good, so its idle-window anchor must go with it.
+    this.#planWindowTrackers.delete(row.id);
     let salvaged: AgentEventRecord | null = null;
     try {
       salvaged = this.#salvageOrphanTerminalEvent(row);
@@ -1972,6 +2079,9 @@ export class AgentIndexService {
           sessionReady &&
           (cached?.historyRef?.kind !== "agent_session" ||
             cached.historyRef.path !== agent.agentSession?.value);
+        const isStalled =
+          (agent.agentStatus === "idle" || agent.agentStatus === "done") &&
+          this.#isAgentStalled(agent.id, input.herdrSessionName);
         const dirty =
           !cached ||
           agent.paneRevision === null ||
@@ -1980,7 +2090,8 @@ export class AgentIndexService {
           cached.historyRef == null ||
           cached.historyRef.kind === "discovered_file" ||
           occupancyConflict ||
-          sessionUnbound;
+          sessionUnbound ||
+          isStalled;
         let refreshed = cached;
         if (dirty) {
           const occupiedForCurrent = new Set(occupiedSessionPaths);
@@ -1988,11 +2099,17 @@ export class AgentIndexService {
             occupiedForCurrent.delete(agent.agentSession.value);
           const result = await this.#context.refreshAgent({
             agent,
+            ...(isStalled ? { forceRefresh: true } : {}),
             identityChanged,
             occupiedSessionPaths: occupiedForCurrent,
           });
           refreshed = result.snapshot;
           if (result.changed) addScope(scopes, scopeOf(agent));
+        }
+        const lateEvent = this.#reconcileLateCompletion(agent, refreshed?.compactHistory);
+        if (lateEvent) {
+          events.push(lateEvent);
+          addScope(scopes, scopeOf(agent));
         }
         if (metadataChanged) {
           if (prior && !sameScope(scopeOf(prior), scopeOf(agent))) addScope(scopes, scopeOf(prior));
@@ -2031,6 +2148,33 @@ export class AgentIndexService {
     if (!paneId) return { contextChangedScopes: [], events: [], statusEventPlans: [] };
     if (event.type === "pane.closed") {
       const closedGeneration = paneGenerationFromEvent(event);
+      const closedLateEvents: AgentEventRecord[] = [];
+      const closingAgent = this.#stores.agents.findByPane({
+        herdrSessionName: input.herdrSessionName,
+        paneId,
+        paneGeneration: closedGeneration,
+      });
+      if (closingAgent && this.#isAgentStalled(closingAgent.id, input.herdrSessionName)) {
+        try {
+          const refreshed = await this.#context.refreshAgent({
+            agent: closingAgent,
+            forceRefresh: true,
+            identityChanged: false,
+          });
+          const lateEvent = this.#reconcileLateCompletion(
+            closingAgent,
+            refreshed.snapshot.compactHistory,
+          );
+          if (lateEvent) closedLateEvents.push(lateEvent);
+        } catch (error) {
+          console.warn("Herdsman late completion rescue on pane.closed failed", {
+            agentId: closingAgent.id,
+            error: error instanceof Error ? error.message : String(error),
+            herdrSessionName: input.herdrSessionName,
+            paneId,
+          });
+        }
+      }
       this.#abortPendingWaiters({
         herdrSessionName: input.herdrSessionName,
         paneId,
@@ -2074,7 +2218,7 @@ export class AgentIndexService {
       }
       return {
         contextChangedScopes: sortedScopes(scopes),
-        events: [],
+        events: closedLateEvents,
         statusEventPlans: [],
       };
     }
@@ -2138,6 +2282,8 @@ export class AgentIndexService {
     for (const scope of recovered?.contextChangedScopes ?? []) addScope(scopes, scope);
     if (refreshed.changed || from !== to) addScope(scopes, scopeOf(current));
     const events = [...(recovered?.events ?? [])];
+    const lateEvent = this.#reconcileLateCompletion(current, refreshed.snapshot.compactHistory);
+    if (lateEvent) events.push(lateEvent);
     const statusEventPlans = [...(recovered?.statusEventPlans ?? [])];
     const equivalent = statusEventPlans.some(
       (candidate) => candidate.agent.id === current.id && candidate.to === to,
@@ -2685,12 +2831,27 @@ export class AgentIndexService {
             // guard: (i) it now looks at a window, because a body delivered before
             // the current latest terminal row would otherwise slip through and, now
             // that M2 accepts unconfirmed rounds, be re-released as this round's
-            // answer; (ii) it only counts rows in `delivered`/`acked`, because a
-            // never-deliverable row (`agent.idle` from a non-`working` status, per
-            // `isDeliverableAgentEvent`; ~50% of ref-bearing `agent.idle` rows for a
-            // given agent (47/94 in a 7-day sample) carry the same ref as a `done` row
-            // of that agent; they are never deliverable) can sit in the window and must
-            // not blank a deliverable round; the tightened guard is not a strict
+            // answer; (ii) it only counts rows in `delivered`/`acked` that represent
+            // a deliverable terminal *round*. A never-deliverable row (`agent.idle`
+            // from a non-`working` status, per `isDeliverableAgentEvent`; ~50% of
+            // ref-bearing `agent.idle` rows for a given agent (47/94 in a 7-day
+            // sample) carry the same ref as a `done` row of that agent; they are
+            // never deliverable) can sit in the window and must not blank a
+            // deliverable round. `status in ('delivered', 'acked')` alone does not
+            // exclude them: sub-agents dispatched in the same batch share a
+            // workspace, and acking a sibling's terminal row runs `markAcked(id,
+            // scope)`, which sweeps every earlier row of that workspace (`id <= ?`
+            // on herdr_session_name + workspace_id) — including this agent's
+            // never-deliverable `unknown -> idle` / `done -> idle` / `blocked -> idle`
+            // rows, which then look acked in the table precisely because they never
+            // became deliverable. The type/`from` restriction below therefore has to
+            // be explicit and match `isDeliverableAgentEvent` (`agent.done`,
+            // `agent.blocked`, or `agent.idle` with `$.from = 'working'`, using the
+            // same `agent.idle` SQL predicate as `#invalidatePaneCore`'s
+            // retained-outcome clause and `latestCompletedTurnEvent` in
+            // `src/db/agent-events.ts`) — otherwise a swept startup idle row reads as
+            // "this agent already delivered a terminal row" and blanks a first
+            // round's on-disk answer. The tightened guard is not a strict
             // superset of the old one (its window is narrower than "every terminal
             // row", and the same window now also answers the no-advance release
             // question below — "did this agent ever deliver a terminal row?" —
@@ -2704,7 +2865,8 @@ export class AgentIndexService {
               .prepare(
                 `select compact_history_json from agent_events
                  where agent_id = ? and herdr_session_name = ?
-                   and type in ('agent.idle', 'agent.done', 'agent.blocked')
+                   and (type in ('agent.done', 'agent.blocked')
+                        or (type = 'agent.idle' and json_extract(payload_json, '$.from') = 'working'))
                    and status in ('delivered', 'acked')
                  order by id desc limit ?`,
               )
@@ -3342,7 +3504,14 @@ export class AgentIndexService {
     const originalAgentId = input.agent.id;
     const resolved = this.#resolvePlanOutcomeAgent(input.agent, input.planCreatedAt);
     const agent = resolved.agent;
-    return this.#appendAndAckSelfEvent({
+    // A discard is a *lost round* for every one of these reasons: the plan never
+    // observed a deliverable terminal body, so the pane's answer (if it ever
+    // lands) still has to reach the orchestrator. `PLAN_STALLED` joined the set
+    // with the jitter fix: the stall fallback settles the plan exactly like the
+    // elastic-window timeout, and without the marker the late-completion replay
+    // stayed disarmed and the agy pane went silent.
+    const fallbackOutcome = STALLED_PLAN_ERRORS.includes(input.reason ?? "");
+    const event = this.#appendAndAckSelfEvent({
       agentId: resolved.agentRowPresent ? agent.id : null,
       compactHistory: input.compactHistory ?? null,
       herdrSessionName: agent.herdrSessionName,
@@ -3353,6 +3522,7 @@ export class AgentIndexService {
         agent: agent.agent,
         agentId: originalAgentId,
         attempts: input.attempts,
+        ...(fallbackOutcome ? { fallbackOutcome: true } : {}),
         from: input.from,
         herdrSessionName: agent.herdrSessionName,
         name: agent.name,
@@ -3368,6 +3538,164 @@ export class AgentIndexService {
       type: "agent.discarded",
       workspaceId: agent.workspaceId,
     });
+    console.debug("Herdsman plan discarded event recorded and published", {
+      agentId: agent.id,
+      eventId: event.id,
+      fallbackOutcome,
+      paneId: agent.paneId,
+      planId: input.planId,
+      reason: input.reason,
+    });
+    return event;
+  }
+
+  /**
+   * Whether this pane's latest settled round was *lost* and is still waiting to
+   * be replayed.
+   *
+   * The judgement reads the plan record, not the newest terminal event. The
+   * event-based form it replaces asked "is the newest `agent.done|idle|discarded|
+   * failed` a discard carrying `fallbackOutcome`?", so a single unrelated
+   * `agent.failed` (or a discard without the marker) landing in between
+   * permanently disarmed the replay and the round's late answer never reached the
+   * orchestrator.
+   *
+   * Arming (all of the following must hold):
+   * 1. the newest `discarded` row of this `agent_id` + session whose `last_error`
+   *    is in {@link STALLED_PLAN_ERRORS} — i.e. a round that was settled as lost.
+   *    The reason filter lives in SQL so an unrelated plain discard inserted later
+   *    cannot mask the stalled one;
+   * 2. no newer plan row of the same pane reached `completed`: the pane already
+   *    moved on to a round that settled normally;
+   * 3. no *completed turn event* newer than the discard event of that stalled
+   *    plan. That covers both the replay itself (`lateCompletion: true`) and a
+   *    later round that reported its own completion. `latestCompletedTurnEvent`
+   *    only matches `agent.done` or `agent.idle` emitted from `working`, so an
+   *    unrelated `agent.failed`, an `agent.status.changed` row or a plain
+   *    `agent.discarded` can never disarm the replay (F7).
+   *
+   * Disarming is what keeps a stalled pane from being force-refreshed on every
+   * 10s inspection for the 7-day settled-event TTL after its answer was already
+   * replayed.
+   *
+   * `status_event_plans.agent_id` is `NOT NULL` and is never rewritten, so the
+   * query survives the `agents` row being deleted (which nulls `agent_id` on the
+   * *events* it wrote). It does not survive the pane being re-created under a new
+   * agent id: a fresh `agents` row gets a fresh id, so the replay is keyed to the
+   * agent instance that actually stalled (see `.agents/notes/`
+   * 20261023-agy-turn-completion-notification-loss.md, "已知边界").
+   */
+  #isAgentStalled(agentId: string, herdrSessionName: string): boolean {
+    const latestStalledDiscard = this.#stores.sqlite
+      .prepare(
+        `select id, last_error, updated_at from status_event_plans
+         where agent_id = ? and herdr_session_name = ? and status = 'discarded'
+           and last_error in (${STALLED_PLAN_ERROR_FILTER})
+         order by id desc limit 1`,
+      )
+      .get(agentId, herdrSessionName, ...STALLED_PLAN_ERRORS) as
+      | { id: number; last_error: string | null; updated_at: number }
+      | undefined;
+    if (!latestStalledDiscard) return false;
+
+    const laterCompletedPlan = this.#stores.sqlite
+      .prepare(
+        `select id from status_event_plans
+         where agent_id = ? and herdr_session_name = ? and id > ? and status = 'completed'
+         limit 1`,
+      )
+      .get(agentId, herdrSessionName, latestStalledDiscard.id);
+    if (laterCompletedPlan) return false;
+
+    const latestCompleted = this.#stores.agentEvents.latestCompletedTurnEvent(
+      agentId,
+      herdrSessionName,
+    );
+    if (latestCompleted) {
+      const discardEvent = this.#stores.sqlite
+        .prepare("select id from agent_events where idempotency_key = ? limit 1")
+        .get(`agent.discarded:plan:${latestStalledDiscard.id}`) as { id: number } | undefined;
+      if (discardEvent) {
+        // A completion produced after the stall discard — the replay itself or a
+        // later round's own terminal event — means the lost round was settled.
+        if (latestCompleted.id > discardEvent.id) return false;
+      } else if (latestCompleted.createdAt.getTime() >= latestStalledDiscard.updated_at) {
+        // The discard event row is gone (pruned) but a completion landed after the
+        // plan was settled: same conclusion, timestamps as the fallback evidence.
+        return false;
+      }
+    }
+    return true;
+  }
+
+  #reconcileLateCompletion(
+    agent: AgentIndexRecord,
+    compactHistory?: CompactAgentHistory | null,
+  ): AgentEventRecord | undefined {
+    // A late answer may only be replayed for a pane that has *settled*. While the
+    // pane reports `working` it is in the middle of a new round: replaying the
+    // intermediate assistant body written so far would emit a fake
+    // `working -> idle` completion (`lateCompletion: true`) in the middle of that
+    // round, and the real completion would then look like a duplicate.
+    if (agent.agentStatus !== "idle" && agent.agentStatus !== "done") {
+      return undefined;
+    }
+    if (!compactHistory || !hasNonEmptyAssistantMessage(compactHistory)) {
+      return undefined;
+    }
+    if (!this.#isAgentStalled(agent.id, agent.herdrSessionName)) {
+      return undefined;
+    }
+    const currentRef = compactHistory.lastAssistantMessage?.ref ?? null;
+    if (!currentRef) return undefined;
+
+    const latestCompletedRef =
+      this.#stores.agentEvents.latestCompletedTurnEvent(agent.id, agent.herdrSessionName)
+        ?.compactHistory?.lastAssistantMessage?.ref ?? null;
+    if (currentRef === latestCompletedRef) {
+      return undefined;
+    }
+
+    const targetStatus = agent.agentStatus === "done" ? "done" : "idle";
+    const statusType = statusEventType(targetStatus) ?? "agent.idle";
+    const event = this.#appendAndAckSelfEvent({
+      agentId: agent.id,
+      compactHistory,
+      herdrSessionName: agent.herdrSessionName,
+      idempotencyKey: `agent.late_completed:${agent.id}:${currentRef}`,
+      paneId: agent.paneId,
+      paneGeneration: agent.paneGeneration ?? null,
+      payload: {
+        ...payload(agent, "working", targetStatus),
+        // `from` is pinned to `working` even when the lost plan started at
+        // `unknown`: the replay has to look like an ordinary completed round to
+        // `latestCompletedTurnEvent` (which only accepts `agent.idle` rows from
+        // `working`) and to the orchestrator-side projector.
+        from: "working",
+        lateCompletion: true,
+        to: targetStatus,
+      },
+      terminalId: agent.terminalId,
+      type: statusType,
+      workspaceId: agent.workspaceId,
+    });
+
+    console.info("Herdsman emitted late completed turn event for stalled agent", {
+      agentId: agent.id,
+      eventId: event.id,
+      herdrSessionName: agent.herdrSessionName,
+      paneId: agent.paneId,
+      ref: currentRef,
+      type: statusType,
+    });
+
+    // Publication stays with the caller, exactly as in `executeStatusEventPlan`:
+    // all three call sites put this event into the `events` array they return,
+    // and `HerdrSessionWatchManager#publishResult` -> `publishAgentEvent` pushes
+    // it once. `publishAgentEvent` has no id-level dedupe, so pushing here as
+    // well wrote the same `agent.event` twice on the socket and broke the
+    // exactly-once delivery contract.
+    return event;
   }
 
   #appendAndAckSelfEvent(input: Parameters<AgentEventStore["append"]>[0]): AgentEventRecord {

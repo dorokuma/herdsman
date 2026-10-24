@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import { type ConfigLoadError, loadHerdsmanConfig } from "@/config/load.js";
-import type { HerdsmanConfig } from "@/config/schema.js";
+import type { HerdsmanConfig, StatusPlansConfig } from "@/config/schema.js";
 import { readDaemonRuntimeRecord } from "@/daemon/process-manager.js";
 
 export type RuntimePaths = {
@@ -159,4 +159,46 @@ function unquoteEnvValue(value: string): string {
     return value.slice(1, -1);
   }
   return value;
+}
+
+export const DEFAULT_STATUS_PLAN_CONFIG: Required<StatusPlansConfig> = {
+  backoff_factor: 2,
+  initial_backoff_ms: 5_000,
+  max_backoff_ms: 60_000,
+  total_window_ms: 15 * 60 * 1000,
+};
+
+export function resolveStatusPlansConfig(
+  config?: HerdsmanConfig,
+  environment: NodeJS.ProcessEnv = process.env,
+): Required<StatusPlansConfig> {
+  const fromConfig = config?.observability?.status_plans;
+  const initialBackoffEnv = environment.HERDSMAN_STATUS_PLAN_INITIAL_BACKOFF_MS?.trim();
+  const maxBackoffEnv = environment.HERDSMAN_STATUS_PLAN_MAX_BACKOFF_MS?.trim();
+  const factorEnv = environment.HERDSMAN_STATUS_PLAN_BACKOFF_FACTOR?.trim();
+  const totalWindowEnv = environment.HERDSMAN_STATUS_PLAN_TOTAL_WINDOW_MS?.trim();
+
+  const initial_backoff_ms =
+    initialBackoffEnv && Number(initialBackoffEnv) > 0
+      ? Number(initialBackoffEnv)
+      : (fromConfig?.initial_backoff_ms ?? DEFAULT_STATUS_PLAN_CONFIG.initial_backoff_ms);
+  const max_backoff_ms =
+    maxBackoffEnv && Number(maxBackoffEnv) > 0
+      ? Number(maxBackoffEnv)
+      : (fromConfig?.max_backoff_ms ?? DEFAULT_STATUS_PLAN_CONFIG.max_backoff_ms);
+  const backoff_factor =
+    factorEnv && Number(factorEnv) >= 1
+      ? Number(factorEnv)
+      : (fromConfig?.backoff_factor ?? DEFAULT_STATUS_PLAN_CONFIG.backoff_factor);
+  const total_window_ms =
+    totalWindowEnv && Number(totalWindowEnv) > 0
+      ? Number(totalWindowEnv)
+      : (fromConfig?.total_window_ms ?? DEFAULT_STATUS_PLAN_CONFIG.total_window_ms);
+
+  return {
+    backoff_factor,
+    initial_backoff_ms,
+    max_backoff_ms,
+    total_window_ms,
+  };
 }

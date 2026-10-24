@@ -2788,6 +2788,97 @@ describe("agent.done / agent.blocked turn completion signal timing", () => {
     harness.sqlite.close();
   }, 20_000);
 
+  test("A2: an unknown -> idle row swept by a same-workspace markAcked does not gate the frozen-baseline release", async () => {
+    const harness = openObservabilityDbHarness();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    try {
+      // Acking a same-workspace sibling sweeps earlier rows (`id <= ?`) to
+      // `status = 'acked'`, including this agent's startup `unknown -> idle` row.
+      const terminalHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: {
+          ref: "m2",
+          stopReason: "stop",
+          text: "final answer",
+          timestamp: null,
+        },
+      };
+      const emptyHistory: CompactAgentHistory = {
+        ...emptyCompactHistory("pi-jsonl"),
+        lastAssistantMessage: null,
+      };
+      const index = staleGuardIndex({ disk: () => terminalHistory, harness, registry });
+      await index.refreshHerdrSession(sessionInput());
+      const agent = harness.agents.findByPane({ herdrSessionName: "default", paneId: "wJ:p2" });
+      if (!agent) throw new Error("expected agent");
+
+      const startup = harness.agentEvents.append({
+        agentId: agent.id,
+        compactHistory: emptyHistory,
+        herdrSessionName: "default",
+        paneId: "wJ:p2",
+        payload: { agent: "pi", from: "unknown", name: "worker", to: "idle" },
+        terminalId: "term_claude",
+        type: "agent.idle",
+        workspaceId: "wJ",
+      });
+      const sibling = harness.agentEvents.append({
+        agentId: null,
+        compactHistory: terminalHistory,
+        herdrSessionName: "default",
+        paneId: "wJ:p9",
+        payload: { agent: "pi", from: "working", name: "sibling", to: "done" },
+        terminalId: "term_sibling",
+        type: "agent.done",
+        workspaceId: "wJ",
+      });
+      harness.agentEvents.markAcked(sibling.id, { herdrSessionName: "default", workspaceId: "wJ" });
+      expect(
+        harness.sqlite
+          .prepare("select status, deliverable from agent_events where id = ?")
+          .get(startup.id),
+      ).toMatchObject({ status: "acked", deliverable: 0 });
+
+      const released = await runConfirmedPlanRound({
+        baseline: terminalHistory,
+        confirmed: false,
+        eventKey: "evt-round-1",
+        expectedText: "expected tail that never reached disk",
+        harness,
+        index,
+        registry,
+      });
+
+      expect(released?.type).toBe("agent.done");
+      expect(released?.compactHistory?.lastAssistantMessage?.text).toBe("final answer");
+      expect(released?.payload).toMatchObject({ staleSnapshot: false });
+      expect(released?.payload).not.toEqual(expect.objectContaining({ degraded: true }));
+      expect(released?.deliverable).toBe(1);
+      const doneRows = harness.sqlite
+        .prepare("select * from agent_events where type = 'agent.done' and agent_id = ?")
+        .all(agent.id) as Array<Record<string, unknown>>;
+      expect(doneRows).toHaveLength(1);
+      expect(doneRows[0]).toMatchObject({ deliverable: 1, status: "pending" });
+      const invalidatedRows = harness.sqlite
+        .prepare("select * from agent_events where status = 'invalidated'")
+        .all();
+      expect(invalidatedRows).toHaveLength(0);
+      const warnCalls = warn.mock.calls as unknown as Array<[unknown, Record<string, unknown>]>;
+      expect(
+        warnCalls.filter(
+          (call) =>
+            call[0] ===
+              "Herdsman released a pi status event from a frozen baseline that already holds the on-disk answer" &&
+            call[1]?.confirmed === false,
+        ),
+      ).toHaveLength(1);
+    } finally {
+      warn.mockRestore();
+    }
+    harness.sqlite.close();
+  }, 20_000);
+
   test("A guard: an unconfirmed frozen baseline that repeats the last delivered body still degrades", async () => {
     const harness = openObservabilityDbHarness();
     const registry = new TurnCompletionRegistry({ timeoutMs: 3_000 });

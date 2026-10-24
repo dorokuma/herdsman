@@ -78,6 +78,12 @@ export type CompactToolResult = {
   toolName: string;
 };
 
+export type AgentHistoryUnreadyReason =
+  | "empty_history"
+  | "no_user_message"
+  | "assistant_only_before_last_user"
+  | "no_assistant_message";
+
 export type CompactAgentHistory = {
   historyRef: AgentHistoryRef | null;
   lastAssistantMessage: AgentHistoryExcerpt | null;
@@ -85,6 +91,7 @@ export type CompactAgentHistory = {
   lastUserMessage: AgentHistoryExcerpt | null;
   messageCount: number;
   source: string | null;
+  unreadyReason?: AgentHistoryUnreadyReason | null;
   updatedAt: string | null;
 };
 
@@ -283,6 +290,29 @@ export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
  * or exceeded the maximum total waiting duration.
  */
 export const PLAN_STALLED = "PLAN_STALLED";
+
+/**
+ * The plan-row `last_error` values that mean "this round's outcome was lost
+ * while waiting", i.e. the pane's answer never reached the orchestrator and may
+ * still land late on disk.
+ *
+ * `PLAN_STALLED` belongs here on purpose: the stall fallback
+ * (`WORKING_PLAN_MAX_STALL_ATTEMPTS` / `WORKING_PLAN_MAX_WAIT_MS`) settles a plan
+ * exactly like the elastic-window timeout does, and an agy pane whose Herdr
+ * status jitters between `idle` and `working` lands on it — the one observed
+ * shape of a "false idle" that must stay self-readable.
+ *
+ * Kept in this frozen plan-error key family (the string values are the
+ * contract) and mirrored outside the root package:
+ * `packages/herdsman-pi/src/wake.ts` (standalone package, cannot import `@/`)
+ * and `src/agy/hook.ts` both project these reasons, so changing the set or a
+ * value means changing all three places.
+ */
+export const STALLED_PLAN_ERRORS: readonly string[] = [
+  PLAN_WAITING_HISTORY,
+  PLAN_STALLED,
+  DEGRADED_PLAN_ERROR,
+];
 
 export type AgentTurnCompletedInput = {
   confirmed: boolean;

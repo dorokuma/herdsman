@@ -11,8 +11,21 @@ const runtimePathsSchema = Type.Object(
   { additionalProperties: false },
 );
 
+const statusPlansSchema = Type.Object(
+  {
+    backoff_factor: Type.Optional(Type.Number({ minimum: 1, default: 2 })),
+    initial_backoff_ms: Type.Optional(Type.Integer({ minimum: 1, default: 5_000 })),
+    max_backoff_ms: Type.Optional(Type.Integer({ minimum: 1, default: 60_000 })),
+    total_window_ms: Type.Optional(Type.Integer({ minimum: 1, default: 15 * 60 * 1000 })),
+  },
+  { additionalProperties: false },
+);
+
+export type StatusPlansConfig = Static<typeof statusPlansSchema>;
+
 const observabilitySchema = Type.Object(
   {
+    status_plans: Type.Optional(statusPlansSchema),
     telemetry: Type.Optional(
       Type.Object(
         {

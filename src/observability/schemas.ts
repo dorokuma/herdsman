@@ -14,6 +14,10 @@ export const agentListInputSchema = Type.Object(
   {
     all: Type.Optional(Type.Boolean()),
     herdrSessionName: Type.Optional(Type.String({ minLength: 1 })),
+    // Expand the caller's workspace with sibling workspaces of the same Herdr
+    // session that have no orchestrator owner of their own (cross-workspace
+    // dispatched workers).
+    includeOwnerlessWorkspaces: Type.Optional(Type.Boolean()),
     workspaceId: Type.Optional(Type.String({ minLength: 1 })),
   },
   { additionalProperties: false },

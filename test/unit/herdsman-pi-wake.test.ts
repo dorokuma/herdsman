@@ -8,6 +8,7 @@ import {
   projectAgentOutcomes,
   WAKE_SETTLE_MS,
 } from "../../packages/herdsman-pi/src/wake.js";
+import { publishedOutcomeKind } from "../../test/fixtures/herdsman-pi-0.15.0-outcome-kind.js";
 
 function event(
   id: number,
@@ -205,7 +206,7 @@ describe("Pi agent wake projection", () => {
     expect(genuineFailureProjection.rawEvents).toHaveLength(1);
   });
 
-  test("Fix A & Fix B: projects PLAN_STALLED as failed outcome, while pi agent.discarded with PLAN_WAITING_HISTORY wakes and agy or empty payload.agent stays silent", () => {
+  test("Fix A & Fix B: projects legacy PLAN_STALLED without fallbackOutcome marker as failed, while pi agent.discarded with PLAN_WAITING_HISTORY wakes and agy or empty payload.agent stays silent", () => {
     // 1. Fix A: PLAN_STALLED produces wakeable failed outcome for agy agent
     const stallAgy = projectAgentOutcomes([
       event(25, "agent.discarded", {
@@ -594,10 +595,59 @@ describe("Pi agent wake projection", () => {
     expect(projection.outcomes).toHaveLength(0);
     expect(projection.rawEvents.map(({ id }) => id)).toEqual([60, 61]);
 
-    // 对照 1：没有同 pane 完成态时，同一个 fallback 事件必须生成 failed outcome。
+    // 对照 1（M1 约束）：agent.failed + fallbackOutcome 必须保持为 failed（不得谎报为 stalled）。
     expect(projectAgentOutcomes([fallbackFailure]).outcomes).toEqual([
       expect.objectContaining({ eventId: 61, kind: "failed", reason: "degraded" }),
     ]);
+
+    // 对照 1b（M1 约束）：只有 agent.discarded + fallbackOutcome 才投影为 stalled。
+    const fallbackDiscarded = event(
+      65,
+      "agent.discarded",
+      {
+        agent: "agy",
+        fallbackOutcome: true,
+        from: "working",
+        name: "worker",
+        reason: "degraded",
+        to: "discarded",
+      },
+      { paneGeneration: "gen-1" },
+    );
+    expect(projectAgentOutcomes([fallbackDiscarded]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 65, kind: "stalled", reason: "degraded" }),
+    ]);
+
+    // 对照 1c：stalled 之后的 completed 必须能唤醒，且不会因为先前 stalled 被抑制。
+    const subsequentCompletion = event(
+      66,
+      "agent.done",
+      { from: "working", to: "done" },
+      {
+        paneGeneration: "gen-1",
+        text: "Finished the late task",
+      },
+    );
+    const wakeProjector = createAgentOutcomeProjector();
+    // 第一轮收到 stalled
+    const firstProj = wakeProjector([fallbackDiscarded]);
+    expect(firstProj.outcomes).toEqual([expect.objectContaining({ eventId: 65, kind: "stalled" })]);
+    // 第二轮收到迟到的 completed：必须正常唤醒
+    const secondProj = wakeProjector([subsequentCompletion]);
+    expect(secondProj.outcomes).toEqual([
+      expect.objectContaining({ eventId: 66, kind: "completed", text: "Finished the late task" }),
+    ]);
+    // 第三轮重复传入同一个 completed：必须去重静默
+    const thirdProj = wakeProjector([subsequentCompletion]);
+    expect(thirdProj.outcomes).toHaveLength(0);
+
+    // 向后兼容断言：跑的是 *真实已发布* 的 @dorokuma/herdsman-pi@0.15.0 的
+    // outcomeKind 快照（test/fixtures/herdsman-pi-0.15.0-outcome-kind.ts，
+    // 带 sha256 溯源），不是测试内手写的「假想老插件」。该版本不认识 stalled，
+    // 因此 agent.discarded + fallbackOutcome 仍投影为 failed：老编排者照样被唤醒，
+    // 不会因为多出一个 kind 而反序列化失败。
+    expect(publishedOutcomeKind(fallbackFailure)).toBe("failed");
+    expect(publishedOutcomeKind(fallbackDiscarded)).toBe("failed");
 
     // 对照 2：完成态属于另一个 pane 时，fallback 不得被压制（两个 outcome 都产生）。
     expect(
@@ -625,6 +675,92 @@ describe("Pi agent wake projection", () => {
         ),
       ]).outcomes.map(({ eventId }) => eventId),
     ).toEqual([63]);
+  });
+
+  test("projects a stall-settled agy discard as the self-readable stalled kind, while pi stays failed", () => {
+    // F6: Herdr 在 idle↔working 抖动时既有的 stall 兜底
+    // (WORKING_PLAN_MAX_STALL_ATTEMPTS / WORKING_PLAN_MAX_WAIT_MS) 会把计划结算为
+    // last_error = PLAN_STALLED 的 discard。该 discard 现在带 fallbackOutcome，
+    // 因此必须投影为 stalled（自读 pane），而不是静默或无脑的 failed。
+    const agyStallDiscard = event(
+      90,
+      "agent.discarded",
+      {
+        agent: "agy",
+        fallbackOutcome: true,
+        from: "working",
+        name: "worker",
+        reason: PLAN_STALLED,
+        to: "discarded",
+      },
+      { paneGeneration: "gen-1" },
+    );
+    expect(projectAgentOutcomes([agyStallDiscard]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 90, kind: "stalled", reason: PLAN_STALLED }),
+    ]);
+    expect(formatAgentOutcomeUpdates(projectAgentOutcomes([agyStallDiscard]).outcomes)).toContain(
+      "- stalled ",
+    );
+
+    // 抖动形态下 agent 字段缺失（孤儿/stitched 行）同样按 stalled 处理。
+    const agentlessStallDiscard: AgentEventWireRecord = {
+      ...event(
+        91,
+        "agent.discarded",
+        {
+          fallbackOutcome: true,
+          from: "working",
+          reason: PLAN_STALLED,
+          to: "discarded",
+        },
+        { paneGeneration: "gen-1" },
+      ),
+      payload: {
+        fallbackOutcome: true,
+        from: "working",
+        reason: PLAN_STALLED,
+        to: "discarded",
+      },
+    };
+    expect(projectAgentOutcomes([agentlessStallDiscard]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 91, kind: "stalled", reason: PLAN_STALLED }),
+    ]);
+
+    // pi 的既有语义不跟着改：agent === "pi" 进不到 isAgyOrEmpty 分支，仍旧 failed。
+    const piStallDiscard = event(
+      92,
+      "agent.discarded",
+      {
+        agent: "pi",
+        fallbackOutcome: true,
+        from: "working",
+        reason: PLAN_STALLED,
+        to: "discarded",
+      },
+      { paneGeneration: "gen-1" },
+    );
+    expect(projectAgentOutcomes([piStallDiscard]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 92, kind: "failed", reason: PLAN_STALLED }),
+    ]);
+
+    // 老版本（0.15.0 快照）不认识 stalled：PLAN_STALLED 仍走默认 failed 分支被唤醒。
+    expect(publishedOutcomeKind(agyStallDiscard)).toBe("failed");
+    expect(publishedOutcomeKind(piStallDiscard)).toBe("failed");
+
+    // stall 之后的迟到 completed 必须能唤醒，且不被 fallback 压制。
+    const projector = createAgentOutcomeProjector();
+    expect(projector([agyStallDiscard]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 90, kind: "stalled" }),
+    ]);
+    const lateCompletion = event(
+      93,
+      "agent.idle",
+      { from: "working", to: "idle" },
+      { paneGeneration: "gen-1", text: "late jittered turn result" },
+    );
+    expect(projector([lateCompletion]).outcomes).toEqual([
+      expect.objectContaining({ eventId: 93, kind: "completed" }),
+    ]);
   });
 
   test("does not let a generation-less completion suppress any fallback", () => {

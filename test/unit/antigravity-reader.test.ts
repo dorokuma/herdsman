@@ -45,6 +45,44 @@ describe("AntigravityHistoryReader readCompact", () => {
 
     expect(compact.lastAssistantMessage).toBeNull();
     expect(compact.messageCount).toBe(1);
+    expect(compact.unreadyReason).toBe("no_user_message");
+  });
+
+  test("returns empty_history unreadyReason when steps table is empty", async () => {
+    const { dbPath, sqlite } = await tempDb("herdsman-agy-empty-");
+    sqlite.close();
+
+    const reader = new AntigravityHistoryReader();
+    const compact = await reader.readCompact({
+      kind: "agent_session",
+      path: dbPath,
+      source: "antigravity-sqlite",
+      value: dbPath,
+    });
+
+    expect(compact.lastAssistantMessage).toBeNull();
+    expect(compact.messageCount).toBe(0);
+    expect(compact.unreadyReason).toBe("empty_history");
+  });
+
+  test("returns no_assistant_message unreadyReason when only user message exists", async () => {
+    const { dbPath, sqlite } = await tempDb("herdsman-agy-only-user-");
+    sqlite
+      .prepare("insert into steps (role, payload, created_at) values (?, ?, ?)")
+      .run("user", "only user", 1000);
+    sqlite.close();
+
+    const reader = new AntigravityHistoryReader();
+    const compact = await reader.readCompact({
+      kind: "agent_session",
+      path: dbPath,
+      source: "antigravity-sqlite",
+      value: dbPath,
+    });
+
+    expect(compact.lastAssistantMessage).toBeNull();
+    expect(compact.messageCount).toBe(1);
+    expect(compact.unreadyReason).toBe("no_assistant_message");
   });
 
   test("returns null when a new user message arrives after old assistant message without new assistant", async () => {
@@ -65,6 +103,7 @@ describe("AntigravityHistoryReader readCompact", () => {
 
     expect(compact.lastAssistantMessage).toBeNull();
     expect(compact.lastUserMessage).toMatchObject({ text: "second question" });
+    expect(compact.unreadyReason).toBe("assistant_only_before_last_user");
   });
 
   test("returns new assistant message once assistant responds to the last user message", async () => {
@@ -86,6 +125,7 @@ describe("AntigravityHistoryReader readCompact", () => {
 
     expect(compact.lastAssistantMessage).toMatchObject({ text: "second answer" });
     expect(compact.lastUserMessage).toMatchObject({ text: "second question" });
+    expect(compact.unreadyReason).toBeNull();
   });
 
   test("decodes ISO timestamps from steps.metadata protobuf blobs when created_at/timestamp columns are absent", async () => {

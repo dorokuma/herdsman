@@ -677,16 +677,17 @@ export class AgentEventStore {
         )
         .run(cutoff).changes;
       // Branch (c): the pane is still open but the delivery terminal no longer
-      // holds the orchestrator scope (owner_terminal_id != delivered_to_terminal_id
-      // or no owner), so reclaim immediately without waiting for last_attempt_at
-      // timeout. If the scope is still owned by the delivery terminal (branch a),
-      // the event remains in-flight with the owner.
+      // holds any orchestrator scope in this Herdr session (owner_terminal_id !=
+      // delivered_to_terminal_id or no owner), so reclaim immediately without
+      // waiting for last_attempt_at timeout. If the delivery terminal still owns
+      // a scope (branch a), the event remains in-flight with the owner. The scope
+      // is matched session-wide because an owner also receives events of
+      // ownerless sibling workspaces (cross-workspace dispatched workers).
       const reclaimWhere = `status = 'delivered'
              and ${agentPaneOpen}
              and not exists (
                select 1 from agent_orchestrator_scopes
                where agent_orchestrator_scopes.herdr_session_name = agent_events.herdr_session_name
-                 and agent_orchestrator_scopes.workspace_id = agent_events.workspace_id
                  and agent_orchestrator_scopes.owner_terminal_id = agent_events.delivered_to_terminal_id
              )`;
       const exceeded = this.#sqlite

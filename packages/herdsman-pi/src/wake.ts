@@ -7,16 +7,19 @@ import { DEFAULT_WAKE_FILTER_CONFIG, isUpstreamModelError, type WakeFilterConfig
 // next microtask (0ms timer) instead of waiting out a settle window. Delivery
 // latency is owned by the bounded deferral in the extension, not by this delay.
 export const WAKE_SETTLE_MS = 0;
-// Mirrors `PLAN_WAITING_HISTORY` in `src/observability/contracts.ts` (the string
-// value is the contract; duplicated here because `@dorokuma/herdsman-pi` ships
-// standalone `src/` without root `src/`).
+// Mirrors the `STALLED_PLAN_ERRORS` set in `src/observability/contracts.ts`
+// (`PLAN_WAITING_HISTORY` / `PLAN_STALLED` / `DEGRADED_PLAN_ERROR`, the last one
+// spelled `"degraded"` inline below) and the copy in `src/agy/hook.ts`: the
+// string value is the contract, and the reason is duplicated here because
+// `@dorokuma/herdsman-pi` ships standalone `src/` without root `src/`. All three
+// places must change together.
 export const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
 export const PLAN_STALLED = "PLAN_STALLED";
 
 export type AgentOutcome = {
   agent: string;
   eventId: number;
-  kind: "blocked" | "completed" | "failed";
+  kind: "blocked" | "completed" | "failed" | "stalled";
   name?: string | null;
   paneId: string | null;
   reason?: string;
@@ -99,9 +102,22 @@ function outcomeKind(event: AgentEventWireRecord): AgentOutcome["kind"] | undefi
     const isAgyOrEmpty = agent === undefined || agent === "agy";
     if (isAgyOrEmpty) {
       const reason = stringValue(payload.reason);
+      // A stalled plan has *settled*, which makes it unlike PLAN_WAITING_HISTORY
+      // / degraded ("still waiting, nothing happened yet"): the round's outcome is
+      // gone and the orchestrator has to see that. With the fallback marker it
+      // projects as the self-readable `stalled`; a legacy row written before the
+      // marker existed still wakes as a plain `failed` rather than vanishing.
+      // A `pi` discard never enters this branch (`agent === "pi"` fails
+      // `isAgyOrEmpty`), so pi's own PLAN_STALLED handling is unchanged.
+      if (reason === PLAN_STALLED) {
+        if (payload.fallbackOutcome === true) {
+          return "stalled";
+        }
+        return "failed";
+      }
       if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
         if (payload.fallbackOutcome === true) {
-          return "failed";
+          return "stalled";
         }
         return undefined;
       }
@@ -180,7 +196,8 @@ function project(
     }
 
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
-    const reason = kind === "failed" ? normalizeExcerpt(payload.reason) : undefined;
+    const reason =
+      kind === "failed" || kind === "stalled" ? normalizeExcerpt(payload.reason) : undefined;
     // Upstream model errors are transient provider failures, not agent results:
     // they are dropped from the wake projection without an outcome (and without
     // being consumed into `seen`, so they stay visible as raw evidence).
@@ -253,6 +270,12 @@ export function formatAgentOutcomeUpdates(outcomes: AgentOutcome[]): string {
       const body =
         outcome.text.length > 0 ? `\n  last assistant (pre-round): ${outcome.text}` : "";
       return `- failed ${identity} ${pane}\n  reason: ${reason}${body}`;
+    }
+    if (outcome.kind === "stalled") {
+      const reason = outcome.reason && outcome.reason.length > 0 ? outcome.reason : "(unknown)";
+      const body =
+        outcome.text.length > 0 ? `\n  last assistant (pre-round): ${outcome.text}` : "";
+      return `- stalled ${identity} ${pane}\n  reason: ${reason} (结果未取到，需自读 pane)${body}`;
     }
     const excerpt = outcome.text.length > 0 ? outcome.text : "(no assistant message)";
     return `- ${outcome.kind} ${identity} ${pane}\n  last assistant: ${excerpt}\n  event: ${outcome.eventId}`;

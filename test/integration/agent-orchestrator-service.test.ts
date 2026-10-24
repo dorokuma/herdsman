@@ -567,6 +567,15 @@ describe("AgentOrchestratorService ack regression", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
     const otherScopeEvent = appendEvent(harness, { terminalId: "term_other", workspaceId: "wC" });
+    // A workspace owned by another terminal stays out of scope; the
+    // ownerless-sibling rule only covers workspaces without their own owner.
+    harness.agentOrchestratorScopes.claim({
+      ...scope,
+      ackedEventId: 0,
+      paneId: "wC:owner",
+      terminalId: "term_other_owner",
+      workspaceId: "wC",
+    });
 
     // Legacy wording is reused from out-of-order; old clients treat these as retryable.
     // This known compatibility behavior is covered by the subsequent state-machine batch.
@@ -649,6 +658,13 @@ describe("AgentOrchestratorService ack regression", () => {
     const { harness, service } = openService();
     service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
     const otherScopeEvent = appendEvent(harness, { terminalId: "term_other", workspaceId: "wC" });
+    harness.agentOrchestratorScopes.claim({
+      ...scope,
+      ackedEventId: 0,
+      paneId: "wC:owner",
+      terminalId: "term_other_owner",
+      workspaceId: "wC",
+    });
 
     expect(() =>
       service.ack({ ...scope, eventId: otherScopeEvent.id, terminalId: "term_owner" }),
@@ -704,6 +720,73 @@ describe("AgentOrchestratorService ack regression", () => {
     expect(first.id).toBeLessThan(second.id);
     expect(harness.agentEvents.get(first.id)).toMatchObject({ status: "pending" });
     expect(harness.agentEvents.get(second.id)).toMatchObject({ status: "pending" });
+  });
+});
+
+describe("AgentOrchestratorService cross-workspace acknowledgement", () => {
+  test("rejects an ack that skips a lower pending event of the ownerless sibling workspace", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const own = appendEvent(harness, { terminalId: "term_w", workspaceId: "wB" });
+    const sibling = appendEvent(harness, { terminalId: "term_s", workspaceId: "wD" });
+    expect(own.id).toBeLessThan(sibling.id);
+
+    expect(() => service.ack({ ...scope, eventId: sibling.id, terminalId: "term_owner" })).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+        message: "Only the next pending orchestrator event can be acknowledged",
+      }),
+    );
+    expect(harness.agentEvents.get(own.id)).toMatchObject({ status: "pending" });
+    expect(harness.agentEvents.get(sibling.id)).toMatchObject({ status: "pending" });
+  });
+
+  test("rejects an ack of the owner workspace event while a lower sibling event is pending", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const sibling = appendEvent(harness, { terminalId: "term_s", workspaceId: "wD" });
+    const own = appendEvent(harness, { terminalId: "term_w", workspaceId: "wB" });
+    expect(sibling.id).toBeLessThan(own.id);
+
+    expect(() => service.ack({ ...scope, eventId: own.id, terminalId: "term_owner" })).toThrow(
+      expect.objectContaining({
+        code: "ORCHESTRATOR_EVENT_OUT_OF_ORDER",
+        message: "Only the next pending orchestrator event can be acknowledged",
+      }),
+    );
+    expect(harness.agentEvents.get(sibling.id)).toMatchObject({ status: "pending" });
+    expect(harness.agentEvents.get(own.id)).toMatchObject({ status: "pending" });
+  });
+
+  test("settles only the acknowledged sibling row and never advances the owner cursor", () => {
+    const { harness, service } = openService();
+    service.claim({ ...scope, paneId: "wB:owner", terminalId: "term_owner" });
+    const deferred = appendEvent(harness, { terminalId: "term_w", workspaceId: "wB" });
+    // Not deliverable right now (delivery backoff), so the ordering guard cannot
+    // see it: exactly the owner-workspace row the scope-cursor ack used to swallow.
+    harness.sqlite
+      .prepare("update agent_events set next_attempt_at = ? where id = ?")
+      .run(Date.now() + 60_000, deferred.id);
+    const sibling = appendEvent(harness, { terminalId: "term_s", workspaceId: "wD" });
+    expect(deferred.id).toBeLessThan(sibling.id);
+
+    const state = service.ack({ ...scope, eventId: sibling.id, terminalId: "term_owner" });
+
+    expect(state).toMatchObject({ ackedEventId: 0 });
+    expect(service.status(scope)).toMatchObject({ ackedEventId: 0 });
+    expect(harness.agentEvents.get(sibling.id)).toMatchObject({ status: "acked" });
+    expect(harness.agentEvents.get(deferred.id)).toMatchObject({
+      deliverable: 1,
+      status: "pending",
+    });
+
+    // The deferred event is still reachable once its backoff expires.
+    harness.sqlite
+      .prepare("update agent_events set next_attempt_at = null where id = ?")
+      .run(deferred.id);
+    expect(service.pending({ ...scope, terminalId: "term_owner" })).toEqual([
+      expect.objectContaining({ id: deferred.id }),
+    ]);
   });
 });
 

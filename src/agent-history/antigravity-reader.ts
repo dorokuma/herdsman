@@ -1,5 +1,9 @@
 import { DatabaseSync } from "node:sqlite";
-import type { AgentHistoryMessage, AgentHistoryRef } from "@/observability/contracts.js";
+import type {
+  AgentHistoryMessage,
+  AgentHistoryRef,
+  AgentHistoryUnreadyReason,
+} from "@/observability/contracts.js";
 import {
   decodeAntigravityMessage,
   decodeAntigravityMetadataTimestamp,
@@ -53,6 +57,17 @@ export class AntigravityHistoryReader implements AgentHistoryReader {
         role?: unknown;
         time?: unknown;
       }[];
+      const lastRow = rows.at(-1);
+      const lastStepId = lastRow?.id ?? null;
+      const lastStepTimestamp = lastRow
+        ? (timestampFrom(lastRow.time) ?? decodeAntigravityMetadataTimestamp(lastRow.metadata))
+        : null;
+      console.debug("Herdsman antigravity reader inspected steps", {
+        conversationPath: ref.path,
+        lastStepId,
+        lastStepTimestamp,
+        stepCount: rows.length,
+      });
       const messages: AgentHistoryMessage[] = rows.flatMap((row) => {
         const explicitRole: AgentHistoryMessage["role"] | null =
           row.role === "user" || row.role === "assistant" ? row.role : null;
@@ -80,25 +95,43 @@ export class AntigravityHistoryReader implements AgentHistoryReader {
   async readCompact(ref: AgentHistoryRef) {
     const messages = await this.read(ref);
     const compact = compactFromMessages(ref, messages);
+    if (messages.length === 0) {
+      return {
+        ...compact,
+        lastAssistantMessage: null,
+        unreadyReason: "empty_history" as const,
+      };
+    }
     const lastUserIndex = messages.findLastIndex((message) => message.role === "user");
     if (lastUserIndex === -1) {
       return {
         ...compact,
         lastAssistantMessage: null,
+        unreadyReason: "no_user_message" as const,
       };
     }
     const assistantAfterUser = messages
       .slice(lastUserIndex + 1)
       .findLast((message) => message.role === "assistant");
+    if (assistantAfterUser) {
+      return {
+        ...compact,
+        lastAssistantMessage: {
+          ref: assistantAfterUser.ref,
+          text: assistantAfterUser.text,
+          timestamp: assistantAfterUser.timestamp,
+        },
+        unreadyReason: null,
+      };
+    }
+    const hasAnyAssistant = messages.some((message) => message.role === "assistant");
+    const unreadyReason: AgentHistoryUnreadyReason = hasAnyAssistant
+      ? "assistant_only_before_last_user"
+      : "no_assistant_message";
     return {
       ...compact,
-      lastAssistantMessage: assistantAfterUser
-        ? {
-            ref: assistantAfterUser.ref,
-            text: assistantAfterUser.text,
-            timestamp: assistantAfterUser.timestamp,
-          }
-        : null,
+      lastAssistantMessage: null,
+      unreadyReason,
     };
   }
 }

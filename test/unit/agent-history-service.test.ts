@@ -4,7 +4,12 @@ import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import type { AgentHistoryLookupInput } from "@/agent-history/discovery.js";
 import type { AgentHistoryReader } from "@/agent-history/readers.js";
-import { createAgentHistoryService, emptyCompactHistory } from "@/agent-history/service.js";
+import {
+  createAgentHistoryService,
+  emptyCompactHistory,
+  getPiEmptyAssistantCount,
+  resetPiEmptyAssistantCount,
+} from "@/agent-history/service.js";
 import type { AgentHistoryCacheStore } from "@/db/agent-history-cache.js";
 import type { AgentHistoryRef } from "@/observability/contracts.js";
 
@@ -187,6 +192,43 @@ describe("agent history service", () => {
     );
     expect(fixture.reader.compactRefs).toHaveLength(1);
   });
+
+  test("logs debug and increments counter on pi empty assistant read, warns on agy", async () => {
+    resetPiEmptyAssistantCount();
+    const debugSpy = vi.spyOn(console, "debug").mockImplementation(() => {});
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => {});
+
+    const piPath = await sourceFile("pi-empty.jsonl");
+    const agyPath = await sourceFile("agy-empty.db");
+    const fixture = service({
+      discovered: null,
+      reader: reader({ noAssistant: true }),
+    });
+
+    const piResult = await fixture.service.readCompactRef(ref(piPath, "pi-jsonl"));
+    expect(piResult.compactHistory.lastAssistantMessage).toBeNull();
+    expect(getPiEmptyAssistantCount()).toBe(1);
+    expect(debugSpy).toHaveBeenCalledWith(
+      "Herdsman history read produced no assistant message",
+      expect.objectContaining({ source: "pi-jsonl" }),
+    );
+    expect(warnSpy).not.toHaveBeenCalledWith(
+      "Herdsman history read produced no assistant message",
+      expect.anything(),
+    );
+
+    const agyResult = await fixture.service.readCompactRef(ref(agyPath, "antigravity-sqlite"));
+    expect(agyResult.compactHistory.lastAssistantMessage).toBeNull();
+    expect(getPiEmptyAssistantCount()).toBe(1);
+    expect(warnSpy).toHaveBeenCalledWith(
+      "Herdsman history read produced no assistant message",
+      expect.objectContaining({ source: "antigravity-sqlite" }),
+    );
+
+    debugSpy.mockRestore();
+    warnSpy.mockRestore();
+  });
+
   test("fingerprints the resolved file while preserving the official session id", async () => {
     const path = await sourceFile("agy.db");
     const preferred: AgentHistoryRef = {

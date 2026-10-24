@@ -4,11 +4,13 @@ import { join, resolve } from "node:path";
 import { afterEach, describe, expect, test } from "vitest";
 import { resolveRuntimeForCommand } from "@/cli/herdsman.js";
 import {
+  DEFAULT_STATUS_PLAN_CONFIG,
   getHerdsmanHome,
   loadHerdsmanDotEnv,
   resolveRuntime,
   resolveRuntimePath,
   resolveRuntimePaths,
+  resolveStatusPlansConfig,
   runtimePathsFromRecordOrDefault,
 } from "@/config/runtime.js";
 
@@ -223,6 +225,63 @@ HERDSMAN_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
     });
 
     expect(paths.dbPath).toBe("/tmp/herdsman-home/data/state.db");
+  });
+});
+
+describe("resolveStatusPlansConfig", () => {
+  test("returns default status plan config when neither config nor env are provided", () => {
+    expect(resolveStatusPlansConfig(undefined, {})).toEqual(DEFAULT_STATUS_PLAN_CONFIG);
+  });
+
+  test("resolves status plans config from parsed config", () => {
+    const resolved = resolveStatusPlansConfig(
+      {
+        observability: {
+          status_plans: {
+            backoff_factor: 1.5,
+            initial_backoff_ms: 3000,
+            max_backoff_ms: 30000,
+            total_window_ms: 60000,
+          },
+        },
+      },
+      {},
+    );
+
+    expect(resolved).toEqual({
+      backoff_factor: 1.5,
+      initial_backoff_ms: 3000,
+      max_backoff_ms: 30000,
+      total_window_ms: 60000,
+    });
+  });
+
+  test("environment variables take precedence over config", () => {
+    const resolved = resolveStatusPlansConfig(
+      {
+        observability: {
+          status_plans: {
+            backoff_factor: 1.5,
+            initial_backoff_ms: 3000,
+            max_backoff_ms: 30000,
+            total_window_ms: 60000,
+          },
+        },
+      },
+      {
+        HERDSMAN_STATUS_PLAN_BACKOFF_FACTOR: "2.5",
+        HERDSMAN_STATUS_PLAN_INITIAL_BACKOFF_MS: "2000",
+        HERDSMAN_STATUS_PLAN_MAX_BACKOFF_MS: "15000",
+        HERDSMAN_STATUS_PLAN_TOTAL_WINDOW_MS: "120000",
+      },
+    );
+
+    expect(resolved).toEqual({
+      backoff_factor: 2.5,
+      initial_backoff_ms: 2000,
+      max_backoff_ms: 15000,
+      total_window_ms: 120000,
+    });
   });
 });
 

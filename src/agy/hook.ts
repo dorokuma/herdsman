@@ -1,14 +1,26 @@
 import { execFile, spawn } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readlinkSync,
+  realpathSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify, stripVTControlCharacters } from "node:util";
 import { ObservabilityRpcClient } from "@/daemon/client.js";
-import type {
-  AgentEventRecord,
-  AgentListItem,
-  AgentOrchestratorWireState,
+import {
+  type AgentEventRecord,
+  type AgentListItem,
+  type AgentOrchestratorWireState,
+  DEGRADED_PLAN_ERROR,
+  PLAN_STALLED,
+  PLAN_WAITING_HISTORY,
 } from "@/observability/contracts.js";
 
 const execFileAsync = promisify(execFile);
@@ -23,6 +35,9 @@ export type AgyHookPayload = {
   sessionId?: string;
   terminationReason?: string;
   transcriptPath?: string;
+  // agy reports the pane's working directory as `workspacePaths` (plural, an
+  // array) instead of `cwd`; see `resolveWakeWaiterCwd`.
+  workspacePaths?: unknown;
 };
 
 export type AgyPreInvocationOutput = {
@@ -63,7 +78,7 @@ type OrchestratorConnectionState = {
 type AgyOutcome = {
   agent: string;
   eventId: number;
-  kind: "blocked" | "completed" | "failed";
+  kind: "blocked" | "completed" | "failed" | "stalled";
   name: string | null;
   paneId: string | null;
   reason?: string;
@@ -75,13 +90,20 @@ const DEFAULT_WAIT_TIMEOUT_MS = 24 * 60 * 60_000;
 const DEFAULT_REQUEST_TIMEOUT_MS = 15_000;
 const MAX_SETTIMEOUT_MS = 2_147_483_647;
 const DEFAULT_POLL_INTERVAL_MS = 1_500;
+// Standby cadence when no peer is known yet: the WakeWaiter is event-driven via
+// `agent.event` / `agent.orchestrator.changed` push notifications, so a long
+// fallback sleep arms the push channel without polling the daemon.
+const DEFAULT_IDLE_POLL_INTERVAL_MS = 60_000;
 const DEFAULT_NEW_AGENT_GRACE_MS = 15_000;
 const DEFAULT_SETTLE_GRACE_MS = 12_000;
 const UNSETTLED_TURN_MAX_AGE_MS = 10 * 60_000;
 const MAX_WAKE_PROMPT_ATTEMPTS = 3;
 const WAKE_PROMPT_TEXT = "[herdsman-wake]";
-const PLAN_WAITING_HISTORY = "PLAN_WAITING_HISTORY";
-export const PLAN_STALLED = "PLAN_STALLED";
+// `PLAN_WAITING_HISTORY` / `PLAN_STALLED` / `DEGRADED_PLAN_ERROR` are imported
+// from `@/observability/contracts.js` above: the string values are the contract
+// and the projection below has to stay in sync with `STALLED_PLAN_ERRORS` there
+// and with the copy in `packages/herdsman-pi/src/wake.ts` (standalone package,
+// cannot import `@/`). Change all three places together.
 
 function defaultStateDir(environment: NodeJS.ProcessEnv): string {
   const home = nonEmptyString(environment.HERDSMAN_HOME) ?? join(homedir(), ".herdsman");
@@ -106,6 +128,8 @@ export type RunAgyHookOptions = {
     onNotification?: (method: string, params: unknown) => void,
   ) => Promise<Pick<ObservabilityRpcClient, "close" | "request">>;
   environment?: NodeJS.ProcessEnv;
+  exitWhenNoPeers?: boolean;
+  idlePollIntervalMs?: number;
   newAgentGraceMs?: number;
   now?: () => number;
   pollIntervalMs?: number;
@@ -249,6 +273,8 @@ export async function runAgyHook(
       const connState = await registerAgyPresence(activeClient, launch, sessionId, false);
       const waitTimeoutMs = options.waitTimeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
       const pollIntervalMs = options.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+      const idlePollIntervalMs = options.idlePollIntervalMs ?? DEFAULT_IDLE_POLL_INTERVAL_MS;
+      const exitWhenNoPeers = options.exitWhenNoPeers === true;
       const newAgentGraceMs = options.newAgentGraceMs ?? DEFAULT_NEW_AGENT_GRACE_MS;
       const settleGraceMs = options.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
       const triggerWakePrompt = options.triggerWakePrompt ?? defaultTriggerWakePrompt;
@@ -256,9 +282,11 @@ export async function runAgyHook(
       let isFirstIteration = true;
       let isFirstEventCheck = true;
       let retryWakePending = false;
+      let deliveredBatchGracePending = false;
       let wakePromptFailures = 0;
       let rpcFailures = 0;
       let sawActivePeers = false;
+      let sawSelf = false;
       let settleDeadline: number | undefined;
 
       while (now() < deadline) {
@@ -273,6 +301,12 @@ export async function runAgyHook(
         }
         isFirstIteration = false;
 
+        // Already-delivered but unacked events are a wake batch of their own: the
+        // Stop hook hands the batch to the host via `decision: continue` *and*
+        // spawns this waiter, so when the host ignores that decision the waiter is
+        // the only remaining way to surface them.
+        const hasUnackedDeliveredEvents = (sessionState.deliveredEventIds ?? []).length > 0;
+
         let hasActivePeers = false;
         let hasPeers = false;
         let selfAgentStatus: AgentListItem["agentStatus"] | undefined;
@@ -286,6 +320,13 @@ export async function runAgyHook(
             newAgentGraceMs,
             settleGraceMs,
           ));
+          if (selfAgentStatus !== undefined) sawSelf = true;
+          if (sawSelf && selfAgentStatus === undefined) {
+            // The orchestrator pane itself left the Herdr index (closed or
+            // re-created): there is nothing left to wake.
+            clearOwnWaiterPid(stateDir, sessionId);
+            return {};
+          }
           if (hasActivePeers) {
             sawActivePeers = true;
             settleDeadline = undefined;
@@ -297,7 +338,11 @@ export async function runAgyHook(
 
           if (
             selfReadyToWake &&
-            (isFirstEventCheck || hasPushNotification || retryWakePending || !hasActivePeers)
+            (isFirstEventCheck ||
+              hasPushNotification ||
+              retryWakePending ||
+              deliveredBatchGracePending ||
+              !hasActivePeers)
           ) {
             const latestState = (await activeClient.request(
               "agent.orchestrator.get",
@@ -305,18 +350,33 @@ export async function runAgyHook(
             )) as OrchestratorConnectionState;
             if (!isLocalOwner(latestState)) return {};
 
-            hasWakeBatch = await peekNextWakeBatch(
+            const peekedBatch = await peekNextWakeBatch(
               activeClient,
               latestState,
               sessionState,
               stateDir,
               sessionId,
             );
+            hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch;
             isFirstEventCheck = false;
             hasPushNotification = false;
             retryWakePending = false;
 
-            if (hasWakeBatch) {
+            if (
+              hasWakeBatch &&
+              hasUnackedDeliveredEvents &&
+              !peekedBatch &&
+              !deliveredBatchGracePending
+            ) {
+              // The batch only exists as delivered-but-unacked events, i.e. the
+              // Stop hook already handed it to the host via `decision: continue`.
+              // Give the host one poll interval to start the next invocation
+              // (which bumps turnEpoch and cancels this waiter) before falling
+              // back to a wake prompt, so a cooperating host never gets a
+              // duplicate prompt.
+              deliveredBatchGracePending = true;
+            } else if (hasWakeBatch) {
+              deliveredBatchGracePending = false;
               const preTriggerState = readSessionState(stateDir, sessionId);
               if (
                 preTriggerState.turnEpoch !== undefined &&
@@ -324,6 +384,10 @@ export async function runAgyHook(
               ) {
                 return {};
               }
+              // The stop hook marked the batch presented before returning it to
+              // the host; the turn started by this prompt has to receive it in
+              // PreInvocation, so re-arm the unacked batch first.
+              rearmDeliveredEvents(stateDir, sessionId);
               try {
                 await triggerWakePrompt({
                   paneId: launch.paneId,
@@ -380,15 +444,23 @@ export async function runAgyHook(
         const selfReadyToWake =
           selfAgentStatus === undefined || selfAgentStatus === "idle" || selfAgentStatus === "done";
         if (!hasActivePeers && !hasWakeBatch && selfReadyToWake && !retryWakePending) {
-          if ((sawActivePeers || hasPeers) && settleGraceMs > 0) {
-            settleDeadline ??= now() + settleGraceMs;
-            if (now() >= settleDeadline) {
+          // Default: stay on standby for the next batch (script-dispatched workers
+          // are not in `agent.list` yet, and a batch may arrive after every known
+          // peer finished). Only an explicit `exitWhenNoPeers` restores the old
+          // exit-when-idle behaviour.
+          if (exitWhenNoPeers) {
+            if ((sawActivePeers || hasPeers) && settleGraceMs > 0) {
+              settleDeadline ??= now() + settleGraceMs;
+              if (now() >= settleDeadline) {
+                clearOwnWaiterPid(stateDir, sessionId);
+                return {};
+              }
+            } else {
               clearOwnWaiterPid(stateDir, sessionId);
               return {};
             }
           } else {
-            clearOwnWaiterPid(stateDir, sessionId);
-            return {};
+            settleDeadline = undefined;
           }
         } else {
           settleDeadline = undefined;
@@ -398,7 +470,18 @@ export async function runAgyHook(
         if (remainingMs <= 0) break;
         const settleRemainingMs =
           settleDeadline !== undefined ? Math.max(0, settleDeadline - now()) : remainingMs;
-        const sleepMs = Math.min(pollIntervalMs, remainingMs, settleRemainingMs);
+        const isIdleStandby =
+          !exitWhenNoPeers &&
+          !hasActivePeers &&
+          !hasPeers &&
+          !hasWakeBatch &&
+          !hasUnackedDeliveredEvents &&
+          selfReadyToWake &&
+          !retryWakePending;
+        const baseSleepMs = isIdleStandby
+          ? Math.max(pollIntervalMs, idlePollIntervalMs)
+          : pollIntervalMs;
+        const sleepMs = Math.min(baseSleepMs, remainingMs, settleRemainingMs);
         if (sleepMs <= 0) continue;
         await waitForNotificationOrTimeout(sleepMs, (wake) => {
           notifyWakeWaiter = wake;
@@ -499,45 +582,54 @@ export async function runAgyHook(
       stateDir,
       sessionId,
     );
-    if (immediateBatch) {
+
+    // A WakeWaiter is spawned even when an immediate batch is handed to the host
+    // via `decision: continue`: agy may ignore that decision, and without a waiter
+    // nothing would notice the *next* batch. The same holds when no peer is active
+    // yet (a script-dispatched worker is not indexed by Herdr immediately, and a
+    // new worker can start after every known peer finished), so only the explicit
+    // `exitWhenNoPeers` opt-in keeps the old "no peers, no waiter" behaviour.
+    let hasActivePeers = false;
+    if (options.exitWhenNoPeers === true) {
+      const newAgentGraceMs = options.newAgentGraceMs ?? DEFAULT_NEW_AGENT_GRACE_MS;
+      const settleGraceMs = options.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
+      ({ hasActivePeers } = await inspectWorkspaceAgents(
+        activeClient,
+        connState.presence,
+        now(),
+        newAgentGraceMs,
+        settleGraceMs,
+      ));
+    }
+    const keepWaiter = options.exitWhenNoPeers !== true || hasActivePeers;
+    if (keepWaiter) {
+      const waiterEpoch = (sessionState.turnEpoch ?? 0) + 1;
+      sessionState.turnEpoch = waiterEpoch;
+      sessionState.waiterEpoch = waiterEpoch;
+      delete sessionState.waiterPid;
       writeSessionState(stateDir, sessionId, sessionState);
+
+      const spawnWakeWaiter = options.spawnWakeWaiter ?? defaultSpawnWakeWaiter;
+      const spawned = spawnWakeWaiter({
+        cwd: resolveWakeWaiterCwd(payload),
+        environment: env,
+        sessionId,
+        stateDir,
+        waiterEpoch,
+      });
+      if (spawned?.pid !== undefined) {
+        sessionState.waiterPid = spawned.pid;
+        writeSessionState(stateDir, sessionId, sessionState);
+      }
+    } else {
+      writeSessionState(stateDir, sessionId, sessionState);
+    }
+
+    if (immediateBatch) {
       return {
         decision: "continue",
         reason: immediateBatch,
       };
-    }
-
-    const newAgentGraceMs = options.newAgentGraceMs ?? DEFAULT_NEW_AGENT_GRACE_MS;
-    const settleGraceMs = options.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
-    const { hasActivePeers } = await inspectWorkspaceAgents(
-      activeClient,
-      connState.presence,
-      now(),
-      newAgentGraceMs,
-      settleGraceMs,
-    );
-    if (!hasActivePeers) {
-      writeSessionState(stateDir, sessionId, sessionState);
-      return {};
-    }
-
-    const waiterEpoch = (sessionState.turnEpoch ?? 0) + 1;
-    sessionState.turnEpoch = waiterEpoch;
-    sessionState.waiterEpoch = waiterEpoch;
-    delete sessionState.waiterPid;
-    writeSessionState(stateDir, sessionId, sessionState);
-
-    const spawnWakeWaiter = options.spawnWakeWaiter ?? defaultSpawnWakeWaiter;
-    const spawned = spawnWakeWaiter({
-      cwd: nonEmptyString(payload.cwd) ?? process.cwd(),
-      environment: env,
-      sessionId,
-      stateDir,
-      waiterEpoch,
-    });
-    if (spawned?.pid !== undefined) {
-      sessionState.waiterPid = spawned.pid;
-      writeSessionState(stateDir, sessionId, sessionState);
     }
     return {};
   } catch {
@@ -607,10 +699,109 @@ function defaultSpawnWakeWaiter(input: {
       },
       stdio: "ignore",
     });
+    child.on("error", (error) => {
+      // Async spawn failures (e.g. the pane cwd was removed between the hook's
+      // synchronous `spawn()` and the child's exec) are reported as an `error`
+      // event; without a listener Node turns it into an uncaught exception and the
+      // Stop hook process would die. Losing the waiter is bad enough on its own.
+      console.warn(
+        `Failed to spawn Herdsman AGY wake waiter: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    });
     child.unref();
     return child.pid !== undefined ? { pid: child.pid } : {};
   } catch {
     return undefined;
+  }
+}
+
+// Mirrors the ancestor walk in `peerBoundToPaneCwd` (`@/shared/unix-peercred.js`):
+// the daemon trusts a connector whose cwd — or the cwd of an ancestor up to 4
+// hops away — matches the Herdr pane cwd. Keep both depths in sync.
+const MAX_WAKE_CWD_ANCESTOR_DEPTH = 4;
+
+/**
+ * Resolves the `cwd` the detached `WakeWaiter` has to inherit.
+ *
+ * agy runs hooks with `process.cwd()` set to the directory containing
+ * `hooks.json` (the global hook file lives in `~/.gemini/config`), and its `Stop`
+ * stdin payload carries the pane directory as `workspacePaths` instead of `cwd`.
+ * Spawning the waiter with the hook cwd therefore breaks the daemon's
+ * `ConnectorPaneMismatchError` check: the detached child is orphaned to PID 1, so
+ * the pane-binding ancestor walk can never match. Priority:
+ *
+ * 1. `payload.cwd` (explicit working directory in the payload);
+ * 2. the first existing entry of `payload.workspacePaths` (else the first
+ *    non-empty one, so path-less unit tests still pin the reported directory);
+ * 3. the cwd of this process' nearest ancestor that differs from `baseCwd`
+ *    (Linux `/proc` walk, same bound as the daemon's pane check);
+ * 4. `baseCwd` itself.
+ */
+export function resolveWakeWaiterCwd(
+  payload: AgyHookPayload,
+  options?: { baseCwd?: string; pid?: number },
+): string {
+  const explicitCwd = nonEmptyString(payload.cwd);
+  if (explicitCwd !== undefined) return explicitCwd;
+
+  const workspacePaths = Array.isArray(payload.workspacePaths) ? payload.workspacePaths : [];
+  const candidates = workspacePaths
+    .map((candidate) => nonEmptyString(candidate))
+    .filter((candidate): candidate is string => candidate !== undefined);
+  const existingCandidate = candidates.find((candidate) => existsSync(candidate));
+  if (existingCandidate !== undefined) return existingCandidate;
+  const [firstCandidate] = candidates;
+  if (firstCandidate !== undefined) return firstCandidate;
+
+  const baseCwd = nonEmptyString(options?.baseCwd) ?? process.cwd();
+  return ancestorCwdDifferingFrom(baseCwd, options?.pid ?? process.pid) ?? baseCwd;
+}
+
+function ancestorCwdDifferingFrom(baseCwd: string, pid: number): string | undefined {
+  if (process.platform !== "linux") return undefined;
+  if (!Number.isInteger(pid) || pid <= 1) return undefined;
+  const normalizedBase = normalizeWakeCwd(baseCwd);
+  let current: number | undefined = pid;
+  for (
+    let step = 0;
+    step <= MAX_WAKE_CWD_ANCESTOR_DEPTH && current !== undefined && current > 1;
+    step += 1
+  ) {
+    const currentCwd = readProcessCwd(current);
+    if (currentCwd === undefined) return undefined;
+    if (normalizeWakeCwd(currentCwd) !== normalizedBase) return currentCwd;
+    const parent = readProcessParentPid(current);
+    if (parent === undefined || parent <= 1 || parent === current) return undefined;
+    current = parent;
+  }
+  return undefined;
+}
+
+function readProcessCwd(pid: number): string | undefined {
+  try {
+    return readlinkSync(`/proc/${pid}/cwd`);
+  } catch {
+    return undefined;
+  }
+}
+
+function readProcessParentPid(pid: number): number | undefined {
+  try {
+    const status = readFileSync(`/proc/${pid}/status`, "utf8");
+    const match = /^PPid:\s*(\d+)\s*$/m.exec(status);
+    if (!match) return undefined;
+    const ppid = Number.parseInt(match[1] ?? "", 10);
+    return Number.isInteger(ppid) && ppid >= 0 ? ppid : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function normalizeWakeCwd(value: string): string {
+  try {
+    return realpathSync(value);
+  } catch {
+    return value.length > 1 && value.endsWith("/") ? value.slice(0, -1) : value;
   }
 }
 
@@ -707,7 +898,11 @@ async function peekNextWakeBatch(
 
   if (candidateEvents.length === 0) return false;
 
-  const { outcomes, suppressedEventIds } = projectAgyOutcomes(candidateEvents);
+  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
+  const { outcomes, suppressedEventIds } = projectAgyOutcomes(
+    candidateEvents,
+    liveWorkingTerminalIds,
+  );
   if (outcomes.length === 0) {
     if (suppressedEventIds.length > 0) {
       for (const suppressedId of suppressedEventIds) {
@@ -757,7 +952,11 @@ async function takeNextWakeBatch(
 
   if (candidateEvents.length === 0) return undefined;
 
-  const { outcomes, suppressedEventIds } = projectAgyOutcomes(candidateEvents);
+  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
+  const { outcomes, suppressedEventIds } = projectAgyOutcomes(
+    candidateEvents,
+    liveWorkingTerminalIds,
+  );
   if (outcomes.length === 0) {
     if (suppressedEventIds.length > 0) {
       for (const suppressedId of suppressedEventIds) {
@@ -798,6 +997,24 @@ function clearOwnWaiterPid(stateDir: string, sessionId: string): void {
     delete sessionState.waiterPid;
     writeSessionState(stateDir, sessionId, sessionState);
   }
+}
+
+/**
+ * Makes the delivered-but-unacked batch injectable again.
+ *
+ * `takeNextWakeBatch` marks the batch presented before handing it to the host.
+ * When the host ignores `decision: continue`, the wake prompt starts a new turn
+ * and its PreInvocation must deliver the batch again; it is filtered out by
+ * `presentedEventIds` otherwise and the prompt would be an empty wake.
+ */
+function rearmDeliveredEvents(stateDir: string, sessionId: string): void {
+  const sessionState = readSessionState(stateDir, sessionId);
+  const delivered = new Set(sessionState.deliveredEventIds ?? []);
+  if (delivered.size === 0 || !sessionState.presentedEventIds) return;
+  sessionState.presentedEventIds = sessionState.presentedEventIds.filter(
+    (id) => !delivered.has(id),
+  );
+  writeSessionState(stateDir, sessionId, sessionState);
 }
 
 function parseTimestampMs(value: unknown): number {
@@ -920,6 +1137,10 @@ async function inspectWorkspaceAgents(
 }> {
   const response = (await client.request("agent.list", {
     herdrSessionName: presence.herdrSessionName,
+    // Workers dispatched into a sibling workspace of the same Herdr session have
+    // no orchestrator owner of their own, so their activity is only visible when
+    // the daemon folds those ownerless workspaces into the caller's scope.
+    includeOwnerlessWorkspaces: true,
     workspaceId: presence.workspaceId,
   })) as { agents?: AgentListItem[] };
   const agents = response.agents ?? [];
@@ -935,7 +1156,49 @@ async function inspectWorkspaceAgents(
   };
 }
 
-function projectAgyOutcomes(events: AgentEventRecord[]): {
+/**
+ * Terminal ids of peers whose live Herdr status is `working`.
+ *
+ * Used to suppress completions that belong to an intermediate round of a still
+ * running turn: `agent.done` / `agent.idle` rows are written for every internal
+ * tool round, so the live status is the only signal that the turn is not over
+ * (`agent.status.changed` rows never reach the hook's event batch). Failure is
+ * tolerated: the completion is then projected as a real outcome (the pre-fix
+ * behaviour) instead of dropping the whole batch.
+ */
+async function fetchLiveWorkingTerminalIds(
+  client: Pick<ObservabilityRpcClient, "request">,
+  presence: {
+    herdrSessionName: string;
+    paneId: string;
+    terminalId: string;
+    workspaceId: string;
+  },
+): Promise<Set<string>> {
+  try {
+    const response = (await client.request("agent.list", {
+      herdrSessionName: presence.herdrSessionName,
+      includeOwnerlessWorkspaces: true,
+      workspaceId: presence.workspaceId,
+    })) as { agents?: AgentListItem[] };
+    return new Set(
+      (response.agents ?? []).flatMap((agent) =>
+        agent.agentStatus === "working" &&
+        agent.terminalId &&
+        agent.terminalId !== presence.terminalId
+          ? [agent.terminalId]
+          : [],
+      ),
+    );
+  } catch {
+    return new Set();
+  }
+}
+
+function projectAgyOutcomes(
+  events: AgentEventRecord[],
+  liveWorkingTerminalIds: ReadonlySet<string> = new Set(),
+): {
   outcomes: AgyOutcome[];
   suppressedEventIds: number[];
 } {
@@ -944,17 +1207,27 @@ function projectAgyOutcomes(events: AgentEventRecord[]): {
   const completedPanes = new Set<string>();
 
   for (const event of events) {
-    if (
-      event.paneId &&
-      event.paneGeneration &&
-      (event.type === "agent.done" ||
-        (event.type === "agent.idle" && asRecord(event.payload).from === "working"))
-    ) {
-      completedPanes.add(`${event.paneId}\0${event.paneGeneration}`);
+    if (isCompletionEvent(event)) {
+      const paneKey = paneGenerationKey(event);
+      if (paneKey) completedPanes.add(paneKey);
     }
   }
 
   for (const event of events) {
+    if (
+      isCompletionEvent(event) &&
+      event.terminalId !== null &&
+      liveWorkingTerminalIds.has(event.terminalId)
+    ) {
+      // The peer is working right now: its completion belongs to an intermediate
+      // round of the same turn, so it must not end the orchestrator's wait. The
+      // live `agent.list` status is the *only* intermediate-round signal: the
+      // `agent.status.changed` rows that would carry event-chain evidence are
+      // never part of a delivered batch (see `isDeliverableAgentEvent`), so there
+      // is no in-batch supersede to evaluate.
+      suppressedEventIds.push(event.id);
+      continue;
+    }
     const kind = outcomeKind(event);
     if (!kind || !event.terminalId) {
       suppressedEventIds.push(event.id);
@@ -971,7 +1244,8 @@ function projectAgyOutcomes(events: AgentEventRecord[]): {
       continue;
     }
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
-    const reason = kind === "failed" ? normalizeExcerpt(payload.reason) : undefined;
+    const reason =
+      kind === "failed" || kind === "stalled" ? normalizeExcerpt(payload.reason) : undefined;
     if (isUpstreamErrorText(text) || (reason !== undefined && isUpstreamErrorText(reason))) {
       suppressedEventIds.push(event.id);
       continue;
@@ -999,6 +1273,18 @@ function projectAgyOutcomes(events: AgentEventRecord[]): {
   return { outcomes, suppressedEventIds };
 }
 
+function isCompletionEvent(event: AgentEventRecord): boolean {
+  return (
+    event.type === "agent.done" ||
+    (event.type === "agent.idle" && asRecord(event.payload).from === "working")
+  );
+}
+
+function paneGenerationKey(event: AgentEventRecord): string | undefined {
+  if (!event.paneId || !event.paneGeneration) return undefined;
+  return `${event.paneId}\0${event.paneGeneration}`;
+}
+
 function outcomeKind(event: AgentEventRecord): AgyOutcome["kind"] | undefined {
   if (!event.terminalId) return undefined;
   if (event.type === "agent.done") return "completed";
@@ -1006,7 +1292,7 @@ function outcomeKind(event: AgentEventRecord): AgyOutcome["kind"] | undefined {
   if (event.type === "agent.failed") {
     const payload = asRecord(event.payload);
     const reason = nonEmptyString(payload.reason);
-    if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
+    if (reason === PLAN_WAITING_HISTORY || reason === DEGRADED_PLAN_ERROR) {
       return payload.fallbackOutcome === true ? "failed" : undefined;
     }
     return "failed";
@@ -1017,8 +1303,16 @@ function outcomeKind(event: AgentEventRecord): AgyOutcome["kind"] | undefined {
     const isAgyOrEmpty = agent === undefined || agent === "agy";
     if (isAgyOrEmpty) {
       const reason = nonEmptyString(payload.reason);
-      if (reason === PLAN_WAITING_HISTORY || reason === "degraded") {
-        return payload.fallbackOutcome === true ? "failed" : undefined;
+      // A stalled plan has *settled*, which makes it unlike PLAN_WAITING_HISTORY
+      // / degraded ("still waiting, nothing happened yet"): the round's outcome is
+      // gone and the orchestrator has to see that. With the fallback marker it
+      // projects as the self-readable `stalled`; a legacy row written before the
+      // marker existed still wakes as a plain `failed` rather than vanishing.
+      if (reason === PLAN_STALLED) {
+        return payload.fallbackOutcome === true ? "stalled" : "failed";
+      }
+      if (reason === PLAN_WAITING_HISTORY || reason === DEGRADED_PLAN_ERROR) {
+        return payload.fallbackOutcome === true ? "stalled" : undefined;
       }
     }
     return "failed";
@@ -1041,6 +1335,12 @@ export function formatAgyOutcomeUpdates(outcomes: AgyOutcome[]): string {
         const body =
           outcome.text.length > 0 ? `\n  last assistant (pre-round): ${outcome.text}` : "";
         return `- failed ${identity} ${pane}\n  reason: ${reason}${body}`;
+      }
+      if (outcome.kind === "stalled") {
+        const reason = outcome.reason && outcome.reason.length > 0 ? outcome.reason : "(unknown)";
+        const body =
+          outcome.text.length > 0 ? `\n  last assistant (pre-round): ${outcome.text}` : "";
+        return `- stalled ${identity} ${pane}\n  reason: ${reason} (结果未取到，需自读 pane)${body}`;
       }
       const excerpt = outcome.text.length > 0 ? outcome.text : "(no assistant message)";
       return `- ${outcome.kind} ${identity} ${pane}\n  last assistant: ${excerpt}\n  event: ${outcome.eventId}`;
