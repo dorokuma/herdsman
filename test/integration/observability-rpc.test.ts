@@ -559,6 +559,55 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
+  test("pushes an ownerless sibling workspace event only to the single active session owner", async () => {
+    const { harness, server, socketPath } = await openServerWithoutClient();
+    seedRoutingAgents(harness);
+    const [owner, secondOwner] = await Promise.all([
+      RpcTestClient.connect(socketPath),
+      RpcTestClient.connect(socketPath),
+    ]);
+    await register(owner, "wB:p-a", "pi-a", "wB");
+    await expect(owner.request("agent.orchestrator.set", { enabled: true })).resolves.toMatchObject(
+      {
+        changed: true,
+        state: { owner: { terminalId: "term_a" } },
+      },
+    );
+    await owner.waitForNotification("agent.orchestrator.changed");
+
+    // Exactly one active owner in the session: the ownerless workspace's event is
+    // routed to it, because the worker pane has no orchestrator of its own.
+    const siblingEvent = appendRoutedEvent(harness, "term_d", "wD");
+    server.publishAgentEvent(siblingEvent);
+    await expect(owner.waitForNotification("agent.event")).resolves.toMatchObject({
+      params: { event: { id: siblingEvent.id, terminalId: "term_d", workspaceId: "wD" } },
+    });
+    // The push is a hint only: the owner still pulls the same event through
+    // `pending()` (the acknowledgement path for ownerless sibling workspaces).
+    await expect(owner.request("agent.orchestrator.get", {})).resolves.toMatchObject({
+      events: [expect.objectContaining({ id: siblingEvent.id, workspaceId: "wD" })],
+    });
+
+    // Two active owners: no broadcast (that would double-deliver one event), so the
+    // ownerless workspace stays pull-only for both owners.
+    await register(secondOwner, "wC:p-c", "pi-c", "wC");
+    await expect(
+      secondOwner.request("agent.orchestrator.set", { enabled: true }),
+    ).resolves.toMatchObject({ changed: true, state: { owner: { terminalId: "term_c" } } });
+    await tick();
+    const pullOnly = appendRoutedEvent(harness, "term_d", "wD");
+    server.publishAgentEvent(pullOnly);
+    await tick();
+    expect(owner.notifications.filter((message) => message.method === "agent.event")).toEqual([]);
+    expect(secondOwner.notifications.filter((message) => message.method === "agent.event")).toEqual(
+      [],
+    );
+
+    owner.close();
+    secondOwner.close();
+    harness.sqlite.close();
+  });
+
   test("serves cached lists and re-resolves live detail reads", async () => {
     const calls: string[] = [];
     const liveHistory = {
@@ -1108,6 +1157,9 @@ function seedRoutingAgents(harness: ReturnType<typeof openObservabilityDbHarness
       { agent: "pi", pane_id: "wB:p-a", terminal_id: "term_a", workspace_id: "wB" },
       { agent: "pi", pane_id: "wB:p-b", terminal_id: "term_b", workspace_id: "wB" },
       { agent: "pi", pane_id: "wC:p-c", terminal_id: "term_c", workspace_id: "wC" },
+      // Ownerless sibling workspace: a script-dispatched worker pane whose
+      // workspace never got an orchestrator of its own.
+      { agent: "pi", pane_id: "wD:p-d", terminal_id: "term_d", workspace_id: "wD" },
     ],
     herdrSessionName: "default",
   });

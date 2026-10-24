@@ -55,6 +55,7 @@ export class AgentOrchestratorService {
 
   pending(
     input: AgentScope & {
+      extraScopes?: AgentScope[];
       limit?: number;
       terminalId: string;
     },
@@ -64,16 +65,18 @@ export class AgentOrchestratorService {
     if (!state?.owner || state.owner.terminalId !== input.terminalId) return [];
 
     const limit = input.limit ?? 100;
-    const validAgents = new Map(this.#agents.list(input).map((agent) => [agent.id, agent]));
+    const scopes = mergeScopes([input, ...(input.extraScopes ?? [])]);
+    const validAgents = new Map(
+      scopes.flatMap((scope) => this.#agents.list(scope)).map((agent) => [agent.id, agent]),
+    );
     const pending: AgentEventRecord[] = [];
     let afterEventId = state.ackedEventId;
     let scanned = 0;
     while (pending.length < limit && scanned < 1_000) {
-      const batch = this.#agentEvents.listAfter({
-        ...input,
+      const batch = this.#listAfterAcrossScopes(scopes, {
         afterEventId,
-        ownerTerminalId: input.terminalId,
         limit: Math.min(100, 1_000 - scanned),
+        ownerTerminalId: input.terminalId,
       });
       if (batch.length === 0) break;
       scanned += batch.length;
@@ -82,7 +85,7 @@ export class AgentOrchestratorService {
         const valid = isDeliverableAgentEvent(
           event,
           event.agentId ? validAgents.get(event.agentId) : undefined,
-          input,
+          eventScope(event, input.workspaceId),
           input.terminalId,
         );
         if (valid && event.terminalId !== null && event.terminalId !== input.terminalId) {
@@ -99,6 +102,72 @@ export class AgentOrchestratorService {
     );
   }
 
+  /**
+   * Workspaces in the same Herdr session that have no orchestrator owner of
+   * their own. Workers dispatched into them (script-dispatched `herdr tab
+   * create` panes) stay invisible to the session orchestrator unless its owner
+   * is allowed to receive and acknowledge their events.
+   */
+  ownerlessSiblingScopes(input: AgentScope): AgentScope[] {
+    const ownedWorkspaces = new Set(
+      this.#scopes.listOwnedForSession(input.herdrSessionName).map((scope) => scope.workspaceId),
+    );
+    const workspaces = new Set(
+      this.#agents
+        .list({ herdrSessionName: input.herdrSessionName })
+        .map((agent) => agent.workspaceId),
+    );
+    return [...workspaces]
+      .filter(
+        (workspaceId) => workspaceId !== input.workspaceId && !ownedWorkspaces.has(workspaceId),
+      )
+      .sort()
+      .map((workspaceId) => ({ herdrSessionName: input.herdrSessionName, workspaceId }));
+  }
+
+  #listAfterAcrossScopes(
+    scopes: AgentScope[],
+    input: { afterEventId: number; limit: number; ownerTerminalId: string },
+  ): AgentEventRecord[] {
+    if (scopes.length === 1) {
+      return this.#agentEvents.listAfter({ ...scopes[0], ...input });
+    }
+    const byId = new Map<number, AgentEventRecord>();
+    for (const scope of scopes) {
+      for (const event of this.#agentEvents.listAfter({ ...scope, ...input })) {
+        byId.set(event.id, event);
+      }
+    }
+    return [...byId.values()].sort((left, right) => left.id - right.id).slice(0, input.limit);
+  }
+
+  /**
+   * The lowest deliverable event id the owner can still receive, across its own
+   * workspace and every ownerless sibling workspace it serves.
+   *
+   * Event ids are global, so ordering has to be judged on the merged view: a
+   * lower id sitting in a sibling workspace blocks the acknowledgement of a
+   * higher id in the owner's own workspace just as much as the other way round.
+   * `afterEventId` is the owner's own cursor, matching the scan `pending()` uses
+   * for both workspace kinds.
+   */
+  #nextDeliverableAcrossScopes(
+    input: AgentScope & { terminalId: string },
+    afterEventId: number,
+  ): AgentEventRecord | undefined {
+    let next: AgentEventRecord | undefined;
+    for (const scope of mergeScopes([input, ...this.ownerlessSiblingScopes(input)])) {
+      const candidate = this.#agentEvents.nextDeliverableAfter({
+        ...scope,
+        afterEventId,
+        ownerTerminalId: input.terminalId,
+        getAgent: (agentId) => this.#safeGetAgent(agentId),
+      });
+      if (candidate && (next === undefined || candidate.id < next.id)) next = candidate;
+    }
+    return next;
+  }
+
   ack(input: AgentScope & { eventId: number; terminalId: string }): AgentOrchestratorState {
     try {
       return this.#ack(input);
@@ -108,12 +177,7 @@ export class AgentOrchestratorService {
         let expectedNextEventId: number | null = null;
         if (state?.owner?.terminalId === input.terminalId) {
           expectedNextEventId =
-            this.#agentEvents.nextDeliverableAfter({
-              ...input,
-              afterEventId: state.ackedEventId,
-              ownerTerminalId: input.terminalId,
-              getAgent: (agentId) => this.#safeGetAgent(agentId),
-            })?.id ?? null;
+            this.#nextDeliverableAcrossScopes(input, state.ackedEventId)?.id ?? null;
         }
         console.warn("Herdsman orchestrator ack rejected", {
           eventId: input.eventId,
@@ -157,7 +221,7 @@ export class AgentOrchestratorService {
     }
     if (
       event.herdrSessionName !== input.herdrSessionName ||
-      event.workspaceId !== input.workspaceId
+      !this.#isAckScopeAllowed(event, input)
     ) {
       throw new OrchestratorAckError({
         code: "ORCHESTRATOR_EVENT_NOT_IN_SCOPE",
@@ -188,7 +252,7 @@ export class AgentOrchestratorService {
         !isDeliverableAgentEvent(
           isDeliveredToCurrentTerminal ? { ...event, status: "pending" } : event,
           eventAgent,
-          input,
+          eventScope(event, input.workspaceId),
           input.terminalId,
         )
       ) {
@@ -198,12 +262,7 @@ export class AgentOrchestratorService {
         });
       }
     }
-    const next = this.#agentEvents.nextDeliverableAfter({
-      ...input,
-      afterEventId: state.ackedEventId,
-      ownerTerminalId: input.terminalId,
-      getAgent: (agentId) => this.#safeGetAgent(agentId),
-    });
+    const next = this.#nextDeliverableAcrossScopes(input, state.ackedEventId);
     // Only an undelivered (pending) later event blocks an out-of-order ack. If the
     // next candidate is already delivered to this owner, or there is no candidate
     // (acked/invalidated/failed/null), let the batch ack through: markAcked uses an
@@ -220,11 +279,34 @@ export class AgentOrchestratorService {
         message: ORCHESTRATOR_ACK_MESSAGES.outOfOrder,
       });
     }
+    if (event.workspaceId !== input.workspaceId) {
+      // Cross-workspace ack (ownerless sibling workspace): settle only this single
+      // row and leave the owner's own cursor untouched. A scope-cursor ack would
+      // rewrite every `id <= eventId` row of the owner's workspace to acked and
+      // advance `acked_event_id` past them, silently swallowing its own events
+      // that were never delivered. The settled row needs no redelivery: `listAfter`
+      // only scans pending/delivered/retained-invalidated rows.
+      this.#agentEvents.markAcked(input.eventId);
+      return this.#scopes.get(input) ?? state;
+    }
     this.#agentEvents.markAcked(input.eventId, {
       herdrSessionName: input.herdrSessionName,
       workspaceId: input.workspaceId,
     });
     return this.#scopes.ack(input);
+  }
+
+  /**
+   * Ack scope guard: the owner's own workspace plus every sibling workspace in
+   * the session that has no orchestrator owner of its own. Events of a workspace
+   * owned by another terminal stay out of scope.
+   */
+  #isAckScopeAllowed(event: AgentEventRecord, input: AgentScope): boolean {
+    if (event.workspaceId === input.workspaceId) return true;
+    if (event.workspaceId === null) return false;
+    return this.ownerlessSiblingScopes(input).some(
+      (scope) => scope.workspaceId === event.workspaceId,
+    );
   }
 
   move(input: {
@@ -250,4 +332,26 @@ export class AgentOrchestratorService {
     // (no row at all) advances to latestEventId to avoid redelivering history.
     return current ? current.ackedEventId : this.#agentEvents.latestEventId(scope);
   }
+}
+
+function mergeScopes(scopes: AgentScope[]): AgentScope[] {
+  const byKey = new Map<string, AgentScope>();
+  for (const scope of scopes) {
+    byKey.set(`${scope.herdrSessionName}\0${scope.workspaceId}`, {
+      herdrSessionName: scope.herdrSessionName,
+      workspaceId: scope.workspaceId,
+    });
+  }
+  return [...byKey.values()];
+}
+
+/** The scope an event belongs to; a null workspace can never match a scope. */
+function eventScope(
+  event: AgentEventRecord,
+  fallbackWorkspaceId: string,
+): { herdrSessionName: string; workspaceId: string } {
+  return {
+    herdrSessionName: event.herdrSessionName,
+    workspaceId: event.workspaceId ?? fallbackWorkspaceId,
+  };
 }

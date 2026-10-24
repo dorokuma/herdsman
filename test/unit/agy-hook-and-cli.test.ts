@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { createAgentHistoryService } from "@/agent-history/service.js";
-import { isPeerActiveOrSettling, runAgyHook } from "@/agy/hook.js";
+import { isPeerActiveOrSettling, resolveWakeWaiterCwd, runAgyHook } from "@/agy/hook.js";
 import { parseCliArgs, runCliCommand } from "@/cli/herdsman.js";
 import { ObservabilityRpcServer } from "@/daemon/observability-server.js";
 import { isDeliverableAgentEvent } from "@/db/agent-events.js";
@@ -13,6 +13,7 @@ import { AgentOrchestratorService } from "@/observability/agent-orchestrator-ser
 import {
   type AgentEventRecord,
   type AgentListItem,
+  type CompactAgentHistory,
   PLAN_STALLED,
   PLAN_WAITING_HISTORY,
 } from "@/observability/contracts.js";
@@ -253,6 +254,9 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
       expect(calls.map(([method]) => method)).toEqual([
         "agent.orchestrator.register",
         "agent.orchestrator.set",
+        // Pending-batch projection consults the live agent list to keep an
+        // intermediate `agent.done` from being consumed while the peer works.
+        "agent.list",
       ]);
       expect(result.injectSteps).toHaveLength(1);
       expect(result.injectSteps?.[0]?.ephemeralMessage).toContain("[HERDSMAN AGENT UPDATES]");
@@ -375,6 +379,9 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
         connect,
         environment: HERDR_ENV,
         socketPath: "/tmp/herdsman.sock",
+        // The hook now always keeps a standby waiter; keep the unit test from
+        // spawning a real detached process.
+        spawnWakeWaiter: () => ({ pid: process.pid }),
         stateDir,
         waitTimeoutMs: 10,
       });
@@ -1098,6 +1105,9 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
         },
         pollIntervalMs: 100,
         settleGraceMs: 300,
+        // Explicit opt-in: the default WakeWaiter now stays on standby instead of
+        // exiting as soon as no peer looks active.
+        exitWhenNoPeers: true,
         socketPath: "/tmp/herdsman.sock",
         stateDir: dir,
         triggerWakePrompt: async (input) => {
@@ -1579,6 +1589,510 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
       rmSync(dir, { force: true, recursive: true });
     }
   });
+
+  test("intermediate agent.done superseded by live working status is acked silently and the later real completion still wakes the main pane", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-intermediate-done-"));
+    const sessionId = "a1111111-2222-3333-4444-555555555555";
+    let pendingEvents: AgentEventRecord[] = [makeDoneEvent(1118, "已改完代码，继续跑测试。")];
+    let ackedEventId = 0;
+    const ackedIds: number[] = [];
+    let peerStatus: "idle" | "working" = "working";
+    let pushNotification: ((method: string, params: unknown) => void) | undefined;
+    const spawnedWaiters: number[] = [];
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+
+    const connect = async (
+      _socketPath: string,
+      onNotification?: (method: string, params: unknown) => void,
+    ) => {
+      if (onNotification) pushNotification = onNotification;
+      return {
+        close: () => undefined,
+        request: async (method: string, params: unknown) => {
+          if (method === "agent.notifications.ack") {
+            const eventId = (params as { eventId: number }).eventId;
+            ackedIds.push(eventId);
+            ackedEventId = Math.max(ackedEventId, eventId);
+            return { acknowledged: true };
+          }
+          if (method === "agent.list") {
+            return {
+              agents: [
+                {
+                  agent: "agy",
+                  agentStatus: "idle",
+                  firstSeenAt: "2026-10-21T11:50:00.000Z",
+                  herdrSessionName: "default",
+                  id: "ag_self",
+                  paneId: "wB:p1",
+                  terminalId: "term_self",
+                  workspaceId: "wB",
+                },
+                {
+                  agent: "pi",
+                  agentStatus: peerStatus,
+                  firstSeenAt: "2026-10-21T11:50:00.000Z",
+                  herdrSessionName: "default",
+                  id: "ag_peer",
+                  paneId: "wB:p2",
+                  terminalId: "term_peer",
+                  workspaceId: "wB",
+                },
+              ],
+            };
+          }
+          return {
+            events: pendingEvents,
+            presence: {
+              herdrSessionName: "default",
+              paneId: "wB:p1",
+              subscriberId: `agy:${sessionId}`,
+              terminalId: "term_self",
+              workspaceId: "wB",
+            },
+            state: {
+              ackedEventId,
+              herdrSessionName: "default",
+              owner: { paneId: "wB:p1", terminalId: "term_self" },
+              updatedAt: "2026-10-21T12:00:00.000Z",
+              workspaceId: "wB",
+            },
+          };
+        },
+      };
+    };
+
+    try {
+      const stopResult = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        {
+          connect,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          spawnWakeWaiter: (input) => {
+            spawnedWaiters.push(input.waiterEpoch);
+            return { pid: process.pid };
+          },
+          stateDir: dir,
+        },
+      );
+
+      // The intermediate completion is not handed over as the final result...
+      expect(stopResult).toEqual({});
+      expect(ackedIds).toEqual([1118]);
+      // ...and a waiter guards the still running turn.
+      expect(spawnedWaiters).toEqual([1]);
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"))).toMatchObject({
+        turnEpoch: 1,
+        waiterEpoch: 1,
+        waiterPid: process.pid,
+      });
+
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 25,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      expect(wakePrompts).toEqual([]);
+
+      // The turn really finishes now: the peer goes idle and the real done lands.
+      peerStatus = "idle";
+      pendingEvents = [...pendingEvents, makeDoneEvent(1126, "全部测试通过。")];
+      pushNotification?.("agent.event", { event: pendingEvents[1] });
+
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("Stop spawns a WakeWaiter alongside decision:continue, unacked delivered events prompt when the host ignores it, and a new PreInvocation epoch cancels the waiter", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-stop-continue-"));
+    const sessionId = "b1111111-2222-3333-4444-555555555555";
+    let pendingEvents: AgentEventRecord[] = [makeDoneEvent(200, "工人完成，测试绿。")];
+    let ackedEventId = 0;
+    const ackedIds: number[] = [];
+    const spawnedWaiters: number[] = [];
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string, params: unknown) => {
+        if (method === "agent.notifications.ack") {
+          const eventId = (params as { eventId: number }).eventId;
+          ackedIds.push(eventId);
+          ackedEventId = Math.max(ackedEventId, eventId);
+          return { acknowledged: true };
+        }
+        if (method === "agent.list") {
+          return {
+            agents: [
+              {
+                agent: "agy",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-21T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_self",
+                paneId: "wB:p1",
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              {
+                agent: "pi",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-21T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_peer",
+                paneId: "wB:p2",
+                terminalId: "term_peer",
+                workspaceId: "wB",
+              },
+            ],
+          };
+        }
+        return {
+          events: pendingEvents,
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-21T12:00:00.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    const stopOptions = {
+      connect,
+      environment: HERDR_ENV,
+      socketPath: "/tmp/herdsman.sock",
+      spawnWakeWaiter: (input: { waiterEpoch: number }) => {
+        spawnedWaiters.push(input.waiterEpoch);
+        return { pid: process.pid };
+      },
+      stateDir: dir,
+    };
+
+    try {
+      const stopResult = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        stopOptions,
+      );
+      expect(stopResult).toMatchObject({ decision: "continue" });
+      expect(spawnedWaiters).toEqual([1]);
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"))).toMatchObject({
+        deliveredEventIds: [200],
+        turnEpoch: 1,
+        waiterEpoch: 1,
+        waiterPid: process.pid,
+      });
+
+      // The host ignores `decision: continue`: the already delivered but unacked
+      // batch is the fallback wake signal.
+      const waiterResult = await runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 25,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+      expect(waiterResult).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+      expect(ackedIds).toEqual([]);
+
+      // A second batch keeps the same contract, but this time the host continues:
+      // the next PreInvocation advances turnEpoch and the fallback waiter exits
+      // without a duplicate prompt.
+      pendingEvents = [...pendingEvents, makeDoneEvent(201, "第二批完成。")];
+      const secondStop = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        stopOptions,
+      );
+      expect(secondStop).toMatchObject({ decision: "continue" });
+      expect(spawnedWaiters).toEqual([1, 2]);
+      expect(ackedIds).toEqual([200]);
+
+      const preOut = await runAgyHook(
+        "PreInvocation",
+        JSON.stringify({ invocationNum: 2, sessionId }),
+        { connect, environment: HERDR_ENV, socketPath: "/tmp/herdsman.sock", stateDir: dir },
+      );
+      expect(preOut).toEqual({});
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"))).toMatchObject({
+        turnEpoch: 3,
+      });
+
+      const cancelledWaiter = await runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "2",
+        },
+        pollIntervalMs: 25,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+      expect(cancelledWaiter).toEqual({});
+      expect(wakePrompts).toHaveLength(1);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("Stop keeps a standby WakeWaiter while no peer is indexed yet, and the first script-dispatched worker completion wakes the main pane", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-standby-"));
+    const sessionId = "c1111111-2222-3333-4444-555555555555";
+    let pendingEvents: AgentEventRecord[] = [];
+    const ackedEventId = 0;
+    let peerListed = false;
+    let peerStatus: "idle" | "working" = "working";
+    let pushNotification: ((method: string, params: unknown) => void) | undefined;
+    const spawnedWaiters: number[] = [];
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+
+    const connect = async (
+      _socketPath: string,
+      onNotification?: (method: string, params: unknown) => void,
+    ) => {
+      if (onNotification) pushNotification = onNotification;
+      return {
+        close: () => undefined,
+        request: async (method: string) => {
+          if (method === "agent.list") {
+            return {
+              agents: [
+                {
+                  agent: "agy",
+                  agentStatus: "idle",
+                  firstSeenAt: "2026-10-21T11:50:00.000Z",
+                  herdrSessionName: "default",
+                  id: "ag_self",
+                  paneId: "wB:p1",
+                  terminalId: "term_self",
+                  workspaceId: "wB",
+                },
+                ...(peerListed
+                  ? [
+                      {
+                        agent: "pi",
+                        agentStatus: peerStatus,
+                        firstSeenAt: "2026-10-21T11:59:00.000Z",
+                        herdrSessionName: "default",
+                        id: "ag_peer",
+                        paneId: "wB:p2",
+                        terminalId: "term_peer",
+                        workspaceId: "wB",
+                      },
+                    ]
+                  : []),
+              ],
+            };
+          }
+          return {
+            events: pendingEvents,
+            presence: {
+              herdrSessionName: "default",
+              paneId: "wB:p1",
+              subscriberId: `agy:${sessionId}`,
+              terminalId: "term_self",
+              workspaceId: "wB",
+            },
+            state: {
+              ackedEventId,
+              herdrSessionName: "default",
+              owner: { paneId: "wB:p1", terminalId: "term_self" },
+              updatedAt: "2026-10-21T12:00:00.000Z",
+              workspaceId: "wB",
+            },
+          };
+        },
+      };
+    };
+
+    try {
+      // 1. The script-dispatched worker is not in agent.list yet: no active peer.
+      const stopResult = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        {
+          connect,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          spawnWakeWaiter: (input) => {
+            spawnedWaiters.push(input.waiterEpoch);
+            return { pid: process.pid };
+          },
+          stateDir: dir,
+        },
+      );
+      expect(stopResult).toEqual({});
+      expect(spawnedWaiters).toEqual([1]);
+
+      let waiterSettled = false;
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 25,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      }).then((result) => {
+        waiterSettled = true;
+        return result;
+      });
+
+      // 2. No peer yet: the waiter stays on standby instead of exiting.
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      expect(waiterSettled).toBe(false);
+
+      // 3. The worker appears and completes; its push immediately wakes the pane.
+      peerListed = true;
+      peerStatus = "idle";
+      pendingEvents = [makeDoneEvent(300, "脚本派发的工人完成。")];
+      pushNotification?.("agent.event", { event: pendingEvents[0] });
+
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("Stop resolves the detached WakeWaiter cwd from agy's workspacePaths instead of the hooks.json directory", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-wake-cwd-"));
+    const sessionId = "d1111111-2222-3333-4444-555555555555";
+    const spawnedCwds: string[] = [];
+
+    // agy runs the global hooks with cwd = the directory holding hooks.json
+    // (production: /root/.gemini/config) and reports the pane directory only as
+    // `workspacePaths`, so the payload below mirrors a real Stop payload.
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string) => {
+        if (method === "agent.list") return { agents: [] };
+        return {
+          events: [],
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId: 0,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-21T12:00:00.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    try {
+      const stopResult = await runAgyHook(
+        "Stop",
+        JSON.stringify({
+          sessionId,
+          terminationReason: "NO_TOOL_CALL",
+          workspacePaths: ["/workspace/pi-extensions"],
+        }),
+        {
+          connect,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          spawnWakeWaiter: (input) => {
+            spawnedCwds.push(input.cwd);
+            return { pid: process.pid };
+          },
+          stateDir: dir,
+        },
+      );
+
+      // Without the fix the waiter would inherit hooks.json's directory, which
+      // pins PPid=1 after Stop exits and makes the daemon reject it with
+      // ConnectorPaneMismatchError.
+      expect(stopResult).toEqual({});
+      expect(spawnedCwds).toEqual(["/workspace/pi-extensions"]);
+      expect(spawnedCwds[0]).not.toBe(process.cwd());
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"))).toMatchObject({
+        turnEpoch: 1,
+        waiterEpoch: 1,
+        waiterPid: process.pid,
+      });
+
+      // Priority: payload.cwd > workspacePaths.
+      expect(
+        resolveWakeWaiterCwd({
+          cwd: "/workspace/pi-extensions",
+          workspacePaths: ["/workspace/other"],
+        }),
+      ).toBe("/workspace/pi-extensions");
+      // A workspacePaths entry wins even when it is not a real directory on disk.
+      expect(resolveWakeWaiterCwd({ workspacePaths: ["/workspace/pi-extensions"] })).toBe(
+        "/workspace/pi-extensions",
+      );
+      // Empty entries are skipped instead of yielding a cwd of "".
+      expect(resolveWakeWaiterCwd({ workspacePaths: ["", "/workspace/pi-extensions"] })).toBe(
+        "/workspace/pi-extensions",
+      );
+      // No payload directory and no readable ancestor (bogus pid): baseCwd.
+      expect(
+        resolveWakeWaiterCwd({}, { baseCwd: "/tmp/herdsman-wake-cwd-base", pid: 4_000_000 }),
+      ).toBe("/tmp/herdsman-wake-cwd-base");
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
 });
 
 describe("ObservabilityRpcServer agy terminal presence lease", () => {
@@ -1756,6 +2270,200 @@ describe("ObservabilityRpcServer agy terminal presence lease", () => {
       orchestrator.status({ herdrSessionName: "default", workspaceId: "wB" })?.owner,
     ).toBeNull();
 
+    harness.sqlite.close();
+  });
+});
+
+describe("ObservabilityRpcServer cross-workspace orchestration", () => {
+  test("surfaces an ownerless sibling workspace's agents and events to the session orchestrator, and stops once that workspace owns an orchestrator", async () => {
+    const harness = openObservabilityDbHarness();
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-cross-workspace-"));
+    tempDirs.push(dir);
+    const socketPath = join(dir, "herdsman.sock");
+    harness.herdrSessions.upsertRunning({
+      name: "default",
+      sessionDir: "/tmp/herdr-default",
+      socketPath: "/tmp/herdr-default.sock",
+    });
+    harness.agents.replaceForSession({
+      agents: [
+        {
+          agent: "agy",
+          agent_status: "idle",
+          cwd: "/repo/a",
+          focused: true,
+          herdr_session_name: "default",
+          name: "main-agy",
+          pane_generation: "gen-main",
+          pane_id: "wB:p1",
+          tab_id: "wB:t1",
+          terminal_id: "term_main",
+          workspace_id: "wB",
+        },
+        {
+          agent: "pi",
+          agent_status: "done",
+          cwd: "/repo/b",
+          focused: false,
+          herdr_session_name: "default",
+          name: "cross-worker",
+          pane_generation: "gen-cross",
+          pane_id: "wC:p1",
+          tab_id: "wC:t1",
+          terminal_id: "term_cross",
+          workspace_id: "wC",
+        },
+      ],
+      herdrSessionName: "default",
+    });
+
+    const history = createAgentHistoryService({ cache: harness.agentHistoryCache, homeDir: dir });
+    const context = new AgentContextService({
+      history,
+      stores: {
+        agentContextSnapshots: harness.agentContextSnapshots,
+        agents: harness.agents,
+      },
+    });
+    const orchestrator = new AgentOrchestratorService({
+      agentEvents: harness.agentEvents,
+      agents: harness.agents,
+      scopes: harness.agentOrchestratorScopes,
+    });
+    const server = new ObservabilityRpcServer({
+      context,
+      disconnectGraceMs: 25,
+      history,
+      orchestrator,
+      peerPidOf: () => process.pid,
+      resolvePaneIdentity: async ({ paneId }) => ({
+        cwd: process.cwd(),
+        foregroundCwd: process.cwd(),
+        paneId,
+        terminalId: paneId === "wB:p1" ? "term_main" : "term_cross",
+        workspaceId: paneId.startsWith("wC:") ? "wC" : "wB",
+      }),
+      socketPath,
+      stores: {
+        agentEvents: harness.agentEvents,
+        agents: harness.agents,
+        herdrSessions: harness.herdrSessions,
+        herdrWorkspaces: harness.herdrWorkspaces,
+      },
+    });
+    await server.start();
+    servers.push(server);
+
+    const crossAgent = harness.agents.list({ workspaceId: "wC" })[0];
+    if (!crossAgent) throw new Error("expected the cross-workspace agent to be indexed");
+    const crossCompactHistory: CompactAgentHistory = {
+      historyRef: {
+        kind: "agent_session",
+        path: "/tmp/cross-session.jsonl",
+        source: "pi-jsonl",
+        value: "/tmp/cross-session.jsonl",
+      },
+      lastAssistantMessage: {
+        ref: "cross-1",
+        text: "跨工作区工人完成。",
+        timestamp: "2026-10-21T12:00:00.000Z",
+      },
+      lastToolResult: null,
+      lastUserMessage: null,
+      messageCount: 2,
+      source: "pi-jsonl",
+      updatedAt: "2026-10-21T12:00:00.000Z",
+    };
+    const appendCrossDone = (agentKind: string) =>
+      harness.agentEvents.append({
+        agentId: crossAgent.id,
+        compactHistory: crossCompactHistory,
+        herdrSessionName: "default",
+        paneGeneration: "gen-cross",
+        paneId: "wC:p1",
+        payload: { agent: "pi", from: "working", name: agentKind, to: "done" },
+        terminalId: "term_cross",
+        type: "agent.done",
+        workspaceId: "wC",
+      });
+
+    const mainClient = await RpcTestClient.connect(socketPath);
+    await mainClient.request("agent.orchestrator.register", {
+      herdrSocketPath: "/tmp/herdr-default.sock",
+      paneId: "wB:p1",
+      sessionRef: {
+        agent: "agy",
+        kind: "id",
+        source: "agy-hook",
+        value: "11111111-2222-3333-4444-555555555555",
+      },
+      subscriberId: "agy:11111111-2222-3333-4444-555555555555",
+      subscriberKind: "agy",
+      workspaceId: "wB",
+    });
+    await mainClient.request("agent.orchestrator.set", { enabled: true });
+
+    // The ownerless sibling workspace is folded into the orchestrated agent list...
+    const expanded = (await mainClient.request("agent.list", {
+      herdrSessionName: "default",
+      includeOwnerlessWorkspaces: true,
+      workspaceId: "wB",
+    })) as { agents: Array<{ paneId: string }> };
+    expect(expanded.agents.map((agent) => agent.paneId).sort()).toEqual(["wB:p1", "wC:p1"]);
+    // ...only on the explicit opt-in.
+    const plain = (await mainClient.request("agent.list", {
+      herdrSessionName: "default",
+      workspaceId: "wB",
+    })) as { agents: Array<{ paneId: string }> };
+    expect(plain.agents.map((agent) => agent.paneId)).toEqual(["wB:p1"]);
+
+    // A completion from the ownerless workspace is delivered to the session owner
+    // and can be acknowledged across workspaces.
+    const crossEvent = appendCrossDone("cross-worker-1");
+    const delivered = (await mainClient.request("agent.orchestrator.get", {})) as {
+      events: AgentEventRecord[];
+    };
+    expect(delivered.events.map((event) => event.id)).toContain(crossEvent.id);
+    await expect(
+      mainClient.request("agent.notifications.ack", { eventId: crossEvent.id }),
+    ).resolves.toMatchObject({ acknowledged: true });
+
+    // Once that workspace owns its own orchestrator, it leaves the main owner's
+    // visibility again: no agent list, no events, no cross-workspace ack.
+    const crossClient = await RpcTestClient.connect(socketPath);
+    await crossClient.request("agent.orchestrator.register", {
+      herdrSocketPath: "/tmp/herdr-default.sock",
+      paneId: "wC:p1",
+      sessionRef: {
+        agent: "pi",
+        kind: "path",
+        source: "herdr:pi",
+        value: "/tmp/cross-session.jsonl",
+      },
+      subscriberId: "pi:term_cross",
+      subscriberKind: "pi",
+      workspaceId: "wC",
+    });
+    await crossClient.request("agent.orchestrator.set", { enabled: true });
+
+    const narrowed = (await mainClient.request("agent.list", {
+      herdrSessionName: "default",
+      includeOwnerlessWorkspaces: true,
+      workspaceId: "wB",
+    })) as { agents: Array<{ paneId: string }> };
+    expect(narrowed.agents.map((agent) => agent.paneId)).toEqual(["wB:p1"]);
+
+    const ownedEvent = appendCrossDone("cross-worker-2");
+    const afterOwnership = (await mainClient.request("agent.orchestrator.get", {})) as {
+      events: AgentEventRecord[];
+    };
+    expect(afterOwnership.events.map((event) => event.id)).not.toContain(ownedEvent.id);
+    await expect(
+      mainClient.request("agent.notifications.ack", { eventId: ownedEvent.id }),
+    ).rejects.toThrow(/next pending orchestrator event|not in scope|no longer pending/i);
+
+    mainClient.close();
+    crossClient.close();
     harness.sqlite.close();
   });
 });

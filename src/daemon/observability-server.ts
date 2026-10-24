@@ -274,9 +274,72 @@ export class ObservabilityRpcServer {
     }
     const scope = { herdrSessionName: event.herdrSessionName, workspaceId: event.workspaceId };
     const owner = this.#orchestrator.status(scope)?.owner;
-    if (!owner || event.terminalId === owner.terminalId) return;
+    if (!owner) {
+      // An ownerless workspace (cross-workspace dispatched worker) has no route of
+      // its own: hand its event to the session's single active orchestrator.
+      const sessionOwner = this.#singleActiveSessionOwner(
+        event.herdrSessionName,
+        event.workspaceId,
+      );
+      if (!sessionOwner) return;
+      const socket = this.#newestSocketForSessionTerminal(
+        event.herdrSessionName,
+        sessionOwner.terminalId,
+      );
+      if (socket) this.#write(socket, { method: "agent.event", params: { event } });
+      return;
+    }
+    if (event.terminalId === owner.terminalId) return;
     const socket = this.#newestSocketForTerminal({ ...scope, terminalId: owner.terminalId });
     if (socket) this.#write(socket, { method: "agent.event", params: { event } });
+  }
+
+  /**
+   * The single active orchestrator of a Herdr session, if there is exactly one.
+   * With several owners the ownerless workspace's event stays pull-only (the
+   * owner still receives it through `pending()`), so no arbitrary owner is woken.
+   */
+  #singleActiveSessionOwner(
+    herdrSessionName: string,
+    eventWorkspaceId: string,
+  ): { terminalId: string } | undefined {
+    const terminalIds = new Set(
+      this.#orchestrator
+        .persistedOwners()
+        .filter(
+          (state) =>
+            state.herdrSessionName === herdrSessionName &&
+            state.workspaceId !== eventWorkspaceId &&
+            state.owner !== null &&
+            this.#hasTerminalPresence({
+              herdrSessionName,
+              terminalId: state.owner.terminalId,
+            }),
+        )
+        .flatMap((state) => (state.owner ? [state.owner.terminalId] : [])),
+    );
+    if (terminalIds.size !== 1) return undefined;
+    const [terminalId] = [...terminalIds];
+    return terminalId ? { terminalId } : undefined;
+  }
+
+  #newestSocketForSessionTerminal(
+    herdrSessionName: string,
+    terminalId: string,
+  ): Socket | undefined {
+    let newest: { order: number; socket: Socket } | undefined;
+    for (const [socket, presence] of this.#piPresenceBySocket) {
+      if (
+        presence.herdrSessionName !== herdrSessionName ||
+        presence.terminalId !== terminalId ||
+        socket.destroyed
+      ) {
+        continue;
+      }
+      const order = this.#connectionOrderBySocket.get(socket) ?? 0;
+      if (!newest || order > newest.order) newest = { order, socket };
+    }
+    return newest?.socket;
   }
 
   reconcileAgentLocations(input: { agents: AgentIndexRecord[]; herdrSessionName: string }): void {
@@ -423,7 +486,21 @@ export class ObservabilityRpcServer {
     switch (method) {
       case "agent.list": {
         assertSchema(agentListInputSchema, params);
-        const scope = this.#resolveScope(params as AgentQueryScope);
+        const input = params as AgentQueryScope & { includeOwnerlessWorkspaces?: boolean };
+        const scope = this.#resolveScope(input);
+        if (input.includeOwnerlessWorkspaces && scope.herdrSessionName && scope.workspaceId) {
+          const ownScope = {
+            herdrSessionName: scope.herdrSessionName,
+            workspaceId: scope.workspaceId,
+          };
+          const siblingScopes = this.#orchestrator.ownerlessSiblingScopes(ownScope);
+          return {
+            agents: [
+              ...this.#context.listAgents(scope),
+              ...siblingScopes.flatMap((sibling) => this.#context.listAgents(sibling)),
+            ],
+          };
+        }
         return { agents: this.#context.listAgents(scope) };
       }
       case "agent.get": {
@@ -656,14 +733,17 @@ export class ObservabilityRpcServer {
 
   #connectionState(presence: PiPresence): AgentOrchestratorConnectionStateResult {
     const state = this.#orchestrator.status(presence);
-    const context =
-      state?.owner?.terminalId === presence.terminalId
-        ? this.#context.workspaceSnapshot({ ...presence, excludeTerminalId: presence.terminalId })
-        : null;
+    const isOwner = state?.owner?.terminalId === presence.terminalId;
+    const context = isOwner
+      ? this.#context.workspaceSnapshot({ ...presence, excludeTerminalId: presence.terminalId })
+      : null;
     return {
       context,
       events: this.#orchestrator.pending({
         ...presence,
+        // The session's orchestrator also receives the events of ownerless
+        // sibling workspaces (workers dispatched across workspaces).
+        ...(isOwner ? { extraScopes: this.#orchestrator.ownerlessSiblingScopes(presence) } : {}),
         limit: 100,
       }),
       presence,
