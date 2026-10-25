@@ -154,7 +154,10 @@ func contextSource(t *testing.T, name string) sessionSource {
 // actually resolve: a well-formed JSONL session carrying one assistant message.
 // contextSourceFile's "history\n" payload is only ever read through the fake, so
 // a test that drives the real agent-history service needs this shape instead.
-func contextPiSession(t *testing.T, name string) sessionSource {
+//
+// assistantText is the text the compact history will carry, so a test that reads
+// two different sessions can tell them apart in the resolved history.
+func contextPiSession(t *testing.T, name, assistantText string) sessionSource {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, name)
@@ -163,8 +166,8 @@ func contextPiSession(t *testing.T, name string) sessionSource {
 		`{"type":"message","id":"u1","timestamp":"2026-07-09T12:00:00.000Z",` +
 			`"message":{"role":"user","content":"please inspect"}}`,
 		`{"type":"message","id":"a1","timestamp":"2026-07-09T12:00:02.000Z",` +
-			`"message":{"role":"assistant","content":[{"type":"text","text":"done"}],` +
-			`"stopReason":"stop"}}`,
+			`"message":{"role":"assistant","content":[{"type":"text","text":"` +
+			assistantText + `"}],"stopReason":"stop"}}`,
 	}, "\n") + "\n"
 	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
 		t.Fatalf("writeFile(%s): %v", path, err)
@@ -297,12 +300,50 @@ type realHistoryService struct {
 	service *agenthistory.AgentHistoryService
 	mu      sync.Mutex
 	calls   []observability.AgentHistoryResolveOptions
+
+	// discoveries counts the real discovery step, when the service was built
+	// with one that is wrapped for counting. It is what lets a test tell "the
+	// persisted ref was reused" from "discovery really ran again", instead of
+	// inferring it from the options the context service asked for.
+	discoveries *int
 }
 
 func newRealHistoryService() *realHistoryService {
 	return &realHistoryService{
 		service: agenthistory.CreateAgentHistoryService(agenthistory.AgentHistoryServiceOptions{}),
 	}
+}
+
+// newCountingRealHistoryService is newRealHistoryService with the discovery step
+// wrapped: it still runs the real discoverAgentHistory, but every invocation is
+// counted so a test can observe the re-discovery directly.
+//
+// Injecting a discovery function also switches off the real service's
+// discovery-failure memory (the port treats an injected discovery as owning its
+// own caching), which is exactly what a test that needs a lookup to really run
+// on every call wants.
+func newCountingRealHistoryService() (*realHistoryService, *int) {
+	discoveries := 0
+	service := agenthistory.CreateAgentHistoryService(agenthistory.AgentHistoryServiceOptions{
+		Discover: func(
+			input agenthistory.AgentHistoryLookupInput,
+			options agenthistory.DiscoverOptions,
+		) *agenthistory.HistoryRef {
+			discoveries++
+			return agenthistory.DiscoverAgentHistory(input, options)
+		},
+	})
+	return &realHistoryService{service: service, discoveries: &discoveries}, &discoveries
+}
+
+// recordedDiscoveries reports how many times the real discovery step ran.
+func (r *realHistoryService) recordedDiscoveries() int {
+	if r.discoveries == nil {
+		return 0
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return *r.discoveries
 }
 
 func (r *realHistoryService) recordedCalls() []observability.AgentHistoryResolveOptions {
@@ -1022,56 +1063,93 @@ func TestAgentContextServiceIgnoresDiscoveredFileRef(t *testing.T) {
 	requireResolveCalls(t, fake.calls, expectedResolveCall{forceDiscovery: false})
 }
 
+// TestAgentContextServiceRediscoversOnOccupiedChange drives the real
+// agent-history service end to end, so the occupied-set change has to survive the
+// production discovery, the fingerprint stat and the compact-history read rather
+// than a fake that only records the options it was handed.
+//
+// The pane reports no official `agent_session` of its own, and that is the only
+// shape in which an occupied-set change can force discovery at all:
+// shouldForceDiscovery returns early for a readable official path and for an id
+// pane, and selectPreferredRef falls back to the persisted ref exactly when the
+// official value is absent. The pane's history therefore comes from the file it
+// used before — the file the other pane now claims.
+// TestAgentContextServiceRediscoversOnOccupiedChange drives the real
+// agent-history service end to end, so the occupied-set change has to survive the
+// production discovery, the fingerprint stat and the compact-history read rather
+// than a fake that only records the options it was handed.
+//
+// The pane reports no official `agent_session` of its own, and that is the only
+// shape in which an occupied-set change can force discovery at all:
+// shouldForceDiscovery returns early for a readable official path and for an id
+// pane, and selectPreferredRef falls back to the persisted ref exactly when the
+// official value is absent. The pane's history therefore comes from the file it
+// used before — the file the other pane now claims.
 func TestAgentContextServiceRediscoversOnOccupiedChange(t *testing.T) {
-	// A file the real pi reader can resolve, because this test drives the real
-	// agent-history service rather than the fake.
-	speculative := contextPiSession(t, "occupied-change.jsonl")
-	path := *speculative.ref.Path
+	// Two real Pi session files with different assistant text: the one the pane
+	// used before, and the one it reports once Herdr tells it about a new session.
+	previous := contextPiSession(t, "occupied-change.jsonl", "from-session-A")
+	path := *previous.ref.Path
+	own := contextPiSession(t, "own-session.jsonl", "from-session-B")
+	ownPath := *own.ref.Path
+
 	harness := openContextAgent(t, contextAgentInput{revision: intPointer(1)})
 	if _, err := harness.snapshots.Put(contextSnapshotInput(
-		harness.agent, contextResolved(speculative.ref, speculative.fingerprint),
+		harness.agent, contextResolved(previous.ref, previous.fingerprint),
 	)); err != nil {
 		t.Fatalf("put snapshot: %v", err)
 	}
-	// The real agent-history service, not the fake: the occupied-set change
-	// has to survive the production discovery, fingerprint and compact-history
-	// path, not just a recorded options object.
-	history := newRealHistoryService()
+	// The real agent-history service, not the fake: the occupied-set change has
+	// to survive the production discovery, fingerprint and compact-history path,
+	// not just a recorded options object. The discovery step is wrapped so the
+	// test can see how often it really ran.
+	history, discoveries := newCountingRealHistoryService()
 	service := newContextService(t, harness, history)
-	if _, err := service.RefreshAgent(observability.RefreshAgentContextInput{
+
+	// 1. The persisted ref is the only one this pane has, so the real service
+	//    reads that file and the compact history carries its own assistant text.
+	first, err := service.RefreshAgent(observability.RefreshAgentContextInput{
 		Agent:           harness.agent,
 		IdentityChanged: false,
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("refreshAgent: %v", err)
 	}
 	requireResolveCalls(t, history.recordedCalls(), expectedResolveCall{
 		forceDiscovery: false,
-		preferredRef:   speculative.ref,
+		preferredRef:   previous.ref,
 	})
+	if got := compactAssistantText(first.Snapshot.CompactHistory); got != "from-session-A" {
+		t.Fatalf("compact history assistant text = %q, want from-session-A", got)
+	}
+	if *discoveries != 0 {
+		t.Fatalf("discovery ran %d times on the cached path, want 0", *discoveries)
+	}
 
+	// 2. Nothing moved, so the persisted ref is reused: the same options are
+	//    asked for again and the real discovery still does not run.
+	second, err := service.RefreshAgent(observability.RefreshAgentContextInput{
+		Agent:           harness.agent,
+		IdentityChanged: false,
+	})
+	if err != nil {
+		t.Fatalf("refreshAgent (cached): %v", err)
+	}
+	requireResolveCalls(t, history.recordedCalls(),
+		expectedResolveCall{forceDiscovery: false, preferredRef: previous.ref},
+		expectedResolveCall{forceDiscovery: false, preferredRef: previous.ref},
+	)
+	if got := compactAssistantText(second.Snapshot.CompactHistory); got != "from-session-A" {
+		t.Fatalf("cached compact history assistant text = %q, want from-session-A", got)
+	}
+	if *discoveries != 0 {
+		t.Fatalf("discovery ran %d times on the cached path, want 0", *discoveries)
+	}
+
+	// The other pane now reports the session file this one was reading, so the
+	// file is occupied by somebody else.
 	if _, err := harness.agents.ReplaceForSession(db.ReplaceAgentsForSessionInput{
-		Agents: []db.HerdrAgentLike{
-			{
-				"agent":        "pi",
-				"agent_status": "working",
-				"pane_id":      "wB:p1",
-				"terminal_id":  "term_pi",
-				"workspace_id": "wB",
-			},
-			{
-				"agent": "pi",
-				"agent_session": map[string]any{
-					"agent":  "pi",
-					"kind":   "path",
-					"source": "pi",
-					"value":  path,
-				},
-				"agent_status": "working",
-				"pane_id":      "wB:p2",
-				"terminal_id":  "term_other",
-				"workspace_id": "wB",
-			},
-		},
+		Agents:           contextOccupiedAgents(path),
 		HerdrSessionName: contextTestSession,
 	}); err != nil {
 		t.Fatalf("replaceForSession: %v", err)
@@ -1086,25 +1164,138 @@ func TestAgentContextServiceRediscoversOnOccupiedChange(t *testing.T) {
 	if self == nil {
 		t.Fatal("Expected self agent")
 	}
-	if _, err := service.RefreshAgent(observability.RefreshAgentContextInput{
-		Agent:           *self,
-		IdentityChanged: false,
-	}); err != nil {
+
+	// 3. The occupied set changed, so the persisted ref is bypassed and the real
+	//    discovery runs — one real discovery, counted, not inferred. This pane
+	//    reports no official session, so discovery resolves nothing and the
+	//    compact history becomes the real unresolved one: the assistant message
+	//    the cached ref used to supply is gone. That is the observable proof the
+	//    re-discovery really executed, because a reused persisted ref would still
+	//    carry "from-session-A".
+	third, err := service.RefreshAgent(observability.RefreshAgentContextInput{
+		Agent:                *self,
+		IdentityChanged:      false,
+		OccupiedSessionPaths: []string{path},
+	})
+	if err != nil {
 		t.Fatalf("refreshAgent (occupied change): %v", err)
 	}
-	if len(history.recordedCalls()) != 2 {
-		t.Fatalf("resolve calls = %d, want 2", len(history.recordedCalls()))
-	}
 	calls := history.recordedCalls()
-	if !calls[1].ForceDiscovery {
-		t.Fatal("second call forceDiscovery = false, want true")
+	if len(calls) != 3 {
+		t.Fatalf("resolve calls = %d, want 3 (one per refreshAgent)", len(calls))
+	}
+	if !calls[2].ForceDiscovery {
+		t.Fatal("third call forceDiscovery = false, want true")
 	}
 	// An official ref belongs to the agent that reported it, so occupancy no
 	// longer suppresses it the way it suppressed a guessed discovered_file.
-	requireResolveCalls(t, calls[1:], expectedResolveCall{
+	requireResolveCalls(t, calls[2:], expectedResolveCall{
 		forceDiscovery: true,
-		preferredRef:   speculative.ref,
+		preferredRef:   previous.ref,
 	})
+	if *discoveries != 1 {
+		t.Fatalf("discovery ran %d times, want exactly 1 after the occupied change", *discoveries)
+	}
+	if third.Snapshot.CompactHistory.LastAssistantMessage != nil {
+		t.Fatalf("compact history after the re-discovery = %+v, "+
+			"want the real unresolved history with no assistant message",
+			third.Snapshot.CompactHistory.LastAssistantMessage)
+	}
+	if third.Snapshot.HistoryRef != nil {
+		t.Fatalf("snapshot history ref after the re-discovery = %+v, want nil", third.Snapshot.HistoryRef)
+	}
+
+	// 4. The pane reports its own official session file, so the compact history
+	//    is read from that real file: the resolved text changes to the new
+	//    session's own, through the real reader and not through a stub.
+	if _, err := harness.agents.ReplaceForSession(db.ReplaceAgentsForSessionInput{
+		Agents: append(contextOccupiedAgents(path), db.HerdrAgentLike{
+			"agent": "pi",
+			"agent_session": map[string]any{
+				"agent":  "pi",
+				"kind":   "path",
+				"source": "pi",
+				"value":  ownPath,
+			},
+			"agent_status": "working",
+			"pane_id":      "wB:p1",
+			"revision":     float64(1),
+			"terminal_id":  "term_pi",
+			"workspace_id": "wB",
+		}),
+		HerdrSessionName: contextTestSession,
+	}); err != nil {
+		t.Fatalf("replaceForSession (own session): %v", err)
+	}
+	self, err = harness.agents.FindByTerminal(db.FindAgentByTerminalInput{
+		HerdrSessionName: contextTestSession,
+		TerminalID:       "term_pi",
+	})
+	if err != nil {
+		t.Fatalf("findByTerminal (own session): %v", err)
+	}
+	if self == nil {
+		t.Fatal("Expected self agent")
+	}
+	fourth, err := service.RefreshAgent(observability.RefreshAgentContextInput{
+		Agent:                *self,
+		IdentityChanged:      false,
+		OccupiedSessionPaths: []string{path},
+	})
+	if err != nil {
+		t.Fatalf("refreshAgent (own session): %v", err)
+	}
+	requireResolveCalls(t, history.recordedCalls(),
+		expectedResolveCall{forceDiscovery: false, preferredRef: previous.ref},
+		expectedResolveCall{forceDiscovery: false, preferredRef: previous.ref},
+		expectedResolveCall{forceDiscovery: true, preferredRef: previous.ref},
+		expectedResolveCall{forceDiscovery: false, preferredRef: own.ref},
+	)
+	if got := compactAssistantText(fourth.Snapshot.CompactHistory); got != "from-session-B" {
+		t.Fatalf("compact history assistant text = %q, want from-session-B", got)
+	}
+	// A readable official path is authoritative, so this round needs no discovery.
+	if *discoveries != 1 {
+		t.Fatalf("discovery ran %d times, want still exactly 1", *discoveries)
+	}
+}
+
+// contextOccupiedAgents is the session's agent list while the pane on wB:p1
+// reports no session of its own and the pane on wB:p2 claims occupiedPath.
+func contextOccupiedAgents(occupiedPath string) []db.HerdrAgentLike {
+	return []db.HerdrAgentLike{
+		{
+			"agent":        "pi",
+			"agent_status": "working",
+			"pane_id":      "wB:p1",
+			"revision":     float64(1),
+			"terminal_id":  "term_pi",
+			"workspace_id": "wB",
+		},
+		{
+			"agent": "pi",
+			"agent_session": map[string]any{
+				"agent":  "pi",
+				"kind":   "path",
+				"source": "pi",
+				"value":  occupiedPath,
+			},
+			"agent_status": "working",
+			"pane_id":      "wB:p2",
+			"revision":     float64(1),
+			"terminal_id":  "term_other",
+			"workspace_id": "wB",
+		},
+	}
+}
+
+// compactAssistantText returns the assistant text of a resolved compact history,
+// or "" when the history carries none.
+func compactAssistantText(history observability.CompactAgentHistory) string {
+	if history.LastAssistantMessage == nil {
+		return ""
+	}
+	return history.LastAssistantMessage.Text
 }
 
 func TestAgentContextServiceReportsOccupiedPaths(t *testing.T) {

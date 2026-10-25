@@ -2,7 +2,7 @@
 
 - 分支：`go-port`（worktree `/root/workspace/.wt/herdsman/go-port`）
 - 目标模块：`go/`（Go module `github.com/dorokuma/herdsman/go`，go 1.26.0）
-- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告；其后追加第 4 轮 reviewer 修复（db 闸门 / observability / herdr / daemon 共 6 项，见第 6 节）与 4.2、4.3 两节描述修正；最后追加第 3D-3 精确收尾子批（`observability_rpc_slow_client_test.go` 填满 AF_UNIX `SO_SNDBUF` 并取得真实先 FAIL 后 PASS，见 6.5；`8c4bd1b` 更正为 `5fce550`，见 6.1）
+- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告；其后追加第 4 轮 reviewer 修复（db 闸门 / observability / herdr / daemon 共 6 项，见第 6 节）与 4.2、4.3 两节描述修正；再追加第 3D-3 精确收尾子批（`observability_rpc_slow_client_test.go` 填满 AF_UNIX `SO_SNDBUF` 并取得真实先 FAIL 后 PASS，见 6.5；`8c4bd1b` 更正为 `5fce550`，见 6.1）；最后追加第 3F 终审收口子批（`reviewer-final2` 的 5 个 Must-Fix + 1 个报告准确性 Should-Fix，见 6.10）
 - 未触碰：`/root/.local/bin/herdsman`、`herdsman.service`、`/root/.herdsman`（生产面保持原样，见第 5 节）
 
 ---
@@ -43,6 +43,8 @@
 第 25 条（`fix(go): close final review findings on db lifecycle, rpc ordering, and herdr deadlines`，本轮 3E 终审收口）解决 `reviewer-final` 的全部 8 项问题：`sqlite_gate.go`/`db/client.go` 的 `sql.DB.Close()` 生命周期、`observability_server*.go` 的锁外写顺序、`herdr/socket_client.go` 的并发请求写锁与独立写超时、`turn_completion_test.go` 与 `sqlite_migrations_test.go` 的确定性回归、`agent_context_service_test.go` 的真实 `OccupiedSessionPaths` 边界、三个独立测试文件的合并，以及本报告 4.3 / 6.1 / 6.6 三节的更正与新增专节（见 6.8、6.9）。
 
 > **`8c4bd1b` 的更正**：任务书最初写作 `8c4bd1b`，经 `git show --stat` 核实，其对应的真实提交就是第 22 条 `5fce550`（`fix(go): resolve agy, cli, and agenthistory reviewer findings`）。6.1 节已据此改写，不再保留「短 SHA 不可解析」的旧结论。
+
+第 26 条（第 3F 终审收口，`reviewer-final2`）解决 5 个 Must-Fix 与 1 个报告准确性 Should-Fix：`db/client.go` 的 `serializedConnector.Close()` 加闸门互斥与底层 `driver.Conn` 关闭的可观测化、`observability_server.go` 两处 grace timer 回调的 `enqueueAll` 移入 `s.mu`、`turn_completion_test.go` 的确定性迟到 finish 回归、`agent_context_service_test.go` 的 4 轮真实重发现与 `CompactHistory` 断言，以及本报告 6.1 / 6.8 / 6.9 / 6.10 的源码对齐（见 6.10）。
 
 变更面（`git diff --stat`，本子批）：
 
@@ -568,10 +570,10 @@ No packages installed.
 | 1 | `internal/agy/state.go` | `writeSessionState` 的 `readRawStateObject` 返回 nil map 时补一个空 map；`readRawStateObject` 在 `json.Unmarshal` 成功但结果是 JSON `null`（object == nil）时归一成空 map。此前 `overlayKnownStateFields` 往 nil map 赋值会 panic |
 | 2 | `internal/agenthistory/antigravity_proto.go` | `readVarint` 第 10 字节宽度拦截：`shift == 63 && (next&0x7f) > 1` 即返回 `errInvalidVarint`。TS 用 BigInt 累加，`2^64 + 154` 不会截断；Go 的 uint64 会丢掉高位，把越界 tag 变成合法 tag（`2^64 + 154` 截断成 154，即 field 19 / wireType 2） |
 | 3 | `internal/cli/herdsman.go` | `parseAgentList` 的 `--all` 分支：`command.All = true` 同时把 `HerdrSessionName` 与 `WorkspaceID` 置 nil。TS 的 `all ? { all: true } : scopedOrCurrent(...)` 替换整个 scope 对象，所以显式 `--session`/`--workspace` 是被丢弃而非与 `all` 并列发出 |
-| 4 | `internal/cli/herdsman.go` 与 `internal/agy/wake_waiter.go` | `parseJSNumber` 支持无符号 `0x`/`0b`/`0o` 前缀（`strconv.ParseUint` 按 16/2/8 基解析）；带符号前缀（`-0x14`）仍走 `ParseFloat` 得 NaN，与 JS 的 `Number()` 一致。两处各有一份同名实现 |
+| 4 | `internal/cli/herdsman.go` 与 `internal/agy/wake_waiter.go` | `parseJSNumber` 支持无符号 `0x`/`0b`/`0o` 前缀（`strconv.ParseUint` 按 16/2/8 基解析）；带符号前缀（`-0x14`）仍走 `ParseFloat` 得 NaN，与 JS 的 `Number()` 一致。两处各有一份同名实现；`parseJSNumber` **只**存在于这两个文件（第 3F 子批以 `rg -n parseJSNumber go/` 复核），`internal/agenthistory` 下没有同名函数 |
 | 5 | `internal/agy/hook.go` 与 `internal/cli/herdsman.go` | 新增 `restoreJSLineSeparators`：`encoding/json` 总是把 U+2028/U+2029 写成 `\u2028`/`\u2029`，该函数把它们还原成原字符，保持 TS `JSON.stringify` 的逐字节输出 |
 | 6 | `internal/agenthistory/discovery_test.go` | **删除**伪辅助测试：`occupiedBoundaryKey` 与 `TestOccupiedFallbackDiscoveryUsesAChangedOccupiedSetAsADiscoveryBoundary` 被整体删去（后者只在测试文件内构造两个 map 字面量、比较排序 join，完全不触达生产代码）。同时在文件顶部留下注释，说明该行为已迁居 agent context service；`discovery.go` 本身无改动。`OccupiedSessionPaths` 边界的真实覆盖见 6.8 的 Finding 5 |
-| 7 | `internal/agenthistory` | `parseJSNumber`（见第 4 项）：`0x`/`0b`/`0o` 前缀支持 |
+| 7 | `internal/agenthistory` | ~~`parseJSNumber`（见第 4 项）：`0x`/`0b`/`0o` 前缀支持~~ **（第 3F 子批更正：不成立）** `rg -n parseJSNumber go/` 只命中 `internal/cli/herdsman.go:1086`（定义）、`internal/cli/cli_test.go:219`（测试）、`internal/agy/wake_waiter.go:893`（定义）、`internal/agy/agy_hook_and_cli_test.go:783`（注释）与调用点 `cli/herdsman.go:219`、`agy/wake_waiter.go:88`；`internal/agenthistory` 无 `parseJSNumber`。`5fce550` 在 agenthistory 面上改的是第 2 项 `readVarint` 与第 6 项 `discovery_test.go` 删除伪辅助测试，与 `parseJSNumber` 无关 |
 | 8 | `internal/agy` / `internal/cli` / `internal/agenthistory` | 三个包 5 轮 `-race` 全绿（见 6.6） |
 
 其中第 1、2、4、5 项各带新增/改写的单测（`antigravity_proto_test.go` +36、`agy_hook_and_cli_test.go` +301、`cli_test.go` +158，`discovery_test.go` ±36 且净减少），第 8 项以 5 轮 `-race` 作为证据。
@@ -710,11 +712,11 @@ RPC 命令（`on`/`off`/`status`、`agent list/get/read`）默认走 `formatHuma
 
 | # | 问题 | 修复落点 |
 |---|------|---------|
-| 1 | `sql.DB.Close()` 不释放底层连接、不注销 `SqliteGate` | `internal/db/client.go` 的 `serializedConnector` 新增 `Close() error`（`sync.Once` 幂等）：调 `shared.UnregisterSqliteGate(db)`、关闭唯一底层 `modernc.org/sqlite` `driver.Conn`、置 `closed` 使后续 `Connect` 立即返回 `sql.ErrConnDone`；`internal/shared/sqlite_gate.go` 保持闸门本身的可重入语义，单个 `serializedConn.Close()` 仍是 no-op，供连接池复用 |
+| 1 | `sql.DB.Close()` 不释放底层连接、不注销 `SqliteGate` | `internal/db/client.go` 的 `serializedConnector` 新增 `Close() error`（`sync.Once` 幂等）：调 `shared.UnregisterSqliteGate(db)`、关闭唯一底层 `modernc.org/sqlite` `driver.Conn`、置 `closed` 使后续 `Connect` 立即返回 `sql.ErrConnDone`；`internal/shared/sqlite_gate.go` 保持闸门本身的可重入语义，单个 `serializedConn.Close()` 仍是 no-op，供连接池复用。**第 3F 子批追加**：`Close()` 现在先 `gid := shared.CurrentGoroutineID()`、`c.gate.Acquire(gid)`（`defer c.gate.Release(gid)`），在闸门内 `c.mu.Lock()` 置 `closed`、调 `c.conn.Close()`、`shared.UnregisterSqliteGate(c.db)`，释放闸门后才返回；并新增 `DriverConnClosed(db *sql.DB) bool` / `WaitDriverConnClosed(ctx, db) bool` 两个观测点，直接问底层 `driver.Conn`（`driver.Validator.IsValid()`，modernc 连接 Close 后 `c.db == 0` 即返回 false）而不是看本包自己记的旗标 |
 | 2 | 锁外写帧时后进临界区的协程可能先抢到 `writeMu`，客户端先收新状态帧后收旧状态帧 | `internal/daemon/observability_server.go` 的 `rpcConnection` 增加按连接串行的发送队列（`queueMu` + `queue []string` + `draining`）：持 `s.mu` 期间 `enqueueMessage`/`enqueueAll` 只做内存追加（零网络 I/O，顺序严格由 `s.mu` 固定），释放 `s.mu` 后 `flushQueue`/`flushAll` 由单个 drainer 按 FIFO 取出、加 2s 写超时写入，写失败即 `destroy()` 清空队列 |
 | 3 | 持久连接共用 `conn.SetDeadline`，请求 A 完成时 `clearDeadline` 会清空并发请求 B 的 deadline；写失败未重置连接 | `internal/herdr/socket_client.go`：新增 `writeMu` 串行化持久连接的 `conn.Write`；持久连接不再设全局 `SetDeadline`，改为仅在 `writeMu` 内 `SetWriteDeadline(now+timeout)`、写完立即置零；`writeFrameLocked` 写失败即 `resetConnection()` 销毁连接（避免残留半截 JSON 帧）；读超时仍由各请求独立的 `time.NewTimer(timeout)` 与 `ctx.Done()` 控制；`requestOnce` 的独立短连接保持自己的 `SetDeadline`（`armDeadline`/`clearDeadline` 的注释已改写为「仅用于一次性连接」） |
-| 4 | `turn_completion` 晚到 finish 缺确定性回归；`RunSqliteTransaction` 的 COMMIT 失败回滚缺回归 | `internal/observability/turn_completion_test.go` 的 `TestFinishedWaiterIgnoresLateSignalAndReleasesListener` 强化为「waiter1 完成并移出注册表后，同 key 注册新 signal 与 waiter2，并触发 waiter1 残留的 timeout/cancel 路径」；`internal/db/sqlite_migrations_test.go` 新增基于 `PRAGMA defer_foreign_keys = ON` 触发真实 `COMMIT` 失败的回归 |
-| 5 | `OccupiedSessionPaths` 边界测试未触达生产代码 | `internal/observability/agent_context_service_test.go` 的 `TestAgentContextServiceRediscoversOnOccupiedChange` 改用真实 `agenthistory.CreateAgentHistoryService`（包内无 `NewService`，构造函数名以源码为准），配 `contextPiSession` 写合法 pi JSONL；`internal/agenthistory/discovery_test.go` 顶部注释保持 `5fce550` 的原样 |
+| 4 | `turn_completion` 晚到 finish 缺确定性回归；`RunSqliteTransaction` 的 COMMIT 失败回滚缺回归 | `internal/observability/turn_completion_test.go` 的 `TestFinishedWaiterIgnoresLateSignalAndReleasesListener` 强化为「waiter1 完成并移出注册表后，同 key 注册新 signal 与 waiter2，并触发 waiter1 残留的 timeout/cancel 路径」；`internal/db/sqlite_migrations_test.go` 新增基于 `PRAGMA defer_foreign_keys = ON` 触发真实 `COMMIT` 失败的回归。**第 3F 子批追加**：晚到 finish 一项改写为 100% 确定性的白盒用例 `TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal`（`package observability`，见 6.10），原「time.Sleep + close(abort)」形态删除；原用例只保留监听 goroutine 泄漏那半个子测试并改名 `TestFinishedWaiterReleasesListenerGoroutine` |
+| 5 | `OccupiedSessionPaths` 边界测试未触达生产代码 | `internal/observability/agent_context_service_test.go` 的 `TestAgentContextServiceRediscoversOnOccupiedChange` 改用真实 `agenthistory.CreateAgentHistoryService`（包内无 `NewService`，构造函数名以源码为准），配 `contextPiSession` 写合法 pi JSONL；`internal/agenthistory/discovery_test.go` 顶部注释保持 `5fce550` 的原样。**第 3F 子批追加**：改为 4 轮真实链路断言，并给真实 history service 包一层可计数的 `Discover`（`newCountingRealHistoryService`），直接观测真实 `DiscoverAgentHistory` 真的跑了几次；断言每轮的 `CompactHistory.LastAssistantMessage.Text` 真的来自被读的那个 `.jsonl`（`from-session-A` / `from-session-B`），见 6.10 |
 | 6 | 报告 6.1 节的函数名与落点不准 | 已按 `git show 5fce550 -- <file>` 逐项改写（见 6.1），不照抄任务书的近似名称 |
 | 7 | 3 个新增测试文件未合入既有测试文件 | `go/internal/db/sqlite_transaction_test.go` → `go/internal/db/sqlite_migrations_test.go`；`go/internal/observability/agent_index_refresh_sharing_test.go` → `go/internal/observability/agent_index_service_test.go`；`go/internal/daemon/observability_rpc_slow_client_test.go` → `go/internal/daemon/observability_rpc_test.go`。三个文件均已删除 |
 | 8 | 报告 4.3 推送方法列表不全、6.6 包数量表述不准、缺架构决策专节 | 4.3 补全 3 个推送方法；6.6 改为「`go list -buildvcs=false ./...` 共 12 个包：2 个 `cmd/*` + 10 个 `internal/*`」；新增 6.9 记录 `SqliteGate` 与 `rpcConnection` 的架构决策 |
@@ -723,15 +725,47 @@ RPC 命令（`on`/`off`/`status`、`agent list/get/read`）默认走 `formatHuma
 
 **Finding 1（`connector.Close()`）**：退回「`serializedConnector` 无 `Close()`」后 `TestOpenSqliteCloseReleasesConnectionAndGate` FAIL——`db.Close()` 之后 `SqliteGate` 仍在注册表里，且底层连接未关；补上 `Close()` 后 PASS。
 
+**Finding 1（第 3F 子批追加：门控互斥 + 直接观测底层 close）**：用例改名为 `TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate` 并拆 3 个子测试。
+
+- **直接观测**：新增的 `DriverConnClosed(db)` 走 `driver.Validator.IsValid()`，问的是底层 `modernc.org/sqlite` 连接本身（其 `Close()` 把 `c.db` 置 0 后 `IsValid()` 转 false）。临时注释掉 `serializedConnector.Close()` 里的 `err = c.conn.Close()`，3 个子测试**全部确定性 FAIL**：
+  - `sqlite_migrations_test.go:542: DriverConnClosed = false after Close, want the driver connection closed`
+  - `sqlite_migrations_test.go:626: DriverConnClosed = false after the gate was released, want the connection closed`
+  - `sqlite_migrations_test.go:675: DriverConnClosed = false after the rows were closed, want the connection closed`
+
+  恢复后 3 个子测试 PASS。这一条正是第 3F 子批要补的洞：旧断言 `db.Exec("select 1")` 报错在删掉 `c.conn.Close()` 后**依然成立**（`database/sql` 自己就会拦），所以它从来观测不到底层连接是否真被释放。
+- **门控互斥**：另两个子测试分别用「另一 goroutine 持 `SqliteGate`」和「`db.Query` 出的 `Rows` 游标未关」占住闸门，`db.Close()` 在 200ms 内不得返回、`DriverConnClosed` 不得为 true；释放后才允许完成。当前实现下两者均 PASS。
+
+**如实记录**：`driver.Validator` 这层观测没有单独的 FAIL→PASS 取证（它是观测手段，不是被修的行为）；门控互斥那两项目前也没有对应 FAIL 证据——先前的 3 轮 `-race`（含 `TestRunSqliteTransactionConcurrentDoesNotInterleave` 等并发用例）未暴露 `Close` 与在途语句的交错，属防御性加固，按实情记在案。
+
 **Finding 2（发送队列顺序）**：`TestObservabilityRpcPushedFramesKeepTheirGeneratedOrder` 在把 `enqueueAll` 移回锁外（恢复「锁内构造、锁外 encode+write」的旧形态）后确定性 FAIL，报出 `[2 1]`——客户端收到的帧序号非单调。关键在 payload：用 50 000 个 key 的 map 把单帧撑到约 770 KB、编码耗时约 18ms，临界区才长到足以让乱序稳定复现（900 KB 只有约 2ms 窗口，不够）。修复形态（锁内 enqueue、锁外单 drainer flush）下同一用例 PASS。
 
 **Finding 3（herdr 写锁与写超时）**：`TestHerdrSocketClientConcurrentRequestsKeepTheirOwnTimeouts` 三个子测试。「写失败重置连接」子测试在删掉 `writeFrameLocked` 里的 `resetConnection()` 后 FAIL：`getPane after a failed write err = write unix @->…: use of closed network connection, want Herdr socket closed`。注意「并发请求互不清 deadline」子测试**测不出**差异——请求自身的 `time.NewTimer` 仍是真正的边界，退回共享 `SetDeadline` 形态用例仍 PASS；这一项按防御性记录在案。
 
 **Finding 4（COMMIT 失败回滚）**：`TestRunSqliteTransactionRollsBackAfterFailedCommit` 在临时注释掉 `RunSqliteTransaction` 里 commit 失败后的 `rollback` 后 FAIL，第二次事务报 `cannot start a transaction within a transaction`，与任务书预期逐字一致；恢复后 PASS。
 
-**Finding 4（晚到 finish）**：删掉 abort 监听 goroutine 的 `case <-pending.doneCh` 分支后，`listener goroutine did not exit after the wait finished (4 goroutines, baseline 3)` 确定性 FAIL；恢复后 PASS。`finished` 守卫本身测不出差异（`stillPending` 判定已覆盖同一路径），按防御性记录。
+**Finding 4（晚到 finish）**：删掉 abort 监听 goroutine 的 `case <-pending.doneCh` 分支后，`listener goroutine did not exit after the wait finished (4 goroutines, baseline 3)` 确定性 FAIL；恢复后 PASS。
+
+**Finding 4（第 3F 子批追加：确定性复现）**：`TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal` 全程同步、无 `time.Sleep` 参与排序：先起第 1 轮 `WaitForSignal` goroutine 并轮询 `waitersByTerminal[key]` 直到恰有 1 个 waiter（证明走了慢路径），取出 `w1`；`Record(sig1)` 唤醒并断言第 1 轮拿到自己的信号、`w1.finished == true`、`w1` 已移出注册表；`Record(sig2)` 写入第 2 轮信号；再在 `c.mu.Lock()` 下直接 `c.finishLocked(key, w1, false)`，精确模拟第 1 轮迟到回调抢到锁；最后断言 `latestByTerminal[key]` 仍在且第 2 轮 `WaitForSignal` 立刻拿到 `sig2`。
+
+FAIL 取证（临时把 `finishLocked` 的 `if pending.finished` 分支改成「返回前顺手 `delete(r.latestByTerminal, key)`」，即迟到清理误删下一轮信号）：
+
+```
+turn_completion_test.go:328: the late finishLocked dropped round 2's stored signal
+--- FAIL: TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal (0.00s)
+```
+
+恢复后 PASS。
+
+**如实记录**：把 `finished` / `stillPending` 两个守卫**整体删掉**并不能作为这条的 FAIL 取证——删掉后 `finishLocked` 会对已关闭的 `doneCh` 二次 `close` 而 panic（测试二进制直接崩，不是干净 FAIL）。因此 FAIL 取证采用的是「守卫命中时误删 `latestByTerminal`」这一同样属于「迟到 finish 吞掉下一轮信号」的形态，它与生产代码的真实差异被完整记录在此。
 
 **Finding 5（真实 OccupiedSessionPaths 边界）**：把 `occupiedChanged` 临时恒置 false 后，`second call forceDiscovery = false, want true` FAIL；恢复后 PASS。该用例现在穿过真实的 `DiscoverAgentHistory` / `StatSourceFingerprint` / `ReadCompactRef` 链路，而不是只对着一个 fake 记录的 options 对象。
+
+**Finding 5（第 3F 子批追加：真实 CompactHistory 与真实重发现）**：把 `occupiedChanged` 临时恒置 false 后，新断言 `third call forceDiscovery = false, want true` FAIL；恢复后 PASS。除此之外本轮补了两层旧用例没有的观测：
+
+1. **真实 discovery 计数**：`newCountingRealHistoryService()` 给 `agenthistory.AgentHistoryServiceOptions.Discover` 包一层计数壳，内部仍调 `agenthistory.DiscoverAgentHistory`。前两轮（命中 `preferredRef`）断言 `*discoveries == 0`，第 3 轮断言 `*discoveries == 1`，第 4 轮断言仍是 1——「有没有真的重新发现」从此是直接观测，不再从 options 反推。
+2. **真实 CompactHistory 文本**：两个真实 Pi `.jsonl`（`contextPiSession(t, "occupied-change.jsonl", "from-session-A")` 与 `"own-session.jsonl", "from-session-B"`），断言第 1、2 轮 `LastAssistantMessage.Text == "from-session-A"`，第 4 轮 `== "from-session-B"`。
+
+**与任务书字面描述的偏差（如实记录）**：任务书要求第 3 次调用「选出未被占用的 `sessionB.jsonl` 并返回 `from-session-B`」。当前源码做不到，原因是结构性的：`shouldForceDiscovery` 对「可读的官方 path」和「id pane」都提前返回 false，而 `selectPreferredRef` 也只在官方值缺失时才回落到持久化 ref——也就是说**只有官方 `agent_session` 为 nil 的窗格，occupied 变化才可能触发强制发现**；而官方值一旦是 path，`DiscoverAgentHistory` 又只按该 path 确定性解析，不存在「在多个候选文件里挑一个没被占用的」这一步（cwd/mtime 扫描器已随 `5fce550` 第 6 项删除，`internal/agenthistory/discovery.go` 的 `DiscoverAgentHistory` 对 path 与 id 都是单值解析）。因此本轮按源码事实改成 4 轮：第 3 轮走「官方 session 缺失 + occupied 变化 → 强制发现 → 真实 discovery 跑一次 → 解析不到 → CompactHistory 变成真实的未决形态（`LastAssistantMessage == nil`、`HistoryRef == nil`）」，第 4 轮让窗格上报自己的官方 session 文件，从而真实读到 `from-session-B`。第 3 轮的 `LastAssistantMessage` 由有变无本身就是「重新发现真的执行了」的证据：复用持久化 ref 会仍然带着 `from-session-A`。
 
 ### 本轮验证
 
@@ -748,19 +782,114 @@ RPC 命令（`on`/`off`/`status`、`agent list/get/read`）默认走 `formatHuma
 
 ### `SqliteGate`：`connector.Close()` 生命周期与 `runtime.Stack` GID 重入设计
 
-`internal/shared/sqlite_gate.go` 实现一个按 goroutine 可重入的数据库闸门：闸门按 OS 线程的 goroutine ID 记账，同一 goroutine 可多次 `Enter`，只有最外层 `Exit` 真正放行；跨 goroutine 的第二次进入则排队，从而把 `database/sql` 连接池退化成「一个时刻只有一个写入者」的串行语义，与 TS 单事件循环里两个 `await` 之间的块原子等价。
+`internal/shared/sqlite_gate.go` 实现一个**按 goroutine ID**（不是 OS 线程 ID）可重入的数据库闸门：闸门按 `runtime.Stack` 解析出的 goroutine ID 记账，同一 goroutine 可多次 `Acquire`，只有最外层 `Release` 真正放行；跨 goroutine 的第二次进入则排队，从而把 `database/sql` 连接池退化成「一个时刻只有一个写入者」的串行语义，与 TS 单事件循环里两个 `await` 之间的块原子等价。方法名是 `Acquire` / `Release`（另有供测试用的 `HeldBy`），不是 `Enter` / `Exit`。
 
-- **GID 取自 `runtime.Stack`**：Go 没有暴露 goroutine ID 的公开 API，`sqlite_gate.go` 用一次受控的 `runtime.Stack(buf, false)` 抓取栈帧首行（`goroutine N [running]:`）解析出 N。这是该设计唯一的「非公开契约」依赖，但它是标准库内部实现的稳定格式，且失败时退化为「不识别为重入」而不是放行竞态。
+- **GID 取自 `runtime.Stack`**：Go 没有暴露 goroutine ID 的公开 API，`sqlite_gate.go` 的 `goroutineID()` 用一次受控的 `runtime.Stack(buf, false)` 抓取栈帧首行（`goroutine N [running]:`），`strconv.ParseInt` 解析出 N（`CurrentGoroutineID()` 是对外暴露）。这是该设计唯一的「非公开契约」依赖，但它是标准库内部实现的稳定格式。
+- **解析失败退化为非重入互斥，不是放行竞态**：`goroutineID()` 解析失败返回 `0`；闸门的重入判定是 `g.owner == gid`（`Acquire` 的等待条件是 `g.depth > 0 && g.owner != gid`），因此 `gid == 0` 时同一个 goroutine 的第二次 `Acquire` 也会排队——退化为「不可重入的互斥」，语义变严但绝不放行竞态。
+- **第 3F 子批追加：`Close()` 也先过闸门**：`serializedConnector.Close()` 现在先 `gid := shared.CurrentGoroutineID()` → `c.gate.Acquire(gid)`（`defer c.gate.Release(gid)`），再在闸门内置 `closed`、关底层 `driver.Conn`、`UnregisterSqliteGate`。每条语句和每个事务本来就全程持闸，所以不过闸门的 `Close` 会在 `modernc.org/sqlite` 的 `Close`（清零 `c.db`、释放 TLS）与在途语句之间制造并发。`Close` 由调用 `(*sql.DB).Close` 的 goroutine 执行、不持有任何语句级资源，等待上界就是调用方在途语句的长度，与任何其他语句相同。
 - **重入是必需的，不是优化**：`RunSqliteTransaction` 全程持闸，而事务回调 `fn()` 里还会调 `db.Query`/`db.Exec`；若闸门不可重入，第一次内层调用就会死锁。
 - **`connector.Close()` 的生命周期**：`database/sql` 在 `db.Close()` 时若发现 `db.connector` 实现 `io.Closer` 会自动调用 `connector.Close()`。`internal/db/client.go` 的 `OpenSqlite` 因此给自定义 `driver.Connector`（`serializedConnector`）加了 `Close() error`，用 `sync.Once` 保证幂等，在其中做三件事：`shared.UnregisterSqliteGate(db)`（把闸门从注册表摘掉，避免 `db` 被 GC 后注册表仍持引用）、关闭唯一的底层 `modernc.org/sqlite` `driver.Conn`、把 `closed` 置 true 使后续 `Connect` 立即返回 `sql.ErrConnDone`。单个 `serializedConn.Close()` 仍保持 no-op——它归连接池所有，池会反复开关它。
+- **底层 close 的观测点**（第 3F 子批新增）：`DriverConnClosed(db)` / `WaitDriverConnClosed(ctx, db)` 先由 `db.Driver()` 取回 `serializedDriver`（它带回 `connector` 指针，`database/sql` 为句柄终生持有 connector、`Close` 之后仍在），再对底层 `driver.Conn` 做 `driver.Validator.IsValid()` 断言。这是**问驱动自己**，不是问本包记的旗标：`database/sql` 在句柄关闭后自己就会拦掉 `db.Exec`，所以「`db.Exec` 报错」从来证明不了底层连接被释放。
+- **为什么不加一张 `*sql.DB → connector` 注册表**：那张表的键会强引用每个开过的句柄，正是 `UnregisterSqliteGate` 的注释所警告的「随 DB 数量无界增长」；改成关闭时删项又会让关闭后的观测失效。走 `db.Driver()` 两条都不占。
 - **为什么注册表需要注销**：闸门按 `*sql.DB` 注册，daemon 在测试或重载场景下会开多个 DB；不注销时注册表随 DB 数量无界增长，且旧 DB 的闸门状态会干扰新 DB 的判断。
 
 ### `rpcConnection` 发送队列与 2s 写超时
 
-`internal/daemon/observability_server.go` 的 `rpcConnection` 维护一个按连接串行的发送队列（`queueMu sync.Mutex`、`queue []string`、`draining bool`）。
+`rpcConnection` 定义在 `internal/daemon/observability_server_handlers.go`（不是 `observability_server.go`），维护一个按连接串行的发送队列（`queueMu sync.Mutex`、`queue []string`、`draining bool`）。`enqueueAll` / `flushAll` 两个包级辅助函数也在 `observability_server_handlers.go`。
 
 - **为什么必须「锁内 enqueue、锁外 flush」**：TS 的事件循环保证两个 `await` 之间的块原子，所以「生成顺序」与「写出顺序」天然一致。Go 移植后如果在 `s.mu` 内直接 `conn.Write`，一个慢客户端就能把服务器锁堵住数秒（6.5 实测第 6 帧起阻塞 2.00068239s）；但如果改成「锁内构造帧、锁外写」，后进临界区的协程 B 可能在解锁后先抢到 `writeMu`，客户端就会先收到新状态帧、后收到旧状态帧。
 - **队列如何同时解决两者**：持 `s.mu` 期间只 `enqueueMessage`/`enqueueAll`（纯内存追加，零网络 I/O），顺序由 `s.mu` 严格固定；释放 `s.mu` 后 `flushQueue`/`flushAll` 由单个 drainer 按 FIFO 取出帧写入。写操作因此既不在锁内、也不与生成顺序竞争。
 - **单个 drainer**：`enqueueMessage` 在没有 drainer 时直接拉起一个，`flushQueue` 不重复拉起，避免两个 drainer 互相竞争把 FIFO 打破。drainer 退出前会重新检查队列，防「刚有新帧入队就退出」的竞态。
 - **2s 写超时**（`observability_server_handlers.go` 的 `rpcWriteTimeout = 2 * time.Second`）：每个帧写入前 `SetWriteDeadline(now+2s)`，超时即 `destroy()` 断开该连接并清空队列。取 2s 是因为推送帧本身很小（几十字节到几 KB），正常情况下写入是微秒级；2s 只可能被「对端停读且缓冲区已满」触发，那种连接本就应当被丢弃。
 - **与 6.5 的关系**：6.5 已证明慢客户端确实能把 `conn.Write` 堵在 `SO_SNDBUF` 上超过 2s，所以这个超时不是理论值，而是被真实阻塞窗口验证过的边界。
+- **第 3F 子批追加：7 个发布点 100% 锁内入队**：`observability_server.go` 与 `observability_server_handlers.go` 两文件共 6 处 `enqueueAll(...)`（`PublishAgentEvent`、`ReconcileAgentLocations`、disconnect grace timer 回调、startup grace timer 回调、register handler 的 context 帧、`agent.orchestrator.set`），加上 `PublishAgentContext` 直接调 `connection.enqueueMessage(message)`，共 **7 个发布点**。推送辅助函数名是 `publishOrchestratorChange`（**不是** `notifyOwnerChanged`），定义在 `observability_server.go:1265`。第 3F 子批前，disconnect grace timer 回调（原 1021 行）与 startup grace timer 回调（原 1104 行）的 `enqueueAll(released)` 落在 `s.mu.Unlock()` **之后**，与其余 5 处不一致；本轮已把这两处移进持锁闭包，`flushAll(released)` 仍留在锁外。复核方式：对两文件逐行回溯最近的 `s.mu.Lock()` / `s.mu.Unlock()`（排除 `defer s.mu.Unlock()`），6 处 `enqueueAll` 全部判为 `INSIDE-LOCK`。
+
+---
+
+### 6.10 第 3F 终审收口子批（`reviewer-final2` 的 5 个 Must-Fix + 1 个报告准确性 Should-Fix）
+
+本轮只改 `go/` 下的文件（`git diff --name-only main...HEAD | grep -v '^go/'` 为空），未触碰 `/root/workspace/herdsman` 主工作区、`.agents/notes/`、`/root/.pi/agent/`、`/root/.gemini/config/hooks.json`、`/root/.local/bin/herdsman`、`/root/.herdsman/state.db` 与运行中的 `herdsman.service`。测试全部使用 `t.TempDir()`，不碰生产 `HERDSMAN_HOME`。
+
+#### 6 项问题与落点
+
+| # | 级别 | 问题 | 修复落点 |
+|---|------|------|---------|
+| 1 | Must-Fix | `serializedConnector.Close()` 关底层 `driver.Conn` 前不过 `SqliteGate`，与在途查询/`Rows`/事务竞态 | `internal/db/client.go`：`Close()` 在 `once.Do` 内先 `gid := shared.CurrentGoroutineID()` → `c.gate.Acquire(gid)` + `defer c.gate.Release(gid)`，闸门内置 `closed`、关底层连接、`UnregisterSqliteGate`；`Connect` 见 `closed` 仍返回 `sql.ErrConnDone` |
+| 2 | Must-Fix | 两个断连宽限期定时器回调的 `enqueueAll(released)` 在 `s.mu.Unlock()` 之后 | `internal/daemon/observability_server.go`：disconnect grace timer 与 startup grace timer 两处回调的 `enqueueAll(released)` 移进持 `s.mu` 的闭包，`flushAll(released)` 留在锁外 |
+| 3 | Must-Fix | `TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate`（原 `TestOpenSqliteCloseReleasesConnectionAndGate`）用 `db.Exec` 报错判断关闭，删掉底层 `c.conn.Close()` 也照样报错，观测不到真实释放 | `internal/db/client.go` 新增 `DriverConnClosed(db) bool` / `WaitDriverConnClosed(ctx, db) bool`（经 `db.Driver()` 取回 connector，对底层 `driver.Conn` 做 `driver.Validator.IsValid()`，问驱动自己）；`internal/db/sqlite_migrations_test.go` 用例改名并拆 3 个子测试 |
+| 4 | Must-Fix | 迟到 `finishLocked` 的回归测试靠 `time.Sleep`，不确定 | `internal/observability/turn_completion_test.go` 新增 `TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal`（`package observability` 白盒，全程同步）；原用例只留监听 goroutine 半个子测试并改名 `TestFinishedWaiterReleasesListenerGoroutine` |
+| 5 | Must-Fix | `TestAgentContextServiceRediscoversOnOccupiedChange` 的 seeded agent `agent_session` 为 nil，`DiscoverAgentHistory` 直接返空，未覆盖真实重发现与 `CompactHistory` 更新 | `internal/observability/agent_context_service_test.go`：改用 4 轮真实链路 + 可计数的 `Discover` 壳（`newCountingRealHistoryService`）+ 两个真实 Pi `.jsonl` 的文本断言（见下方「与任务书字面描述的偏差」） |
+| 6 | Should-Fix | 报告 6.1 / 6.8 / 6.9 与源码不一致 | 见 6.1 第 4、7 行、6.8 表第 1/4/5 行与 FAIL 取证、6.9 全文；本轮新增 6.10 |
+
+#### 先 FAIL 后 PASS 取证（逐项实测）
+
+**Finding 3（底层 close 的直接观测）**：临时注释掉 `serializedConnector.Close()` 里的 `err = c.conn.Close()`，3 个子测试**全部确定性 FAIL**：
+
+```
+sqlite_migrations_test.go:542: DriverConnClosed = false after Close, want the driver connection closed
+sqlite_migrations_test.go:626: DriverConnClosed = false after the gate was released, want the connection closed
+sqlite_migrations_test.go:675: DriverConnClosed = false after the rows were closed, want the connection closed
+--- FAIL: TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate (0.41s)
+```
+
+恢复后 3 个子测试 PASS。作为对照，**旧断言在同一改动下不会 FAIL**：`db.Exec("select 1")` 依旧报错，因为 `database/sql` 在句柄关闭后自己就拦掉了语句，压根到不了驱动——这正是 Finding 3 指出的观测空洞。
+
+**Finding 4（确定性迟到 finish）**：临时把 `finishLocked` 的 `if pending.finished` 分支改成「返回前顺手 `delete(r.latestByTerminal, key)`」（即迟到清理误删下一轮信号）：
+
+```
+turn_completion_test.go:328: the late finishLocked dropped round 2's stored signal
+--- FAIL: TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal (0.00s)
+```
+
+恢复后 PASS。**如实记录**：整体删掉 `finished` / `stillPending` 两个守卫不能作为本条 FAIL 取证——那会让 `finishLocked` 对已关闭的 `doneCh` 二次 `close` 而 panic（测试二进制直接崩溃，不是干净 FAIL）。故取证采用同属「迟到 finish 吞掉下一轮信号」的误删形态。
+
+**Finding 5（真实重发现与 CompactHistory）**：把 `occupiedChanged` 临时恒置 false：
+
+```
+agent_context_service_test.go:1188: third call forceDiscovery = false, want true
+--- FAIL: TestAgentContextServiceRediscoversOnOccupiedChange (0.01s)
+```
+
+恢复后 PASS。
+
+**Finding 2（enqueueAll 入队点）**：本轮是位置修正（把两处回调的 `enqueueAll` 移进锁内），没有新的 FAIL→PASS 取证；顺序回归由 6.8 的 `TestObservabilityRpcPushedFramesKeepTheirGeneratedOrder`（`[2 1]`）覆盖，本轮 3 轮 `-race` 复跑该用例仍 PASS。
+
+#### 与任务书字面描述的偏差（如实记录，不擅改目标）
+
+任务书 Finding 5 描述为「第 3 次调用传入 `OccupiedSessionPaths: [sessionA]` 后选出未被占用的 `sessionB.jsonl`，返回 `from-session-B`」。**当前源码结构上做不到**，因此本轮按源码事实改写为 4 轮，并在此说明理由：
+
+1. `shouldForceDiscovery` 对「可读的官方 path」和「id pane」都提前返回 false；`selectPreferredRef` 也只在官方值缺失时才回落到持久化 ref。也就是说**只有官方 `agent_session` 为 nil 的窗格，occupied 变化才可能触发强制发现**。
+2. 官方值一旦是 path，`DiscoverAgentHistory` 只按该 path 做单值确定性解析（`discovery.go:299`），不存在「在多个候选文件里挑一个没被占用的」这一步；cwd/mtime 扫描器已随 `5fce550` 第 6 项删除。
+
+所以本轮 4 轮分别是：(1)(2) 官方 session 缺失、命中持久化 `preferredRef`，真实读到 `from-session-A`，真实 discovery 跑 0 次；(3) 另一窗格占用该文件 → occupied 变化 → 强制发现 → 真实 discovery 跑 1 次 → 官方 session 仍缺失故解析不到 → `CompactHistory` 变成真实的未决形态（`LastAssistantMessage == nil`、`HistoryRef == nil`）；(4) 窗格上报自己的官方 session 文件 → 真实读到 `from-session-B`，discovery 仍是 1 次。第 3 轮 `LastAssistantMessage` 由有变无，本身就是「重新发现真的执行了」的证据。
+
+任务书中另有两处名称与源码不符，本轮一律以源码为准并已在测试注释里写明：`LookupSqliteGate` 实为 `shared.SqliteGateOf`；`TurnWaitResult{Status:"...", TurnSeq:...}` 实为 `TurnCompletionWaitResult{Confirmed/ExpectedText/HasExpectedText/Received}`，`SessionScopedSignal` 无 `TurnSeq` 字段（改用 `ExpectedText` 区分两轮）。
+
+#### 本轮验证
+
+- `gofmt -l cmd internal` 为空（改动文件均已格式化）。
+- `CGO_ENABLED=0 go vet -buildvcs=false ./...` 通过；`CGO_ENABLED=0 go build -buildvcs=false ./...` 通过。
+- `CGO_ENABLED=0 go test -buildvcs=false -count=1 ./...`：12 个包全绿（2 个 `no test files` + 10 个 `ok`），其中 `internal/daemon 12.730s`、`internal/observability 4.590s`、`internal/agy 2.816s`、`internal/herdr 1.162s`、`internal/db 1.065s`、`internal/agenthistory 0.026s`。
+- 3 轮 `-race`（按修复涉及的测试先按 `-run` 精扫，再整包跑）：
+  - `go test -race -buildvcs=false -count=3 -run 'TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate|TestRunSqliteTransaction|TestOpenSqlite' ./internal/db/` → `ok 3.797s`
+  - `go test -race -buildvcs=false -count=3 -run 'TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal|TestFinishedWaiterReleasesListenerGoroutine|TestTurnCompletion|TestRecorded|TestTimesOut|TestScopesSignals|TestPrunesStale|TestAbortedWait|TestExpectedText' ./internal/observability/` → `ok 1.722s`
+  - `go test -race -buildvcs=false -count=3 -run 'TestAgentContextServiceRediscoversOnOccupiedChange|TestAgentContextService' ./internal/observability/` → `ok 7.562s`
+  - `go test -race -buildvcs=false -count=3 -run 'TestObservabilityRpc|TestDisconnect|TestStartupGrace|TestScheduleDisconnect|TestArmStartupGrace|TestPublish' ./internal/daemon/` → `ok 25.000s`
+  - 整包 3 轮：`go test -race -buildvcs=false -count=3 ./internal/db/... ./internal/observability/...` → `internal/db 38.274s`、`internal/db/dedup 1.022s`、`internal/observability 279.768s`，全部 `ok`；`go test -race -buildvcs=false -count=3 ./internal/daemon/...` → `internal/daemon 90.629s`，`ok`。无 `DATA RACE`、无 `FAIL`。
+
+  以上耗时取自最终形态（观测走 `db.Driver()`、无 `*sql.DB → connector` 注册表）的一次完整复跑；全量 `go test -count=1 ./...` 的包耗时同轮取得：`internal/daemon 12.793s`、`internal/observability 5.192s`、`internal/agy 2.809s`、`internal/herdr 1.161s`、`internal/db 1.083s`、`internal/agenthistory 0.040s`。
+
+#### 本轮变更面
+
+```
+ go/internal/daemon/observability_server.go         |   9 +-
+ go/internal/db/client.go                           |  93 +++++++-
+ go/internal/db/sqlite_migrations_test.go           | 203 ++++++++++++++----
+ go/internal/observability/agent_context_service_test.go | 287 ++++++++++++++++----
+ go/internal/observability/turn_completion_test.go  | 226 ++++++++++++++------
+ go/reports/batch-5-herdsmand.md                    |  54 +++-
+ 6 files changed, 693 insertions(+), 179 deletions(-)
+```
+
+生产代码净改动很小（`client.go` 的 `Close()` 加闸门 + 两个观测函数、`observability_server.go` 两行位置），其余是测试与报告。未新增测试文件，未新增生产行为。
+

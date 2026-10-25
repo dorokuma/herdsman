@@ -122,12 +122,29 @@ func (c *serializedConnector) Connect(context.Context) (driver.Conn, error) {
 	return &serializedConn{conn: c.conn, gate: c.gate}, nil
 }
 
-func (c *serializedConnector) Driver() driver.Driver { return serializedDriver{} }
+// Driver returns the driver database/sql reports for this connector. It carries
+// the connector back so the handle-lifecycle observation below can reach the one
+// driver connection without a registry keyed on the handle (a map keyed by
+// *sql.DB would keep every handle a process ever opened alive, which is exactly
+// what UnregisterSqliteGate exists to avoid for the gate).
+func (c *serializedConnector) Driver() driver.Driver { return serializedDriver{connector: c} }
 
 // Close releases everything the open handle owned: the gate registration and the
 // one driver connection every wrapper shares. database/sql calls it from
 // (*sql.DB).Close, which is why a closed handle must not be used afterwards —
 // Connect reports sql.ErrConnDone from then on.
+//
+// It takes the database gate before closing the driver connection. Every
+// statement and every transaction of this handle runs while holding that gate,
+// so a Close that skipped it could tear down the connection underneath a
+// goroutine that is still inside the driver (modernc.org/sqlite frees its
+// per-connection state on Close). Acquiring the gate makes the teardown wait for
+// the in-flight work to finish instead of racing it.
+//
+// Holding it is safe: Close runs on the goroutine that called
+// (*sql.DB).Close, not on a statement, and the wait is bounded by the longest
+// statement the caller had in flight — the same bound any other statement would
+// have.
 //
 // It is idempotent: (*sql.DB).Close may be called more than once (and a caller
 // that never closed may still race a deferred cleanup), and closing a driver
@@ -135,16 +152,84 @@ func (c *serializedConnector) Driver() driver.Driver { return serializedDriver{}
 func (c *serializedConnector) Close() error {
 	var err error
 	c.once.Do(func() {
+		gid := shared.CurrentGoroutineID()
+		c.gate.Acquire(gid)
+		defer c.gate.Release(gid)
+
 		c.mu.Lock()
 		c.closed = true
 		c.mu.Unlock()
-		shared.UnregisterSqliteGate(c.db)
+
+		// The observation point: the driver connection is released here, and
+		// DriverConnClosed asks the driver itself whether it still is usable. That
+		// is what makes the lifecycle test able to tell a real release from
+		// database/sql merely refusing statements on a handle it shut.
 		err = c.conn.Close()
+
+		shared.UnregisterSqliteGate(c.db)
 	})
 	return err
 }
 
-type serializedDriver struct{}
+// DriverConnClosed reports whether OpenSqlite's handle has actually closed the
+// underlying driver connection.
+//
+// It asks the driver, not this package's bookkeeping: modernc.org/sqlite's
+// connection reports itself invalid once Close has run (its sqlite3 handle is
+// released), so the answer comes from the connection's own state. A *sql.DB
+// that was closed through database/sql refuses statements on its own, which is
+// why an error from db.Exec proves nothing about whether the driver connection
+// was released — that is exactly the hole this closes.
+//
+// A handle that did not come from OpenSqlite has no serializedDriver behind it
+// and is reported as not closed.
+func DriverConnClosed(db *sql.DB) bool {
+	connector := connectorOf(db)
+	if connector == nil {
+		return false
+	}
+	validator, ok := connector.conn.(driver.Validator)
+	if !ok {
+		return false
+	}
+	return !validator.IsValid()
+}
+
+// WaitDriverConnClosed blocks until the handle's driver connection reports
+// itself closed, or until ctx is done. It exists so a test can wait for a
+// Close that is still blocked on the gate instead of sleeping on a guess.
+func WaitDriverConnClosed(ctx context.Context, db *sql.DB) bool {
+	if connectorOf(db) == nil {
+		return false
+	}
+	for {
+		if DriverConnClosed(db) {
+			return true
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+// connectorOf reaches the serializedConnector behind db, or reports nil for a
+// handle that did not come from OpenSqlite. database/sql keeps the connector for
+// the handle's whole life (and past its Close), so the handle's own driver is
+// the only lookup this needs.
+func connectorOf(db *sql.DB) *serializedConnector {
+	if db == nil {
+		return nil
+	}
+	driver, ok := db.Driver().(serializedDriver)
+	if !ok {
+		return nil
+	}
+	return driver.connector
+}
+
+type serializedDriver struct{ connector *serializedConnector }
 
 func (serializedDriver) Open(string) (driver.Conn, error) {
 	return nil, errors.New("serialized sqlite driver is connector-only")

@@ -504,48 +504,177 @@ func insertTestWorkspace(db *sql.DB, workspace string) error {
 	return err
 }
 
-// TestOpenSqliteCloseReleasesConnectionAndGate is the regression test for the
-// handle lifecycle. database/sql calls connector.Close from (*sql.DB).Close, so
-// the connector is the one place that can release the single shared driver
-// connection and drop the gate registration.
+// TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate is the regression test
+// for the handle lifecycle. database/sql calls connector.Close from
+// (*sql.DB).Close, so the connector is the one place that can release the single
+// shared driver connection and drop the gate registration.
 //
-// Before this, Close on the handle left both alive for the process: the gate
-// stayed in the registry under a handle nobody would use again (a leak per
-// database a daemon opens), and the driver connection was never closed.
-func TestOpenSqliteCloseReleasesConnectionAndGate(t *testing.T) {
-	db, err := OpenSqlite(filepath.Join(t.TempDir(), "close.sqlite"))
-	if err != nil {
-		t.Fatalf("openSqlite: %v", err)
-	}
-	gate := shared.SqliteGateOf(db)
-	if gate == nil {
-		t.Fatal("SqliteGateOf = nil after OpenSqlite, want the registered gate")
-	}
+// Two things are asserted against the driver connection itself, not against
+// database/sql's own bookkeeping: a closed *sql.DB refuses statements on its own
+// (it never reaches the driver), so an error from db.Exec would prove nothing
+// about whether the connection was released. DriverConnClosed and
+// WaitDriverConnClosed report the connector's own record of the driver Close
+// returning, which only the production code can set.
+func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
+	t.Run("the handle closes the driver connection and drops the gate", func(t *testing.T) {
+		db, err := OpenSqlite(filepath.Join(t.TempDir(), "close.sqlite"))
+		if err != nil {
+			t.Fatalf("openSqlite: %v", err)
+		}
+		gate := shared.SqliteGateOf(db)
+		if gate == nil {
+			t.Fatal("SqliteGateOf = nil after OpenSqlite, want the registered gate")
+		}
+		// The connection is open before the close, so the observation below really
+		// does track a transition rather than a constant true.
+		if DriverConnClosed(db) {
+			t.Fatal("DriverConnClosed = true before Close, want an open driver connection")
+		}
 
-	if err := db.Close(); err != nil {
-		t.Fatalf("close: %v", err)
-	}
+		if err := db.Close(); err != nil {
+			t.Fatalf("close: %v", err)
+		}
 
-	// The gate registration goes with the handle, so a later lookup by the same
-	// (now dead) handle finds nothing.
-	//
-	// SqliteGateOf reads the registry map, and the handle pointer is still a
-	// valid map key, so this really does ask about the closed handle rather than
-	// about a fresh one.
-	if lingering := shared.SqliteGateOf(db); lingering != nil {
-		t.Fatal("SqliteGateOf after Close returned the gate, want the registration to be dropped")
-	}
+		// The direct observation: the driver connection itself was closed. Comment
+		// out c.conn.Close() in serializedConnector.Close and this line fails while
+		// every db.Exec-based assertion below still passes.
+		if !DriverConnClosed(db) {
+			t.Fatal("DriverConnClosed = false after Close, want the driver connection closed")
+		}
 
-	// The driver connection is closed too: a statement can no longer reach it.
-	if _, err := db.Exec("select 1"); err == nil {
-		t.Fatal("exec on a closed handle succeeded, want an error")
-	}
+		// The gate registration goes with the handle, so a later lookup by the same
+		// (now dead) handle finds nothing. SqliteGateOf reads the registry map, and
+		// the handle pointer is still a valid map key, so this really does ask about
+		// the closed handle rather than about a fresh one.
+		if lingering := shared.SqliteGateOf(db); lingering != nil {
+			t.Fatal("SqliteGateOf after Close returned the gate, want the registration to be dropped")
+		}
 
-	// Close is idempotent: (*sql.DB).Close may run more than once and a second
-	// call must not resurface an error from closing the driver connection twice.
-	if err := db.Close(); err != nil {
-		t.Fatalf("second close: %v", err)
-	}
+		// The handle is unusable afterwards (database/sql enforces this itself, so
+		// it is a usability assertion, not the release evidence above).
+		if _, err := db.Exec("select 1"); err == nil {
+			t.Fatal("exec on a closed handle succeeded, want an error")
+		}
+
+		// Close is idempotent: (*sql.DB).Close may run more than once and a second
+		// call must not resurface an error from closing the driver connection twice.
+		if err := db.Close(); err != nil {
+			t.Fatalf("second close: %v", err)
+		}
+		if !DriverConnClosed(db) {
+			t.Fatal("DriverConnClosed = false after the second Close, want it to stay closed")
+		}
+	})
+
+	// The gate is what makes the teardown safe: a Close that closes the driver
+	// connection without taking the gate races whatever statement is inside the
+	// driver right now. Holding the gate from another goroutine must delay the
+	// driver Close until it is released.
+	t.Run("Close waits for a concurrently held gate", func(t *testing.T) {
+		db, err := OpenSqlite(filepath.Join(t.TempDir(), "close-gated.sqlite"))
+		if err != nil {
+			t.Fatalf("openSqlite: %v", err)
+		}
+		gate := shared.SqliteGateOf(db)
+		if gate == nil {
+			t.Fatal("SqliteGateOf = nil after OpenSqlite, want the registered gate")
+		}
+
+		// A different goroutine holds the gate, exactly as a statement or a
+		// transaction would while it is inside the driver.
+		holderDone := make(chan struct{})
+		release := make(chan struct{})
+		holderReady := make(chan struct{})
+		go func() {
+			defer close(holderDone)
+			gid := shared.CurrentGoroutineID()
+			gate.Acquire(gid)
+			defer gate.Release(gid)
+			close(holderReady)
+			<-release
+		}()
+		<-holderReady
+
+		closed := make(chan error, 1)
+		go func() { closed <- db.Close() }()
+
+		// While the gate is held the driver connection must stay open. This is the
+		// observation that fails when Close closes it without acquiring the gate.
+		select {
+		case err := <-closed:
+			t.Fatalf("db.Close returned (%v) while another goroutine held the gate", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if DriverConnClosed(db) {
+			t.Fatal("DriverConnClosed = true while another goroutine held the gate, " +
+				"want the close to wait for it")
+		}
+
+		// Releasing the gate lets the close proceed; the driver connection is then
+		// really closed and the handle reports no error.
+		close(release)
+		<-holderDone
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatalf("close after the gate was released: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("db.Close did not finish after the gate was released")
+		}
+		if !DriverConnClosed(db) {
+			t.Fatal("DriverConnClosed = false after the gate was released, want the connection closed")
+		}
+		if lingering := shared.SqliteGateOf(db); lingering != nil {
+			t.Fatal("SqliteGateOf after Close returned the gate, want the registration to be dropped")
+		}
+	})
+
+	// A Close racing a live Rows cursor is the same hazard in the shape the
+	// daemon actually hits: the cursor holds the gate for as long as it streams.
+	t.Run("Close waits for an open Rows cursor", func(t *testing.T) {
+		db := openMigratedTestDB(t)
+
+		rows, err := db.Query("select name from sqlite_master")
+		if err != nil {
+			t.Fatalf("query: %v", err)
+		}
+		// The cursor holds the gate now, exactly like a caller still draining it.
+		if rows.Next() {
+			// Reading one row is enough: the gate stays held until Close.
+			var name string
+			if err := rows.Scan(&name); err != nil {
+				t.Fatalf("scan: %v", err)
+			}
+		}
+
+		closed := make(chan error, 1)
+		go func() { closed <- db.Close() }()
+		select {
+		case err := <-closed:
+			t.Fatalf("db.Close returned (%v) with a Rows cursor still open", err)
+		case <-time.After(200 * time.Millisecond):
+		}
+		if DriverConnClosed(db) {
+			t.Fatal("DriverConnClosed = true with a Rows cursor still open, " +
+				"want the close to wait for it")
+		}
+
+		if err := rows.Close(); err != nil {
+			t.Fatalf("close rows: %v", err)
+		}
+		select {
+		case err := <-closed:
+			if err != nil {
+				t.Fatalf("close after the rows were closed: %v", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("db.Close did not finish after the Rows cursor was closed")
+		}
+		if !DriverConnClosed(db) {
+			t.Fatal("DriverConnClosed = false after the rows were closed, want the connection closed")
+		}
+	})
 }
 
 // TestRunSqliteTransactionConcurrentDoesNotInterleave is the gate regression:

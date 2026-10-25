@@ -247,93 +247,155 @@ func TestExpectedTextCarriedWhenPresent(t *testing.T) {
 	}
 }
 
-// A finished waiter must stay finished: once waiter1 has been resolved and
-// removed from the registry, its leftover timeout and cancel paths must not
-// resolve it again — a second resolution would consume the signal the next
-// round registered on the same key, and would close an already-closed doneCh.
-// The goroutine watching the caller's signal channel used to park on it forever
-// for the same reason.
-func TestFinishedWaiterIgnoresLateSignalAndReleasesListener(t *testing.T) {
-	t.Run("a finished waiter's leftover paths do not consume the next round's signal", func(t *testing.T) {
-		// The timeout is short, so the leftover timer path is guaranteed to be
-		// still pending when the signal resolves the first wait.
-		registry := NewTurnCompletionRegistry(WithTurnSettimeout(120))
+// TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal is the deterministic
+// regression for the window the earlier version of this test could not pin down:
+// round 1's leftover timer (or cancel) path reaching finishLocked *after* round
+// 2's signal has already been stored on the same key.
+//
+// Every step below is synchronous and reads the registry under its own lock, so
+// the ordering is fixed by the test rather than by scheduling: round 1 really is
+// suspended as a waiter before anything is recorded, and the late finishLocked
+// really is invoked with round 2's signal already in place. The clock is
+// injected, so the recordedAt comparisons do not depend on wall time either.
+func TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal(t *testing.T) {
+	const (
+		session  = "default"
+		terminal = "term_pi"
+	)
+	key := terminalTurnKey(session, terminal)
 
-		abort := make(chan struct{})
-		first := make(chan TurnCompletionWaitResult, 1)
-		go func() {
-			first <- registry.WaitForSignal(WaitForSignalInput{
-				HerdrSessionName: "default",
-				RecordedAfterMs:  time.Now().UnixMilli() - 1,
-				Signal:           abort,
-				TerminalID:       "term_pi",
-			})
-		}()
+	// A long timeout: nothing in this test is allowed to end a wait by timing
+	// out, because a timeout here would be the very race being ruled out.
+	current := int64(1_000_000)
+	registry := NewTurnCompletionRegistry(
+		WithTurnSetNow(func() int64 { return current }),
+		WithTurnSettimeout(60_000),
+	)
 
-		// The signal resolves the first wait and removes it from the registry
-		// while both its timeout and its cancel path are still outstanding.
-		registry.Record(testSignal(nil))
-		if got := <-first; !got.Received {
-			t.Fatalf("first wait = %+v, want it resolved by the signal", got)
+	// 1. Round 1 takes the slow path: no signal is stored yet, so Wait registers
+	//    a waiter and suspends. Polling the registry (rather than sleeping) is
+	//    what proves the waiter really exists before anything else happens.
+	first := make(chan TurnCompletionWaitResult, 1)
+	go func() {
+		first <- registry.WaitForSignal(WaitForSignalInput{
+			HerdrSessionName: session,
+			RecordedAfterMs:  1,
+			TerminalID:       terminal,
+		})
+	}()
+	w1 := suspendedWaiter(t, registry, key)
+
+	// 2. Round 1's own signal resolves it and removes it from the registry.
+	current++
+	registry.Record(testSignal(func(s *SessionScopedSignal) {
+		s.ExpectedText = "round-1"
+		s.HasExpectedText = true
+	}))
+	select {
+	case got := <-first:
+		if !got.Received || got.ExpectedText != "round-1" {
+			t.Fatalf("first wait = %+v, want it resolved by round 1's signal", got)
 		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first wait never settled after its signal was recorded")
+	}
+	if !waiterFinished(registry, w1) {
+		t.Fatal("w1.finished = false after its signal resolved it, want true")
+	}
+	if count := waiterCount(registry, key); count != 0 {
+		t.Fatalf("waiters for the key = %d after the first wait ended, want 0", count)
+	}
 
-		// The next round registers on the same key before anything leftover from
-		// the first one runs.
-		second := make(chan TurnCompletionWaitResult, 1)
-		go func() {
-			second <- registry.WaitForSignal(WaitForSignalInput{
-				HerdrSessionName: "default",
-				RecordedAfterMs:  time.Now().UnixMilli() - 1,
-				TerminalID:       "term_pi",
-			})
-		}()
+	// 3. Round 2's signal arrives while nobody is waiting, so it is only stored.
+	current++
+	registry.Record(testSignal(func(s *SessionScopedSignal) {
+		s.ExpectedText = "round-2"
+		s.HasExpectedText = true
+	}))
 
-		// The next round's own signal, recorded while it is the only waiter.
-		registry.Record(testSignal(func(s *SessionScopedSignal) {
-			s.ExpectedText = "second round"
-			s.HasExpectedText = true
-		}))
+	// 4. Round 1's leftover path finally gets the lock — strictly after round 2's
+	//    signal landed — and runs finishLocked on the already-finished waiter.
+	//    This is the exact interleaving the timer callback and the cancel
+	//    listener can produce, reached here without any sleep or luck.
+	registry.mu.Lock()
+	registry.finishLocked(key, w1, false)
+	registry.mu.Unlock()
 
-		// Now fire both leftover paths of the finished waiter: its cancel channel
-		// and, well past its budget, its timeout.
-		close(abort)
-		time.Sleep(300 * time.Millisecond)
+	// 5. Round 2's signal must still be there. Checked before waiting so a
+	//    regression reports the dropped signal instead of a timeout.
+	stored, ok := storedSignal(registry, key)
+	if !ok {
+		t.Fatal("the late finishLocked dropped round 2's stored signal")
+	}
+	if stored.ExpectedText != "round-2" {
+		t.Fatalf("stored signal = %q, want round-2", stored.ExpectedText)
+	}
 
-		// The second round must still hold its own signal: a finished waiter that
-		// stayed finished cannot have taken it.
-		select {
-		case got := <-second:
-			if !got.Received || got.ExpectedText != "second round" {
-				t.Fatalf("second wait = %+v, want the second round's signal", got)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("the second round never settled after the first waiter's leftover paths ran")
-		}
-
-		// The registry is still usable, which also proves the leftover paths left
-		// neither a wedge nor a closed channel behind.
-		third := make(chan TurnCompletionWaitResult, 1)
-		go func() {
-			third <- registry.WaitForSignal(WaitForSignalInput{
-				HerdrSessionName: "default",
-				RecordedAfterMs:  time.Now().UnixMilli() - 1,
-				TerminalID:       "term_pi",
-			})
-		}()
-		registry.Record(testSignal(func(s *SessionScopedSignal) {
-			s.ExpectedText = "third round"
-			s.HasExpectedText = true
-		}))
-		select {
-		case got := <-third:
-			if !got.Received || got.ExpectedText != "third round" {
-				t.Fatalf("third wait = %+v, want the third round's signal", got)
-			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("the registry stopped serving waits after the first waiter's leftover paths ran")
-		}
+	// 6. And round 2 must actually receive it: the fast path returns it at once,
+	//    so this also proves the late finish did not consume it.
+	got := registry.WaitForSignal(WaitForSignalInput{
+		HerdrSessionName: session,
+		RecordedAfterMs:  1,
+		TerminalID:       terminal,
 	})
+	if !got.Received || got.ExpectedText != "round-2" {
+		t.Fatalf("second wait = %+v, want round 2's signal", got)
+	}
+}
 
+// suspendedWaiter waits until exactly one waiter is registered for key and
+// returns it. It reads the registry under its own lock, so the caller can rely
+// on the wait really having suspended instead of resolving from a stored signal.
+func suspendedWaiter(t *testing.T, registry *TurnCompletionRegistry, key string) *waiter {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		registry.mu.Lock()
+		waiters := registry.waitersByTerminal[key]
+		var found *waiter
+		for pending := range waiters {
+			found = pending
+		}
+		count := len(waiters)
+		registry.mu.Unlock()
+		if count == 1 && found != nil {
+			return found
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiters for %q = %d, want exactly 1 registered waiter", key, count)
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+// waiterCount reports how many waiters are registered for key.
+func waiterCount(registry *TurnCompletionRegistry, key string) int {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	return len(registry.waitersByTerminal[key])
+}
+
+// waiterFinished reports the waiter's finished flag, read under the registry lock.
+func waiterFinished(registry *TurnCompletionRegistry, pending *waiter) bool {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	return pending.finished
+}
+
+// storedSignal reports the signal currently stored for key, read under the
+// registry lock.
+func storedSignal(registry *TurnCompletionRegistry, key string) (TurnCompletionSignal, bool) {
+	registry.mu.Lock()
+	defer registry.mu.Unlock()
+	signal, ok := registry.latestByTerminal[key]
+	return signal, ok
+}
+
+// TestFinishedWaiterReleasesListenerGoroutine covers the other half of the same
+// invariant: the goroutine watching the caller's signal channel must leave as
+// soon as the wait is over by any other means, instead of staying parked on a
+// channel nobody will ever write to.
+func TestFinishedWaiterReleasesListenerGoroutine(t *testing.T) {
 	t.Run("listener goroutine leaves when the wait is already over", func(t *testing.T) {
 		registry := NewTurnCompletionRegistry(WithTurnSettimeout(50))
 		// Sampled before the wait starts, so the only goroutine this subtest adds

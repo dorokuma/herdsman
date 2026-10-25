@@ -1017,8 +1017,11 @@ func (s *ObservabilityRpcServer) scheduleDisconnect(presence PiPresence) error {
 				return
 			}
 			released = owned
+			// Enqueue while the lock is still held: the append is the ordering point
+			// for these frames, so it belongs where the server's own order is fixed.
+			// The write itself waits until the lock is released.
+			enqueueAll(released)
 		}()
-		enqueueAll(released)
 		flushAll(released)
 	}, s.disconnectGraceMs)
 	s.disconnectTimers[key] = graceTimer{handle: handle}
@@ -1100,8 +1103,10 @@ func (s *ObservabilityRpcServer) armStartupGrace() {
 					return
 				}
 				released = owned
+				// Same shape as the disconnect timer: enqueue under the lock (the ordering
+				// point), write after it is released.
+				enqueueAll(released)
 			}()
-			enqueueAll(released)
 			flushAll(released)
 		}, s.startupReconnectMs)
 		s.startupTimers[key] = graceTimer{handle: handle}
