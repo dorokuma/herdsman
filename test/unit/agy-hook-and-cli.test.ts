@@ -1729,6 +1729,55 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
 
       expect(await waiterPromise).toEqual({});
       expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+
+      // The wake prompt starts a new turn, so PreInvocation now takes the batch.
+      // Both deferred completions of the same terminal are candidates at once; the
+      // batch must carry only the newest one.
+      const wakeTurn = await runAgyHook(
+        "PreInvocation",
+        JSON.stringify({ invocationNum: 2, sessionId }),
+        {
+          connect,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          stateDir: dir,
+        },
+      );
+      const injected = wakeTurn.injectSteps?.[0]?.ephemeralMessage ?? "";
+      expect(injected).toContain("全部测试通过。");
+      expect(injected).toContain("event: 1126");
+      expect(injected).not.toContain("已改完代码，继续跑测试。");
+      expect(injected).not.toContain("event: 1118");
+      expect(injected.match(/^- completed /gm)).toHaveLength(1);
+      expect(
+        warnSpy.mock.calls.some(
+          (call) =>
+            String(call[0]).includes("eventId=1118") &&
+            String(call[0]).includes("superseded by newer completion for terminal term_peer"),
+        ),
+      ).toBe(true);
+
+      const afterInject = JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"));
+      expect(
+        [...afterInject.presentedEventIds].sort((left: number, right: number) => left - right),
+      ).toEqual([1118, 1126]);
+      expect(
+        [...afterInject.deliveredEventIds].sort((left: number, right: number) => left - right),
+      ).toEqual([1118, 1126]);
+
+      // The woken turn's Stop settles the batch, so the superseded mid-turn
+      // completion is acked and can never be injected again later.
+      expect(
+        await runAgyHook("Stop", JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }), {
+          connect,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          spawnWakeWaiter: () => ({ pid: process.pid }),
+          stateDir: dir,
+        }),
+      ).toEqual({});
+      expect(ackedIds).toEqual(expect.arrayContaining([1118, 1126]));
+      expect(wakePrompts).toHaveLength(1);
     } finally {
       warnSpy.mockRestore();
       rmSync(dir, { force: true, recursive: true });
@@ -1835,9 +1884,9 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
             String(call[0]).includes("eventId=73501") && String(call[0]).includes("still working"),
         ),
       ).toBe(true);
-      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8")).presentedEventIds ?? []).toEqual(
-        [],
-      );
+      expect(
+        JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8")).presentedEventIds ?? [],
+      ).toEqual([]);
 
       // Live status catches up on the next poll.
       peerStatus = "done";
@@ -1936,9 +1985,9 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
       expect(result).toEqual({});
       expect(wakePrompts).toEqual([]);
       expect(ackedEventId).toBe(0);
-      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8")).presentedEventIds ?? []).toEqual(
-        [],
-      );
+      expect(
+        JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8")).presentedEventIds ?? [],
+      ).toEqual([]);
     } finally {
       warnSpy.mockRestore();
       rmSync(dir, { force: true, recursive: true });
@@ -2060,9 +2109,7 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
       ),
     ).toBe("");
     expect(
-      parseAgyComposerDraft(
-        ["output", rule, "> hello draft", rule, "? for shortcuts"].join("\n"),
-      ),
+      parseAgyComposerDraft(["output", rule, "> hello draft", rule, "? for shortcuts"].join("\n")),
     ).toBe("hello draft");
     expect(
       parseAgyComposerDraft(
@@ -2073,9 +2120,160 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
     ).toBe("line one\nline two\nline three");
     // A sole `>` with only whitespace is still empty (no placeholder observed on real panes).
     expect(parseAgyComposerDraft(["output", rule, ">   ", rule, "footer"].join("\n"))).toBe("");
+    // A draft that itself contains a rule must not collapse the box: the real top
+    // rule is the last one followed by the `>` prompt line, not the previous rule.
+    expect(
+      parseAgyComposerDraft(
+        ["output", rule, "> 第一段", "--------", "第三段", rule, "? for shortcuts"].join("\n"),
+      ),
+    ).toBe("第一段\n--------\n第三段");
+    expect(
+      parseAgyComposerDraft(
+        ["output", rule, "> 第一段", "第二行", rule, rule, "? for shortcuts"].join("\n"),
+      ),
+    ).toBe(`第一段\n第二行\n${rule}`);
+    // A rule on the draft's last line would make `bottom <= top + 1` with the naive
+    // second-to-last rule; the box must still be located.
+    expect(
+      parseAgyComposerDraft(["output", rule, "> 草稿", rule, rule, "? for shortcuts"].join("\n")),
+    ).toBe(`草稿\n${rule}`);
     // If the composer box cannot be found, return undefined so wake keeps original behaviour.
     expect(parseAgyComposerDraft("no separators here\n> orphan")).toBeUndefined();
     expect(parseAgyComposerDraft([rule, rule].join("\n"))).toBeUndefined();
+    // No rule above the box bottom is followed by a `>` prompt line.
+    expect(
+      parseAgyComposerDraft(["output", rule, "plain", rule, "footer"].join("\n")),
+    ).toBeUndefined();
+  });
+
+  test("WakeWaiter wakes through retryWakePending alone when one deferred peer settles while another keeps working", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-retry-wake-pending-"));
+    const sessionId = "f1111111-2222-3333-4444-555555555555";
+    const pendingEvents: AgentEventRecord[] = [
+      makeDoneEvent(9500, "工人 A 的最终结论。", "term_peer_a"),
+    ];
+    let ackedEventId = 0;
+    let peerAStatus: "done" | "idle" | "working" = "working";
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    writeFileSync(
+      join(dir, `${sessionId}.json`),
+      JSON.stringify({ turnEpoch: 1, waiterEpoch: 1, waiterPid: process.pid }),
+    );
+
+    const emptyComposer = [
+      "assistant output",
+      "───────────────────────────────────────────────────",
+      ">",
+      "───────────────────────────────────────────────────",
+      "? for shortcuts",
+    ].join("\n");
+
+    try {
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect: async () => ({
+          close: () => undefined,
+          request: async (method: string, params: unknown) => {
+            if (method === "agent.notifications.ack") {
+              const eventId = (params as { eventId: number }).eventId;
+              ackedEventId = Math.max(ackedEventId, eventId);
+              return { acknowledged: true };
+            }
+            if (method === "agent.list") {
+              return {
+                agents: [
+                  {
+                    agent: "agy",
+                    agentStatus: "idle" as const,
+                    firstSeenAt: "2026-10-25T05:06:00.000Z",
+                    herdrSessionName: "default",
+                    id: "ag_self",
+                    paneId: "wB:p1",
+                    terminalId: "term_self",
+                    workspaceId: "wB",
+                  },
+                  {
+                    agent: "agy",
+                    agentStatus: peerAStatus,
+                    firstSeenAt: "2026-10-25T05:06:00.000Z",
+                    herdrSessionName: "default",
+                    id: "ag_peer_a",
+                    paneId: "wB:p2",
+                    terminalId: "term_peer_a",
+                    workspaceId: "wB",
+                  },
+                  // Peer B never leaves working and no push notification ever
+                  // arrives, so `!hasActivePeers` can never trigger the check.
+                  {
+                    agent: "agy",
+                    agentStatus: "working" as const,
+                    firstSeenAt: "2026-10-25T05:06:00.000Z",
+                    herdrSessionName: "default",
+                    id: "ag_peer_b",
+                    paneId: "wB:p3",
+                    terminalId: "term_peer_b",
+                    workspaceId: "wB",
+                  },
+                ],
+              };
+            }
+            return {
+              events: pendingEvents,
+              presence: {
+                herdrSessionName: "default",
+                paneId: "wB:p1",
+                subscriberId: `agy:${sessionId}`,
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              state: {
+                ackedEventId,
+                herdrSessionName: "default",
+                owner: { paneId: "wB:p1", terminalId: "term_self" },
+                updatedAt: "2026-10-25T05:06:49.000Z",
+                workspaceId: "wB",
+              },
+            };
+          },
+        }),
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 20,
+        readPaneText: async () => emptyComposer,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 60));
+      // Peer A is still working: the completion is deferred, nothing is acked and
+      // peer B keeps the wake check from firing through the no-active-peers path.
+      expect(wakePrompts).toEqual([]);
+      expect(ackedEventId).toBe(0);
+      expect(
+        warnSpy.mock.calls.some(
+          (call) =>
+            String(call[0]).includes("eventId=9500") && String(call[0]).includes("still working"),
+        ),
+      ).toBe(true);
+
+      // No push notification is delivered: the deferred retry timer is the only
+      // thing that can re-check the batch and wake the orchestrator.
+      peerAStatus = "done";
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { force: true, recursive: true });
+    }
   });
 
   test("Stop spawns a WakeWaiter alongside decision:continue, unacked delivered events prompt when the host ignores it, and a new PreInvocation epoch cancels the waiter", async () => {

@@ -837,7 +837,7 @@ async function defaultTriggerWakePrompt(input: {
 
 async function defaultReadPaneText(paneId: string): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileAsync("herdr", ["pane", "read", paneId, "--lines", "12"], {
+    const { stdout } = await execFileAsync("herdr", ["pane", "read", paneId, "--lines", "40"], {
       timeout: 5_000,
     });
     return stdout;
@@ -868,8 +868,22 @@ export function parseAgyComposerDraft(paneText: string): string | undefined {
   }
   if (separatorIndexes.length < 2) return undefined;
   const bottom = separatorIndexes[separatorIndexes.length - 1];
-  const top = separatorIndexes[separatorIndexes.length - 2];
-  if (bottom === undefined || top === undefined || bottom <= top + 1) return undefined;
+  if (bottom === undefined) return undefined;
+  // The rule right above the status bar is the bottom of the composer box. The
+  // top rule is *not* simply the previous rule: a multi-line draft may itself end
+  // with a `--------` / `────────` line, which then becomes the second-to-last
+  // rule and would collapse the box. The real top rule is the last rule whose
+  // next line is the `>` prompt line.
+  let top: number | undefined;
+  for (let index = separatorIndexes.length - 2; index >= 0; index -= 1) {
+    const separatorIndex = separatorIndexes[index];
+    if (separatorIndex === undefined) continue;
+    if (/^>(?:\s|$)/.test(lines[separatorIndex + 1] ?? "")) {
+      top = separatorIndex;
+      break;
+    }
+  }
+  if (top === undefined || bottom <= top + 1) return undefined;
 
   const region = lines.slice(top + 1, bottom);
   if (region.length === 0) return undefined;
@@ -881,7 +895,10 @@ export function parseAgyComposerDraft(paneText: string): string | undefined {
     }
     return line;
   });
-  return draftLines.join("\n").replace(/[ \t]+$/gm, "").trimEnd();
+  return draftLines
+    .join("\n")
+    .replace(/[ \t]+$/gm, "")
+    .trimEnd();
 }
 
 async function readComposerDraft(
@@ -1321,6 +1338,33 @@ function projectAgyOutcomes(
     }
   }
 
+  // One terminal may legally emit several completion events inside a single
+  // Stop-to-Stop window (an intermediate tool round deferred above, then the
+  // real final round). Once the peer stops reporting `working` they all become
+  // projectable at once, which would inject the same peer twice with two
+  // different round texts. Keep only the newest completion that actually yields
+  // a usable `completed` outcome and suppress everything older for that terminal.
+  const newestCompletionId = new Map<string, number>();
+  for (const event of events) {
+    if (!isCompletionEvent(event) || event.terminalId === null) continue;
+    if (outcomeKind(event) !== "completed") continue;
+    const payload = asRecord(event.payload);
+    if (
+      payload.fallbackOutcome === true &&
+      event.paneId &&
+      event.paneGeneration &&
+      completedPanes.has(`${event.paneId}\0${event.paneGeneration}`)
+    ) {
+      continue;
+    }
+    const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
+    if (text.length === 0 || isUpstreamErrorText(text)) continue;
+    const current = newestCompletionId.get(event.terminalId);
+    if (current === undefined || event.id > current) {
+      newestCompletionId.set(event.terminalId, event.id);
+    }
+  }
+
   for (const event of events) {
     if (
       isCompletionEvent(event) &&
@@ -1337,14 +1381,23 @@ function projectAgyOutcomes(
       );
       continue;
     }
+    if (isCompletionEvent(event) && event.terminalId !== null) {
+      const newest = newestCompletionId.get(event.terminalId);
+      if (newest !== undefined && event.id < newest) {
+        suppressedEventIds.push(event.id);
+        logAgyEventSuppressed(
+          event.id,
+          `superseded by newer completion for terminal ${event.terminalId}`,
+        );
+        continue;
+      }
+    }
     const kind = outcomeKind(event);
     if (!kind || !event.terminalId) {
       suppressedEventIds.push(event.id);
       logAgyEventSuppressed(
         event.id,
-        !event.terminalId
-          ? "no terminalId"
-          : `non-outcome event type ${event.type}`,
+        !event.terminalId ? "no terminalId" : `non-outcome event type ${event.type}`,
       );
       continue;
     }
