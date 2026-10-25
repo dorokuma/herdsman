@@ -56,7 +56,18 @@ export type AgyHookOutput = AgyPreInvocationOutput & AgyStopOutput;
 type AgySessionHookState = {
   autoClaimAttempted?: boolean;
   awaitingNextTurn?: boolean;
+  // Completions `projectAgyOutcomes` deferred because `agent.list` still reports
+  // the peer as `working`. They stay unacked and unpresented so a later poll can
+  // project them once the live status catches up; the ids are recorded so the
+  // acknowledgement cursor can be held below them.
+  deferredEventIds?: number[];
   deliveredEventIds?: number[];
+  // Events that are already presented (permanently suppressed or handed to the
+  // host) whose `agent.notifications.ack` RPC is *held back* because a lower-id
+  // event is still waiting to be projected. Deliberately separate from
+  // `deliveredEventIds`: `rearmDeliveredEvents` re-arms the latter, and an event
+  // that was already delivered must never be injected twice.
+  pendingAckEventIds?: number[];
   presentedEventIds?: number[];
   turnEpoch?: number;
   waiterEpoch?: number;
@@ -223,6 +234,16 @@ export async function runAgyHook(
       if (!isLocalOwner(connState)) {
         if ((sessionState.deliveredEventIds?.length ?? 0) > 0) {
           sessionState.deliveredEventIds = [];
+        }
+        // Ownership moved elsewhere: held-back acknowledgements belong to the new
+        // owner now, and this session may not ack them out of scope anyway.
+        if ((sessionState.pendingAckEventIds?.length ?? 0) > 0) {
+          sessionState.pendingAckEventIds = [];
+        }
+        if (
+          sessionState.deliveredEventIds !== undefined ||
+          sessionState.pendingAckEventIds !== undefined
+        ) {
           writeSessionState(stateDir, sessionId, sessionState);
         }
         return {};
@@ -404,6 +425,23 @@ export async function runAgyHook(
                 );
                 retryWakePending = true;
               } else {
+                // `readComposerDraft` is async I/O (up to 5s). While it was in
+                // flight the user may have submitted a new turn (bumping
+                // `turnEpoch`) or a fresh Stop may have started a new waiter, so
+                // the state this loop decided on can already be superseded.
+                // Re-check before touching shared state: rearming the batch or
+                // prompting on behalf of a stale turn would duplicate an
+                // injection the host already received.
+                const postReadState = readSessionState(stateDir, sessionId);
+                if (
+                  (postReadState.turnEpoch !== undefined &&
+                    postReadState.turnEpoch !== waiterEpoch) ||
+                  (postReadState.waiterEpoch !== undefined &&
+                    postReadState.waiterEpoch !== waiterEpoch) ||
+                  (postReadState.waiterPid !== undefined && postReadState.waiterPid !== process.pid)
+                ) {
+                  return {};
+                }
                 // The stop hook marked the batch presented before returning it to
                 // the host; the turn started by this prompt has to receive it in
                 // PreInvocation, so re-arm the unacked batch first.
@@ -869,36 +907,48 @@ export function parseAgyComposerDraft(paneText: string): string | undefined {
   if (separatorIndexes.length < 2) return undefined;
   const bottom = separatorIndexes[separatorIndexes.length - 1];
   if (bottom === undefined) return undefined;
-  // The rule right above the status bar is the bottom of the composer box. The
-  // top rule is *not* simply the previous rule: a multi-line draft may itself end
-  // with a `--------` / `────────` line, which then becomes the second-to-last
-  // rule and would collapse the box. The real top rule is the last rule whose
-  // next line is the `>` prompt line.
-  let top: number | undefined;
-  for (let index = separatorIndexes.length - 2; index >= 0; index -= 1) {
-    const separatorIndex = separatorIndexes[index];
+  // The rule right above the status bar is the bottom of the composer box.
+  const bottomLine = (lines[bottom] ?? "").trim();
+  // The top rule is *not* simply the previous rule: a multi-line draft may itself
+  // contain a `--------` / `────────` line followed by a `>` quote line, which then
+  // looks exactly like a composer top rule and would collapse the box (and, for an
+  // empty `>`, return an empty draft). The composer frame is drawn by one TUI
+  // component, so its top and bottom rules share the same characters and width:
+  // prefer candidates that match the bottom rule byte for byte, and among those
+  // walk outwards until one yields a non-empty draft.
+  const followedByPrompt = separatorIndexes
+    .slice(0, -1)
+    .filter((separatorIndex) => /^>(?:\s|$)/.test(lines[separatorIndex + 1] ?? ""));
+  if (followedByPrompt.length === 0) return undefined;
+  const matchingFrame = followedByPrompt.filter(
+    (separatorIndex) => (lines[separatorIndex] ?? "").trim() === bottomLine,
+  );
+  const topCandidates = matchingFrame.length > 0 ? matchingFrame : followedByPrompt;
+
+  let sawCandidate = false;
+  for (let index = topCandidates.length - 1; index >= 0; index -= 1) {
+    const separatorIndex = topCandidates[index];
     if (separatorIndex === undefined) continue;
-    if (/^>(?:\s|$)/.test(lines[separatorIndex + 1] ?? "")) {
-      top = separatorIndex;
-      break;
-    }
+    const region = lines.slice(separatorIndex + 1, bottom);
+    if (region.length === 0) continue;
+    sawCandidate = true;
+    const draft = region
+      .map((line, regionIndex) => {
+        if (regionIndex === 0) {
+          const match = /^(?:>\s?)(.*)$/.exec(line);
+          if (match) return match[1] ?? "";
+        }
+        return line;
+      })
+      .join("\n")
+      .replace(/[ \t]+$/gm, "")
+      .trimEnd();
+    // An innermost candidate that parses to an empty draft is the rule the user
+    // typed inside the composer; the real frame is the enclosing one.
+    if (draft.trim().length > 0) return draft;
   }
-  if (top === undefined || bottom <= top + 1) return undefined;
-
-  const region = lines.slice(top + 1, bottom);
-  if (region.length === 0) return undefined;
-
-  const draftLines = region.map((line, index) => {
-    if (index === 0) {
-      const match = /^(?:>\s?)(.*)$/.exec(line);
-      if (match) return match[1] ?? "";
-    }
-    return line;
-  });
-  return draftLines
-    .join("\n")
-    .replace(/[ \t]+$/gm, "")
-    .trimEnd();
+  // Every same-frame candidate is an empty `>` prompt line: the composer is empty.
+  return sawCandidate ? "" : undefined;
 }
 
 async function readComposerDraft(
@@ -937,6 +987,76 @@ async function registerAgyPresence(
   })) as OrchestratorConnectionState;
 }
 
+/**
+ * Events of this session that are still waiting to be projected.
+ *
+ * `agent.orchestrator.get` only returns rows with `id > ackedEventId`, so an id
+ * that survived into `candidateEvents` is by definition neither acknowledged nor
+ * handed to the host yet.
+ */
+function collectWakeCandidateEvents(
+  connState: OrchestratorConnectionState,
+  presented: ReadonlySet<number>,
+): AgentEventRecord[] {
+  const ackedEventId = connState.state?.ackedEventId ?? 0;
+  return (connState.events ?? [])
+    .filter(
+      (event) =>
+        event.id > ackedEventId &&
+        !presented.has(event.id) &&
+        event.terminalId !== connState.presence.terminalId,
+    )
+    .sort((left, right) => left.id - right.id);
+}
+
+function minDeferredEventId(deferredEventIds: readonly number[] | undefined): number {
+  if (deferredEventIds === undefined || deferredEventIds.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.min(...deferredEventIds);
+}
+
+function mergeEventIds(...lists: Array<readonly number[] | undefined>): number[] {
+  return [...new Set(lists.flatMap((list) => list ?? []))].sort((left, right) => left - right);
+}
+
+/**
+ * Lowest event id that must not be acknowledged yet.
+ *
+ * `agent.notifications.ack` settles *every* row with `id <= eventId` and advances
+ * the workspace cursor to it (`src/db/agent-events.ts: markAcked`), so
+ * acknowledging a high id silently swallows every lower id that is still waiting
+ * to be projected — exactly the working-race event that `deferredWorkingEventIds`
+ * protects. The bound is recomputed from the *current* candidate set instead of
+ * trusting the recorded deferral: a peer that stopped reporting `working` turns
+ * its deferred completion into a real outcome that has not been consumed yet, and
+ * that must hold the ack back just as firmly.
+ */
+async function resolveMinHoldbackEventId(
+  client: Pick<ObservabilityRpcClient, "request">,
+  connState: OrchestratorConnectionState,
+  sessionState: AgySessionHookState,
+): Promise<number> {
+  const ackedEventId = connState.state?.ackedEventId ?? 0;
+  const presented = new Set(
+    (sessionState.presentedEventIds ?? []).filter((id) => id > ackedEventId),
+  );
+  const candidateEvents = collectWakeCandidateEvents(connState, presented);
+  if (candidateEvents.length === 0) return Number.POSITIVE_INFINITY;
+  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
+  const { deferredWorkingEventIds, outcomes } = projectAgyOutcomes(
+    candidateEvents,
+    liveWorkingTerminalIds,
+    // The following `takeNextWakeBatch` / `peekNextWakeBatch` pass logs these very
+    // suppressions; logging them here too would only duplicate the warn lines.
+    () => undefined,
+  );
+  return minDeferredEventId([
+    ...deferredWorkingEventIds,
+    ...outcomes.map((outcome) => outcome.eventId),
+  ]);
+}
+
 async function flushDeliveredAcks(
   client: Pick<ObservabilityRpcClient, "request">,
   connState: OrchestratorConnectionState,
@@ -944,14 +1064,31 @@ async function flushDeliveredAcks(
   stateDir: string,
   sessionId: string,
 ): Promise<OrchestratorConnectionState> {
-  const delivered = [...new Set(sessionState.deliveredEventIds ?? [])].sort((a, b) => a - b);
-  if (delivered.length === 0) return connState;
+  const allToAck = mergeEventIds(sessionState.pendingAckEventIds, sessionState.deliveredEventIds);
+  // Nothing to settle, but a recorded deferral may have been resolved by the
+  // latest poll: drop it so it cannot hold back future acknowledgements forever.
+  if (allToAck.length === 0) {
+    if ((sessionState.deferredEventIds ?? []).length > 0) {
+      sessionState.deferredEventIds = [];
+      writeSessionState(stateDir, sessionId, sessionState);
+    }
+    return connState;
+  }
+  const minHoldbackEventId = await resolveMinHoldbackEventId(client, connState, sessionState);
   const presented = new Set(sessionState.presentedEventIds ?? []);
   const remaining: number[] = [];
+  const stillPendingAck: number[] = [];
   let ackedAny = false;
-  for (let index = 0; index < delivered.length; index += 1) {
-    const eventId = delivered[index];
+  for (let index = 0; index < allToAck.length; index += 1) {
+    const eventId = allToAck[index];
     if (eventId === undefined) continue;
+    if (eventId >= minHoldbackEventId) {
+      // Already presented, so it will never be injected again; only the RPC ack is
+      // postponed until the lower-id event stops blocking the cursor.
+      presented.add(eventId);
+      stillPendingAck.push(eventId);
+      continue;
+    }
     try {
       await client.request("agent.notifications.ack", { eventId });
       presented.add(eventId);
@@ -961,12 +1098,22 @@ async function flushDeliveredAcks(
         presented.add(eventId);
         continue;
       }
-      remaining.push(...delivered.slice(index));
+      // Transient failure: keep this id and every later one for the next attempt.
+      // Ids above the hold-back bound stay in `pendingAckEventIds` so
+      // `rearmDeliveredEvents` can never re-inject them.
+      for (const restId of allToAck.slice(index)) {
+        if (restId >= minHoldbackEventId) {
+          stillPendingAck.push(restId);
+        } else {
+          remaining.push(restId);
+        }
+      }
       break;
     }
   }
   sessionState.presentedEventIds = [...presented].slice(-500);
   sessionState.deliveredEventIds = remaining;
+  sessionState.pendingAckEventIds = stillPendingAck;
   writeSessionState(stateDir, sessionId, sessionState);
   if (!ackedAny) return connState;
   try {
@@ -989,16 +1136,13 @@ async function peekNextWakeBatch(
   );
   sessionState.presentedEventIds = [...presented];
 
-  const candidateEvents = (connState.events ?? [])
-    .filter(
-      (event) =>
-        event.id > ackedEventId &&
-        !presented.has(event.id) &&
-        event.terminalId !== connState.presence.terminalId,
-    )
-    .sort((left, right) => left.id - right.id);
+  const candidateEvents = collectWakeCandidateEvents(connState, presented);
 
   if (candidateEvents.length === 0) {
+    if ((sessionState.deferredEventIds ?? []).length > 0) {
+      sessionState.deferredEventIds = [];
+      writeSessionState(stateDir, sessionId, sessionState);
+    }
     return { hasDeferredWorking: false, hasOutcomes: false };
   }
 
@@ -1007,36 +1151,46 @@ async function peekNextWakeBatch(
     candidateEvents,
     liveWorkingTerminalIds,
   );
+  // An ack settles `id <= eventId`, so acknowledging a suppressed id above a
+  // still-deferred id would advance the cursor past the deferred event and
+  // permanently swallow it.
+  const minDeferredId = minDeferredEventId(deferredWorkingEventIds);
   // Working-deferred completions must stay unacked and unpresented so a later
   // poll can project them once agent.list catches up to idle/done.
+  const heldAckEventIds: number[] = [];
   if (outcomes.length === 0) {
-    if (suppressedEventIds.length > 0) {
-      for (const suppressedId of suppressedEventIds) {
-        try {
-          await client.request("agent.notifications.ack", { eventId: suppressedId });
-          presented.add(suppressedId);
-        } catch (error) {
-          if (isPermanentAckFailure(error)) {
-            presented.add(suppressedId);
-            continue;
-          }
-          break;
-        }
+    for (const suppressedId of suppressedEventIds) {
+      if (suppressedId > minDeferredId) {
+        // Held back: mark it presented (so the suppression is not logged or
+        // re-projected every poll) but leave the RPC ack for a later pass.
+        presented.add(suppressedId);
+        heldAckEventIds.push(suppressedId);
+        continue;
       }
-      const freshState = readSessionState(stateDir, sessionId);
-      freshState.presentedEventIds = [...presented].slice(-500);
-      sessionState.presentedEventIds = freshState.presentedEventIds;
-      writeSessionState(stateDir, sessionId, freshState);
+      try {
+        await client.request("agent.notifications.ack", { eventId: suppressedId });
+        presented.add(suppressedId);
+      } catch (error) {
+        if (isPermanentAckFailure(error)) {
+          presented.add(suppressedId);
+          continue;
+        }
+        break;
+      }
     }
-    return {
-      hasDeferredWorking: deferredWorkingEventIds.length > 0,
-      hasOutcomes: false,
-    };
   }
+  const freshState = readSessionState(stateDir, sessionId);
+  freshState.presentedEventIds = [...presented].slice(-500);
+  freshState.deferredEventIds = deferredWorkingEventIds;
+  freshState.pendingAckEventIds = mergeEventIds(freshState.pendingAckEventIds, heldAckEventIds);
+  sessionState.presentedEventIds = freshState.presentedEventIds;
+  sessionState.deferredEventIds = freshState.deferredEventIds;
+  sessionState.pendingAckEventIds = freshState.pendingAckEventIds;
+  writeSessionState(stateDir, sessionId, freshState);
 
   return {
     hasDeferredWorking: deferredWorkingEventIds.length > 0,
-    hasOutcomes: true,
+    hasOutcomes: outcomes.length > 0,
   };
 }
 
@@ -1053,39 +1207,53 @@ async function takeNextWakeBatch(
   );
   sessionState.presentedEventIds = [...presented];
 
-  const candidateEvents = (connState.events ?? [])
-    .filter(
-      (event) =>
-        event.id > ackedEventId &&
-        !presented.has(event.id) &&
-        event.terminalId !== connState.presence.terminalId,
-    )
-    .sort((left, right) => left.id - right.id);
+  const candidateEvents = collectWakeCandidateEvents(connState, presented);
 
-  if (candidateEvents.length === 0) return undefined;
+  if (candidateEvents.length === 0) {
+    if ((sessionState.deferredEventIds ?? []).length > 0) {
+      sessionState.deferredEventIds = [];
+      writeSessionState(stateDir, sessionId, sessionState);
+    }
+    return undefined;
+  }
 
   const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
-  const { outcomes, suppressedEventIds } = projectAgyOutcomes(
+  const { deferredWorkingEventIds, outcomes, suppressedEventIds } = projectAgyOutcomes(
     candidateEvents,
     liveWorkingTerminalIds,
   );
+  // An ack settles `id <= eventId`: acknowledging a suppressed id above a
+  // still-deferred id would advance the cursor past the deferred event and
+  // permanently swallow it.
+  const minDeferredId = minDeferredEventId(deferredWorkingEventIds);
   if (outcomes.length === 0) {
-    if (suppressedEventIds.length > 0) {
-      for (const suppressedId of suppressedEventIds) {
-        try {
-          await client.request("agent.notifications.ack", { eventId: suppressedId });
-          presented.add(suppressedId);
-        } catch (error) {
-          if (isPermanentAckFailure(error)) {
-            presented.add(suppressedId);
-            continue;
-          }
-          break;
-        }
+    const heldAckEventIds: number[] = [];
+    for (const suppressedId of suppressedEventIds) {
+      if (suppressedId > minDeferredId) {
+        // Presented so it is neither re-logged nor re-projected, but the RPC
+        // ack waits for `flushDeliveredAcks` until the deferral clears.
+        presented.add(suppressedId);
+        heldAckEventIds.push(suppressedId);
+        continue;
       }
-      sessionState.presentedEventIds = [...presented].slice(-500);
-      writeSessionState(stateDir, sessionId, sessionState);
+      try {
+        await client.request("agent.notifications.ack", { eventId: suppressedId });
+        presented.add(suppressedId);
+      } catch (error) {
+        if (isPermanentAckFailure(error)) {
+          presented.add(suppressedId);
+          continue;
+        }
+        break;
+      }
     }
+    sessionState.presentedEventIds = [...presented].slice(-500);
+    sessionState.deferredEventIds = deferredWorkingEventIds;
+    sessionState.pendingAckEventIds = mergeEventIds(
+      sessionState.pendingAckEventIds,
+      heldAckEventIds,
+    );
+    writeSessionState(stateDir, sessionId, sessionState);
     // Working-deferred completions stay unacked/unpresented for the next poll.
     return undefined;
   }
@@ -1093,14 +1261,13 @@ async function takeNextWakeBatch(
   const outcomeIds = outcomes.map((outcome) => outcome.eventId);
   // Only permanent suppressions and real outcomes are marked presented.
   // Working-deferred ids must remain eligible for the next projection pass.
-  const deliveredIds = [...new Set([...suppressedEventIds, ...outcomeIds])].sort(
-    (left, right) => left - right,
-  );
+  const deliveredIds = mergeEventIds(suppressedEventIds, outcomeIds);
   for (const id of deliveredIds) presented.add(id);
   sessionState.presentedEventIds = [...presented].slice(-500);
-  sessionState.deliveredEventIds = [
-    ...new Set([...(sessionState.deliveredEventIds ?? []), ...deliveredIds]),
-  ].sort((left, right) => left - right);
+  sessionState.deliveredEventIds = mergeEventIds(sessionState.deliveredEventIds, deliveredIds);
+  // Recorded for the acknowledgement hold-back bound; `flushDeliveredAcks` moves
+  // any id above it from `deliveredEventIds` into `pendingAckEventIds`.
+  sessionState.deferredEventIds = deferredWorkingEventIds;
   writeSessionState(stateDir, sessionId, sessionState);
 
   return formatAgyOutcomeUpdates(outcomes);
@@ -1321,6 +1488,9 @@ function logAgyEventSuppressed(eventId: number, reason: string): void {
 function projectAgyOutcomes(
   events: AgentEventRecord[],
   liveWorkingTerminalIds: ReadonlySet<string> = new Set(),
+  // Injectable so internal re-projections (the acknowledgement hold-back bound)
+  // can stay silent instead of logging the same suppression twice.
+  logSuppressed: (eventId: number, reason: string) => void = logAgyEventSuppressed,
 ): {
   deferredWorkingEventIds: number[];
   outcomes: AgyOutcome[];
@@ -1375,7 +1545,7 @@ function projectAgyOutcomes(
       // tool round *or* a race where agent.list has not yet flipped to idle/done.
       // Defer (do not ack / present) so a later poll can decide.
       deferredWorkingEventIds.push(event.id);
-      logAgyEventSuppressed(
+      logSuppressed(
         event.id,
         `deferred: peer terminal ${event.terminalId} still working in agent.list`,
       );
@@ -1385,17 +1555,14 @@ function projectAgyOutcomes(
       const newest = newestCompletionId.get(event.terminalId);
       if (newest !== undefined && event.id < newest) {
         suppressedEventIds.push(event.id);
-        logAgyEventSuppressed(
-          event.id,
-          `superseded by newer completion for terminal ${event.terminalId}`,
-        );
+        logSuppressed(event.id, `superseded by newer completion for terminal ${event.terminalId}`);
         continue;
       }
     }
     const kind = outcomeKind(event);
     if (!kind || !event.terminalId) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(
+      logSuppressed(
         event.id,
         !event.terminalId ? "no terminalId" : `non-outcome event type ${event.type}`,
       );
@@ -1409,10 +1576,7 @@ function projectAgyOutcomes(
       completedPanes.has(`${event.paneId}\0${event.paneGeneration}`)
     ) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(
-        event.id,
-        `fallback outcome superseded by completion for pane ${event.paneId}`,
-      );
+      logSuppressed(event.id, `fallback outcome superseded by completion for pane ${event.paneId}`);
       continue;
     }
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
@@ -1420,12 +1584,12 @@ function projectAgyOutcomes(
       kind === "failed" || kind === "stalled" ? normalizeExcerpt(payload.reason) : undefined;
     if (isUpstreamErrorText(text) || (reason !== undefined && isUpstreamErrorText(reason))) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(event.id, "upstream model error text");
+      logSuppressed(event.id, "upstream model error text");
       continue;
     }
     if (kind === "completed" && text.length === 0) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(event.id, "empty completed assistant text");
+      logSuppressed(event.id, "empty completed assistant text");
       continue;
     }
     outcomes.push({

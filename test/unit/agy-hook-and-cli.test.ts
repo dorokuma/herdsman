@@ -2146,6 +2146,29 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
     ).toBeUndefined();
   });
 
+  test("parseAgyComposerDraft keeps a draft that contains a rule followed by a `>` quote line", () => {
+    const rule = "───────────────────────────────────────────────────";
+    // An ASCII rule inside the draft does not match the box-drawing frame, so the
+    // frame rule wins outright.
+    expect(
+      parseAgyComposerDraft(
+        ["output", rule, "> 草稿", "--------", ">", rule, "? for shortcuts"].join("\n"),
+      ),
+    ).toBe("草稿\n--------\n>");
+    // A same-width box-drawing rule inside the draft looks exactly like the frame
+    // top rule: the innermost candidate parses to an empty draft (its `>` line is
+    // the last draft line), so the enclosing frame rule has to win.
+    expect(
+      parseAgyComposerDraft(
+        ["output", rule, "> 草稿", rule, ">", rule, "? for shortcuts"].join("\n"),
+      ),
+    ).toBe(`草稿\n${rule}\n>`);
+    // With no outer frame rule left, the composer really is just an empty `>`.
+    expect(parseAgyComposerDraft(["output", rule, ">", rule, "? for shortcuts"].join("\n"))).toBe(
+      "",
+    );
+  });
+
   test("WakeWaiter wakes through retryWakePending alone when one deferred peer settles while another keeps working", async () => {
     const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-retry-wake-pending-"));
     const sessionId = "f1111111-2222-3333-4444-555555555555";
@@ -2272,6 +2295,296 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
       expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
     } finally {
       warnSpy.mockRestore();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("a low-id working-deferred event is never swallowed by the ack of a higher-id suppressed event", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-defer-ack-cursor-"));
+    const sessionId = "d1111111-2222-3333-4444-555555555555";
+    const ackedIds: number[] = [];
+    // Real `markAcked` settles *every* row with `id <= eventId` and advances the
+    // workspace cursor, so a high-id ack swallows every lower id below it.
+    let ackedEventId = 0;
+    let peerAStatus: "done" | "idle" | "working" = "working";
+    const peerAEvent: AgentEventRecord = {
+      ...makeDoneEvent(100, "工人 A 的最终结论。", "term_peer_a"),
+      agentId: "ag_peer_a",
+      paneId: "wB:p2",
+    };
+    // Peer B finished with an empty assistant text: permanently suppressed noise.
+    const peerBEvent: AgentEventRecord = {
+      ...makeDoneEvent(105, "", "term_peer_b"),
+      agentId: "ag_peer_b",
+      paneId: "wB:p3",
+    };
+    const pendingEvents: AgentEventRecord[] = [peerAEvent, peerBEvent];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string, params: unknown) => {
+        if (method === "agent.notifications.ack") {
+          const eventId = (params as { eventId: number }).eventId;
+          ackedIds.push(eventId);
+          ackedEventId = Math.max(ackedEventId, eventId);
+          return { acknowledged: true };
+        }
+        if (method === "agent.list") {
+          return {
+            agents: [
+              {
+                agent: "agy",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-25T05:06:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_self",
+                paneId: "wB:p1",
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              {
+                agent: "pi",
+                agentStatus: peerAStatus,
+                firstSeenAt: "2026-10-25T05:06:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_peer_a",
+                paneId: "wB:p2",
+                terminalId: "term_peer_a",
+                workspaceId: "wB",
+              },
+              {
+                agent: "pi",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-25T05:06:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_peer_b",
+                paneId: "wB:p3",
+                terminalId: "term_peer_b",
+                workspaceId: "wB",
+              },
+            ],
+          };
+        }
+        return {
+          events: pendingEvents.filter((event) => event.id > ackedEventId),
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-25T05:06:49.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    const stopOptions = {
+      connect,
+      environment: HERDR_ENV,
+      socketPath: "/tmp/herdsman.sock",
+      spawnWakeWaiter: () => ({ pid: process.pid }),
+      stateDir: dir,
+    };
+    const readState = () =>
+      JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8")) as {
+        deferredEventIds?: number[];
+        deliveredEventIds?: number[];
+        pendingAckEventIds?: number[];
+        presentedEventIds?: number[];
+      };
+
+    try {
+      // 1. Peer A is still `working`, so event 100 is deferred; event 105 is
+      //    permanently suppressed noise sitting above it.
+      const firstStop = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        stopOptions,
+      );
+      expect(firstStop).toEqual({});
+      // The ack of 105 must not fire: it would settle `id <= 105` and swallow the
+      // deferred event 100 forever.
+      expect(ackedIds).toEqual([]);
+      expect(ackedEventId).toBe(0);
+      expect(readState()).toMatchObject({
+        deferredEventIds: [100],
+        pendingAckEventIds: [105],
+        presentedEventIds: [105],
+      });
+
+      // 2. Peer A stops reporting working: event 100 becomes a real outcome. The
+      //    held-back ack of 105 must still wait, because acking it would advance
+      //    the cursor past the not-yet-delivered event 100.
+      peerAStatus = "done";
+      const secondStop = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        stopOptions,
+      );
+      expect(secondStop).toMatchObject({ decision: "continue" });
+      expect(String((secondStop as { reason?: string }).reason)).toContain("工人 A 的最终结论。");
+      expect(ackedIds).toEqual([]);
+      expect(ackedEventId).toBe(0);
+      expect(readState()).toMatchObject({ deliveredEventIds: [100], pendingAckEventIds: [105] });
+
+      // 3. Once both events are presented (consumed by the host) nothing blocks
+      //    the cursor any more and both are acknowledged.
+      const thirdStop = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        stopOptions,
+      );
+      expect(thirdStop).toEqual({});
+      expect(ackedIds).toEqual([100, 105]);
+      expect(ackedEventId).toBe(105);
+      expect(readState()).toMatchObject({ deliveredEventIds: [], pendingAckEventIds: [] });
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("WakeWaiter cancels the wake when turnEpoch advances while readComposerDraft is in flight", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-wake-epoch-race-"));
+    const sessionId = "e1111111-2222-3333-4444-555555555555";
+    const pendingEvents: AgentEventRecord[] = [makeDoneEvent(300, "工人完成，测试绿。")];
+    const ackedEventId = 0;
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    let readPaneTextCalls = 0;
+    let releaseRead: (paneText: string | undefined) => void = () => undefined;
+    const readGate = new Promise<string | undefined>((resolve) => {
+      releaseRead = resolve;
+    });
+
+    const emptyComposer = [
+      "assistant output",
+      "───────────────────────────────────────────────────",
+      ">",
+      "───────────────────────────────────────────────────",
+      "? for shortcuts",
+    ].join("\n");
+
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string) => {
+        if (method === "agent.list") {
+          return {
+            agents: [
+              {
+                agent: "agy",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-25T05:06:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_self",
+                paneId: "wB:p1",
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              {
+                agent: "pi",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-25T05:06:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_peer",
+                paneId: "wB:p2",
+                terminalId: "term_peer",
+                workspaceId: "wB",
+              },
+            ],
+          };
+        }
+        return {
+          events: pendingEvents.filter((event) => event.id > ackedEventId),
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-25T05:06:49.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    const stopOptions = {
+      connect,
+      environment: HERDR_ENV,
+      socketPath: "/tmp/herdsman.sock",
+      spawnWakeWaiter: () => ({ pid: process.pid }),
+      stateDir: dir,
+    };
+
+    try {
+      // The Stop hook hands the batch to the host via `decision: continue` and
+      // leaves it delivered-but-unacked, which is what the waiter falls back to.
+      const stopResult = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        stopOptions,
+      );
+      expect(stopResult).toMatchObject({ decision: "continue" });
+      const statePath = join(dir, `${sessionId}.json`);
+      expect(JSON.parse(readFileSync(statePath, "utf8"))).toMatchObject({
+        deliveredEventIds: [300],
+        presentedEventIds: [300],
+        turnEpoch: 1,
+        waiterEpoch: 1,
+        waiterPid: process.pid,
+      });
+
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 20,
+        readPaneText: async () => {
+          readPaneTextCalls += 1;
+          return readGate;
+        },
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await vi.waitFor(() => expect(readPaneTextCalls).toBe(1));
+      // The user submits a new turn while the pane read is still in flight: the
+      // epoch this waiter was started for is gone.
+      const inFlightState = JSON.parse(readFileSync(statePath, "utf8")) as Record<string, unknown>;
+      writeFileSync(statePath, JSON.stringify({ ...inFlightState, turnEpoch: 2 }));
+      releaseRead(emptyComposer);
+
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([]);
+      // `rearmDeliveredEvents` must not have dropped the delivered batch from
+      // `presentedEventIds`, otherwise the next PreInvocation injects it twice.
+      expect(JSON.parse(readFileSync(statePath, "utf8"))).toMatchObject({
+        deliveredEventIds: [300],
+        presentedEventIds: [300],
+        turnEpoch: 2,
+      });
+    } finally {
       rmSync(dir, { force: true, recursive: true });
     }
   });
