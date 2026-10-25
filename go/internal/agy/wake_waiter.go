@@ -886,11 +886,32 @@ func normalizeWakeCwd(value string) string {
 	return value
 }
 
-// parseJSNumber mirrors `Number(value)`.
+// parseJSNumber mirrors `Number(value)`, including the unsigned 0x / 0b / 0o
+// prefixes strconv.ParseFloat rejects: `Number("0x14")` is 20, not a NaN. A sign
+// in front of the prefix is not accepted by JS either (`Number("-0x14")` is a
+// NaN), so only the bare two-character prefixes take the radix path.
 func parseJSNumber(value string) float64 {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return 0
+	}
+	if len(trimmed) > 2 {
+		base := 0
+		switch trimmed[:2] {
+		case "0x", "0X":
+			base = 16
+		case "0b", "0B":
+			base = 2
+		case "0o", "0O":
+			base = 8
+		}
+		if base != 0 {
+			parsed, err := strconv.ParseUint(trimmed[2:], base, 64)
+			if err != nil {
+				return math.NaN()
+			}
+			return float64(parsed)
+		}
 	}
 	parsed, err := strconv.ParseFloat(trimmed, 64)
 	if err != nil {

@@ -7,6 +7,7 @@ package agy_test
 // remaining cases live in agy_hook_part2_test.go.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -629,4 +630,304 @@ func TestDispatchedSubagentSkipsPreInvocationAndSignalsTurnCompletion(t *testing
 // and no reason.
 func isEmptyHookOutput(output agy.HookOutput) bool {
 	return len(output.InjectSteps) == 0 && output.Decision == nil && output.Reason == nil
+}
+
+// TestPreInvocationKeepsLineSeparatorsLiteral is the regression for the U+2028 /
+// U+2029 escaping gap: encoding/json writes both as `\u2028` / `\u2029` even with
+// SetEscapeHTML(false), while JS's JSON.stringify leaves them literal, so a hook
+// output carrying either character differed from the TS output byte for byte.
+//
+// The excerpt normalizer mirrors `normalizeExcerpt`, which folds both separators
+// into `\n`, so they cannot reach the hook output through a real PreInvocation.
+// The serialization contract is therefore asserted directly on HookOutput.JSON,
+// including the case where the message holds the six-character text `\u2028`.
+func TestPreInvocationKeepsLineSeparatorsLiteral(t *testing.T) {
+	// 1. A real PreInvocation folds the separators into newlines, exactly like
+	// the TS `replace(/[\u2028\u2029\u0085]/g, "\n")`.
+	stateDir := t.TempDir()
+	sessionID := "44444444-2222-3333-4444-555555555555"
+	client := &hookFakeClient{}
+	client.respond = func(string, any) (any, error) {
+		return map[string]any{
+			"events": []any{makeDoneEvent(31, "line1\u2028line2\u2029line3")},
+			"presence": map[string]any{
+				"herdrSessionName": "default",
+				"paneId":           "wB:p1",
+				"subscriberId":     "agy:" + sessionID,
+				"terminalId":       "term_self",
+				"workspaceId":      "wB",
+			},
+			"state": map[string]any{
+				"ackedEventId":     0,
+				"herdrSessionName": "default",
+				"owner":            map[string]any{"paneId": "wB:p1", "terminalId": "term_self"},
+				"updatedAt":        "2026-10-21T12:00:00.000Z",
+				"workspaceId":      "wB",
+			},
+		}, nil
+	}
+	result := agy.RunAgyHook(
+		agy.HookPreInvocation,
+		`{"invocationNum":1,"sessionId":"`+sessionID+`"}`,
+		agy.RunAgyHookOptions{
+			Connect:     connectReturning(client),
+			Environment: herdrEnv,
+			SocketPath:  "/tmp/herdsman.sock",
+			StateDir:    strPtr(stateDir),
+		},
+	)
+	if len(result.InjectSteps) != 1 {
+		t.Fatalf("injectSteps = %+v, want exactly one", result.InjectSteps)
+	}
+	if got := result.InjectSteps[0].EphemeralMessage; !strings.Contains(got, "line1\nline2\nline3") {
+		t.Fatalf("ephemeralMessage = %q, want the separators folded into newlines", got)
+	}
+
+	// 2. The serialization itself: a non-empty output carrying both separators is
+	// written with the literal characters, not the `\u2028` / `\u2029` escapes.
+	decision := "continue"
+	output := agy.HookOutput{
+		Decision:    &decision,
+		InjectSteps: []agy.InjectStep{{EphemeralMessage: "line1\u2028line2\u2029line3"}},
+		Reason:      strPtr("line1\u2028line2\u2029line3"),
+	}
+	encoded, err := output.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(encoded, `\u2028`) || strings.Contains(encoded, `\u2029`) {
+		t.Fatalf("JSON still escapes the separators: %s", encoded)
+	}
+	if want := `{"injectSteps":[{"ephemeralMessage":"line1 line2 line3"}],"decision":"continue","reason":"line1 line2 line3"}`; encoded != want {
+		t.Fatalf("JSON = %s, want %s", encoded, want)
+	}
+
+	// 3. A message holding the six-character text `\u2028` (a literal backslash
+	// plus `u2028`) keeps the escaped spelling, exactly like JSON.stringify.
+	literal := agy.HookOutput{InjectSteps: []agy.InjectStep{{EphemeralMessage: `text\u2028text`}}}
+	encodedLiteral, err := literal.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"injectSteps":[{"ephemeralMessage":"text\\u2028text"}]}`; encodedLiteral != want {
+		t.Fatalf("JSON = %s, want %s", encodedLiteral, want)
+	}
+}
+
+// TestRunAgyHookReadsTheProcessEnvironmentWhenEnvironmentIsOmitted is the
+// regression for `options.environment ?? process.env`: an omitted environment
+// must fall back to the process environment. Go used an empty map, so the
+// Herdr launch identity could not resolve and the hook silently returned {}.
+func TestRunAgyHookReadsTheProcessEnvironmentWhenEnvironmentIsOmitted(t *testing.T) {
+	t.Setenv("HERDR_ENV", "1")
+	t.Setenv("HERDR_PANE_ID", "wB:p1")
+	t.Setenv("HERDR_SOCKET_PATH", "/tmp/herdr-default.sock")
+	t.Setenv("HERDR_WORKSPACE_ID", "wB")
+	t.Setenv("HERDSMAN_AGY_SESSION_ID", "55555555-2222-3333-4444-555555555555")
+	// The test process itself runs as a dispatched subagent, which would make
+	// PreInvocation bail out before the connect seam.
+	t.Setenv("CTXMODE_ROLE", "")
+
+	// WakeWaiter resolves the session id from the environment, so a hook output
+	// proves the process environment was read.
+	result := agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{})
+	if !isEmptyHookOutput(result) {
+		t.Fatalf("result = %+v, want {}", result)
+	}
+
+	// The launch identity resolves from the process environment too, which the
+	// PreInvocation path proves by reaching the connect seam instead of bailing
+	// out before it.
+	connected := false
+	client := &hookFakeClient{}
+	client.respond = func(string, any) (any, error) { return map[string]any{}, nil }
+	pre := agy.RunAgyHook(agy.HookPreInvocation, `{"sessionId":"55555555-2222-3333-4444-555555555555"}`,
+		agy.RunAgyHookOptions{
+			Connect: func(string, func(string, any)) (agy.RpcClient, error) {
+				connected = true
+				return client, nil
+			},
+			SocketPath: "/tmp/herdsman.sock",
+			StateDir:   strPtr(t.TempDir()),
+		})
+	if !connected {
+		t.Fatal("Connect was never called: the process environment was not read")
+	}
+	if !isEmptyHookOutput(pre) {
+		t.Fatalf("pre = %+v, want {}", pre)
+	}
+
+	// An explicitly passed empty map stays empty: the identity cannot resolve and
+	// the hook returns {} without ever connecting.
+	explicit := false
+	pre = agy.RunAgyHook(agy.HookPreInvocation, `{"sessionId":"55555555-2222-3333-4444-555555555555"}`,
+		agy.RunAgyHookOptions{
+			Connect: func(string, func(string, any)) (agy.RpcClient, error) {
+				explicit = true
+				return client, nil
+			},
+			Environment: map[string]string{},
+			SocketPath:  "/tmp/herdsman.sock",
+			StateDir:    strPtr(t.TempDir()),
+		})
+	if explicit {
+		t.Fatal("Connect was called with an explicit empty environment, want no resolution")
+	}
+	if !isEmptyHookOutput(pre) {
+		t.Fatalf("pre = %+v, want {}", pre)
+	}
+}
+
+// TestWakeWaiterEpochAcceptsRadixPrefixes is the regression for the JS radix
+// prefixes strconv.ParseFloat rejects: `Number("0x5")` is 5, not a NaN. The waiter
+// epoch is read from HERDSMAN_AGY_WAITER_EPOCH through parseJSNumber, and the loop
+// only runs while it equals the state's turnEpoch, so a dropped value silently
+// stopped the standby loop instead of letting it deliver the wake batch.
+//
+// The state carries turnEpoch 5 with a stale waiterEpoch 7: only a parsed
+// environment epoch of 5 keeps the loop alive long enough to prompt.
+func TestWakeWaiterEpochAcceptsRadixPrefixes(t *testing.T) {
+	for _, raw := range []string{"0x5", "0X5", "0b101", "0o5"} {
+		dir := t.TempDir()
+		sessionID := "66666666-2222-3333-4444-555555555555"
+		writeStateFile(t, sessionStatePath(dir, sessionID), map[string]any{
+			"turnEpoch": float64(5), "waiterEpoch": float64(7), "waiterPid": float64(os.Getpid()),
+		})
+
+		peerStatus := "done"
+		client := workingRaceClient(t, sessionID, []any{makeDoneEvent(41, "前缀 epoch 完成。")}, &peerStatus, new(int64), nil)
+		wakePrompts := []wakePrompt{}
+		result := agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: client.connect,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", sessionID,
+				"HERDSMAN_AGY_STATE_DIR", dir,
+				"HERDSMAN_AGY_WAITER_EPOCH", raw),
+			PollIntervalMs: floatPtr(25),
+			SocketPath:     "/tmp/herdsman.sock",
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+				return nil
+			},
+			WaitTimeoutMs: floatPtr(5000),
+		})
+		if !isEmptyHookOutput(result) {
+			t.Fatalf("result = %+v, want {}", result)
+		}
+		if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(wakePrompts, want) {
+			t.Fatalf("wakePrompts for %q = %+v, want %+v", raw, wakePrompts, want)
+		}
+	}
+
+	// A signed prefix is a NaN in JS, so the stale state epoch 7 wins, the loop
+	// stops immediately and no wake prompt is delivered.
+	dir := t.TempDir()
+	sessionID := "77777777-2222-3333-4444-555555555555"
+	writeStateFile(t, sessionStatePath(dir, sessionID), map[string]any{
+		"turnEpoch": float64(5), "waiterEpoch": float64(7), "waiterPid": float64(os.Getpid()),
+	})
+	peerStatus := "done"
+	client := workingRaceClient(t, sessionID, []any{makeDoneEvent(42, "签名前缀完成。")}, &peerStatus, new(int64), nil)
+	wakePrompts := []wakePrompt{}
+	result := agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+		Connect: client.connect,
+		Environment: mergeEnv(herdrEnv,
+			"HERDSMAN_AGY_SESSION_ID", sessionID,
+			"HERDSMAN_AGY_STATE_DIR", dir,
+			"HERDSMAN_AGY_WAITER_EPOCH", "-0x5"),
+		PollIntervalMs: floatPtr(25),
+		SocketPath:     "/tmp/herdsman.sock",
+		TriggerWakePrompt: func(paneID, promptText string) error {
+			wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+			return nil
+		},
+		WaitTimeoutMs: floatPtr(5000),
+	})
+	if !isEmptyHookOutput(result) {
+		t.Fatalf("result = %+v, want {}", result)
+	}
+	if len(wakePrompts) != 0 {
+		t.Fatalf("wakePrompts = %+v, want none", wakePrompts)
+	}
+}
+
+// TestStateFileContainingJSONNullDoesNotPanic is the regression for a state file
+// whose content is the JSON literal `null`: json.Unmarshal succeeds and leaves a
+// nil map, and the write path then assigned into that nil map (`assignment to
+// entry in nil map`). Both hook events must treat it as an empty state and
+// rewrite the file with the real object.
+func TestStateFileContainingJSONNullDoesNotPanic(t *testing.T) {
+	stateDir := t.TempDir()
+	sessionID := "33333333-2222-3333-4444-555555555555"
+	statePath := filepath.Join(stateDir, sessionID+".json")
+	if err := os.WriteFile(statePath, []byte("null"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	client := &hookFakeClient{}
+	client.respond = func(method string, _ any) (any, error) {
+		if method == "agent.notifications.ack" {
+			return map[string]any{"acknowledged": true}, nil
+		}
+		return map[string]any{
+			"events": []any{makeDoneEvent(21, "Null state finished.")},
+			"presence": map[string]any{
+				"herdrSessionName": "default",
+				"paneId":           "wB:p1",
+				"subscriberId":     "agy:" + sessionID,
+				"terminalId":       "term_self",
+				"workspaceId":      "wB",
+			},
+			"state": map[string]any{
+				"ackedEventId":     0,
+				"herdrSessionName": "default",
+				"owner":            map[string]any{"paneId": "wB:p1", "terminalId": "term_self"},
+				"updatedAt":        "2026-10-21T12:00:00.000Z",
+				"workspaceId":      "wB",
+			},
+		}, nil
+	}
+	options := func() agy.RunAgyHookOptions {
+		return agy.RunAgyHookOptions{
+			Connect:     connectReturning(client),
+			Environment: herdrEnv,
+			SocketPath:  "/tmp/herdsman.sock",
+			StateDir:    strPtr(stateDir),
+		}
+	}
+
+	pre := agy.RunAgyHook(agy.HookPreInvocation, `{"invocationNum":1,"sessionId":"`+sessionID+`"}`, options())
+	if len(pre.InjectSteps) != 1 {
+		t.Fatalf("pre injectSteps = %+v, want one", pre.InjectSteps)
+	}
+
+	stopOptions := options()
+	stopOptions.SpawnWakeWaiter = func(agy.SpawnWakeWaiterInput) *agy.SpawnWakeWaiterResult {
+		pid := os.Getpid()
+		return &agy.SpawnWakeWaiterResult{PID: &pid}
+	}
+	stop := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, stopOptions)
+	if !isEmptyHookOutput(stop) {
+		t.Fatalf("stop = %+v, want {}", stop)
+	}
+
+	persisted, err := os.ReadFile(statePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	written := map[string]any{}
+	if err := json.Unmarshal(persisted, &written); err != nil {
+		t.Fatalf("state file is not an object: %v (%s)", err, persisted)
+	}
+	if written["turnEpoch"] != float64(2) {
+		t.Fatalf("turnEpoch = %v, want 2 (PreInvocation bumped it, Stop armed the next turn)", written["turnEpoch"])
+	}
+	if written["awaitingNextTurn"] != true {
+		t.Fatalf("awaitingNextTurn = %v, want true", written["awaitingNextTurn"])
+	}
+	// The Stop branch acks the delivered event, so the acked id lands in
+	// presentedEventIds while deliveredEventIds is emptied again.
+	if want := []any{float64(21)}; !reflect.DeepEqual(written["presentedEventIds"], want) {
+		t.Fatalf("presentedEventIds = %v, want %v", written["presentedEventIds"], want)
+	}
 }

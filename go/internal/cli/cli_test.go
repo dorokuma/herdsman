@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"math"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -137,6 +138,117 @@ func TestParseCliArgsExplicitAgentScopes(t *testing.T) {
 	want = CliCommand{Command: CommandAgentList, HerdrSessionName: strPtr("default")}
 	if !reflect.DeepEqual(command, want) {
 		t.Fatalf("command = %+v, want %+v", command, want)
+	}
+}
+
+// TestParseCliArgsAgentListAllDropsExplicitScope is the regression for the
+// TS `all ? { all: true } : scopedOrCurrent(...)` spread: an explicit --session
+// / --workspace is replaced by `all`, never sent next to it. The Go parser used
+// to keep both, so the RPC carried `all: true` together with the scope.
+//
+// Argument order must not matter, because TS reads --session / --workspace before
+// the subcommand branch that consumes --all.
+func TestParseCliArgsAgentListAllDropsExplicitScope(t *testing.T) {
+	for _, args := range [][]string{
+		{"agent", "list", "--session", "default", "--workspace", "wA", "--all"},
+		{"agent", "list", "--all", "--session", "default", "--workspace", "wA"},
+	} {
+		command, err := ParseCliArgs(args, map[string]string{
+			"HERDR_ENV":          "1",
+			"HERDR_WORKSPACE_ID": "wB",
+		})
+		if err != nil {
+			t.Fatalf("ParseCliArgs(%v): %v", args, err)
+		}
+		if want := (CliCommand{All: true, Command: CommandAgentList}); !reflect.DeepEqual(command, want) {
+			t.Fatalf("ParseCliArgs(%v) = %+v, want %+v", args, command, want)
+		}
+		if params := scopeParams(command); !reflect.DeepEqual(params, map[string]any{"all": true}) {
+			t.Fatalf("scopeParams = %+v, want {all:true}", params)
+		}
+	}
+
+	// The explicit scope still survives without --all, so the clearing above is
+	// specific to --all.
+	command, err := ParseCliArgs([]string{"agent", "list", "--session", "default", "--workspace", "wA"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CliCommand{Command: CommandAgentList, HerdrSessionName: strPtr("default"), WorkspaceID: strPtr("wA")}
+	if !reflect.DeepEqual(command, want) {
+		t.Fatalf("command = %+v, want %+v", command, want)
+	}
+
+	// And --all on its own keeps the plain { all: true } shape.
+	command, err = ParseCliArgs([]string{"agent", "list", "--all", "--json"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := (CliCommand{All: true, Command: CommandAgentList, JSON: true}); !reflect.DeepEqual(command, want) {
+		t.Fatalf("command = %+v, want %+v", command, want)
+	}
+}
+
+// TestParseJSNumberAcceptsRadixPrefixes is the regression for the JS radix
+// prefixes strconv.ParseFloat rejects: `Number("0x14")` is 20, `Number("0b101")`
+// is 5 and `Number("0o17")` is 15. A sign in front of the prefix is not accepted
+// by JS either (`Number("-0x14")` is a NaN), and a non-digit in the body fails.
+func TestParseJSNumberAcceptsRadixPrefixes(t *testing.T) {
+	cases := []struct {
+		in   string
+		want float64
+	}{
+		{"0x14", 20},
+		{"0X14", 20},
+		{"0b101", 5},
+		{"0B101", 5},
+		{"0o17", 15},
+		{"0O17", 15},
+		{"0x14g", math.NaN()},
+		{"0b2", math.NaN()},
+		{"0o18", math.NaN()},
+		{"0x", math.NaN()},
+		{"-0x14", math.NaN()},
+		{"+0x14", math.NaN()},
+		{"0", 0},
+		{"", 0},
+		{"  12  ", 12},
+		{"1.5", 1.5},
+	}
+	for _, testCase := range cases {
+		got := parseJSNumber(testCase.in)
+		if math.IsNaN(testCase.want) {
+			if !math.IsNaN(got) {
+				t.Errorf("parseJSNumber(%q) = %v, want NaN", testCase.in, got)
+			}
+			continue
+		}
+		if got != testCase.want {
+			t.Errorf("parseJSNumber(%q) = %v, want %v", testCase.in, got, testCase.want)
+		}
+	}
+}
+
+// TestParseCliArgsAgentReadAcceptsRadixPrefixLimit is the production surface of
+// the same gap: `--limit` runs through `Number(...)`, so `0x14` is 20 rather than
+// a rejected value.
+func TestParseCliArgsAgentReadAcceptsRadixPrefixLimit(t *testing.T) {
+	command, err := ParseCliArgs([]string{"agent", "read", "wB:p2", "--limit", "0x14"}, map[string]string{
+		"HERDR_ENV":          "1",
+		"HERDR_WORKSPACE_ID": "wB",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := CliCommand{Command: CommandAgentRead, Limit: intPtr(20), Target: "wB:p2", WorkspaceID: strPtr("wB")}
+	if !reflect.DeepEqual(command, want) {
+		t.Fatalf("command = %+v, want %+v", command, want)
+	}
+
+	// A signed prefix is still rejected by the range check, because JS reads it as
+	// a NaN and NaN is not an integer.
+	if _, err := ParseCliArgs([]string{"agent", "read", "wB:p2", "--limit", "-0x14"}, nil); err == nil {
+		t.Fatal("error = nil, want the --limit range failure")
 	}
 }
 
@@ -530,6 +642,52 @@ func TestHelpTextRendersAgentCommands(t *testing.T) {
 		if !strings.Contains(help, expected) {
 			t.Fatalf("help text misses %q:\n%s", expected, help)
 		}
+	}
+}
+
+// TestRunCliCommandJSONKeepsLineSeparatorsLiteral is the regression for the
+// U+2028 / U+2029 escaping gap in the CLI JSON output: encoding/json writes both
+// as `\u2028` / `\u2029` even with SetEscapeHTML(false), while JS's
+// JSON.stringify leaves them literal, so `agent list --json` differed from the TS
+// output byte for byte for any agent name carrying either character.
+func TestRunCliCommandJSONKeepsLineSeparatorsLiteral(t *testing.T) {
+	name := "line1\u2028line2\u2029line3"
+	client := createFakeClient(name)
+	output := []string{}
+	err := RunCliCommand(CliCommand{All: true, Command: CommandAgentList, JSON: true}, RunCliDeps{
+		Connect:    func(string, func(string, any)) (RpcClientLike, error) { return client, nil },
+		Output:     func(line string) { output = append(output, line) },
+		SocketPath: "/tmp/s.sock",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(output) != 1 {
+		t.Fatalf("output = %v, want one line", output)
+	}
+	if strings.Contains(output[0], `\u2028`) || strings.Contains(output[0], `\u2029`) {
+		t.Fatalf("output still escapes the separators: %s", output[0])
+	}
+	if !strings.Contains(output[0], `"name":"line1 line2 line3"`) {
+		t.Fatalf("output = %s, want the literal separators in the name", output[0])
+	}
+
+	// The same name through `agent get --json`, which goes through the same
+	// marshalJS seam.
+	getOutput := []string{}
+	err = RunCliCommand(CliCommand{Command: CommandAgentGet, JSON: true, Target: "reviewer"}, RunCliDeps{
+		Connect:    func(string, func(string, any)) (RpcClientLike, error) { return client, nil },
+		Output:     func(line string) { getOutput = append(getOutput, line) },
+		SocketPath: "/tmp/s.sock",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(getOutput) != 1 {
+		t.Fatalf("getOutput = %v, want one line", getOutput)
+	}
+	if strings.Contains(getOutput[0], `\u2028`) || strings.Contains(getOutput[0], `\u2029`) {
+		t.Fatalf("getOutput still escapes the separators: %s", getOutput[0])
 	}
 }
 

@@ -52,7 +52,60 @@ func (o HookOutput) JSON() (string, error) {
 	if err := encoder.Encode(o); err != nil {
 		return "", err
 	}
-	return strings.TrimSuffix(buffer.String(), "\n"), nil
+	return restoreJSLineSeparators(strings.TrimSuffix(buffer.String(), "\n")), nil
+}
+
+// escapedLineSeparator and escapedParagraphSeparator are the six-character
+// spellings encoding/json always writes for U+2028 and U+2029.
+const (
+	escapedLineSeparator      = `\u2028`
+	escapedParagraphSeparator = `\u2029`
+)
+
+// restoreJSLineSeparators turns encoding/json's `\u2028` / `\u2029` escapes back
+// into the literal UTF-8 characters, because JS's JSON.stringify leaves both
+// characters as they are (they are legal in JSON strings, only illegal in JS
+// source). SetEscapeHTML(false) does not cover them, so without this a hook
+// output carrying either character differs from the TS output byte for byte.
+//
+// Only a real escape is rewritten. A run of backslashes ends with the candidate
+// escape, so an odd run length means that final backslash was not itself escaped
+// and the sequence is a real escape; an even run means the backslash was escaped
+// and the text behind it is literal.
+func restoreJSLineSeparators(encoded string) string {
+	if !strings.Contains(encoded, `\u202`) {
+		return encoded
+	}
+	var builder strings.Builder
+	builder.Grow(len(encoded))
+	for index := 0; index < len(encoded); {
+		if encoded[index] != '\\' {
+			builder.WriteByte(encoded[index])
+			index++
+			continue
+		}
+		start := index
+		for index < len(encoded) && encoded[index] == '\\' {
+			index++
+		}
+		backslashes := index - start
+		if backslashes%2 == 1 {
+			if strings.HasPrefix(encoded[index-1:], escapedLineSeparator) {
+				builder.WriteString(encoded[start : index-1])
+				builder.WriteString("\u2028")
+				index += len(escapedLineSeparator) - 1
+				continue
+			}
+			if strings.HasPrefix(encoded[index-1:], escapedParagraphSeparator) {
+				builder.WriteString(encoded[start : index-1])
+				builder.WriteString("\u2029")
+				index += len(escapedParagraphSeparator) - 1
+				continue
+			}
+		}
+		builder.WriteString(encoded[start:index])
+	}
+	return builder.String()
 }
 
 // Presence mirrors the `presence` half of OrchestratorConnectionState.
@@ -187,6 +240,19 @@ type RunAgyHookOptions struct {
 	ReadPPID func(pid int) (int, bool)
 }
 
+// processEnvironment mirrors process.env: the process environment as a map.
+func processEnvironment() map[string]string {
+	env := map[string]string{}
+	for _, entry := range os.Environ() {
+		key, value, ok := strings.Cut(entry, "=")
+		if !ok {
+			continue
+		}
+		env[key] = value
+	}
+	return env
+}
+
 // runner carries the resolved options plus the per-invocation state shared by
 // the three hook events.
 type runner struct {
@@ -215,7 +281,9 @@ type runner struct {
 func RunAgyHook(hookEventName HookEventName, rawStdin string, options RunAgyHookOptions) HookOutput {
 	env := options.Environment
 	if env == nil {
-		env = map[string]string{}
+		// `options.environment ?? process.env`: an omitted environment reads the
+		// process environment, while an explicitly passed empty map stays empty.
+		env = processEnvironment()
 	}
 	launch, ok := ResolveHerdrLaunchIdentity(env)
 	if !ok {

@@ -126,6 +126,42 @@ func TestAntigravityProtoUserTurnRequiresCleanUTF8(t *testing.T) {
 	}
 }
 
+// TestAntigravityProtoRejectsOverflowingVarintTag is the regression for a tag
+// varint whose 10th byte carries bits above bit 63: `2^64 + 154`. The TS reader
+// accumulates into a BigInt, keeps 2^64 and rejects the field number; Go's
+// uint64 dropped the high bit and truncated the tag to 154, i.e. a perfectly
+// valid field 19 / wireType 2, so the very same blob decoded as a user turn.
+//
+// realUser starts with the two-byte tag `9a 01` (154 = field 19 << 3 | 2); the
+// overflow blob swaps that for the ten-byte encoding of 2^64 + 154 and keeps
+// the rest of the field intact, so a truncating reader would still find the
+// nested text.
+func TestAntigravityProtoRejectsOverflowingVarintTag(t *testing.T) {
+	// The intact control case must keep decoding, otherwise the assertions below
+	// would pass vacuously.
+	if got, ok := DecodeAntigravityMessage(realUser); !ok || got.Role != RoleUser ||
+		got.Text != "plan list files in /tmp" {
+		t.Fatalf("realUser decoded as (%+v, %v), want the user turn", got, ok)
+	}
+
+	overflowTag := hexBytes(t, "9a818080808080808002")
+	overflow := append(append([]byte{}, overflowTag...), realUser[2:]...)
+	if got, ok := DecodeAntigravityMessage(overflow); ok {
+		t.Fatalf("overflowing tag decoded as (%+v, true), want absent", got)
+	}
+	if fields := parseFields(overflow); fields != nil {
+		t.Fatalf("parseFields(overflow) = %+v, want no fields", fields)
+	}
+
+	// A length varint that runs past the buffer must fail cleanly rather than
+	// overflow `int(length)` negative and slice out of range.
+	hugeLength := append(append([]byte{}, overflowTag[:2]...), hexBytes(t, "808080808080808001")...)
+	hugeLength = append(hugeLength, []byte("x")...)
+	if got, ok := DecodeAntigravityMessage(hugeLength); ok {
+		t.Fatalf("huge length decoded as (%+v, true), want absent", got)
+	}
+}
+
 func TestAntigravityProtoFallsBackThroughUserPaths(t *testing.T) {
 	// [19,3,1] wins when present.
 	both := nestedField(19, concatBytes(

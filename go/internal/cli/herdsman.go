@@ -174,7 +174,12 @@ func parseAgentCommand(args *argList, environment map[string]string) (CliCommand
 			return CliCommand{}, err
 		}
 		if all {
+			// `all ? { all: true } : scopedOrCurrent(...)`: the TS list branch
+			// replaces the whole scope object, so an explicit --session /
+			// --workspace is dropped instead of being sent alongside `all`.
 			command.All = true
+			command.HerdrSessionName = nil
+			command.WorkspaceID = nil
 		} else if err := applyScopeOrCurrent(&command, environment); err != nil {
 			return CliCommand{}, err
 		}
@@ -899,7 +904,60 @@ func marshalJS(value any) (string, error) {
 	if err := encoder.Encode(value); err != nil {
 		return "", err
 	}
-	return strings.TrimSuffix(buffer.String(), "\n"), nil
+	return restoreJSLineSeparators(strings.TrimSuffix(buffer.String(), "\n")), nil
+}
+
+// escapedLineSeparator and escapedParagraphSeparator are the six-character
+// spellings encoding/json always writes for U+2028 and U+2029.
+const (
+	escapedLineSeparator      = `\u2028`
+	escapedParagraphSeparator = `\u2029`
+)
+
+// restoreJSLineSeparators turns encoding/json's `\u2028` / `\u2029` escapes back
+// into the literal UTF-8 characters, because JS's JSON.stringify leaves both
+// characters as they are (they are legal in JSON strings, only illegal in JS
+// source). SetEscapeHTML(false) does not cover them, so without this a CLI JSON
+// line carrying either character differs from the TS output byte for byte.
+//
+// Only a real escape is rewritten. A run of backslashes ends with the candidate
+// escape, so an odd run length means that final backslash was not itself escaped
+// and the sequence is a real escape; an even run means the backslash was escaped
+// and the text behind it is literal.
+func restoreJSLineSeparators(encoded string) string {
+	if !strings.Contains(encoded, `\u202`) {
+		return encoded
+	}
+	var builder strings.Builder
+	builder.Grow(len(encoded))
+	for index := 0; index < len(encoded); {
+		if encoded[index] != '\\' {
+			builder.WriteByte(encoded[index])
+			index++
+			continue
+		}
+		start := index
+		for index < len(encoded) && encoded[index] == '\\' {
+			index++
+		}
+		backslashes := index - start
+		if backslashes%2 == 1 {
+			if strings.HasPrefix(encoded[index-1:], escapedLineSeparator) {
+				builder.WriteString(encoded[start : index-1])
+				builder.WriteString("\u2028")
+				index += len(escapedLineSeparator) - 1
+				continue
+			}
+			if strings.HasPrefix(encoded[index-1:], escapedParagraphSeparator) {
+				builder.WriteString(encoded[start : index-1])
+				builder.WriteString("\u2029")
+				index += len(escapedParagraphSeparator) - 1
+				continue
+			}
+		}
+		builder.WriteString(encoded[start:index])
+	}
+	return builder.String()
 }
 
 // quoteJSONString renders a JSON string like JSON.stringify does.
@@ -1021,11 +1079,32 @@ func derefOrPointer(value, fallback *string) *string {
 	return fallback
 }
 
-// parseJSNumber mirrors `Number(value)`.
+// parseJSNumber mirrors `Number(value)`, including the unsigned 0x / 0b / 0o
+// prefixes strconv.ParseFloat rejects: `Number("0x14")` is 20, not a NaN. A sign
+// in front of the prefix is not accepted by JS either (`Number("-0x14")` is a
+// NaN), so only the bare two-character prefixes take the radix path.
 func parseJSNumber(value string) float64 {
 	trimmed := strings.TrimSpace(value)
 	if trimmed == "" {
 		return 0
+	}
+	if len(trimmed) > 2 {
+		base := 0
+		switch trimmed[:2] {
+		case "0x", "0X":
+			base = 16
+		case "0b", "0B":
+			base = 2
+		case "0o", "0O":
+			base = 8
+		}
+		if base != 0 {
+			parsed, err := strconv.ParseUint(trimmed[2:], base, 64)
+			if err != nil {
+				return math.NaN()
+			}
+			return float64(parsed)
+		}
 	}
 	parsed, err := strconv.ParseFloat(trimmed, 64)
 	if err != nil {

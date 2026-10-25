@@ -3,16 +3,24 @@ package agenthistory
 import (
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 
 	"github.com/dorokuma/herdsman/go/internal/observability"
 )
 
-// Ported from test/unit/agent-history-discovery.test.ts,
-// test/unit/agent-history-discovery-regressions.test.ts and the
-// "occupied fallback discovery" case of test/unit/final-audit-regressions.test.ts.
+// Ported from test/unit/agent-history-discovery.test.ts and
+// test/unit/agent-history-discovery-regressions.test.ts.
+//
+// The "occupied fallback discovery" case of test/unit/final-audit-regressions.test.ts
+// is deliberately not ported: it built two literal sets inside the test file and
+// asserted their sorted join differed, without touching production code. The
+// behaviour it named lives in the agent context service, where the occupied set
+// is fingerprinted and a change forces discovery again; that path is covered for
+// real by TestAgentContextServiceRediscoversOnOccupiedChange in
+// go/internal/observability/agent_context_service_test.go, which drives
+// AgentContextService.RefreshAgent and asserts the second resolve flips
+// forceDiscovery to true.
 
 // strp is the pointer helper for the optional string fields of the ported input
 // records.
@@ -793,24 +801,4 @@ func TestAnOfficialPathUnderARetiredRoleRootIsAcceptedButTheWhitelistRejectsIt(t
 	}, DiscoverOptions{}), HistoryRef{
 		Kind: KindAgentSession, Path: &oldPath, Source: SourcePiJSONL, Value: oldPath,
 	})
-}
-
-// occupiedBoundaryKey mirrors the boundary key the occupied-set guard derives
-// from a set of already-claimed session paths.
-func occupiedBoundaryKey(occupied map[string]struct{}) string {
-	keys := make([]string, 0, len(occupied))
-	for key := range occupied {
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
-	return strings.Join(keys, "\x00")
-}
-
-func TestOccupiedFallbackDiscoveryUsesAChangedOccupiedSetAsADiscoveryBoundary(t *testing.T) {
-	first := map[string]struct{}{}
-	second := map[string]struct{}{"/tmp/other.jsonl": {}}
-	if occupiedBoundaryKey(first) == occupiedBoundaryKey(second) {
-		t.Fatalf("a changed occupied set must change the discovery boundary: %q",
-			occupiedBoundaryKey(second))
-	}
 }

@@ -150,6 +150,9 @@ func writeSessionState(stateDir, sessionID string, state SessionHookState, pid i
 	targetPath := stateFilePath(stateDir, sessionID)
 	tmpPath := fmt.Sprintf("%s.%d.%d.tmp", targetPath, pid, int64(nowMs))
 	merged := readRawStateObject(targetPath)
+	if merged == nil {
+		merged = map[string]any{}
+	}
 	encoded, err := json.Marshal(state)
 	if err != nil {
 		return
@@ -176,13 +179,17 @@ func writeSessionState(stateDir, sessionID string, state SessionHookState, pid i
 // readRawStateObject reads the persisted state file as a generic object. A
 // missing, unparseable or non-object file reads as an empty object, exactly
 // like readSessionState.
+//
+// A file holding the JSON literal `null` unmarshals into a nil map without an
+// error, so the nil result is normalized here: callers assign into the map
+// (overlayKnownStateFields), and an assignment to a nil map panics.
 func readRawStateObject(path string) map[string]any {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return map[string]any{}
 	}
 	object := map[string]any{}
-	if err := json.Unmarshal(data, &object); err != nil {
+	if err := json.Unmarshal(data, &object); err != nil || object == nil {
 		return map[string]any{}
 	}
 	return object

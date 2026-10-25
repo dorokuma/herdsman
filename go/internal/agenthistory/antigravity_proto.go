@@ -169,6 +169,12 @@ func parseFields(bytes []byte) (result []wireField) {
 				return nil
 			}
 			offset = next
+			// A length past the end of the buffer is rejected before the slice
+			// expression: on a huge length `int(length)` can overflow negative and
+			// the slice would panic instead of failing cleanly.
+			if uint64(length) > uint64(len(bytes)-offset) {
+				return nil
+			}
 			end := offset + int(length)
 			if end > len(bytes) {
 				return nil
@@ -191,14 +197,22 @@ func parseFields(bytes []byte) (result []wireField) {
 }
 
 // readVarint mirrors readVarint(bytes, offset). A varint that runs past the end
-// of the buffer or exceeds the 10-byte / 64-bit window reports an error. Extra
-// high bits past bit 63 are dropped, which cannot change any outcome: such a
-// tag always lands outside the valid field-number range either way.
+// of the buffer or exceeds the 10-byte / 64-bit window reports an error.
+//
+// The TS implementation accumulates into a BigInt, so the 10th byte keeps every
+// bit it carries. Go's uint64 drops bit 63 and above, which would silently turn
+// an out-of-range tag into a valid one: `2^64 + 154` truncates to 154, i.e.
+// field 19 / wireType 2, while the TS BigInt keeps 2^64 and the field-number
+// range check rejects it. A 10th byte wider than 1 therefore fails here instead
+// of being truncated.
 func readVarint(bytes []byte, offset int) (int64, int, error) {
 	var value uint64
 	for shift := uint(0); offset < len(bytes) && shift <= 63; shift += 7 {
 		next := bytes[offset]
 		offset++
+		if shift == 63 && (next&0x7f) > 1 {
+			return 0, 0, errInvalidVarint
+		}
 		value |= uint64(next&127) << shift
 		if next < 0x80 {
 			return int64(value), offset, nil
