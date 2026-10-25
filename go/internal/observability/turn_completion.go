@@ -70,7 +70,9 @@ type TurnCompletionRegistry struct {
 // waiter is one pending waitForSignal call.
 type waiter struct {
 	done          chan TurnCompletionWaitResult
+	doneCh        chan struct{}
 	recordedAfter int64
+	finished      bool
 }
 
 // TurnCompletionOption customises a registry (mirrors the TS options object).
@@ -157,7 +159,17 @@ func (r *TurnCompletionRegistry) WaitForSignal(input WaitForSignalInput) TurnCom
 		return TurnCompletionWaitResult{}
 	}
 
-	pending := &waiter{done: make(chan TurnCompletionWaitResult, 1), recordedAfter: input.RecordedAfterMs}
+	// A waiter can be finished twice — a timeout racing a recorded signal, or a
+	// signal that arrives after the caller already stopped waiting — so the
+	// finishing is guarded by `finished` and announced on doneCh. Without it a
+	// late timeout would consume the signal the *next* wait registered, and the
+	// goroutine watching options.Signal would stay parked on a channel nobody
+	// will ever write to.
+	pending := &waiter{
+		done:          make(chan TurnCompletionWaitResult, 1),
+		doneCh:        make(chan struct{}),
+		recordedAfter: input.RecordedAfterMs,
+	}
 	if r.waitersByTerminal[key] == nil {
 		r.waitersByTerminal[key] = make(map[*waiter]struct{})
 	}
@@ -171,14 +183,20 @@ func (r *TurnCompletionRegistry) WaitForSignal(input WaitForSignalInput) TurnCom
 	})
 
 	// Abort: finish(true) as soon as the signal fires, matching the TS
-	// `input.signal.addEventListener("abort", onAbort, { once: true })`.
+	// `input.signal.addEventListener("abort", onAbort, { once: true })`. The
+	// waiter's doneCh lets this goroutine leave as soon as the wait is over by
+	// any other means, instead of holding the channel for the next round.
 	if input.Signal != nil {
 		signal := input.Signal
 		go func() {
-			<-signal
-			r.mu.Lock()
-			defer r.mu.Unlock()
-			r.finishLocked(key, pending, true)
+			select {
+			case <-signal:
+				r.mu.Lock()
+				defer r.mu.Unlock()
+				r.finishLocked(key, pending, true)
+			case <-pending.doneCh:
+				return
+			}
 		}()
 	}
 	r.mu.Unlock()
@@ -193,6 +211,13 @@ func (r *TurnCompletionRegistry) WaitForSignal(input WaitForSignalInput) TurnCom
 // finishLocked mirrors the TS finish(): it only resolves when a new signal is
 // present, or when timedOut is set.
 func (r *TurnCompletionRegistry) finishLocked(key string, pending *waiter, timedOut bool) {
+	// A waiter that is already finished — and a waiter the last wake already
+	// removed from the registry — must not be resolved a second time: the
+	// resolution would deliver to a channel nobody reads, and worse, could
+	// consume the signal the next wait for this key has just registered.
+	if pending.finished {
+		return
+	}
 	if waiters, ok := r.waitersByTerminal[key]; ok {
 		if _, stillPending := waiters[pending]; !stillPending {
 			return
@@ -203,6 +228,8 @@ func (r *TurnCompletionRegistry) finishLocked(key string, pending *waiter, timed
 	if !timedOut && !isNew {
 		return
 	}
+	pending.finished = true
+	close(pending.doneCh)
 	r.removeWaiterLocked(key, pending)
 
 	var result TurnCompletionWaitResult

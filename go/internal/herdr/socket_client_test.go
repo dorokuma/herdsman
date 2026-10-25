@@ -538,6 +538,116 @@ func TestHerdrSocketClientSilentPeerTimesOut(t *testing.T) {
 	}
 }
 
+// TestHerdrSocketClientDeadlineCoversWriteAndRead is the regression test for the
+// request deadline: the budget must bound the dial, the write and the read of a
+// request, not just the logical wait for a response.
+//
+// A peer that accepts the connection and then goes silent used to leave the
+// caller parked in the read until the OS gave up on the socket — far past the
+// request timeout. Both the one-shot and the persistent request path have to
+// return inside the budget.
+func TestHerdrSocketClientDeadlineCoversWriteAndRead(t *testing.T) {
+	const timeoutMs = 50
+	budget := time.Duration(timeoutMs) * time.Millisecond
+
+	t.Run("requestOnce times out inside the budget", func(t *testing.T) {
+		// The peer accepts the connection and never answers, so only the deadline
+		// can bring the caller back.
+		server := openFakeHerdrServer(t, func(conn net.Conn, request map[string]any) {})
+
+		client, err := NewHerdrSocketClient(HerdrSocketClientOptions{
+			RequestTimeoutMs: timeoutMs,
+			SocketPath:       server.socketPath,
+		})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		defer client.Close()
+
+		started := time.Now()
+		_, err = client.SessionSnapshot()
+		elapsed := time.Since(started)
+		if err == nil {
+			t.Fatal("sessionSnapshot = nil error, want a timeout")
+		}
+		if !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("sessionSnapshot err = %v, want a request timeout", err)
+		}
+		// Generous ceiling: the budget plus scheduling slack. Without the deadline
+		// this read would block for the OS socket timeout, which is minutes.
+		if elapsed > budget*4 {
+			t.Fatalf("sessionSnapshot took %v, want it bounded by the %v budget", elapsed, budget)
+		}
+	})
+
+	t.Run("persistent request times out inside the budget", func(t *testing.T) {
+		server := openFakeHerdrServer(t, func(conn net.Conn, request map[string]any) {
+			buf := make([]byte, 32*1024)
+			_, _ = conn.Read(buf)
+		})
+
+		client, err := NewHerdrSocketClient(HerdrSocketClientOptions{
+			RequestTimeoutMs: timeoutMs,
+			SocketPath:       server.socketPath,
+		})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		defer client.Close()
+
+		started := time.Now()
+		_, err = client.GetPane(map[string]any{"pane_id": "w1:p1"})
+		elapsed := time.Since(started)
+		if err == nil {
+			t.Fatal("getPane = nil error, want a timeout")
+		}
+		if !strings.Contains(err.Error(), "timed out") {
+			t.Fatalf("getPane err = %v, want a request timeout", err)
+		}
+		if elapsed > budget*4 {
+			t.Fatalf("getPane took %v, want it bounded by the %v budget", elapsed, budget)
+		}
+	})
+
+	t.Run("a timed-out request leaves the socket usable", func(t *testing.T) {
+		// The peer reads every request frame and stays silent on the first one,
+		// then answers the rest, so the persistent reader must survive the timeout.
+		var mu sync.Mutex
+		answered := 0
+		server := openFakeHerdrServer(t, func(conn net.Conn, request map[string]any) {
+			mu.Lock()
+			answered++
+			count := answered
+			mu.Unlock()
+			if count == 1 {
+				return
+			}
+			writeJSONLine(t, conn, map[string]any{"id": request["id"], "result": map[string]any{"pane_id": "w1:p1"}})
+		})
+
+		client, err := NewHerdrSocketClient(HerdrSocketClientOptions{
+			RequestTimeoutMs: timeoutMs,
+			SocketPath:       server.socketPath,
+		})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		defer client.Close()
+
+		if _, err := client.GetPane(map[string]any{"pane_id": "w1:p1"}); err == nil {
+			t.Fatal("first getPane = nil error, want a timeout")
+		}
+		result, err := client.GetPane(map[string]any{"pane_id": "w1:p1"})
+		if err != nil {
+			t.Fatalf("second getPane after a timeout: %v", err)
+		}
+		pane, ok := result.(map[string]any)
+		if !ok || pane["pane_id"] != "w1:p1" {
+			t.Fatalf("second getPane result = %v, want the answered pane", result)
+		}
+	})
+}
+
 func TestHerdrSocketClientRejectsEventStreamOnSocketClose(t *testing.T) {
 	server := openFakeHerdrServer(t, func(conn net.Conn, request map[string]any) {
 		writeJSONLine(t, conn, map[string]any{"id": request["id"], "result": map[string]any{"subscribed": true}})

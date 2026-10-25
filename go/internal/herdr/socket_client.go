@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -128,6 +129,32 @@ type HerdrSocketClient struct {
 	nextID           int
 }
 
+// connect dials the Herdr socket with the request timeout as the dial budget.
+// A socket path that accepts but never completes the connect (a stale socket
+// file whose listener is gone, say) would otherwise park the caller until the OS
+// gives up, which is far past the request timeout the TS side applies.
+func (c *HerdrSocketClient) connect() (net.Conn, error) {
+	return net.DialTimeout("unix", c.socketPath, c.requestTimeout())
+}
+
+// requestTimeout renders the per-request budget as a duration.
+func (c *HerdrSocketClient) requestTimeout() time.Duration {
+	return time.Duration(c.requestTimeoutMs) * time.Millisecond
+}
+
+// armDeadline bounds both the write and the read of one request with the same
+// budget, so a peer that accepts the frame and then never answers cannot park
+// the caller. A cleared deadline is applied once the response is in.
+func (c *HerdrSocketClient) armDeadline(conn net.Conn) {
+	_ = conn.SetDeadline(time.Now().Add(c.requestTimeout()))
+}
+
+// clearDeadline removes the deadline after a request has been answered, so a
+// long-lived persistent socket is not left holding an expired one.
+func (c *HerdrSocketClient) clearDeadline(conn net.Conn) {
+	_ = conn.SetDeadline(time.Time{})
+}
+
 // NewHerdrSocketClient mirrors the TS constructor: it connects to the Herdr
 // socket and wires the data/error/close handlers onto a reader goroutine. A dial
 // failure is returned here (the TS constructor surfaces it asynchronously via
@@ -137,7 +164,15 @@ func NewHerdrSocketClient(options HerdrSocketClientOptions) (*HerdrSocketClient,
 	if options.RequestTimeoutMs > 0 {
 		requestTimeoutMs = options.RequestTimeoutMs
 	}
-	conn, err := net.Dial("unix", options.SocketPath)
+	client := &HerdrSocketClient{
+		decoder:          nil,
+		pending:          make(map[string]*herdrPending),
+		subscribers:      make(map[*eventSubscriber]struct{}),
+		requestTimeoutMs: requestTimeoutMs,
+		socketPath:       options.SocketPath,
+		nextID:           1,
+	}
+	conn, err := client.connect()
 	if err != nil {
 		return nil, err
 	}
@@ -146,15 +181,8 @@ func NewHerdrSocketClient(options HerdrSocketClientOptions) (*HerdrSocketClient,
 		conn.Close()
 		return nil, err
 	}
-	client := &HerdrSocketClient{
-		decoder:          decoder,
-		pending:          make(map[string]*herdrPending),
-		subscribers:      make(map[*eventSubscriber]struct{}),
-		requestTimeoutMs: requestTimeoutMs,
-		conn:             conn,
-		socketPath:       options.SocketPath,
-		nextID:           1,
-	}
+	client.decoder = decoder
+	client.conn = conn
 	go client.readLoop()
 	return client, nil
 }
@@ -174,6 +202,12 @@ func (c *HerdrSocketClient) Close() {
 }
 
 // readLoop mirrors the socket "data"/"error"/"close" handlers.
+//
+// A read that fails because a per-request deadline expired is not a socket
+// error: the request's own timer has already reported the timeout, and the
+// deadline is cleared (or re-armed by the next request) moments later. The loop
+// therefore survives it — a persistent socket must still be able to deliver
+// notifications and answer the request after a timed-out one.
 func (c *HerdrSocketClient) readLoop() {
 	defer c.conn.Close()
 	buf := make([]byte, 32*1024)
@@ -186,6 +220,13 @@ func (c *HerdrSocketClient) readLoop() {
 			// net.ErrClosed is our own Close(); Close already rejected everything.
 			if errors.Is(err, net.ErrClosed) {
 				return
+			}
+			if errors.Is(err, os.ErrDeadlineExceeded) {
+				// The deadline belongs to one request, not to the socket. Wait for
+				// the requesting goroutine to clear or re-arm it instead of spinning
+				// on a read that can only fail again.
+				time.Sleep(time.Millisecond)
+				continue
 			}
 			// A clean peer close is the "close" event ("Herdr socket closed");
 			// any other read error is the "error" event carrying the error.
@@ -339,6 +380,10 @@ func (c *HerdrSocketClient) request(ctx context.Context, method string, params a
 		}
 	})
 
+	// The same budget bounds the write and the read: a peer that accepts the
+	// frame and then goes silent must not park this goroutine until the OS gives
+	// up on the socket.
+	c.armDeadline(c.conn)
 	frame, err := shared.EncodeJSONLine(map[string]any{"id": id, "method": method, "params": paramsOrEmpty(params)})
 	if err != nil {
 		timer.Stop()
@@ -354,6 +399,9 @@ func (c *HerdrSocketClient) request(ctx context.Context, method string, params a
 	select {
 	case outcome := <-ch:
 		timer.Stop()
+		// The response is in, so the socket is healthy again: drop the deadline
+		// before the next request re-arms it.
+		c.clearDeadline(c.conn)
 		return outcome.value, outcome.err
 	case <-ctx.Done():
 		timer.Stop()
@@ -367,7 +415,7 @@ func (c *HerdrSocketClient) request(ctx context.Context, method string, params a
 // settles on the first of (matching response, error response, timeout, close).
 func (c *HerdrSocketClient) requestOnce(method string, params any) (any, error) {
 	id := c.nextRequestID()
-	conn, err := net.Dial("unix", c.socketPath)
+	conn, err := c.connect()
 	if err != nil {
 		return nil, err
 	}
@@ -388,6 +436,9 @@ func (c *HerdrSocketClient) requestOnce(method string, params any) (any, error) 
 	if err != nil {
 		return nil, err
 	}
+	// One deadline for the write and the read of this one-shot connection, so a
+	// peer that accepts the frame and never answers cannot park the caller.
+	c.armDeadline(conn)
 	if _, err := conn.Write([]byte(frame)); err != nil {
 		return nil, err
 	}
@@ -423,6 +474,13 @@ func (c *HerdrSocketClient) requestOnce(method string, params any) (any, error) 
 				}
 			}
 			if err != nil {
+				// The deadline armed for this request expired: report it as the
+				// request timeout the caller expects, not as a raw socket error.
+				if errors.Is(err, os.ErrDeadlineExceeded) {
+					finish(herdrOutcome{err: fmt.Errorf(
+						"Herdr %s request timed out after %dms", method, c.requestTimeoutMs)})
+					return
+				}
 				if errors.Is(err, io.EOF) {
 					finish(herdrOutcome{err: errHerdrSocketClosed})
 				} else {
@@ -434,6 +492,9 @@ func (c *HerdrSocketClient) requestOnce(method string, params any) (any, error) 
 	}()
 
 	outcome := <-resultCh
+	// The response is in, so the deadline has done its job: clear it before the
+	// deferred close so the close is never reported as a timeout.
+	c.clearDeadline(conn)
 	return outcome.value, outcome.err
 }
 

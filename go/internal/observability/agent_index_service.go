@@ -368,21 +368,27 @@ func (s *AgentIndexService) RefreshHerdrSession(
 // caller the same promise and its watch manager keys its publication dedup on
 // that promise identity, so the sharing has to be observable here instead of
 // only inside RefreshHerdrSession.
+//
+// The epoch read, the membership check and the install happen inside one lock
+// hold. Split into two, two concurrent callers of the same epoch would both find
+// no in-flight refresh and each start its own, handing back two different
+// *RefreshSource values for work the TS side would have shared in one promise.
 func (s *AgentIndexService) RefreshHerdrSessionSource(
 	input RefreshInput,
 ) *RefreshSource {
 	s.mu.Lock()
 	epoch := s.mutationEpochBySession[input.HerdrSessionName]
 	existing := s.refreshInFlightBySession[input.HerdrSessionName]
-	s.mu.Unlock()
 	if existing != nil && existing.epoch == epoch {
-		return existing.source
+		source := existing.source
+		s.mu.Unlock()
+		return source
 	}
 	source := &RefreshSource{done: make(chan struct{})}
 	inFlight := &refreshInFlight{epoch: epoch, source: source}
-	s.mu.Lock()
 	s.refreshInFlightBySession[input.HerdrSessionName] = inFlight
 	s.mu.Unlock()
+
 	go func() {
 		defer close(source.done)
 		intermediate, err := s.enqueueSessionOperation(

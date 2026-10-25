@@ -2,7 +2,7 @@
 
 - 分支：`go-port`（worktree `/root/workspace/.wt/herdsman/go-port`）
 - 目标模块：`go/`（Go module `github.com/dorokuma/herdsman/go`，go 1.26.0）
-- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告
+- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告；其后追加第 4 轮 reviewer 修复（db 闸门 / observability / herdr / daemon 共 6 项，见第 6 节）与 4.2、4.3 两节描述修正
 - 未触碰：`/root/.local/bin/herdsman`、`herdsman.service`、`/root/.herdsman`（生产面保持原样，见第 5 节）
 
 ---
@@ -33,12 +33,10 @@
 | 18 | `bcf56d380179e00764684278689974b0f9a871b7` | test(go): port agy-hook-and-cli unit tests part 2 |
 | 19 | `6af358c374e15305525321e3c883b31339024622` | Merge branch 'main' into go-port |
 | 20 | `7d5da2eaceea92a081daf44f044fd0d1f34cd0ae` | feat(go): sync agy draft check, port index/turn-signal tests |
+| 21 | `39bf1c63b7bd5c43e5399c29d203858a62d7901a` | fix(go): resolve daemon startup-signal race and add batch 5 report |
+| 22 | `5fce55023119e8e1602585f4bed1640160932f39` | fix(go): resolve agy, cli, and agenthistory reviewer findings |
 
-本子批提交（第 21 条）：
-
-| # | 说明 |
-|---|------|
-| 21 | `fix(go): resolve daemon startup-signal race and add batch 5 report` |
+第 21、22 条是本子批前两轮 reviewer 修复；第 23 条（`fix(go): resolve db, observability, herdr, and daemon reviewer findings`，本轮）见第 6 节。
 
 变更面（`git diff --stat`，本子批）：
 
@@ -503,15 +501,20 @@ No packages installed.
 
 ### 4.2 stdout / stdin JSON 与退出码
 
-- stdout 一律单行 JSON（`daemon status` 默认 JSON，`--text` 为人读视图）；Go 侧 `printResult`/`DaemonStatusJSON` 复刻同一渲染。
+两条互相独立的输出路径，Go 与 TS 逐字对齐（`printResult` ↔ `internal/cli/herdsman.go` 的 `printResult`，`runDaemonCommand` ↔ `cmd/herdsman/main.go` 的 `runDaemonCommand`）：
+
+- **RPC 命令默认人读，`--json` 才出 JSON**：`on`/`off`/`status`、`agent list/get/read` 走 `printResult`，它只认 `--json`（`command.json`）——不带 `--json` 时渲染 `formatHumanResult` 的人读视图（orchestrator 一行 `Herdsman is watching/off …`，`agent list/get/read` 多行 `name:/agent:/status:` 字段表），带上才输出单行 JSON。`formatHumanResult` 只覆盖 orchestrator 与三个 agent 子命令，其余一律落回 `JSON.stringify`/`marshalJS`。用例：`TestRunCliCommandRendersHumanAgentList`、`TestRunCliCommandRendersLiveNameAndAgentKindInHumanGetAndRead`。
+- **`daemon status` 反过来：默认 JSON，`--text` 才是人读视图**。该命令**不经过** `printResult`，由入口的 `runDaemonCommand` 直接分流：默认 `DaemonStatusJSON(view)` 出单行 JSON，`--text` 走 `FormatDaemonStatus(view)` 出多行人读视图（`state:`、`pid:`、`pidFileMissing:`、`stalePid:`、`socketReachable:`、`managedBy:`、`restartCount:`）。
+- 人读视图与 JSON 视图字段集刻意不同：`FormatDaemonStatus` 只保留人扫一眼要的事实，并 systemd 的 `NRestarts` 不可用时拼出 `unavailable` 而非静默丢弃（TS 注释同述）。
 - stdin：仅 `agy-hook` 读取，`WakeWaiter` 例外（不读 stdin）；空白/非对象/不可解析 JSON 一律当作空 payload（`parseHookPayload`）。实测两边 `PreInvocation`/`Stop` 均输出 `{}`、exit 0。
 - 退出码：成功 0；CLI 错误经 `FormatCliError` 打印到 stderr 并 exit 1（`Unknown command: orchestrator` 实测两侧同为 1）。hook 的**所有**失败都被吞成 `{}` + exit 0（与 TS 同）。
 - 守护进程退出码：优雅关停 `0`，启动失败 `1`；第二个 `SIGTERM/SIGINT` 强制退出仍为 `0`（避免 `Restart=on-failure` 拉回），与 TS 一致。
+- 实测（同一隔离 `HERDSMAN_HOME=/tmp/herdsman-cli-check/home`，两侧逐字节相同）：`daemon status` → `{"pidPath":"…/herdsman.pid","socketPath":"…/herdsman.sock","state":"stopped"}`；`daemon status --text` → `state: stopped`。
 
 ### 4.3 RPC 方法名与消息格式
 
 - 传输：Unix domain socket + JSON-lines（`internal/shared/json_lines.go` ↔ `src/shared/json-lines.ts`），帧上限与 `observability_server_frame_limit_test.go` 对应。
-- 方法名逐字一致：`agent.list`、`agent.get`、`agent.read`、`agent.orchestrator.register`、`agent.orchestrator.set`，以及通知 `agent.event`、`agent.context.changed`、`turn.completed`、`notifications.ack`（双客户端用例断言的就是这套 pi 面向面）。
+- 方法名逐字一致。请求侧（`observability_server_handlers.go` 的 `#dispatch` switch，共 10 个 case）：`agent.list`、`agent.get`、`agent.read`、`agent.events`、`agent.orchestrator.register`、`agent.orchestrator.get`、`agent.orchestrator.set`、`agent.notifications.ack`、`agent.turn.completed`、`agent.ping`；服务端推送侧：`agent.event`、`agent.context.changed`。两个方法名注意都带 `agent.` 前缀：`agent.turn.completed`（`internal/agy/hook.go` 的 `client.Call("agent.turn.completed", …)`）与 `agent.notifications.ack`（`client.Call("agent.notifications.ack", …)`）；`internal/observability/contracts.go` 里不带前缀的 `turn.completed` 只是 params 的 type 判别名，不是线上方法名。双客户端用例断言的就是这套 pi 面向面。
 - 互操作实测：TS 客户端（`dist/`）经 Go 服务拿到 `agent list`/`daemon status`；`TestObservabilityRpcServerSimultaneousTsAndGoClients` 证明 TS 与 Go 客户端**同时在线**时彼此可见 presence、orchestrator 归属与 turn 信号，且只有持角色的一侧收到推送。
 
 ### 4.4 SQLite 表结构与 Drizzle 迁移兼容性
@@ -541,3 +544,103 @@ No packages installed.
 4. **PiG 隔离配置未装扩展**：`/root/.pig-test/agent/extensions/` 为空、`pig list` = `No packages installed.`，因此 PiG 实测只覆盖「隔离配置 + Go 守护进程 home 下正常问答」，未覆盖 herdsman-pi 扩展的 agent 快照/唤醒链路。需要覆盖时应在该隔离目录安装 `@dorokuma/herdsman-pi` 后复跑。
 5. **worktree 里的 TS 构建产物**：为验证包装脚本 TS 分支，本 worktree 执行了 `pnpm install --frozen-lockfile --ignore-scripts` 与 `pnpm build`，产生 `node_modules/`、`dist/`（均被 `.gitignore` 忽略，未进 commit）。`pnpm install` 首次带脚本版本因 `husky: not found` 失败，改用 `--ignore-scripts` 成功；husky 钩子因此未安装，对本子批的 `git commit` 无影响（提交规范由全局 commit-msg hook 校验）。
 6. **`src/db/migrate.ts` 无独立 Go 迁移命令**：`db:migrate` 是开发脚本，Go 侧能力由 `ApplyMigrations`（daemon 启动时自动执行）与 `ApplyMigrationsThrough` 提供；若需要等价的 `go` CLI 迁移子命令，属新增功能，需另立任务。
+
+---
+
+## 6. 第 4 轮 reviewer 修复（db / observability / herdr / daemon）
+
+对应提交：`fix(go): resolve db, observability, herdr, and daemon reviewer findings`（本子批第 23 条）。前一节 4.2/4.3 的两处描述错误也在本轮一并修正。
+
+### 6.1 参照提交 `8c4bd1b`
+
+任务书要求补记 `8c4bd1b`。该短 SHA **在本仓与其 object 数据库中不可解析**：`git cat-file -t 8c4bd1b` 在 worktree（`go-port`，HEAD `5fce550`）与主仓（`main`，HEAD `6ec2c27`）均报 `Not a valid object name`，`git ls-remote origin HEAD` 为 `6ec2c271e8b471b16a3293d10c3f7db0929f09ef`，两个 worktree（`git worktree list`）也没有包含它的分支。因此此处只登记该 SHA 本身，不臆测其内容；若它指向本仓之外的提交（另一仓库/另一分支/尚未 fetch），需主代理指明来源后再补字段。
+
+### 6.2 六项修复
+
+| # | 面 | 改动 |
+|---|----|------|
+| 1 | `internal/db` | 新增 `internal/shared/sqlite_gate.go`（`SqliteGate`：按 goroutine 可重入的数据库闸门），`RunSqliteTransaction` 全程持闸；commit 失败时补 `rollback`（失败 commit 会让事务保持打开，下一轮的 `begin immediate` 会撞 "cannot start a transaction within a transaction"） |
+| 2 | `internal/observability` | `TurnCompletionRegistry` 的 waiter 增加 `finished` 守卫与 `doneCh`；abort 监听 goroutine 改为 `select`，wait 以任何方式结束后即退出，不再永久占住调用方的 signal channel |
+| 3 | `internal/daemon` | RPC 发布路径（`PublishAgentEvent` / `PublishAgentContext` / register handler 的 context 帧 / disconnect 回调）由「持锁写帧」改为「锁内收集 `pendingFrame`、锁外 `writeAll`」 |
+| 4 | `internal/daemon` | 关停预算自信号到达时刻起算；新增 `startupDone` + `waitClosed` 有界等待启动交接，超时打 stderr 并以 `startupMu.TryLock()` 放行；`ReconcileOptions` 增 `ShutdownSignal`，启动 reconcile 的会话遍历可被中断；`WriteDaemonPidFile` 的错误不再被吞 |
+| 5 | `internal/observability` | `RefreshHerdrSessionSource` 的 epoch 读取、在途判定与安装合并进同一段锁持有，避免同 epoch 的并发调用方拿到两个不同的 `*RefreshSource` |
+| 6 | `internal/herdr` | `HerdrSocketClient` 增加 `connect`（带 dial 预算）、`armDeadline`/`clearDeadline`；`readLoop` 识别 `os.ErrDeadlineExceeded` 后继续存活，`requestOnce` 把超时翻译成调用方期待的 request timeout 文案 |
+
+### 6.3 变更面
+
+```
+ go/internal/daemon/agent_event_reconciler.go       |  28 ++
+ go/internal/daemon/observability_server.go         | 254 +++++++++++++-------
+ go/internal/daemon/observability_server_handlers.go| 126 ++++++---
+ go/internal/daemon/service.go                      |  80 +++++-
+ go/internal/daemon/service_test.go                 | 136 ++++++++++
+ go/internal/daemon/startup_reconcile_test.go       |  42 +++
+ go/internal/db/client.go                           | 294 ++++++++++++++++++++-
+ go/internal/herdr/socket_client.go                 |  83 +++++-
+ go/internal/herdr/socket_client_test.go            | 110 ++++++++
+ go/internal/observability/agent_index_service.go   |  12 +-
+ go/internal/observability/turn_completion.go       |  39 ++-
+ go/internal/observability/turn_completion_test.go  |  86 ++++++
+ go/internal/shared/sqlite_transaction.go           |  19 +-
+ go/reports/batch-5-herdsmand.md                    |  17 +-
+```
+
+新增文件：`go/internal/shared/sqlite_gate.go`（132 行）、`go/internal/daemon/observability_rpc_slow_client_test.go`（273 行）、`go/internal/db/sqlite_transaction_test.go`（132 行）、`go/internal/observability/agent_index_refresh_sharing_test.go`（64 行）。
+
+### 6.4 回归测试的先 FAIL 验证（逐项实测，非声称）
+
+对每项修复都把改动临时退回修复前形态、跑对应用例、再恢复。结果分三档，**如实记录，不统一说成「已捕获」**：
+
+**确实捕获（FAIL → PASS）**
+
+- **Finding 1**（数据库闸门）：退回「不持闸」后两条用例同时 FAIL，且正是闸门要关的两种失效形态——`TestRunSqliteTransactionConcurrentDoesNotInterleave` 报 `cannot start a transaction within a transaction`；`TestRunSqliteTransactionRollbackDoesNotDiscardOtherGoroutineWrite` 报 `survivor workspace count = 0`（他人已提交的写被回滚吃掉）。
+- **Finding 4**（启动/关停预算）：三条全部 FAIL → PASS。pid 文件用例退回吞错后 `= nil error`；预算用例把有界等待换回无界 `<-startupDone` 后 60s 超时（goroutine 阻塞在该行）；reconciler 用例把 `stopping()` 改成恒假后报 `visited 4 sessions, want 0`。
+- **Finding 6**（herdr 读循环存活）：删掉 `readLoop` 的 `os.ErrDeadlineExceeded` 分支后两条持久连接子用例 FAIL——超时以裸 `i/o timeout` 冒出来而不是 request timeout 文案，且 socket 被拆掉，下一次请求报 `use of closed network connection`。**这一项才是 Finding 6 的承重墙。**
+
+**非确定性捕获**
+
+- **Finding 5**（refresh 共享）：把单段锁拆回「读-判定-安装」两段后，用例**并非每次必失败**——`-count=30` 时第 15 轮才报 `caller 15 got a different *RefreshSource than caller 0`；恢复修复后 `-count=50` 全绿。竞态类用例的固有能力，记录在案。
+
+**仅防御性、不可独立观测**
+
+- **Finding 2**：`doneCh` 的 `select` 是真承重的（退回 `<-signal` 后 `listener goroutine did not exit after the wait finished` FAIL，4 > 3 个 goroutine）；但 `finished` 守卫**测不出来**——删掉它用例仍 PASS，因为 `finishLocked` 里的 `stillPending` 判定已经覆盖了「已完成即已移出注册表」这条路径。`finished` 只是让「二次 finish / 二次 close」显式不可能，不依赖该不变式。
+- **Finding 6**：`armDeadline`/`clearDeadline` 的 socket 截止时间同理是防御性的——置空后用例仍 PASS，因为逻辑层 `time.AfterFunc` 已经给出了可观测的超时契约（小帧也不会把 `conn.Write` 堵住，见 6.5）。
+
+### 6.5 Finding 3 的用例未能复现缺陷（重要保留项）
+
+`observability_rpc_slow_client_test.go` 的两条用例**通不过「退回修复前形态」这一关**：把 `writeAll(frames)` 放回 `s.mu.Lock()` 与 `s.mu.Unlock()` 之间（即修复前的持锁写帧形态），两条用例仍然 PASS。
+
+原因已定位到平台语义，而非用例写法：用例靠 `unix.SetReadBuffer(1024)` 缩小不读数据那端的接收缓冲，指望服务器的 `conn.Write` 堵死。但 **AF_UNIX 流式套接字的流控跟随发送方的 `SO_SNDBUF`，接收方的 `SO_RCVBUF` 不构成上限**。用独立小程序实测（同样 1024 字节接收缓冲、64 × 344 字节帧、对端全程不读）：`wrote 64 frames, blocked=false elapsed=76.537µs`。服务器侧实测同样如此——64 帧写入全部在微秒级返回，`writeFrame` 既未阻塞也未触发 `destroy()`，因此用例注释里「服务器已停在一个无法排空的写里」这个前提从未成立，`time.Sleep(300ms)` 的 settle 等的其实是一个空窗口。
+
+作为对照，把发布路径改成**真的长时间持锁**（锁内 `time.Sleep(1500ms)`）后两条用例都 FAIL：`agent.ping on a healthy client: timed out`（3.03s）与 `server.Stop took 2.700789076s`。说明用例对「持锁」是灵敏的，只是它构造不出触发该持锁的那个阻塞写。
+
+**结论**：Finding 3 的修复本身成立（锁外写帧是正确的形状，TS 原版也是在临界区外 await 写），但这两条回归用例是**空转的**——它们无法把修复前形态判红。需要真正的「堵住的写」时，应改为限制**服务器侧**连接的 `SO_SNDBUF`，或直接用一对 `net.Pipe()`/预先填满的管道替代 Unix socket。此项需另立任务，本子批未改测试。
+
+### 6.6 五轮 `-race` 实测
+
+`CGO_ENABLED=1 go test -buildvcs=false -count=1 -race ./...`，连跑 5 轮，每轮都覆盖全部 12 个包结果行（2 个 `no test files` + 10 个 `ok`）：
+
+| 轮次 | 结果 | 耗时 |
+|------|------|------|
+| 1 | PASS | 98s |
+| 2 | PASS | 95s |
+| 3 | PASS | 95s |
+| 4 | PASS | 96s |
+| 5 | PASS | 96s |
+
+5 轮均无 `DATA RACE`、无 `FAIL`、无 `--- FAIL`。单轮样例（第 5 轮）：`internal/daemon 31.768s`、`internal/observability 95.522s`、`internal/db 14.229s`、`internal/agy 4.589s`、其余包 1s 上下。
+
+同一状态的其它门禁：`go build -buildvcs=false ./...` 通过、`go vet -buildvcs=false ./...` 通过、`gofmt -l .` 无待格式化文件、`go test -count=1 ./...` 全绿。
+
+### 6.7 CLI 输出实测（4.2 节修正的依据）
+
+同一隔离 `HERDSMAN_HOME`，Go 与 TS 两侧逐字节相同：
+
+```
+$ herdsman daemon status
+{"pidPath":"…/herdsman.pid","socketPath":"…/herdsman.sock","state":"stopped"}
+$ herdsman daemon status --text
+state: stopped
+```
+
+RPC 命令（`on`/`off`/`status`、`agent list/get/read`）默认走 `formatHumanResult` 的人读视图，只有带 `--json` 才出单行 JSON；`daemon status` 不经过 `printResult`，由入口的 `runDaemonCommand` 按 `--text` 分流。

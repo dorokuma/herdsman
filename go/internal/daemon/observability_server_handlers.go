@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/dorokuma/herdsman/go/internal/db"
 	"github.com/dorokuma/herdsman/go/internal/herdr"
@@ -23,6 +24,27 @@ import (
 // errInvalidRPCParams mirrors the TS assertSchema failure: the message is the
 // whole payload, and it is what every TS client has ever seen.
 var errInvalidRPCParams = errors.New("Invalid RPC params")
+
+// pendingFrame is a frame that has been built under the server lock and is
+// waiting to be written once the lock is released.
+type pendingFrame struct {
+	target  *rpcConnection
+	message map[string]any
+}
+
+// writeAll writes the collected frames. Each write is independently bounded, so
+// one wedged peer cannot delay the others.
+func writeAll(frames []pendingFrame) {
+	for _, frame := range frames {
+		frame.target.writeMessage(frame.message)
+	}
+}
+
+// rpcWriteTimeout bounds one frame write. TS writes on a socket that applies
+// backpressure and never fails; a Go socket blocks instead when the peer stops
+// reading, so the port caps it. Two seconds is far beyond any local UDS frame
+// and keeps a wedged client from stalling the daemon.
+const rpcWriteTimeout = 2 * time.Second
 
 // rpcConnection is one accepted client connection, the Go counterpart of the TS
 // `Socket`. `destroyed` mirrors `socket.destroyed`, and `writeMu` keeps frames
@@ -42,9 +64,15 @@ func (c *rpcConnection) destroy() {
 	}
 }
 
-// write mirrors `#write`: nothing is written to a destroyed socket, and a write
-// failure is not reported (TS `socket.write` only reports a backpressure hint).
-func (c *rpcConnection) write(frame string) {
+// writeFrame is the one place a frame reaches the socket.
+//
+// A peer that stops reading must not be able to block the daemon: net.Conn.Write
+// waits for the socket buffer, and the callers of this method are the server's
+// publish paths, which the TS original ran while holding its lock. Every write
+// therefore carries a deadline, and a failed write closes the connection — the
+// socket is unusable after a write error anyway, and destroying it here unblocks
+// the reader goroutine that is still parked on it.
+func (c *rpcConnection) writeFrame(frame string) {
 	if c.destroyed.Load() {
 		return
 	}
@@ -53,7 +81,10 @@ func (c *rpcConnection) write(frame string) {
 	if c.destroyed.Load() {
 		return
 	}
-	_, _ = c.conn.Write([]byte(frame))
+	_ = c.conn.SetWriteDeadline(time.Now().Add(rpcWriteTimeout))
+	if _, err := c.conn.Write([]byte(frame)); err != nil {
+		c.destroy()
+	}
 }
 
 // writeMessage encodes one RPC frame and writes it. A value JSON.stringify
@@ -65,7 +96,7 @@ func (c *rpcConnection) writeMessage(message any) {
 	if err != nil {
 		return
 	}
-	c.write(frame)
+	c.writeFrame(frame)
 }
 
 // rpcRequest is the decoded TS `RpcRequest`. `hasID` keeps "no id at all"
@@ -443,9 +474,20 @@ func (s *ObservabilityRpcServer) handleOrchestratorRegister(
 		if err != nil {
 			return nil, err
 		}
+		// The context publications are collected under the lock and written after
+		// it is released, exactly like PublishAgentContext: a frame write must
+		// never run inside the critical section a wedged peer could block.
+		contextFrames := make([]pendingFrame, 0, len(registration.ContextChangedScopes))
 		for _, scope := range registration.ContextChangedScopes {
-			s.publishAgentContextLocked(scope)
+			if target, message, ok := s.publishAgentContextLocked(scope); ok {
+				contextFrames = append(contextFrames, pendingFrame{target: target, message: message})
+			}
 		}
+		s.mu.Unlock()
+		for _, frame := range contextFrames {
+			frame.target.writeMessage(frame.message)
+		}
+		s.mu.Lock()
 	}
 	return s.connectionStateLocked(presence)
 }
@@ -482,18 +524,38 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 		return nil, err
 	}
 
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	presence, err := s.requirePiPresence(connection)
+	// The orchestrator-change notifications are written after the lock is
+	// released: the TS original awaited its socket writes outside the critical
+	// section, and a Go write to a peer that stopped reading blocks.
+	frames, result, err := func() ([]pendingFrame, map[string]any, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.orchestratorSetLocked(connection, input.Enabled)
+	}()
 	if err != nil {
+		writeAll(frames)
 		return nil, err
 	}
+	writeAll(frames)
+	return result, nil
+}
+
+// orchestratorSetLocked is the agent.orchestrator.set branch with the lock held.
+// It returns the frames to write once the lock is released.
+func (s *ObservabilityRpcServer) orchestratorSetLocked(
+	connection *rpcConnection,
+	enabled bool,
+) ([]pendingFrame, map[string]any, error) {
+	var frames []pendingFrame
+	presence, err := s.requirePiPresence(connection)
+	if err != nil {
+		return nil, nil, err
+	}
 	changed := false
-	if input.Enabled {
+	if enabled {
 		current, err := s.orchestrator.Status(presence.Scope())
 		if err != nil {
-			return nil, err
+			return frames, nil, err
 		}
 		ownerConnected := false
 		if current != nil && current.Owner != nil {
@@ -502,7 +564,7 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 				current.Owner.TerminalID,
 			)
 			if err != nil {
-				return nil, err
+				return frames, nil, err
 			}
 		}
 		change, err := s.orchestrator.Claim(observability.OrchestratorClaimInput{
@@ -512,7 +574,7 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 			TerminalID:     presence.TerminalID,
 		})
 		if err != nil {
-			return nil, err
+			return frames, nil, err
 		}
 		if presenceIsAgy(presence) {
 			isPi, err := s.isPiTerminal(
@@ -521,7 +583,7 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 				presence.TerminalID,
 			)
 			if err != nil {
-				return nil, err
+				return frames, nil, err
 			}
 			if !isPi {
 				paneGeneration, err := s.resolvePaneGeneration(
@@ -530,7 +592,7 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 					presence.TerminalID,
 				)
 				if err != nil {
-					return nil, err
+					return frames, nil, err
 				}
 				s.agyPresenceByTerminal[terminalPresenceKey(presence.HerdrSessionName, presence.TerminalID)] = agyTerminalLease{PaneGeneration: paneGeneration, Presence: presence}
 				s.cancelGraceForTerminal(presence.HerdrSessionName, presence.TerminalID)
@@ -538,7 +600,7 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 		}
 		changed = !sameOwner(change.Current.Owner, change.Previous.Owner)
 		if changed {
-			s.publishOrchestratorChange(toWireChange(change))
+			frames = append(frames, s.publishOrchestratorChange(toWireChange(change))...)
 		}
 	} else {
 		delete(
@@ -551,23 +613,23 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 			TerminalID: presence.TerminalID,
 		})
 		if err != nil {
-			return nil, err
+			return frames, nil, err
 		}
 		changed = change != nil
 		if change != nil {
-			s.publishOrchestratorChange(toWireChange(*change))
+			frames = append(frames, s.publishOrchestratorChange(toWireChange(*change))...)
 		}
 	}
 	state, err := s.connectionStateLocked(presence)
 	if err != nil {
-		return nil, err
+		return frames, nil, err
 	}
 	result, err := jsonValueObject(state)
 	if err != nil {
-		return nil, err
+		return frames, nil, err
 	}
 	result["changed"] = changed
-	return result, nil
+	return frames, result, nil
 }
 
 // handleOrchestratorAck mirrors the agent.notifications.ack branch.
@@ -861,21 +923,23 @@ func (s *ObservabilityRpcServer) requirePiPresence(
 }
 
 // publishAgentContextLocked is publishAgentContext with the lock held, the form
-// the register handler uses after the Pi session registration returns.
+// the register handler uses after the Pi session registration returns. It
+// decides the target and builds the frame; the caller writes it after releasing
+// the lock, so a wedged peer cannot block every other RPC.
 func (s *ObservabilityRpcServer) publishAgentContextLocked(
 	scope observability.AgentScope,
-) {
+) (*rpcConnection, map[string]any, bool) {
 	state, err := s.orchestrator.Status(scope)
 	if err != nil {
 		s.warn("Herdsman could not read the orchestrator owner for a context publication", err)
-		return
+		return nil, nil, false
 	}
 	if state == nil || state.Owner == nil {
-		return
+		return nil, nil, false
 	}
 	connection := s.newestSocketForTerminal(scope, state.Owner.TerminalID)
 	if connection == nil {
-		return
+		return nil, nil, false
 	}
 	context, err := s.context.WorkspaceSnapshot(observability.WorkspaceSnapshotInput{
 		AgentScope:        scope,
@@ -883,26 +947,26 @@ func (s *ObservabilityRpcServer) publishAgentContextLocked(
 	})
 	if err != nil {
 		s.warn("Herdsman could not build the workspace context snapshot", err)
-		return
+		return nil, nil, false
 	}
 	fingerprint, err := jsonStringify(context)
 	if err != nil {
 		s.warn("Herdsman could not fingerprint the workspace context snapshot", err)
-		return
+		return nil, nil, false
 	}
 	scopeKey := scope.HerdrSessionName + "\x00" + scope.WorkspaceID
 	if s.publishedContextFingerprintByScope[scopeKey] == fingerprint {
-		return
+		return nil, nil, false
 	}
 	s.publishedContextFingerprintByScope[scopeKey] = fingerprint
-	connection.writeMessage(map[string]any{
+	return connection, map[string]any{
 		"method": "agent.context.changed",
 		"params": map[string]any{
 			"context":          context,
 			"herdrSessionName": scope.HerdrSessionName,
 			"workspaceId":      scope.WorkspaceID,
 		},
-	})
+	}, true
 }
 
 // resolveScope mirrors #resolveScope.

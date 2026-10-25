@@ -728,6 +728,142 @@ func TestShutdownBudgetKeepsSigtermInsideBudget(t *testing.T) {
 	release()
 }
 
+// The startup half of the shutdown budget: a SIGTERM that lands while the daemon
+// is still starting must not buy the shutdown a fresh full budget for the time
+// startup has already spent, and the startup walk itself has to be interruptible.
+//
+// The TS start path and its stop() closure share one event loop, so a stop that
+// arrives mid-startup simply preempts the remaining steps. In Go the startup
+// steps run to completion on their own goroutines, so the hand-off has to be
+// explicit: the budget starts when the signal lands, the startup phase is waited
+// for only as long as the budget allows, and the shutdown sequence gets what is
+// left of it.
+
+// TestStartupPidFileFailureAbortsStartup is the regression test for the swallowed
+// WriteDaemonPidFile error: a daemon that cannot write its pid file is a failed
+// startup, not a healthy one, and the teardown must still leave nothing behind.
+func TestStartupPidFileFailureAbortsStartup(t *testing.T) {
+	home, paths := openDaemonTestHome(t)
+	restoreUmask(t)
+
+	// Make the pid file path unwritable by occupying it with a directory: the
+	// write then fails with "is a directory" instead of silently succeeding.
+	if err := os.MkdirAll(paths.PIDPath, 0o700); err != nil {
+		t.Fatalf("mkdir pid path: %v", err)
+	}
+
+	exitCodes := []int{}
+	signals := newSignalTargetDouble()
+	err := daemon.RunObservabilityDaemonService(&daemon.DaemonServiceOptions{
+		Environment:  map[string]string{"HERDSMAN_HOME": home},
+		Exit:         func(code int) { exitCodes = append(exitCodes, code) },
+		PID:          4321,
+		HasPID:       true,
+		SessionList:  emptySessionList,
+		SignalTarget: signals,
+	})
+	if err == nil {
+		t.Fatal("runObservabilityDaemonService = nil error, want the pid file write to fail startup")
+	}
+	if !strings.Contains(err.Error(), "is a directory") {
+		t.Fatalf("error = %v, want the pid file write failure", err)
+	}
+
+	// The startup failure path tore everything down: no socket, no instance lock
+	// owner left behind for the next daemon to trip over.
+	requireNoFile(t, paths.SocketPath)
+	requireNoFile(t, paths.PIDPath+".instance.lock.owner.json")
+	release, lockErr := daemon.AcquireDaemonLock(paths.PIDPath+".instance.lock", nil)
+	if lockErr != nil {
+		t.Fatalf("acquireDaemonLock after the failed startup: %v", lockErr)
+	}
+	release()
+	// The failed startup never reached the running state, so it never asked for
+	// an exit code.
+	if len(exitCodes) != 0 {
+		t.Fatalf("exitCodes = %v, want none", exitCodes)
+	}
+}
+
+// TestShutdownBudgetCountsStartupHandoff is the regression test for the budget
+// starting at the signal: a startup walk that is still running when SIGTERM lands
+// must not extend the shutdown past the configured budget.
+func TestShutdownBudgetCountsStartupHandoff(t *testing.T) {
+	home, paths := openDaemonTestHome(t)
+	restoreUmask(t)
+	capture := startLogCapture(t)
+
+	const budgetMs = 500
+	exitCodes := []int{}
+	signals := newSignalTargetDouble()
+	var sessionListCalls atomic.Int64
+	started := make(chan struct{})
+
+	// The service call blocks for as long as the daemon runs, so it goes on its own
+	// goroutine: this case is about the shutdown, not about the daemon returning.
+	svcErr := make(chan error, 1)
+	go func() {
+		svcErr <- daemon.RunObservabilityDaemonService(&daemon.DaemonServiceOptions{
+			Environment: map[string]string{"HERDSMAN_HOME": home},
+			Exit:        func(code int) { exitCodes = append(exitCodes, code) },
+			PID:         8642,
+			HasPID:      true,
+			// The very first session list — the startup reconcile — never settles, so
+			// the startup phase is wedged when the signal lands. Before the fix the
+			// shutdown waited for the startup hand-off first and only then started
+			// counting its budget, so a wedged startup made the shutdown unbounded.
+			SessionList: func() ([]herdr.HerdrSessionListEntry, error) {
+				if sessionListCalls.Add(1) == 1 {
+					close(started)
+				}
+				blocked := make(chan struct{})
+				<-blocked
+				return nil, nil
+			},
+			ReconcileClearInterval: func(any) {},
+			ReconcileIntervalMs:    int64Ptr(1),
+			ReconcileSetInterval:   func(func(), int64) any { return 1 },
+			ShutdownBudgetMs:       int64Ptr(budgetMs),
+			SignalTarget:           signals,
+		})
+	}()
+
+	// Wait until the startup phase is wedged in its first session list.
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the startup reconcile never started")
+	}
+
+	startedAt := time.Now()
+	<-signals.emit("SIGTERM")
+	elapsedMs := time.Since(startedAt).Milliseconds()
+
+	// The whole shutdown, including the bounded wait for the wedged startup phase,
+	// stays inside the budget: the startup hand-off is waited for with the same
+	// budget rather than adding to it.
+	if elapsedMs >= int64(budgetMs)*2 {
+		t.Fatalf("shutdown took %dms, want it inside the %dms budget", elapsedMs, budgetMs)
+	}
+	// The wedged startup never returns, so the service call has not settled; the
+	// exit code the shutdown requested is what matters.
+	select {
+	case err := <-svcErr:
+		t.Fatalf("runObservabilityDaemonService returned %v while its startup step was wedged", err)
+	default:
+	}
+	if len(exitCodes) != 1 || exitCodes[0] != 0 {
+		t.Fatalf("exitCodes = %v, want [0]", exitCodes)
+	}
+	// The finally block still cleaned everything up.
+	requireNoFile(t, paths.PIDPath)
+	requireNoFile(t, paths.SocketPath)
+	requireNoFile(t, paths.PIDPath+".instance.lock.owner.json")
+	capture.settle(t, "the shutdown to report the skipped startup hand-off", func() bool {
+		return strings.Contains(capture.stderr(), "without the startup hand-off")
+	})
+}
+
 func TestShutdownBudgetSecondSignalForcesExit(t *testing.T) {
 	home, paths := openDaemonTestHome(t)
 	restoreUmask(t)

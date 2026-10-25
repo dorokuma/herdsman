@@ -6,13 +6,16 @@ package db
 import (
 	"context"
 	"database/sql"
+	"database/sql/driver"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
-	_ "modernc.org/sqlite" // pure-Go driver: the port stays CGO_ENABLED=0 clean
+	"modernc.org/sqlite" // pure-Go driver: the port stays CGO_ENABLED=0 clean
 
 	"github.com/dorokuma/herdsman/go/internal/shared"
 )
@@ -23,34 +26,301 @@ import (
 // enforcement (node:sqlite's DatabaseSync defaults enableForeignKeyConstraints
 // to true, so the TS daemon effectively runs with foreign keys on).
 //
-// The handle is a *sql.DB pinned to a single connection, mirroring the one
-// DatabaseSync connection the TS side shares: every statement and transaction
-// serializes on it and the pragmas stay in effect for all of them.
+// One real driver connection backs every handle, mirroring the single
+// DatabaseSync connection the TS side shares, but the serialisation is the
+// database gate rather than a one-slot pool: `database/sql` holding a
+// transaction on its only connection would deadlock the statements that
+// transaction runs (they would wait for the connection the transaction owns).
+// Instead every Connect returns a lightweight serializedConn over the one
+// underlying driver.Conn, and each of its Exec/Query/Prepare takes the gate
+// first. See SqliteGate for why a transaction has to hold the gate across its
+// whole window.
 func OpenSqlite(path string) (*sql.DB, error) {
 	dsn := (&url.URL{Scheme: "file", Path: filepath.ToSlash(path)}).String()
-	db, err := sql.Open("sqlite", dsn)
+	underlying, err := sqlite.NewConnector(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
 
 	ctx := context.Background()
+	conn, err := underlying.Connect(ctx)
+	if err != nil {
+		return nil, err
+	}
+	// The pragmas live on the one connection, exactly as they did on the single
+	// pooled connection before, so they stay in effect for every statement.
+	//
 	// journal_mode is best effort, exactly like the TS try/catch: a database
 	// that cannot switch to WAL (an in-memory database, for instance) still
 	// opens and runs, so the failure is reported but not fatal.
-	if _, err := db.ExecContext(ctx, "PRAGMA journal_mode=WAL"); err != nil {
+	if err := execOnConn(ctx, conn, "PRAGMA journal_mode=WAL"); err != nil {
 		fmt.Fprintf(os.Stderr, "Unable to enable SQLite WAL mode; continuing startup: %v\n", err)
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA busy_timeout=5000"); err != nil {
-		_ = db.Close()
+	if err := execOnConn(ctx, conn, "PRAGMA busy_timeout=5000"); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx, "PRAGMA foreign_keys=ON"); err != nil {
-		_ = db.Close()
+	if err := execOnConn(ctx, conn, "PRAGMA foreign_keys=ON"); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
+
+	gate := shared.NewSqliteGate()
+	db := sql.OpenDB(&serializedConnector{
+		conn: conn,
+		gate: gate,
+	})
+	// The pool no longer serialises anything, so it must not cap itself at one
+	// connection: the gate hands out the one driver connection to one goroutine
+	// at a time, and the extra handles are only wrappers waiting on it.
+	shared.RegisterSqliteGate(db, gate)
 	return db, nil
+}
+
+// execOnConn runs a pragma on the raw driver connection during startup, before
+// any statement can be in flight.
+func execOnConn(ctx context.Context, conn driver.Conn, statement string) error {
+	execer, ok := conn.(driver.ExecerContext)
+	if !ok {
+		return errors.New("sqlite driver connection does not support ExecContext")
+	}
+	_, err := execer.ExecContext(ctx, statement, nil)
+	return err
+}
+
+// serializedConnector hands database/sql a serializedConn for every Connect. The
+// underlying driver connection is shared, never opened twice.
+type serializedConnector struct {
+	conn driver.Conn
+	gate *shared.SqliteGate
+}
+
+func (c *serializedConnector) Connect(context.Context) (driver.Conn, error) {
+	return &serializedConn{conn: c.conn, gate: c.gate}, nil
+}
+
+func (c *serializedConnector) Driver() driver.Driver { return serializedDriver{} }
+
+type serializedDriver struct{}
+
+func (serializedDriver) Open(string) (driver.Conn, error) {
+	return nil, errors.New("serialized sqlite driver is connector-only")
+}
+
+// serializedConn is the gate-aware wrapper around the one shared driver
+// connection. Every operation that touches SQLite takes the gate for its whole
+// duration; a query keeps it until its rows are closed, because the connection
+// stays busy while rows are streaming.
+type serializedConn struct {
+	conn driver.Conn
+	gate *shared.SqliteGate
+}
+
+func (c *serializedConn) Prepare(query string) (driver.Stmt, error) {
+	return nil, errors.New("serialized sqlite connection requires PrepareContext")
+}
+
+func (c *serializedConn) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	gid := shared.CurrentGoroutineID()
+	c.gate.Acquire(gid)
+	stmt, err := c.prepareOnConn(ctx, query)
+	if err != nil {
+		c.gate.Release(gid)
+		return nil, err
+	}
+	// The statement keeps its own gate level so a caller that prepares and then
+	// closes (normalize/column metadata) does not race a reentrant Exec.
+	return &serializedStmt{stmt: stmt, gate: c.gate, gid: gid, held: true}, nil
+}
+
+func (c *serializedConn) prepareOnConn(ctx context.Context, query string) (driver.Stmt, error) {
+	if preparer, ok := c.conn.(driver.ConnPrepareContext); ok {
+		return preparer.PrepareContext(ctx, query)
+	}
+	return c.conn.Prepare(query)
+}
+
+func (c *serializedConn) Close() error {
+	// The underlying connection is shared by every wrapper, so closing a handle
+	// must not close it; sql.DB closing its last wrapper leaves the driver
+	// connection for the process, like the one long-lived TS connection.
+	return nil
+}
+
+func (c *serializedConn) Begin() (driver.Tx, error) {
+	return nil, errors.New("serialized sqlite connection requires BeginTx")
+}
+
+func (c *serializedConn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+	gid := shared.CurrentGoroutineID()
+	c.gate.Acquire(gid)
+	beginnable, ok := c.conn.(driver.ConnBeginTx)
+	if !ok {
+		c.gate.Release(gid)
+		return nil, errors.New("sqlite driver connection does not support BeginTx")
+	}
+	tx, err := beginnable.BeginTx(ctx, opts)
+	if err != nil {
+		c.gate.Release(gid)
+		return nil, err
+	}
+	return &serializedTx{tx: tx, gate: c.gate, gid: gid}, nil
+}
+
+func (c *serializedConn) ExecContext(
+	ctx context.Context,
+	query string,
+	args []driver.NamedValue,
+) (driver.Result, error) {
+	gid := shared.CurrentGoroutineID()
+	c.gate.Acquire(gid)
+	defer c.gate.Release(gid)
+	if execer, ok := c.conn.(driver.ExecerContext); ok {
+		return execer.ExecContext(ctx, query, args)
+	}
+	stmt, err := c.prepareOnConn(ctx, query)
+	if err != nil {
+		return nil, err
+	}
+	defer stmt.Close()
+	return runStmt(ctx, stmt, args)
+}
+
+func (c *serializedConn) QueryContext(
+	ctx context.Context,
+	query string,
+	args []driver.NamedValue,
+) (driver.Rows, error) {
+	gid := shared.CurrentGoroutineID()
+	c.gate.Acquire(gid)
+	queryer, ok := c.conn.(driver.QueryerContext)
+	if !ok {
+		c.gate.Release(gid)
+		return nil, errors.New("sqlite driver connection does not support QueryContext")
+	}
+	rows, err := queryer.QueryContext(ctx, query, args)
+	if err != nil {
+		c.gate.Release(gid)
+		return nil, err
+	}
+	if rows == nil {
+		c.gate.Release(gid)
+		return nil, nil
+	}
+	// The gate is held until the rows are drained and closed: the connection is
+	// busy while rows stream, so releasing earlier would let another goroutine
+	// step on the open cursor.
+	return &serializedRows{rows: rows, gate: c.gate, gid: gid}, nil
+}
+
+// runStmt executes a prepared statement with the arguments database/sql passes.
+func runStmt(ctx context.Context, stmt driver.Stmt, args []driver.NamedValue) (driver.Result, error) {
+	execer, ok := stmt.(driver.StmtExecContext)
+	if !ok {
+		return nil, errors.New("sqlite statement does not support StmtExecContext")
+	}
+	return execer.ExecContext(ctx, args)
+}
+
+// serializedStmt is a prepared statement holding one gate level from Prepare
+// until Close, so the prepare/exec pair cannot interleave with another
+// goroutine between them.
+type serializedStmt struct {
+	stmt driver.Stmt
+	gate *shared.SqliteGate
+	gid  int64
+	held bool
+}
+
+func (s *serializedStmt) Close() error {
+	defer s.release()
+	return s.stmt.Close()
+}
+
+func (s *serializedStmt) release() {
+	if s.held {
+		s.held = false
+		s.gate.Release(s.gid)
+	}
+}
+
+func (s *serializedStmt) NumInput() int { return s.stmt.NumInput() }
+
+func (s *serializedStmt) Exec(args []driver.Value) (driver.Result, error) {
+	return s.stmt.Exec(args)
+}
+
+func (s *serializedStmt) Query(args []driver.Value) (driver.Rows, error) {
+	rows, err := s.stmt.Query(args)
+	if err != nil || rows == nil {
+		return rows, err
+	}
+	// The gate level moves to the rows so it survives until they are closed.
+	s.held = false
+	return &serializedRows{rows: rows, gate: s.gate, gid: s.gid}, nil
+}
+
+func (s *serializedStmt) ExecContext(
+	ctx context.Context,
+	args []driver.NamedValue,
+) (driver.Result, error) {
+	execer, ok := s.stmt.(driver.StmtExecContext)
+	if !ok {
+		return runStmt(ctx, s.stmt, args)
+	}
+	return execer.ExecContext(ctx, args)
+}
+
+func (s *serializedStmt) QueryContext(
+	ctx context.Context,
+	args []driver.NamedValue,
+) (driver.Rows, error) {
+	queryer, ok := s.stmt.(driver.StmtQueryContext)
+	if !ok {
+		return nil, errors.New("sqlite statement does not support StmtQueryContext")
+	}
+	rows, err := queryer.QueryContext(ctx, args)
+	if err != nil || rows == nil {
+		return rows, err
+	}
+	s.held = false
+	return &serializedRows{rows: rows, gate: s.gate, gid: s.gid}, nil
+}
+
+// serializedRows releases the gate exactly once, when the rows are closed.
+type serializedRows struct {
+	rows driver.Rows
+	gate *shared.SqliteGate
+	gid  int64
+	once sync.Once
+}
+
+func (r *serializedRows) Columns() []string { return r.rows.Columns() }
+
+func (r *serializedRows) Close() error {
+	defer r.once.Do(func() { r.gate.Release(r.gid) })
+	return r.rows.Close()
+}
+
+func (r *serializedRows) Next(dest []driver.Value) error { return r.rows.Next(dest) }
+
+// serializedTx releases the gate when the transaction ends. The BEGIN it wraps
+// was issued while the gate was held, so no other goroutine can be inside one.
+type serializedTx struct {
+	tx   driver.Tx
+	gate *shared.SqliteGate
+	gid  int64
+	once sync.Once
+}
+
+func (t *serializedTx) Commit() error {
+	defer t.once.Do(func() { t.gate.Release(t.gid) })
+	return t.tx.Commit()
+}
+
+func (t *serializedTx) Rollback() error {
+	defer t.once.Do(func() { t.gate.Release(t.gid) })
+	return t.tx.Rollback()
 }
 
 // RunSqliteTransaction mirrors runSqliteTransaction. The implementation lives

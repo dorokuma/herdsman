@@ -445,18 +445,37 @@ func (s *ObservabilityRpcServer) acceptLoop(listener net.Listener) {
 
 // PublishAgentContext mirrors publishAgentContext: the owner's newest connection
 // gets the workspace context, unless the very same fingerprint was already sent.
+//
+// The frames are written with the lock released: a peer that stopped reading
+// blocks net.Conn.Write, and the TS original awaited its socket write outside
+// the critical section for the same reason.
 func (s *ObservabilityRpcServer) PublishAgentContext(scope observability.AgentScope) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.publishAgentContextLocked(scope)
+	connection, message, ok := s.publishAgentContextLocked(scope)
+	s.mu.Unlock()
+	if ok {
+		connection.writeMessage(message)
+	}
 }
 
 // PublishAgentEvent mirrors publishAgentEvent: a deliverable worker event is
 // routed to the workspace orchestrator's newest connection.
+//
+// The routing runs under the lock and the frames are written after it is
+// released: net.Conn.Write blocks when a peer stops reading, and holding the
+// server lock across it would stall every other RPC and the shutdown sequence.
 func (s *ObservabilityRpcServer) PublishAgentEvent(event observability.AgentEventRecord) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	frames := s.publishAgentEventLocked(event)
+	s.mu.Unlock()
+	writeAll(frames)
+}
 
+// publishAgentEventLocked is publishAgentEvent's routing half, with the lock
+// held: it resolves the target connections and builds their frames.
+func (s *ObservabilityRpcServer) publishAgentEventLocked(
+	event observability.AgentEventRecord,
+) []pendingFrame {
 	// `agentId` is intentionally not required: a terminal event written after the
 	// agents row was physically removed still has to reach the orchestrator. The
 	// workspace/terminal scope is required, because without it the event cannot be
@@ -473,11 +492,11 @@ func (s *ObservabilityRpcServer) PublishAgentEvent(event observability.AgentEven
 				"workspaceId":      derefString(event.WorkspaceID),
 			})
 		}
-		return
+		return nil
 	}
 	// Status changes are persisted for history but never routed as worker wake events.
 	if event.Type == observability.AgentEventStatusChanged {
-		return
+		return nil
 	}
 	status := ""
 	if event.Status != nil {
@@ -486,7 +505,7 @@ func (s *ObservabilityRpcServer) PublishAgentEvent(event observability.AgentEven
 	if (status != string(observability.AgentEventStatusPending) &&
 		status != string(observability.AgentEventStatusDelivered)) ||
 		event.Deliverable != 1 {
-		return
+		return nil
 	}
 	scope := observability.AgentScope{
 		HerdrSessionName: event.HerdrSessionName,
@@ -495,11 +514,15 @@ func (s *ObservabilityRpcServer) PublishAgentEvent(event observability.AgentEven
 	state, err := s.orchestrator.Status(scope)
 	if err != nil {
 		s.warn("Herdsman could not read the orchestrator owner for an agent event", err)
-		return
+		return nil
 	}
 	var owner *observability.AgentOrchestratorOwner
 	if state != nil {
 		owner = state.Owner
+	}
+	frame := map[string]any{
+		"method": "agent.event",
+		"params": map[string]any{"event": event},
 	}
 	if owner == nil {
 		// An ownerless workspace (cross-workspace dispatched worker) has no route of
@@ -510,30 +533,25 @@ func (s *ObservabilityRpcServer) PublishAgentEvent(event observability.AgentEven
 		)
 		if ownerErr != nil {
 			s.warn("Herdsman could not resolve the session orchestrator for an agent event", ownerErr)
-			return
+			return nil
 		}
 		if sessionOwner == nil {
-			return
+			return nil
 		}
 		connection := s.newestSocketForSessionTerminal(event.HerdrSessionName, *sessionOwner)
-		if connection != nil {
-			connection.writeMessage(map[string]any{
-				"method": "agent.event",
-				"params": map[string]any{"event": event},
-			})
+		if connection == nil {
+			return nil
 		}
-		return
+		return []pendingFrame{{target: connection, message: frame}}
 	}
 	if stringPresent(event.TerminalID) && *event.TerminalID == owner.TerminalID {
-		return
+		return nil
 	}
 	connection := s.newestSocketForTerminal(scope, owner.TerminalID)
-	if connection != nil {
-		connection.writeMessage(map[string]any{
-			"method": "agent.event",
-			"params": map[string]any{"event": event},
-		})
+	if connection == nil {
+		return nil
 	}
+	return []pendingFrame{{target: connection, message: frame}}
 }
 
 // singleActiveSessionOwner mirrors #singleActiveSessionOwner: the single active
@@ -586,9 +604,26 @@ type AgentLocationReconcile struct {
 func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 	input AgentLocationReconcile,
 ) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	// The frames collected by this pass are written once the lock is released:
+	// a peer that stopped reading must not be able to block every other RPC
+	// through the lock this function holds.
+	var frames []pendingFrame
+	var runErr error
+	func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		frames, runErr = s.reconcileAgentLocationsLocked(input)
+	}()
+	writeAll(frames)
+	return runErr
+}
 
+// reconcileAgentLocationsLocked is the reconcile pass with the lock held. It
+// returns the frames to write after the lock is released.
+func (s *ObservabilityRpcServer) reconcileAgentLocationsLocked(
+	input AgentLocationReconcile,
+) ([]pendingFrame, error) {
+	var frames []pendingFrame
 	byTerminal := map[string]observability.AgentIndexRecord{}
 	for _, agent := range input.Agents {
 		if stringPresent(agent.TerminalID) {
@@ -597,7 +632,7 @@ func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 	}
 	owners, err := s.orchestrator.PersistedOwners()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	owners = filterStatesForSession(owners, input.HerdrSessionName)
 
@@ -630,17 +665,19 @@ func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 				SinceMs:          presence.ConnectedAt,
 			})
 			if err != nil {
-				return err
+				return frames, err
 			}
 			if closed {
 				delete(s.agyPresenceByTerminal, key)
 				if len(s.socketsByTerminal[key]) == 0 {
-					if err := s.releaseCurrentOwnersForTerminal(
+					released, err := s.releaseCurrentOwnersForTerminal(
 						input.HerdrSessionName,
 						observability.OrchestratorChangeDisconnected,
 						presence.TerminalID,
-					); err != nil {
-						return err
+					)
+					frames = append(frames, released...)
+					if err != nil {
+						return frames, err
 					}
 				}
 			}
@@ -649,12 +686,14 @@ func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 		if agent.Agent != nil && *agent.Agent != "agy" {
 			delete(s.agyPresenceByTerminal, key)
 			if len(s.socketsByTerminal[key]) == 0 {
-				if err := s.releaseCurrentOwnersForTerminal(
+				released, err := s.releaseCurrentOwnersForTerminal(
 					input.HerdrSessionName,
 					observability.OrchestratorChangeDisconnected,
 					presence.TerminalID,
-				); err != nil {
-					return err
+				)
+				frames = append(frames, released...)
+				if err != nil {
+					return frames, err
 				}
 			}
 			continue
@@ -678,7 +717,7 @@ func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 		}
 		current, err := s.orchestrator.Status(ownerState.AgentScope)
 		if err != nil {
-			return err
+			return frames, err
 		}
 		if current == nil || current.Owner == nil || current.Owner.TerminalID != owner.TerminalID {
 			continue
@@ -699,7 +738,7 @@ func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 				TerminalID: owner.TerminalID,
 			})
 			if err != nil {
-				return err
+				return frames, err
 			}
 			// TS: `toWireChange({ ...change, reason: "moved" })`.
 			moved := observability.AgentOrchestratorChanged{
@@ -707,7 +746,7 @@ func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 				Previous: toWireState(change.Previous),
 				Reason:   observability.OrchestratorChangeMoved,
 			}
-			s.publishOrchestratorChange(moved)
+			frames = append(frames, s.publishOrchestratorChange(moved)...)
 			continue
 		}
 		changes, err := s.orchestrator.Move(observability.OrchestratorMoveInput{
@@ -720,13 +759,13 @@ func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 			},
 		})
 		if err != nil {
-			return err
+			return frames, err
 		}
 		for _, change := range changes {
-			s.publishOrchestratorChange(toWireChange(change))
+			frames = append(frames, s.publishOrchestratorChange(toWireChange(change))...)
 		}
 	}
-	return nil
+	return frames, nil
 }
 
 // IsTerminalConnected mirrors isTerminalConnected: the authoritative live Pi
@@ -940,27 +979,36 @@ func (s *ObservabilityRpcServer) scheduleDisconnect(presence PiPresence) error {
 	}
 	var handle any
 	handle = s.setTimeout(func() {
-		s.mu.Lock()
-		defer s.mu.Unlock()
-		delete(s.disconnectTimers, key)
-		if s.stopping {
-			return
-		}
-		stillPresent, err := s.hasTerminalPresence(presence.HerdrSessionName, presence.TerminalID)
-		if err != nil {
-			s.warn("Herdsman could not read terminal presence while releasing an owner", err)
-			return
-		}
-		if stillPresent {
-			return
-		}
-		if err := s.releaseCurrentOwnersForTerminal(
-			presence.HerdrSessionName,
-			observability.OrchestratorChangeDisconnected,
-			presence.TerminalID,
-		); err != nil {
-			s.warn("Herdsman could not release the owners of a disconnected terminal", err)
-		}
+		// The frames this release produces are written once the lock is
+		// released, so a wedged peer cannot stall the daemon through it.
+		var released []pendingFrame
+		func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			delete(s.disconnectTimers, key)
+			if s.stopping {
+				return
+			}
+			stillPresent, err := s.hasTerminalPresence(presence.HerdrSessionName, presence.TerminalID)
+			if err != nil {
+				s.warn("Herdsman could not read terminal presence while releasing an owner", err)
+				return
+			}
+			if stillPresent {
+				return
+			}
+			owned, err := s.releaseCurrentOwnersForTerminal(
+				presence.HerdrSessionName,
+				observability.OrchestratorChangeDisconnected,
+				presence.TerminalID,
+			)
+			if err != nil {
+				s.warn("Herdsman could not release the owners of a disconnected terminal", err)
+				return
+			}
+			released = owned
+		}()
+		writeAll(released)
 	}, s.disconnectGraceMs)
 	s.disconnectTimers[key] = graceTimer{handle: handle}
 	return nil
@@ -1009,46 +1057,57 @@ func (s *ObservabilityRpcServer) armStartupGrace() {
 		captured := state
 		var handle any
 		handle = s.setTimeout(func() {
-			s.mu.Lock()
-			defer s.mu.Unlock()
-			delete(s.startupTimers, key)
-			ownerTerminalID := ""
-			if captured.Owner != nil {
-				ownerTerminalID = captured.Owner.TerminalID
-			}
-			if s.stopping {
-				return
-			}
-			present, err := s.hasTerminalPresence(captured.HerdrSessionName, ownerTerminalID)
-			if err != nil {
-				s.warn("Herdsman could not read terminal presence in the startup grace", err)
-				return
-			}
-			if present {
-				return
-			}
-			if err := s.releaseCurrentOwnersForTerminal(
-				captured.HerdrSessionName,
-				observability.OrchestratorChangeStartupTimeout,
-				ownerTerminalID,
-			); err != nil {
-				s.warn("Herdsman could not release the owners of a stale startup owner", err)
-			}
+			// Same shape as the disconnect timer: collect under the lock, write
+			// after it is released.
+			var released []pendingFrame
+			func() {
+				s.mu.Lock()
+				defer s.mu.Unlock()
+				delete(s.startupTimers, key)
+				ownerTerminalID := ""
+				if captured.Owner != nil {
+					ownerTerminalID = captured.Owner.TerminalID
+				}
+				if s.stopping {
+					return
+				}
+				present, err := s.hasTerminalPresence(captured.HerdrSessionName, ownerTerminalID)
+				if err != nil {
+					s.warn("Herdsman could not read terminal presence in the startup grace", err)
+					return
+				}
+				if present {
+					return
+				}
+				owned, err := s.releaseCurrentOwnersForTerminal(
+					captured.HerdrSessionName,
+					observability.OrchestratorChangeStartupTimeout,
+					ownerTerminalID,
+				)
+				if err != nil {
+					s.warn("Herdsman could not release the owners of a stale startup owner", err)
+					return
+				}
+				released = owned
+			}()
+			writeAll(released)
 		}, s.startupReconnectMs)
 		s.startupTimers[key] = graceTimer{handle: handle}
 	}
 }
 
-// releaseCurrentOwnersForTerminal mirrors #releaseCurrentOwnersForTerminal.
+// releaseCurrentOwnersForTerminal mirrors #releaseCurrentOwnersForTerminal. It
+// returns the frames to write once the caller has released the lock.
 func (s *ObservabilityRpcServer) releaseCurrentOwnersForTerminal(
 	herdrSessionName string,
 	reason observability.AgentOrchestratorChangeReason,
 	terminalID string,
-) error {
+) ([]pendingFrame, error) {
 	states, err := s.orchestrator.PersistedOwners()
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var frames []pendingFrame
 	for _, state := range states {
 		if state.HerdrSessionName != herdrSessionName {
 			continue
@@ -1062,13 +1121,13 @@ func (s *ObservabilityRpcServer) releaseCurrentOwnersForTerminal(
 			TerminalID: terminalID,
 		})
 		if err != nil {
-			return err
+			return frames, err
 		}
 		if change != nil {
-			s.publishOrchestratorChange(toWireChange(*change))
+			frames = append(frames, s.publishOrchestratorChange(toWireChange(*change))...)
 		}
 	}
-	return nil
+	return frames, nil
 }
 
 // cancelGraceForTerminal mirrors #cancelGraceForTerminal.
@@ -1188,19 +1247,26 @@ func (s *ObservabilityRpcServer) indexedForPresence(
 	})
 }
 
-// publishOrchestratorChange mirrors #publishOrchestratorChange.
+// publishOrchestratorChange mirrors #publishOrchestratorChange. It collects the
+// frames of every connection in either scope; the caller writes them once the
+// lock is released.
 func (s *ObservabilityRpcServer) publishOrchestratorChange(
 	change observability.AgentOrchestratorChanged,
-) {
+) []pendingFrame {
+	frames := make([]pendingFrame, 0, len(s.piPresenceBySocket))
 	for connection, presence := range s.piPresenceBySocket {
 		if sameScope(presence.Scope(), change.Previous.AgentScope) ||
 			sameScope(presence.Scope(), change.Current.AgentScope) {
-			connection.writeMessage(map[string]any{
-				"method": "agent.orchestrator.changed",
-				"params": map[string]any{"change": change},
+			frames = append(frames, pendingFrame{
+				target: connection,
+				message: map[string]any{
+					"method": "agent.orchestrator.changed",
+					"params": map[string]any{"change": change},
+				},
 			})
 		}
 	}
+	return frames
 }
 
 // cancelTimer mirrors #cancelTimer.

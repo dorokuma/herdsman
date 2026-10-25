@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -244,4 +245,89 @@ func TestExpectedTextCarriedWhenPresent(t *testing.T) {
 	if got.ExpectedText != "final answer" || !got.HasExpectedText {
 		t.Fatalf("result = %+v, want expectedText carried through", got)
 	}
+}
+
+// A finished waiter must stay finished: a timeout that fires after the waiter was
+// already resolved by a signal used to run its cleanup a second time, consuming
+// the signal the *next* wait had just registered. The goroutine watching the
+// caller's signal channel used to park on it forever for the same reason.
+func TestFinishedWaiterIgnoresLateSignalAndReleasesListener(t *testing.T) {
+	t.Run("late timeout does not consume the next round's signal", func(t *testing.T) {
+		// A timeout that only fires once the first wait is long over.
+		registry := NewTurnCompletionRegistry(WithTurnSettimeout(120))
+
+		signal := make(chan struct{}, 1)
+		first := make(chan TurnCompletionWaitResult, 1)
+		go func() {
+			first <- registry.WaitForSignal(WaitForSignalInput{
+				HerdrSessionName: "default",
+				RecordedAfterMs:  time.Now().UnixMilli() - 1,
+				Signal:           signal,
+				TerminalID:       "term_pi",
+			})
+		}()
+
+		// The signal resolves the first wait while its timeout is still pending.
+		registry.Record(testSignal(nil))
+		if got := <-first; !got.Received {
+			t.Fatalf("first wait = %+v, want it resolved by the signal", got)
+		}
+
+		// The next round registers before the first waiter's timeout fires, so a
+		// non-idempotent finish would take its signal.
+		second := make(chan TurnCompletionWaitResult, 1)
+		go func() {
+			second <- registry.WaitForSignal(WaitForSignalInput{
+				HerdrSessionName: "default",
+				RecordedAfterMs:  time.Now().UnixMilli() - 1,
+				TerminalID:       "term_pi",
+			})
+		}()
+		registry.Record(testSignal(func(s *SessionScopedSignal) {
+			s.ExpectedText = "second round"
+			s.HasExpectedText = true
+		}))
+
+		select {
+		case got := <-second:
+			if !got.Received || got.ExpectedText != "second round" {
+				t.Fatalf("second wait = %+v, want the second round's signal", got)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("the first waiter's late finish consumed the second round's signal")
+		}
+	})
+
+	t.Run("listener goroutine leaves when the wait is already over", func(t *testing.T) {
+		registry := NewTurnCompletionRegistry(WithTurnSettimeout(50))
+		// Sampled before the wait starts, so the only goroutine this subtest adds
+		// is the one watching the signal channel.
+		baseline := runtime.NumGoroutine()
+
+		// An open channel nobody writes to: the listener must leave on doneCh
+		// instead of staying parked on the signal.
+		signal := make(chan struct{})
+		got := registry.WaitForSignal(WaitForSignalInput{
+			HerdrSessionName: "default",
+			RecordedAfterMs:  time.Now().UnixMilli(),
+			Signal:           signal,
+			TerminalID:       "term_pi",
+		})
+		if got.Received {
+			t.Fatalf("result = %+v, want a plain timeout", got)
+		}
+
+		deadline := time.Now().Add(2 * time.Second)
+		for {
+			if runtime.NumGoroutine() <= baseline {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf(
+					"signal listener goroutine did not exit after the wait finished (%d goroutines, baseline %d)",
+					runtime.NumGoroutine(), baseline)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	})
 }

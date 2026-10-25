@@ -699,6 +699,11 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 	// startupStep below for why the hand-off has to be explicit in Go.
 	var startupMu sync.Mutex
 
+	// startupDone is closed once the startup phase has finished, successfully or
+	// not. The shutdown path waits on it (bounded) so it knows the steps are no
+	// longer running before it starts tearing the daemon down.
+	startupDone := make(chan struct{})
+
 	// stopping, exitRequested and the live signal registration are touched from
 	// the signal goroutine and from the startup path, so they share one mutex.
 	// The TS keeps them in closure variables, which its single event loop makes
@@ -779,24 +784,42 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 		detachSignalHandlers()
 		attachSignalHandlers(onSecondSignal)
 
-		// Abort first, so the startup steps that consult this controller stand down
-		// instead of running to completion against a database this path is about to
-		// close; then take the startup hand-off. A step that is inside sqlite right
-		// now finishes before the shutdown sequence starts, and no later step can
-		// begin while the sequence holds the mutex — which is what keeps a SIGTERM
-		// that lands mid-startup from turning a graceful stop into `sql: database is
-		// closed` and exit code 1.
-		shutdownController.Abort()
-		startupMu.Lock()
-		defer startupMu.Unlock()
-
+		// The budget starts the moment the signal lands, not once the startup
+		// hand-off has been taken: a SIGTERM that arrives while startup is still
+		// walking sessions must not be handed a fresh full budget for the wait it
+		// has already spent. Abort first, so the startup steps that consult this
+		// controller stand down instead of running to completion against a
+		// database this path is about to close.
 		startedAt := time.Now()
+		shutdownController.Abort()
+
+		// Wait for the startup phase to end, bounded by the budget. A step stuck
+		// in a slow Herdr round trip must not be able to hold the shutdown past
+		// its budget; systemd would SIGKILL and leave the pid file, socket and
+		// instance lock behind.
+		if !waitClosed(startupDone, time.Duration(max(int64(1), shutdownBudgetMs))*time.Millisecond) {
+			fmt.Fprintf(os.Stderr,
+				"Herdsman daemon shutdown proceeding without the startup hand-off (budgetMs=%d)\n",
+				shutdownBudgetMs)
+		}
+
+		// The hand-off mutex keeps a startup step from interleaving with the
+		// shutdown sequence and its sqlite.Close. If the startup phase never
+		// released it the budget is already spent, so the sequence runs without it
+		// rather than blocking: the daemon is on its way out either way.
+		if startupMu.TryLock() {
+			defer startupMu.Unlock()
+		}
+
 		exitCode := 0
 		fmt.Fprintf(os.Stdout,
 			"Herdsman daemon shutdown starting (budgetMs=%d pid=%d)\n",
 			shutdownBudgetMs, currentPid)
+		// Whatever the startup hand-off consumed is already gone, so the sequence
+		// only gets what is left of the budget.
+		remainingMs := max(int64(1), shutdownBudgetMs-time.Since(startedAt).Milliseconds())
 		if err := runShutdownSequence(shutdownSequenceInput{
-			budgetMs:   shutdownBudgetMs,
+			budgetMs:   remainingMs,
 			index:      index,
 			reconciler: reconcileScheduler,
 			server:     server,
@@ -842,6 +865,14 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 	// teardown as a startup failure.
 	errStartupHandedOver := errors.New("herdsman daemon shutdown took over startup")
 
+	// finishStartup closes the startup-phase channel exactly once, so a shutdown
+	// that arrives at any point after the first step sees the phase as over.
+	var finishStartupOnce sync.Once
+	finishStartup := func() {
+		finishStartupOnce.Do(func() { close(startupDone) })
+	}
+	defer finishStartup()
+
 	// startupStep runs one startup step with the hand-off mutex held, so it can
 	// never overlap the shutdown sequence and its sqlite.Close. The step checks
 	// for a shutdown first (never starting work the shutdown already owns) and
@@ -881,14 +912,23 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 		return startupCause(err)
 	}
 	if err := startupStep(func() error {
-		WriteDaemonPidFile(runtime.Paths.PIDPath, currentPid)
-		return nil
+		// A pid file that cannot be written is a real startup failure: the daemon
+		// would run without the file the unit's stop path and the next daemon's
+		// instance lock both rely on. Swallowing it used to leave a daemon that
+		// looked healthy and could not be stopped cleanly. startupStep owns the
+		// teardown and the "was this the shutdown?" question, so the step only has
+		// to surface the error.
+		return WriteDaemonPidFile(runtime.Paths.PIDPath, currentPid)
 	}); err != nil {
 		return startupCause(err)
 	}
 	if err := startupStep(func() error {
+		// The startup reconcile walks every Herdr session; passing the shutdown
+		// signal lets a SIGTERM that lands mid-walk stop it instead of spending the
+		// whole shutdown budget on round trips nobody is waiting for.
 		_, err := reconciler.Reconcile(ReconcileOptions{
 			ReleaseStaleOwners: boolPointer(false),
+			ShutdownSignal:     shutdownController.Done(),
 		})
 		return err
 	}); err != nil {
@@ -912,6 +952,20 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 	}
 	fmt.Fprintf(os.Stdout, "Herdsman daemon listening on %s\n", runtime.Paths.SocketPath)
 	return nil
+}
+
+// waitClosed reports whether done was closed within budget. It never blocks past
+// the budget, which is what lets a shutdown honour its own deadline when the
+// startup phase is wedged.
+func waitClosed(done <-chan struct{}, budget time.Duration) bool {
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
+	}
 }
 
 // shutdownSequenceInput carries what the TS stop() closure captures.

@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -442,6 +443,47 @@ func TestStartupReconcileInvalidatesAbsentPanesAndReleasesStaleOwner(t *testing.
 	}
 	if scope.Owner != nil {
 		t.Fatalf("owner = %+v, want nil", scope.Owner)
+	}
+}
+
+func TestStartupReconcileStopsTheSessionWalkWhenShutdownFires(t *testing.T) {
+	harness := openReconcileHarness(t)
+	// A zombie that the sweep would invalidate if it got that far: the point is
+	// that the walk stops before any snapshot is taken, not what the sweep does.
+	harness.appendDone(t, doneAppendInput{
+		paneID:     "wA:gone",
+		terminalID: "term-gone",
+	})
+
+	// Four running sessions: the shutdown signal is already aborted, so none of
+	// them may be visited. The TS start path shares an event loop with stop() and
+	// simply never resumes; in Go the session walk has to consult the signal.
+	sessions := []herdr.HerdrSessionListEntry{
+		{Name: "s1", Running: true},
+		{Name: "s2", Running: true},
+		{Name: "s3", Running: true},
+		{Name: "s4", Running: true},
+	}
+	var visited atomic.Int64
+	signal := observability.NewShutdownSignal()
+	signal.Abort()
+
+	reconciler := daemon.NewAgentEventReconciler(daemon.AgentEventReconcilerOptions{
+		AgentHistoryCache: harness.agentHistoryCache,
+		Events:            harness.agentEvents,
+		Scopes:            harness.scopes,
+		SessionList:       func() ([]herdr.HerdrSessionListEntry, error) { return sessions, nil },
+		ClientFactory: func(herdr.HerdrSessionListEntry) (daemon.HerdrSessionSnapshotClient, error) {
+			visited.Add(1)
+			return &fakeSnapshotClient{panes: staticPanes()}, nil
+		},
+		ConnectedTerminal: func(daemon.ConnectedTerminalInput) bool { return false },
+	})
+	if _, err := reconciler.Reconcile(daemon.ReconcileOptions{ShutdownSignal: signal.Done()}); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if got := visited.Load(); got != 0 {
+		t.Fatalf("visited %d sessions, want 0: the walk must stop once the shutdown signal fires", got)
 	}
 }
 

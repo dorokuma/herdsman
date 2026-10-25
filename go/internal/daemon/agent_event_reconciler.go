@@ -144,8 +144,26 @@ func defaultHerdrSessionClientFactory(
 
 // ReconcileOptions mirrors `{ releaseStaleOwners?: boolean }`: a nil
 // ReleaseStaleOwners means the TS key was absent, which runs the release sweep.
+//
+// ShutdownSignal lets a caller interrupt a reconcile that is walking many
+// sessions: each round trip to Herdr costs real time, and a daemon that is
+// shutting down must not spend its whole budget waiting for them.
 type ReconcileOptions struct {
 	ReleaseStaleOwners *bool
+	ShutdownSignal     <-chan struct{}
+}
+
+// stopping reports whether the caller's shutdown signal has already fired.
+func (o ReconcileOptions) stopping() bool {
+	if o.ShutdownSignal == nil {
+		return false
+	}
+	select {
+	case <-o.ShutdownSignal:
+		return true
+	default:
+		return false
+	}
 }
 
 // Reconcile mirrors reconcile.
@@ -166,6 +184,11 @@ func (s *AgentEventReconciler) Reconcile(
 		}
 	}
 	for _, entry := range sessions {
+		// A shutdown that lands mid-walk stops it here: the sessions already
+		// collected stay usable, and the remaining ones are simply not visited.
+		if options.stopping() {
+			break
+		}
 		if !entry.Running {
 			continue
 		}
@@ -192,6 +215,11 @@ func (s *AgentEventReconciler) Reconcile(
 	invalidated := 0
 	var cursor int64
 	for {
+		// A shutdown that lands mid-sweep stops the walk here too: the cursor has
+		// already advanced past what was processed, so the next round resumes.
+		if options.stopping() {
+			break
+		}
 		candidates, listErr := s.events.ListReconcileCandidates(ReconcileBatchLimit, cursor)
 		if listErr != nil {
 			return AgentEventReconcileResult{}, listErr
