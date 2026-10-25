@@ -13,6 +13,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -142,7 +143,7 @@ func (r *runner) runWakeWaiter() HookOutput {
 
 	rawClient, err := r.connect(r.options.SocketPath, func(method string, params any) {
 		if method == "agent.event" || method == "agent.orchestrator.changed" {
-			w.hasPushNotification = true
+			w.hasPushNotification.Store(true)
 			select {
 			case w.wakeCh <- struct{}{}:
 			default:
@@ -190,7 +191,7 @@ type waiter struct {
 	deadline           float64
 	wakeCh             chan struct{}
 
-	hasPushNotification        bool
+	hasPushNotification        atomic.Bool
 	isFirstIteration           bool
 	isFirstEventCheck          bool
 	retryWakePending           bool
@@ -260,7 +261,7 @@ func (w *waiter) loop() error {
 			selfReadyToWake := w.selfReadyToWake(selfAgentStatus)
 
 			if selfReadyToWake && (w.isFirstEventCheck ||
-				w.hasPushNotification ||
+				w.hasPushNotification.Load() ||
 				w.retryWakePending ||
 				w.deliveredBatchGracePending ||
 				!hasActivePeers) {
@@ -280,7 +281,7 @@ func (w *waiter) loop() error {
 				}
 				hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch
 				w.isFirstEventCheck = false
-				w.hasPushNotification = false
+				w.hasPushNotification.Store(false)
 				w.retryWakePending = false
 
 				if hasWakeBatch && hasUnackedDeliveredEvents && !peekedBatch && !w.deliveredBatchGracePending {

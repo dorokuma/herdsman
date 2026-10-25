@@ -18,6 +18,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/dorokuma/herdsman/go/internal/agy"
 	"github.com/dorokuma/herdsman/go/internal/config"
@@ -849,6 +850,13 @@ func Environment() map[string]string {
 
 // FormatCliError mirrors formatCliError: a connection failure gets the
 // systemd hint appended, everything else is printed as-is.
+//
+// The TS check keys on the Node error strings ("ENOENT" / "ECONNREFUSED"),
+// which a Go `net.Dial("unix", ...)` failure never emits: the OS surfaces it
+// as `errors.Is(err, os.ErrNotExist)` / `syscall.ENOENT` (a missing socket)
+// or `syscall.ECONNREFUSED`, with the message text "no such file or directory"
+// / "connection refused". All of those spellings are recognised so a real Unix
+// socket failure prints the same systemd hint the TS CLI does.
 func FormatCliError(err error) string {
 	if err == nil {
 		return ""
@@ -856,8 +864,13 @@ func FormatCliError(err error) string {
 	message := err.Error()
 	if strings.Contains(message, "ENOENT") ||
 		strings.Contains(message, "ECONNREFUSED") ||
+		strings.Contains(message, "no such file or directory") ||
+		strings.Contains(message, "connection refused") ||
 		strings.Contains(message, "Herdsman daemon socket closed") ||
-		strings.Contains(message, "Observability RPC socket closed") {
+		strings.Contains(message, "Observability RPC socket closed") ||
+		errors.Is(err, os.ErrNotExist) ||
+		errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, syscall.ECONNREFUSED) {
 		return message + "\n" +
 			"Herdsman's daemon has no CLI start/stop commands; check the systemd-managed service with `systemctl status herdsman.service`."
 	}

@@ -123,26 +123,86 @@ func readSessionState(stateDir, sessionID string) SessionHookState {
 	return state
 }
 
+// knownStateJSONKeys is the set of JSON keys SessionHookState owns. The
+// write path overlays exactly these onto the persisted object, so a field the
+// struct leaves absent is deleted from disk (mirroring `delete sessionState.x`
+// / `= undefined`) while every other key is carried through untouched.
+var knownStateJSONKeys = []string{
+	"autoClaimAttempted",
+	"awaitingNextTurn",
+	"deliveredEventIds",
+	"presentedEventIds",
+	"turnEpoch",
+	"waiterEpoch",
+	"waiterPid",
+}
+
 // writeSessionState mirrors writeSessionState: a mode-0600 temp file next to
 // the target plus a rename, with every failure swallowed as best effort state
 // persistence.
+//
+// The TS readSessionState returns the parsed object verbatim, so keys the hook
+// never assigns (unknown extension fields) survive a read→write round trip.
+// The Go SessionHookState only models the known keys, so the existing file is
+// re-read here and the known keys are overlaid on top of it: an absent struct
+// field deletes its key, everything else is preserved.
 func writeSessionState(stateDir, sessionID string, state SessionHookState, pid int, nowMs float64) {
 	targetPath := stateFilePath(stateDir, sessionID)
 	tmpPath := fmt.Sprintf("%s.%d.%d.tmp", targetPath, pid, int64(nowMs))
+	merged := readRawStateObject(targetPath)
 	encoded, err := json.Marshal(state)
+	if err != nil {
+		return
+	}
+	if err := overlayKnownStateFields(merged, encoded); err != nil {
+		return
+	}
+	finalEncoded, err := json.Marshal(merged)
 	if err != nil {
 		return
 	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		return
 	}
-	if err := os.WriteFile(tmpPath, encoded, 0o600); err != nil {
+	if err := os.WriteFile(tmpPath, finalEncoded, 0o600); err != nil {
 		os.Remove(tmpPath)
 		return
 	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {
 		os.Remove(tmpPath)
 	}
+}
+
+// readRawStateObject reads the persisted state file as a generic object. A
+// missing, unparseable or non-object file reads as an empty object, exactly
+// like readSessionState.
+func readRawStateObject(path string) map[string]any {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return map[string]any{}
+	}
+	object := map[string]any{}
+	if err := json.Unmarshal(data, &object); err != nil {
+		return map[string]any{}
+	}
+	return object
+}
+
+// overlayKnownStateFields writes the known keys of the marshaled struct onto
+// merged and deletes the known keys the struct leaves absent.
+func overlayKnownStateFields(merged map[string]any, structJSON []byte) error {
+	present := map[string]any{}
+	if err := json.Unmarshal(structJSON, &present); err != nil {
+		return err
+	}
+	for _, key := range knownStateJSONKeys {
+		if value, ok := present[key]; ok {
+			merged[key] = value
+		} else {
+			delete(merged, key)
+		}
+	}
+	return nil
 }
 
 // defaultStateDir mirrors defaultStateDir:
