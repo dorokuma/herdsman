@@ -192,9 +192,10 @@ func TestDecodeAntigravityMetadataTimestampRejectsOutOfRangeValues(t *testing.T)
 		"seconds below the protobuf epoch bound": metadataTimestamp(1, 999_999_999, 0),
 		"seconds above the protobuf epoch bound": metadataTimestamp(1, 10_000_000_001, 0),
 		"nanos out of range":                     metadataTimestamp(1, 1_700_000_000, 1_000_000_000),
+		"unknown sub field":                      unknownSubFieldTimestamp(),
+		"repeated seconds field":                 repeatedSecondsTimestamp(),
 		"no embedded timestamp":                  []byte{0x08, 0x01},
 		"sub message too short":                  nestedField(1, []byte{0x08, 0x01}),
-		"unknown sub field":                      concatBytes(nestedField(1, []byte{0x08, 0x01, 0x10, 0x00, 0x18, 0x01}), nil),
 	}
 	for name, input := range cases {
 		if got := DecodeAntigravityMetadataTimestamp(input); got != nil {
@@ -227,6 +228,23 @@ func metadataTimestamp(fieldNumber int, seconds int64, nanos int64) []byte {
 		body = append(body, encodeVarint(uint64(nanos))...)
 	}
 	return nestedField(fieldNumber, body)
+}
+
+// unknownSubFieldTimestamp is a well-formed Timestamp body with one extra field
+// number, which makes the whole candidate unusable.
+func unknownSubFieldTimestamp() []byte {
+	body := []byte{0x08}
+	body = append(body, encodeVarint(1_700_000_000)...)
+	return nestedField(1, append(body, 0x18, 0x01))
+}
+
+// repeatedSecondsField is a duplicate seconds field: the TS decoder only
+// accepts the first one and marks the candidate invalid on the repeat.
+func repeatedSecondsTimestamp() []byte {
+	body := []byte{0x08}
+	body = append(body, encodeVarint(1_700_000_000)...)
+	body = append(body, 0x08)
+	return nestedField(1, append(body, encodeVarint(1_700_000_001)...))
 }
 
 func encodeVarint(value uint64) []byte {

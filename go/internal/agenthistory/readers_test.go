@@ -198,11 +198,16 @@ func TestReadJSONLReadsTailWindowOfOversizedFile(t *testing.T) {
 			t.Errorf("entries[%d].value = %+v, want %+v", i, entries[i].Value, want)
 		}
 	}
-	// Tail trimming still has a line number to reference.
-	limited := entries[len(entries)-1:]
-	if limited[0].Line <= 0 {
-		t.Errorf("last entry line = %d, want a positive line number", limited[0].Line)
+	// Line numbers are window-local: the partial lead line is skipped before
+	// numbering, exactly as in TS, so the two kept records are 1 and 2. Tail
+	// trimming therefore still has a referenceable line for the last entry.
+	wantLines := []int{1, 2}
+	for i, want := range wantLines {
+		if entries[i].Line != want {
+			t.Errorf("entries[%d].line = %d, want %d", i, entries[i].Line, want)
+		}
 	}
+	limited := entries[len(entries)-1:]
 	if !reflect.DeepEqual(limited[0].Value, wantValues[1]) {
 		t.Errorf("limited entry = %+v, want %+v", limited[0], wantValues[1])
 	}
