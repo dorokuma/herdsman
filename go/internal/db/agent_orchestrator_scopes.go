@@ -12,35 +12,20 @@ import (
 // Herdr session and workspace.
 type AgentOrchestratorScopeKey = observability.AgentScope
 
-// ClaimOrchestratorInput mirrors the TS claim input.
-type ClaimOrchestratorInput struct {
-	AgentOrchestratorScopeKey
-	AckedEventID   int64
-	PaneID         string
-	TerminalID     string
-	OwnerConnected *bool
-}
+// ClaimOrchestratorInput and the other orchestrator scope inputs live in
+// internal/observability (which internal/db imports, and which cannot import
+// internal/db), so the service and the store share one type.
+type ClaimOrchestratorInput = observability.ClaimOrchestratorInput
 
-// AgentOrchestratorScopeChange mirrors ScopeChange: the state before and after
-// one ownership change.
-type AgentOrchestratorScopeChange struct {
-	Current  observability.AgentOrchestratorState
-	Previous observability.AgentOrchestratorState
-}
+type ReleaseIfOwnerInput = observability.ReleaseIfOwnerInput
 
-// AgentOrchestratorReleaseResult mirrors the { changed, current, previous }
-// shape the release operations return.
-type AgentOrchestratorReleaseResult struct {
-	Changed  bool
-	Current  *observability.AgentOrchestratorState
-	Previous *observability.AgentOrchestratorState
-}
+type AckInput = observability.AckInput
 
-// ReleaseIfOwnerInput mirrors the releaseIfOwner input.
-type ReleaseIfOwnerInput struct {
-	AgentOrchestratorScopeKey
-	TerminalID string
-}
+type MoveOwnerInput = observability.MoveOwnerInput
+
+type AgentOrchestratorScopeChange = observability.AgentOrchestratorScopeChange
+
+type AgentOrchestratorReleaseResult = observability.AgentOrchestratorReleaseResult
 
 // ReleaseIfOwnerIdentityInput mirrors the releaseIfOwnerIdentity input.
 type ReleaseIfOwnerIdentityInput struct {
@@ -55,22 +40,6 @@ type ReleaseIfStaleOwnerInput struct {
 	AgentOrchestratorScopeKey
 	LivePaneIDs     map[string]struct{}
 	LiveTerminalIDs map[string]struct{}
-}
-
-// AckInput mirrors the ack input.
-type AckInput struct {
-	AgentOrchestratorScopeKey
-	EventID    int64
-	TerminalID string
-}
-
-// MoveOwnerInput mirrors the moveOwner input.
-type MoveOwnerInput struct {
-	From               AgentOrchestratorScopeKey
-	PaneID             string
-	TargetAckedEventID int64
-	TerminalID         string
-	To                 AgentOrchestratorScopeKey
 }
 
 // AgentOrchestratorScopeStore ports src/db/agent-orchestrator-scopes.ts.

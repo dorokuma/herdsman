@@ -39,8 +39,9 @@ const statementBreakpoint = "--> statement-breakpoint"
 // migrationJournal mirrors drizzle/meta/_journal.json.
 type migrationJournal struct {
 	Entries []struct {
-		Tag  string `json:"tag"`
-		When int64  `json:"when"`
+		Tag     string `json:"tag"`
+		Version string `json:"version"`
+		When    int64  `json:"when"`
 	} `json:"entries"`
 }
 
@@ -98,9 +99,36 @@ func readMigrationFiles() ([]migrationFile, error) {
 // daemon already migrated has all timestamps recorded, so this is a no-op on
 // it — the existing tables are reused as they are.
 func ApplyMigrations(db *sql.DB) error {
+	return applyMigrationsThrough(db, "")
+}
+
+// ApplyMigrationsThrough mirrors ApplyMigrations up to and including the given
+// tag, leaving the database in the state that migration produced. An empty tag
+// means "every migration", which is what ApplyMigrations does. The
+// data-backfill test migrates to an older schema first and then replays one
+// migration by hand, exactly like the TS harness does with a pruned drizzle
+// folder.
+func ApplyMigrationsThrough(db *sql.DB, throughTag string) error {
+	return applyMigrationsThrough(db, throughTag)
+}
+
+func applyMigrationsThrough(db *sql.DB, throughTag string) error {
 	files, err := readMigrationFiles()
 	if err != nil {
 		return err
+	}
+	if throughTag != "" {
+		upto := -1
+		for index, file := range files {
+			if file.tag == throughTag {
+				upto = index
+				break
+			}
+		}
+		if upto < 0 {
+			return fmt.Errorf("unknown migration tag: %s", throughTag)
+		}
+		files = files[:upto+1]
 	}
 	if _, err := db.Exec(createMigrationsTableSQL); err != nil {
 		return err
@@ -119,6 +147,51 @@ func ApplyMigrations(db *sql.DB) error {
 		}
 	}
 	return nil
+}
+
+// MigrationJournalEntry mirrors one entry of drizzle's meta/_journal.json.
+type MigrationJournalEntry struct {
+	Tag     string
+	Version string
+	When    int64
+}
+
+// MigrationJournal reads the embedded journal: the ordered migration entries the
+// replay follows.
+func MigrationJournal() ([]MigrationJournalEntry, error) {
+	journalBytes, err := migrationsFS.ReadFile("migrations/meta/_journal.json")
+	if err != nil {
+		return nil, err
+	}
+	var journal migrationJournal
+	if err := json.Unmarshal(journalBytes, &journal); err != nil {
+		return nil, err
+	}
+	entries := make([]MigrationJournalEntry, 0, len(journal.Entries))
+	for _, entry := range journal.Entries {
+		entries = append(entries, MigrationJournalEntry{
+			Tag:     entry.Tag,
+			Version: entry.Version,
+			When:    entry.When,
+		})
+	}
+	return entries, nil
+}
+
+// MigrationStatements returns the statements of one embedded migration file,
+// split on drizzle's statement breakpoint. A data-backfill migration is replayed
+// by hand by the tests that cover it in isolation.
+func MigrationStatements(tag string) ([]string, error) {
+	files, err := readMigrationFiles()
+	if err != nil {
+		return nil, err
+	}
+	for _, file := range files {
+		if file.tag == tag {
+			return file.statements, nil
+		}
+	}
+	return nil, fmt.Errorf("unknown migration tag: %s", tag)
 }
 
 // applyMigration replays one migration file inside a single transaction and

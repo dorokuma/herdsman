@@ -196,24 +196,25 @@ type AckSelfOwnedInput struct {
 	WorkspaceID      string
 }
 
-// ListAfterInput mirrors `AgentQueryScope & { afterEventId?, limit?,
-// ownerTerminalId? }`. AfterEventID and Limit are optional; nil means the TS
-// default (0 and 100 respectively).
-type ListAfterInput struct {
-	AfterEventID     *int64
-	HerdrSessionName *string
-	Limit            *int
-	OwnerTerminalID  *string
-	WorkspaceID      *string
-}
+// ListAfterInput, NextDeliverableAfterInput and the orchestrator query inputs
+// live in internal/observability, because internal/observability cannot import
+// internal/db (that would be an import cycle) yet its AgentOrchestratorService
+// needs to speak them. The aliases keep the existing call sites and test names
+// unchanged.
+type ListAfterInput = observability.ListAfterInput
 
-// NextDeliverableAfterInput mirrors the TS input of the same name.
-type NextDeliverableAfterInput struct {
-	AfterEventID     int64
-	GetAgent         func(agentID string) *observability.AgentIndexRecord
-	HerdrSessionName string
-	OwnerTerminalID  string
-	WorkspaceID      string
+type NextDeliverableAfterInput = observability.NextDeliverableAfterInput
+
+// IsDeliverableAgentEvent mirrors the shared delivery predicate as a method, so
+// the observability service can reach it through its store interface. The
+// package-level function of the same name stays the implementation.
+func (s *AgentEventStore) IsDeliverableAgentEvent(
+	event observability.AgentEventRecord,
+	agent *observability.AgentIndexRecord,
+	scope observability.AgentScope,
+	ownerTerminalID string,
+) bool {
+	return IsDeliverableAgentEvent(event, agent, scope, ownerTerminalID)
 }
 
 // AgentEventStore ports src/db/agent-events.ts.
