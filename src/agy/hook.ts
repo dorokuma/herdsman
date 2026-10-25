@@ -75,7 +75,8 @@ type AgySessionHookState = {
   // `reservePending` never refreshes it for an already delivered row, so an
   // unacked event vanishes from `connState.events` after that window while it
   // is still unacked. The snapshot keeps it injectable and keeps it visible to
-  // the acknowledgement hold-back bound. See `collectWakeCandidateEvents`.
+  // the acknowledgement hold-back bound. See `mergeKnownUnackedEvents` and
+  // `filterEligibleRetainedEvents`.
   retainedCandidateEvents?: AgentEventRecord[];
   turnEpoch?: number;
   waiterEpoch?: number;
@@ -120,7 +121,9 @@ const MAX_WAKE_PROMPT_ATTEMPTS = 3;
 const WAKE_PROMPT_TEXT = "[herdsman-wake]";
 // Upper bound of the persisted candidate snapshot (`retainedCandidateEvents`).
 // A wake batch is a handful of peer completions, so 100 records cover even a
-// long working-defer streak while keeping the session state file bounded.
+// long working-defer streak while keeping the session state file bounded. When
+// the bound is hit the *lowest* ids are kept (see `retainWakeCandidates`),
+// because those are the ones the acknowledgement cursor must not pass.
 const RETAINED_CANDIDATE_EVENT_LIMIT = 100;
 // `PLAN_WAITING_HISTORY` / `PLAN_STALLED` / `DEGRADED_PLAN_ERROR` are imported
 // from `@/observability/contracts.js` above: the string values are the contract
@@ -1011,11 +1014,10 @@ async function registerAgyPresence(
 }
 
 /**
- * Events of this session that are still waiting to be projected.
+ * Every event of this session that still owes a projection *or* an ack.
  *
  * `agent.orchestrator.get` only returns rows with `id > ackedEventId`, so an id
- * that survived into `candidateEvents` is by definition neither acknowledged nor
- * handed to the host yet.
+ * that survives this merge is by definition not acknowledged yet.
  *
  * `retained` is the snapshot persisted in the session state. A `delivered` row
  * leaves `connState.events` once it is older than `REDELIVERY_FRESHNESS_MS`
@@ -1025,10 +1027,18 @@ async function registerAgyPresence(
  * an event injectable after a long composer draft, and keeps it in front of
  * `resolveMinHoldbackEventId` so a higher id cannot ack past it. For an id the
  * daemon still reports, the daemon's current copy wins.
+ *
+ * Deliberately **not** filtered by `presentedEventIds`: the Stop hook marks the
+ * batch presented *and* records it in `deliveredEventIds` before handing it to
+ * the host via `decision: continue`, so a presented-filtered view would report
+ * "nothing to do" for exactly the batch that still has to survive — and would
+ * then let the snapshot (and the event with it) be cleared while the host has
+ * not started the turn yet. Callers apply the presented filter themselves via
+ * `collectWakeCandidateEvents`, and `retainWakeCandidates` uses the unfiltered
+ * view to keep the delivered-but-unacked records alive.
  */
-function collectWakeCandidateEvents(
+function mergeKnownUnackedEvents(
   connState: OrchestratorConnectionState,
-  presented: ReadonlySet<number>,
   retained?: readonly AgentEventRecord[],
 ): AgentEventRecord[] {
   const ackedEventId = connState.state?.ackedEventId ?? 0;
@@ -1043,7 +1053,6 @@ function collectWakeCandidateEvents(
     .filter(
       (event) =>
         event.id > ackedEventId &&
-        !presented.has(event.id) &&
         event.terminalId !== connState.presence.terminalId &&
         // A state file can outlive the workspace it was written for; never
         // project an event that belongs to a different Herdr session.
@@ -1054,24 +1063,134 @@ function collectWakeCandidateEvents(
 }
 
 /**
+ * The subset of `knownUnackedEvents` that may still be handed to the host,
+ * i.e. everything that has not been presented (suppressed or delivered) yet.
+ */
+function collectWakeCandidateEvents(
+  knownUnackedEvents: readonly AgentEventRecord[],
+  presented: ReadonlySet<number>,
+): AgentEventRecord[] {
+  return knownUnackedEvents.filter((event) => !presented.has(event.id));
+}
+
+/**
+ * Retained-only rows that are no longer deliverable in this scope are dropped.
+ *
+ * A row the daemon re-listed in *this* `agent.orchestrator.get` response was
+ * just validated by the daemon itself (workspace scope, deliverable state, and
+ * the `INVALIDATED_GRACE_MS` grace for a `retained invalidated` / orphan row),
+ * so it is kept unconditionally. A row that only survives in the local snapshot
+ * has not been validated for a while, and absence from `connState.events` means
+ * more than "older than `REDELIVERY_FRESHNESS_MS`":
+ *
+ * - the event may belong to a sibling workspace that has an orchestrator owner
+ *   of its own by now, so it left this owner's `ownerlessSiblingScopes`;
+ * - its pane may have been closed and the row reclaimed / invalidated meanwhile
+ *   (`PANE_CLOSED_RECLAIM`, `LEGACY_CLOSE_WITHOUT_GENERATION`), so it is not
+ *   deliverable any more — a row that merely stays inside the grace window would
+ *   still have been re-listed by the daemon.
+ *
+ * Injecting such a row would wake the orchestrator with an outcome it cannot act
+ * on, and keeping it would hold `resolveMinHoldbackEventId` back forever. When
+ * `agent.list` failed (`liveScope === undefined`) nothing is known, so every row
+ * is kept: losing a real completion is worse than one more useless wake.
+ */
+function filterEligibleRetainedEvents(
+  events: readonly AgentEventRecord[],
+  liveConnEventIds: ReadonlySet<number>,
+  presenceWorkspaceId: string,
+  liveScope:
+    | { liveScopeWorkspaces: ReadonlySet<string>; liveTerminalIds: ReadonlySet<string> }
+    | undefined,
+): AgentEventRecord[] {
+  if (liveScope === undefined) return [...events];
+  return events.filter((event) => {
+    if (liveConnEventIds.has(event.id)) return true;
+    if (
+      typeof event.workspaceId === "string" &&
+      event.workspaceId !== presenceWorkspaceId &&
+      !liveScope.liveScopeWorkspaces.has(event.workspaceId)
+    ) {
+      return false;
+    }
+    if (event.terminalId !== null && !liveScope.liveTerminalIds.has(event.terminalId)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
  * The candidates that still have to be handed over, for the persisted snapshot.
  *
- * Keeps an unacked event that is either not presented yet (never handed to the
- * host) or still waiting for its RPC ack after delivery (`deliveredEventIds`):
- * `rearmDeliveredEvents` makes exactly those ids injectable again, so
- * `takeNextWakeBatch` must be able to rebuild their records even after the
- * daemon stopped re-listing them. Once `flushDeliveredAcks` settles the ack the
- * id leaves `deliveredEventIds`, is presented, and drops out of the snapshot.
+ * Takes the *unfiltered* `knownUnackedEvents` (not the presented-filtered
+ * candidates) and keeps an unacked event that is either not presented yet (never
+ * handed to the host) or still waiting for its RPC ack after delivery
+ * (`deliveredEventIds`): `rearmDeliveredEvents` makes exactly those ids
+ * injectable again, so `takeNextWakeBatch` must be able to rebuild their records
+ * even after the daemon stopped re-listing them and even while the WakeWaiter is
+ * peeking in between. Once `flushDeliveredAcks` settles the ack the id leaves
+ * `deliveredEventIds`, is presented, and drops out of the snapshot.
+ *
+ * `knownUnackedEvents` is sorted by id, so the capacity bound trims from the
+ * top: the oldest ids — the ones the acknowledgement cursor must not pass — are
+ * the ones that stay.
  */
 function retainWakeCandidates(
-  candidateEvents: readonly AgentEventRecord[],
+  knownUnackedEvents: readonly AgentEventRecord[],
   presented: ReadonlySet<number>,
   deliveredEventIds: readonly number[] | undefined,
 ): AgentEventRecord[] {
   const unackedDelivered = new Set(deliveredEventIds ?? []);
-  return candidateEvents
+  return knownUnackedEvents
     .filter((event) => !presented.has(event.id) || unackedDelivered.has(event.id))
-    .slice(-RETAINED_CANDIDATE_EVENT_LIMIT);
+    .slice(0, RETAINED_CANDIDATE_EVENT_LIMIT);
+}
+
+/**
+ * Identity of a persisted snapshot, used to skip no-op state writes.
+ */
+function retainedSnapshotKey(events: readonly AgentEventRecord[] | undefined): string {
+  return (events ?? []).map((event) => event?.id).join(",");
+}
+
+/**
+ * Known-unacked events that are still eligible for projection, together with
+ * the peers whose live Herdr status is `working`.
+ *
+ * One `agent.list` round trip serves both consumers: `projectAgyOutcomes` needs
+ * the live `working` set to defer intermediate rounds, and
+ * `filterEligibleRetainedEvents` needs the live peer/scope sets to re-validate
+ * the rows that only survive in the local snapshot. With nothing known to be
+ * unacked there is nothing to validate, so the RPC is skipped.
+ */
+async function resolveEligibleWakeEvents(
+  client: Pick<ObservabilityRpcClient, "request">,
+  connState: OrchestratorConnectionState,
+  sessionState: AgySessionHookState,
+): Promise<{
+  eligibleKnownEvents: AgentEventRecord[];
+  liveWorkingTerminalIds: ReadonlySet<string>;
+}> {
+  const knownUnackedEvents = mergeKnownUnackedEvents(
+    connState,
+    sessionState.retainedCandidateEvents,
+  );
+  if (knownUnackedEvents.length === 0) {
+    return { eligibleKnownEvents: [], liveWorkingTerminalIds: new Set() };
+  }
+  const liveScope = await fetchLivePeerScope(client, connState.presence);
+  return {
+    eligibleKnownEvents: filterEligibleRetainedEvents(
+      knownUnackedEvents,
+      new Set((connState.events ?? []).map((event) => event.id)),
+      connState.presence.workspaceId,
+      liveScope,
+    ),
+    // `agent.list` failed: no live status is known, so completions are projected
+    // (the tolerated pre-fix behaviour) and retained rows are kept.
+    liveWorkingTerminalIds: liveScope?.workingTerminalIds ?? new Set(),
+  };
 }
 
 /**
@@ -1128,13 +1247,26 @@ async function resolveMinHoldbackEventId(
   const presented = new Set(
     (sessionState.presentedEventIds ?? []).filter((id) => id > ackedEventId),
   );
-  const candidateEvents = collectWakeCandidateEvents(
+  // Nothing to project can hold the cursor back, and eligibility can only remove
+  // candidates — so with no candidate at all the bound is unbounded and the
+  // `agent.list` round trip below is not needed.
+  if (
+    collectWakeCandidateEvents(
+      mergeKnownUnackedEvents(connState, sessionState.retainedCandidateEvents),
+      presented,
+    ).length === 0
+  ) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const { eligibleKnownEvents, liveWorkingTerminalIds } = await resolveEligibleWakeEvents(
+    client,
     connState,
-    presented,
-    sessionState.retainedCandidateEvents,
+    sessionState,
   );
+  // Recomputed through the eligibility filter: a retained row that is no longer
+  // deliverable must not hold the cursor back forever.
+  const candidateEvents = collectWakeCandidateEvents(eligibleKnownEvents, presented);
   if (candidateEvents.length === 0) return Number.POSITIVE_INFINITY;
-  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
   const { deferredWorkingEventIds, outcomes } = projectAgyOutcomes(
     candidateEvents,
     liveWorkingTerminalIds,
@@ -1231,33 +1363,44 @@ async function peekNextWakeBatch(
   );
   sessionState.presentedEventIds = [...presented];
 
-  const candidateEvents = collectWakeCandidateEvents(
+  const { eligibleKnownEvents, liveWorkingTerminalIds } = await resolveEligibleWakeEvents(
+    client,
     connState,
-    presented,
-    sessionState.retainedCandidateEvents,
+    sessionState,
   );
+  const candidateEvents = collectWakeCandidateEvents(eligibleKnownEvents, presented);
 
   if (candidateEvents.length === 0) {
+    // Re-read before writing: `sessionState` may predate a turn that started
+    // while this poll was in flight, and the on-disk copy is the newer one.
+    const freshState = readSessionState(stateDir, sessionId);
+    if (isWaiterSuperseded(freshState, expectedWaiter)) {
+      return { hasDeferredWorking: false, hasOutcomes: false };
+    }
+    // No candidate does *not* mean nothing left to retain: a batch the Stop hook
+    // handed to the host is presented (so it is no longer a candidate) while it
+    // waits in `deliveredEventIds` for its ack or for `rearmDeliveredEvents`.
+    // Wiping the snapshot here would drop exactly that batch when the host
+    // ignores `decision: continue` and the draft outlives the redelivery window.
+    const retainedEvents = retainWakeCandidates(
+      eligibleKnownEvents,
+      presented,
+      freshState.deliveredEventIds,
+    );
     if (
-      (sessionState.deferredEventIds ?? []).length > 0 ||
-      (sessionState.retainedCandidateEvents ?? []).length > 0
+      (freshState.deferredEventIds ?? []).length > 0 ||
+      retainedSnapshotKey(freshState.retainedCandidateEvents) !==
+        retainedSnapshotKey(retainedEvents)
     ) {
-      // Re-read before writing: `sessionState` may predate a turn that started
-      // while this poll was in flight, and the on-disk copy is the newer one.
-      const freshState = readSessionState(stateDir, sessionId);
-      if (isWaiterSuperseded(freshState, expectedWaiter)) {
-        return { hasDeferredWorking: false, hasOutcomes: false };
-      }
       freshState.deferredEventIds = [];
-      freshState.retainedCandidateEvents = [];
+      freshState.retainedCandidateEvents = retainedEvents;
       sessionState.deferredEventIds = [];
-      sessionState.retainedCandidateEvents = [];
+      sessionState.retainedCandidateEvents = retainedEvents;
       writeSessionState(stateDir, sessionId, freshState);
     }
     return { hasDeferredWorking: false, hasOutcomes: false };
   }
 
-  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
   const { deferredWorkingEventIds, outcomes, suppressedEventIds } = projectAgyOutcomes(
     candidateEvents,
     liveWorkingTerminalIds,
@@ -1309,9 +1452,11 @@ async function peekNextWakeBatch(
   freshState.pendingAckEventIds = mergeEventIds(freshState.pendingAckEventIds, heldAckEventIds);
   // `peek` never marks outcomes presented, so the batch it just reported stays in
   // the snapshot: the composer draft may outlive the daemon's redelivery window
-  // before `takeNextWakeBatch` consumes it.
+  // before `takeNextWakeBatch` consumes it. The input is the *unfiltered*
+  // eligible view, so a batch that is already presented but still unacked is
+  // retained for the whole polling round instead of being dropped here.
   freshState.retainedCandidateEvents = retainWakeCandidates(
-    candidateEvents,
+    eligibleKnownEvents,
     presented,
     freshState.deliveredEventIds,
   );
@@ -1340,25 +1485,35 @@ async function takeNextWakeBatch(
   );
   sessionState.presentedEventIds = [...presented];
 
-  const candidateEvents = collectWakeCandidateEvents(
+  const { eligibleKnownEvents, liveWorkingTerminalIds } = await resolveEligibleWakeEvents(
+    client,
     connState,
-    presented,
-    sessionState.retainedCandidateEvents,
+    sessionState,
   );
+  const candidateEvents = collectWakeCandidateEvents(eligibleKnownEvents, presented);
 
   if (candidateEvents.length === 0) {
+    // Same reasoning as `peekNextWakeBatch`: a presented-but-unacked batch is
+    // not a candidate, yet its records must stay in the snapshot until
+    // `flushDeliveredAcks` settles the ack (or `rearmDeliveredEvents` makes it
+    // injectable again), otherwise a later turn cannot rebuild it.
+    const retainedEvents = retainWakeCandidates(
+      eligibleKnownEvents,
+      presented,
+      sessionState.deliveredEventIds,
+    );
     if (
       (sessionState.deferredEventIds ?? []).length > 0 ||
-      (sessionState.retainedCandidateEvents ?? []).length > 0
+      retainedSnapshotKey(sessionState.retainedCandidateEvents) !==
+        retainedSnapshotKey(retainedEvents)
     ) {
       sessionState.deferredEventIds = [];
-      sessionState.retainedCandidateEvents = [];
+      sessionState.retainedCandidateEvents = retainedEvents;
       writeSessionState(stateDir, sessionId, sessionState);
     }
     return undefined;
   }
 
-  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
   const { deferredWorkingEventIds, outcomes, suppressedEventIds } = projectAgyOutcomes(
     candidateEvents,
     liveWorkingTerminalIds,
@@ -1395,7 +1550,7 @@ async function takeNextWakeBatch(
       heldAckEventIds,
     );
     sessionState.retainedCandidateEvents = retainWakeCandidates(
-      candidateEvents,
+      eligibleKnownEvents,
       presented,
       sessionState.deliveredEventIds,
     );
@@ -1417,8 +1572,10 @@ async function takeNextWakeBatch(
   // The batch is presented *and* delivered-but-unacked here: `rearmDeliveredEvents`
   // can hand it back to a later `PreInvocation`, possibly after a draft outlived
   // the daemon's redelivery window, so its records have to survive in the state.
+  // The unfiltered eligible view is what keeps them in even though the ids are
+  // already presented by now.
   sessionState.retainedCandidateEvents = retainWakeCandidates(
-    candidateEvents,
+    eligibleKnownEvents,
     presented,
     sessionState.deliveredEventIds,
   );
@@ -1593,20 +1750,32 @@ async function inspectWorkspaceAgents(
 }
 
 /**
- * Terminal ids of peers whose live Herdr status is `working`.
+ * Live peer view of this orchestrator scope, straight from `agent.list`.
  *
- * Used to defer completions that may belong to an intermediate round of a still
- * running turn: `agent.done` / `agent.idle` rows are written for every internal
- * tool round, so the live status is the only signal that the turn is not over
- * (`agent.status.changed` rows never reach the hook's event batch). Failure is
- * tolerated: the completion is then projected as a real outcome (the pre-fix
- * behaviour) instead of dropping the whole batch.
+ * The request is issued as the orchestrator owner with
+ * `includeOwnerlessWorkspaces: true`, so the daemon answers with the agents of
+ * this workspace *plus* the sibling workspaces that still have no owner of their
+ * own — one response therefore carries three different facts:
  *
- * A stale `working` row right after a real `agent.done` is also possible; those
- * events are deferred (not permanently acked) so the next poll can wake once
- * the live status catches up.
+ * - `workingTerminalIds`: peers whose live Herdr status is `working`. Used to
+ *   defer completions that may belong to an intermediate round of a still
+ *   running turn: `agent.done` / `agent.idle` rows are written for every
+ *   internal tool round, so the live status is the only signal that the turn is
+ *   not over (`agent.status.changed` rows never reach the hook's event batch).
+ *   A stale `working` row right after a real `agent.done` is also possible;
+ *   those events are deferred (not permanently acked) so the next poll can wake
+ *   once the live status catches up.
+ * - `liveTerminalIds`: every peer terminal still present in the index. A
+ *   retained snapshot row whose terminal is gone has lost its source pane, so it
+ *   is no longer deliverable (`filterEligibleRetainedEvents`).
+ * - `liveScopeWorkspaces`: the workspaces this owner may still project, used for
+ *   the same check against sibling-workspace rows that were taken over.
+ *
+ * Failure is tolerated and reported as `undefined`: completions are then
+ * projected as real outcomes (the pre-fix behaviour) instead of dropping the
+ * whole batch, and unvalidated snapshot rows are kept.
  */
-async function fetchLiveWorkingTerminalIds(
+async function fetchLivePeerScope(
   client: Pick<ObservabilityRpcClient, "request">,
   presence: {
     herdrSessionName: string;
@@ -1614,24 +1783,47 @@ async function fetchLiveWorkingTerminalIds(
     terminalId: string;
     workspaceId: string;
   },
-): Promise<Set<string>> {
+): Promise<
+  | {
+      liveScopeWorkspaces: Set<string>;
+      liveTerminalIds: Set<string>;
+      workingTerminalIds: Set<string>;
+    }
+  | undefined
+> {
   try {
     const response = (await client.request("agent.list", {
       herdrSessionName: presence.herdrSessionName,
       includeOwnerlessWorkspaces: true,
       workspaceId: presence.workspaceId,
     })) as { agents?: AgentListItem[] };
-    return new Set(
-      (response.agents ?? []).flatMap((agent) =>
-        agent.agentStatus === "working" &&
-        agent.terminalId &&
-        agent.terminalId !== presence.terminalId
-          ? [agent.terminalId]
-          : [],
-      ),
+    const agents = response.agents ?? [];
+    const peers = agents.filter(
+      (agent) => typeof agent.terminalId === "string" && agent.terminalId !== presence.terminalId,
     );
+    const peerTerminalIds = peers.flatMap((agent) =>
+      typeof agent.terminalId === "string" ? [agent.terminalId] : [],
+    );
+    return {
+      liveScopeWorkspaces: new Set([
+        presence.workspaceId,
+        ...agents.flatMap((agent) =>
+          typeof agent.workspaceId === "string" && agent.workspaceId.length > 0
+            ? [agent.workspaceId]
+            : [],
+        ),
+      ]),
+      liveTerminalIds: new Set(peerTerminalIds),
+      workingTerminalIds: new Set(
+        peers.flatMap((agent) =>
+          agent.agentStatus === "working" && typeof agent.terminalId === "string"
+            ? [agent.terminalId]
+            : [],
+        ),
+      ),
+    };
   } catch {
-    return new Set();
+    return undefined;
   }
 }
 

@@ -6,11 +6,11 @@ supersedes: ""
 模块: "observability"
 ---
 
-# agy 叫醒竞态：working 完成事件改为 defer、同 terminal 完成事件去重、叫醒前检测输入框草稿（含 ack 游标下界 / 草稿框顶消歧 / peek 写盘复核 / 300s 重投窗口快照四轮加固）
+# agy 叫醒竞态：working 完成事件改为 defer、同 terminal 完成事件去重、叫醒前检测输入框草稿（含 ack 游标下界 / 草稿框顶消歧 / peek 写盘复核 / 300s 重投窗口快照 / 快照来源与投递资格与截断方向等多轮加固）
 
 ## 一句话结论
 
-`liveWorkingTerminalIds` 命中的完成事件**不能再当永久噪声静默 ack**，必须放进 `deferredWorkingEventIds` 保持「未 ack、未 presented」等下一轮重投，否则 `agent.done` 与 `agent.list` 状态刷新之间的竞态会永久吞掉真正的最终结果；与之配套，同一 `terminalId` 在一批候选事件里出现多条完成事件时，只有**最新一条能产出有效 completed outcome 的完成事件**进入唤醒批次，更早的按 `superseded by newer completion for terminal <id>` 抑制并 ack；另外 `WakeWaiter` 在 `triggerWakePrompt` 前要先 `herdr pane read --lines 40` + `parseAgyComposerDraft` 看 orchestrator 输入框是否有半成品草稿，有草稿就推迟本轮叫醒，但**解析不到框必须回退成照常叫醒**，避免解析器退化把唤醒永久堵死。第二轮审查又补上三处：ack 是 `id <= ?` 的批量结算，高 ID ack 会顺带吞掉低 ID 的未决 deferred 事件，因此 hook 侧引入 `pendingAckEventIds` 与 `< minDeferredId` 游标下界；`readComposerDraft` 的异步等待之后必须复核 `turnEpoch` / `waiterPid` 再叫醒；composer 框顶改为「与框底等宽同款 + 外层非空优先」以挡住草稿内部的「横线 + `>` 行」。第三轮再补两处：**`peekNextWakeBatch` 写盘前必须复核 `turnEpoch` / `waiterPid`，且 `presentedEventIds` 只能并集不能覆盖**（异步等待期间新回合 `PreInvocation` 写入的 presented 会被旧 waiter 用调用前的旧集合抹掉，导致重复注入）；**`sessionState` 里持久化未消费候选事件快照 `retainedCandidateEvents`**，因为 daemon 的 `listAfter` 只重列 `last_attempt_at` 在 `REDELIVERY_FRESHNESS_MS`（300 秒）内的 `delivered` 行，长草稿 / 长时 working-defer 一旦超过 300 秒，事件就从 `connState.events` 消失——既会永久丢通知，也会让 ack 游标下界失去依据而被高 ID ack 顺带吞掉。
+`liveWorkingTerminalIds` 命中的完成事件**不能再当永久噪声静默 ack**，必须放进 `deferredWorkingEventIds` 保持「未 ack、未 presented」等下一轮重投，否则 `agent.done` 与 `agent.list` 状态刷新之间的竞态会永久吞掉真正的最终结果；与之配套，同一 `terminalId` 在一批候选事件里出现多条完成事件时，只有**最新一条能产出有效 completed outcome 的完成事件**进入唤醒批次，更早的按 `superseded by newer completion for terminal <id>` 抑制并 ack；另外 `WakeWaiter` 在 `triggerWakePrompt` 前要先 `herdr pane read --lines 40` + `parseAgyComposerDraft` 看 orchestrator 输入框是否有半成品草稿，有草稿就推迟本轮叫醒，但**解析不到框必须回退成照常叫醒**，避免解析器退化把唤醒永久堵死。第二轮审查又补上三处：ack 是 `id <= ?` 的批量结算，高 ID ack 会顺带吞掉低 ID 的未决 deferred 事件，因此 hook 侧引入 `pendingAckEventIds` 与 `< minDeferredId` 游标下界；`readComposerDraft` 的异步等待之后必须复核 `turnEpoch` / `waiterPid` 再叫醒；composer 框顶改为「与框底等宽同款 + 外层非空优先」以挡住草稿内部的「横线 + `>` 行」。第三轮再补两处：**`peekNextWakeBatch` 写盘前必须复核 `turnEpoch` / `waiterPid`，且 `presentedEventIds` 只能并集不能覆盖**（异步等待期间新回合 `PreInvocation` 写入的 presented 会被旧 waiter 用调用前的旧集合抹掉，导致重复注入）；**`sessionState` 里持久化未消费候选事件快照 `retainedCandidateEvents`**，因为 daemon 的 `listAfter` 只重列 `last_attempt_at` 在 `REDELIVERY_FRESHNESS_MS`（300 秒）内的 `delivered` 行，长草稿 / 长时 working-defer 一旦超过 300 秒，事件就从 `connState.events` 消失——既会永久丢通知，也会让 ack 游标下界失去依据而被高 ID ack 顺带吞掉。第四轮把快照的**内容来源、淘汰规则与截断方向**修准：快照一律从「未按 `presented` 过滤的已知未 ack 事件」（`mergeKnownUnackedEvents`）重算，否则宿主忽略 `decision: continue` 后 `WakeWaiter` 的首次 `peek` 就会把仍停在 `deliveredEventIds` 里的批次清空；只存在于快照、daemon 本轮不再重列的事件必须经 `agent.list` 的 scope / 源窗格存活核验（`fetchLivePeerScope` + `filterEligibleRetainedEvents`），死窗格与被接管兄弟工作区的旧行不再误注入、也不再长期压住 ack 游标；容量截断改为保留低 ID，被挤掉的变成最新的高 ID 事件。
 
 ## 背景
 
@@ -85,16 +85,48 @@ supersedes: ""
      - (b) 更糟的是 `resolveMinHoldbackEventId` 此时候选集为空返回 `+Infinity`，`flushDeliveredAcks` 会放行高 ID 事件的 ack，`markAcked` 的 `id <= ?` 把低 ID 的未消费事件在库里顺带吞掉。
    - 决策：把「仍未交出去的候选事件对象」持久化进 session state。
      - `AgySessionHookState` 新增 `retainedCandidateEvents?: AgentEventRecord[]`。
-     - `collectWakeCandidateEvents(connState, presented, retained)` 按 `event.id` 合并 `retained` 与 `connState.events` 并去重（同 id 以 daemon 返回的为准），其余过滤条件不变；额外加一条：`event.herdrSessionName` 存在时必须等于 `connState.presence.herdrSessionName`，防状态文件跨越 workspace/session 后把别的会话的事件注入进来。
+     - `collectWakeCandidateEvents(connState, presented, retained)` 按 `event.id` 合并 `retained` 与 `connState.events` 并去重（同 id 以 daemon 返回的为准），其余过滤条件不变；额外加一条：`event.herdrSessionName` 存在时必须等于 `connState.presence.herdrSessionName`，防状态文件跨越 workspace/session 后把别的会话的事件注入进来。（第四轮把这条合并拆成 `mergeKnownUnackedEvents` + 纯 presented 过滤的 `collectWakeCandidateEvents`，见第 10 条。）
      - `resolveMinHoldbackEventId` / `peekNextWakeBatch` / `takeNextWakeBatch` 三处均传 `sessionState.retainedCandidateEvents`。
      - 写回时机：`peek`（两处）与 `take`（三处）每次写 state 时重算，保留条件 `!presented.has(event.id) || deliveredEventIds.has(event.id)`（`collectWakeCandidateEvents` 已经保证 `id > ackedEventId`），上限 `RETAINED_CANDIDATE_EVENT_LIMIT = 100`，空则 `[]`。
        - 用「未 presented **或** 仍在 `deliveredEventIds`」而不是只看「未 presented」：`Stop` 的 `takeNextWakeBatch` 会先给 `decision: continue` 把事件标 presented + 记进 `deliveredEventIds`，随后 `rearmDeliveredEvents` 又把它从 `presented` 摘回来；只按「未 presented」保留的话，这条事件在 `Stop` 写盘那一刻就会掉出快照，「宿主忽略 `decision: continue` + 用户写 10 分钟草稿」的场景依旧丢事件。等 `flushDeliveredAcks` 真正 ack（或移入 `pendingAckEventIds`）后，它既不在 `deliveredEventIds` 也已 presented，自然淘汰。
        - `peek` 看到 outcomes 时**不**标 presented（真正消费发生在下一轮 `PreInvocation` 的 `takeNextWakeBatch`），所以 outcomes 对应的记录会一直留在快照里，草稿写多久都不会掉；草稿清空后 `peek` 仍能看到 `hasOutcomes: true` 并叫醒，接下来的 `PreInvocation` 从 `retainedCandidateEvents` 取回并注入。
-     - 淘汰：事件被 ack 后 `id > ackedEventId` 不再成立，下一次 `peek` / `take` 写盘时自动清掉；`peek` / `take` 的空候选分支也会把非空的 `retainedCandidateEvents` 一并清成 `[]`。
+     - 淘汰：事件被 ack 后 `id > ackedEventId` 不再成立，下一次 `peek` / `take` 写盘时自动清掉；`peek` / `take` 的空候选分支也会把非空的 `retainedCandidateEvents` 一并清成 `[]`（第四轮发现这条「空候选就清空」正是丢批次的根因，改成按 `retainWakeCandidates` 重算，见第 10 条）。
      - `!isLocalOwner`（`PreInvocation`）时与 `deliveredEventIds` / `pendingAckEventIds` 一起清掉 `deferredEventIds` 与 `retainedCandidateEvents`：所有权转移后这批事件的投递节奏归新 owner。
    - 代价：session state 文件多一段事件 JSON（上限 100 条，实际通常 1~3 条；事件记录里的 `createdAt` 经 JSON round-trip 后是 ISO 字符串，hook 侧不读该字段，`parseTimestampMs` 也兼容字符串）；以及「daemon 还认不认这条事件」不再是 hook 的唯一真相来源。
    - **没有采用**「让 hook 定期重新 ack / 刷新 `last_attempt_at`」：`reservePending` 不刷新已 delivered 行是 daemon 的投递语义（防离线 terminal 无限重投），hook 不该反向改 daemon 状态。
    - **没有采用**「把 `REDELIVERY_FRESHNESS_MS` 调大」：300 秒是所有订阅方（pi 扩展、`agent-event-reconciler` 的 E6 判定）共用的重投时限，为 agy 草稿场景放大它会把「关页后仍长期重投」的副作用铺到整条链路；hook 自己记住待办事件是本地状态，影响面最小。
+
+### 第四轮加固（2026-10-25，`fix/agy-wake-race-and-draft` 第四轮代码审查）
+
+第三轮的快照把「daemon 不再重列就丢事件」堵住了，但它把「候选事件」与「快照内容」绑成同一个集合，又把「daemon 没重列」当成「事件仍然可投递」，留下三个漏口：
+
+10. **`candidateEvents.length === 0` 把仍被 `deliveredEventIds` 持有的快照清空：合并已知未 ack 事件与过滤未 presented 候选必须分离**
+   - 事实：`Stop` 的 `takeNextWakeBatch` 在返回 `decision: continue` 前，已把批次同时写进 `presentedEventIds` 与 `deliveredEventIds`，并按第三轮的保留条件写快照（那时它确实在快照里）。但紧接着 `WakeWaiter` 的首次 `peekNextWakeBatch` 用的 `collectWakeCandidateEvents` 带 `!presented.has(event.id)`，这条批次**必然**被过滤掉 ⇒ `candidateEvents.length === 0` ⇒ 走进空候选分支 `freshState.retainedCandidateEvents = []`。
+   - 后果：宿主忽略 `decision: continue`、且用户在草稿框写了超过 300 秒后，`rearmDeliveredEvents` 虽然把 id 从 `presentedEventIds` 摘回来，但 `connState.events`（已超窗）与 `retainedCandidateEvents`（已被首次 peek 清空）**都是空的**，下一轮 `PreInvocation` 依然注入不到 ⇒ 第三轮快照在这条主场景上等于没生效。
+   - 决策：拆成两个职责单一的函数，快照一律从**未过滤**的视图重算。
+     - `mergeKnownUnackedEvents(connState, retained)`：只做 `retained ∪ connState.events` 合并（同 id 以 daemon 为准）+ 基础有效性（`id > ackedEventId`、`terminalId !== presence.terminalId`、`herdrSessionName` 匹配），按 id 升序返回，**不看 `presented`**。
+     - `collectWakeCandidateEvents(knownUnackedEvents, presented)`：退化成纯粹的 `!presented.has(event.id)` 过滤。
+     - `retainWakeCandidates(knownUnackedEvents, presented, deliveredEventIds)`：第一个参数改成未过滤视图，保留条件不变（`!presented || unackedDelivered`），于是「已 presented 但仍在 `deliveredEventIds`」的批次在整个 `WakeWaiter` 轮询期间稳稳留在快照里，直到 `flushDeliveredAcks` 把 ack 结清才自然淘汰。
+     - `peek` / `take` 的空候选分支不再无脑写 `[]`，而是写 `retainWakeCandidates(...)` 的结果（`peek` 用 `freshState.deliveredEventIds`，`take` 用 `sessionState.deliveredEventIds`），并且只在 `deferredEventIds` 非空或快照 id 序列（`retainedSnapshotKey`）真的变了时才写盘，避免 standby 期每轮多一次无意义写。
+   - **没有采用**「在空候选分支里加一条 `deliveredEventIds.length > 0` 再决定清不清」：那样快照内容仍然只能靠 `takeNextWakeBatch` 从 `connState.events` 重建，而这条路径恰恰是 daemon 已不再重列的场景；「哪些还能注入」与「哪些还得记住」本来就不是同一个集合，拆开才是根因修法。
+   - **没有采用**「在 `peek` 的空候选分支里跳过快照重算、只在 `outcomes.length > 0` 时重算」：宿主忽略 `decision: continue` 的批次永远走不到 `outcomes.length > 0`（它已 presented），空候选分支就是它唯一的存活机会。
+11. **仅存在于快照的事件要核验当前 scope 与源窗格投递资格**
+   - 事实：一条事件不再出现在 `connState.events` 里，除「超过 300 秒重投窗口」外还有两种可能：(1) 事件属于兄弟工作区，而那个兄弟工作区后来有了自己的 orchestrator owner，不再属于本 owner 的 `ownerlessSiblingScopes`；(2) 事件对应的子代理窗格已关闭、行在库里已被 invalidated / reclaim（`PANE_CLOSED_RECLAIM` / `LEGACY_CLOSE_WITHOUT_GENERATION`），不再可投递。快照若不判别就把三种情况都当可投递，会把死窗格的旧结论注入进唤醒批次（文本还在、`paneGeneration` 还是旧的），并在 `resolveMinHoldbackEventId` 里当候选长期压住 ack 游标。
+   - 决策：`fetchLiveWorkingTerminalIds` 扩成 `fetchLivePeerScope(client, presence)`，一次 `agent.list`（`includeOwnerlessWorkspaces: true` 由 daemon 侧限定「本工作区 + 当前仍无独立 owner 的兄弟工作区」）同时给出：
+     - `workingTerminalIds`：原有用途，传给 `projectAgyOutcomes` 做 working-defer；
+     - `liveTerminalIds`：所有仍存活的 peer terminal（排除自身）；
+     - `liveScopeWorkspaces`：`presence.workspaceId` ∪ 返回 agent 的 `workspaceId`；
+     - `agent.list` 抛异常时返回 `undefined`（而不是空集合），以便与「真的没有 peer」区分开做容错。
+   - `filterEligibleRetainedEvents(events, liveConnEventIds, presenceWorkspaceId, liveScope)`：
+     - 本轮 `agent.orchestrator.get` 亲自返回过的 id ⇒ **无条件保留**（daemon 刚校验过 scope / deliverable / `INVALIDATED_GRACE_MS` 宽限，`retained invalidated` 与 orphan outcome 在宽限内正是这一类）；
+     - 只来自快照的事件：`liveScope === undefined`（`agent.list` 瞬时失败）保守保留；否则 workspace 不在本 owner 的 scope 内 → 淘汰，`terminalId !== null` 且已从 `liveTerminalIds` 消失 → 淘汰。
+   - `resolveEligibleWakeEvents` 把「合并 → 取一次 `agent.list` → 资格核验」合成一步，`resolveMinHoldbackEventId` / `peekNextWakeBatch` / `takeNextWakeBatch` 三处统一走它：既拿到 `workingTerminalIds`，又完成快照核验，**0 额外 RPC**；`knownUnackedEvents` 为空时直接跳过 `agent.list`。`resolveMinHoldbackEventId` 另保留「无候选直接返回 `+Infinity`」的早退（资格过滤只会减少候选，早退安全），使 ack 路径的 RPC 次数与第三轮一致。
+   - **没有采用**「让 hook 自己拿 `INVALIDATED_GRACE_MS` / 事件 `status` 判定淘汰」：invalidated / reclaim 的判定与宽限窗口在 `src/db/agent-events.ts` 与 daemon 侧，hook 复制一份常量与规则就是第二套真相；「daemon 本轮还认不认」+「`agent.list` 里源窗格还在不在」已经是 hook 侧能拿到的最贴近事实的两个信号。
+   - **没有采用**「`agent.list` 失败就把快照全清」：一次 `agent.list` 抖动就把未消费的真实完成事件清光，等于把本轮要防的丢通知请回来；信息缺失时宁保守。
+12. **快照容量截断方向：保留低 ID**
+   - 事实：第三轮是 `.slice(-RETAINED_CANDIDATE_EVENT_LIMIT)`，超出上限时**从最旧（低 ID）开始挤出去**。而低 ID 恰是 `resolveMinHoldbackEventId` 需要用来压住 ack 游标的那一端：一旦被挤出，快照不再包含它、`peek` / `take` 也重建不出它，`flushDeliveredAcks` 反而可能放行高 ID ack 把它吞掉——正是第 9 条要防的失效模式。
+   - 决策：`knownUnackedEvents` 已按 id 升序，改成 `.slice(0, RETAINED_CANDIDATE_EVENT_LIMIT)`，优先保住最早未消费的低 ID 事件；被挤掉的是最新的高 ID 事件，它们要么仍在 `connState.events`（未超窗），要么由后续轮次的 `agent.orchestrator.get` 重新带回。
+   - **没有采用**「把 `RETAINED_CANDIDATE_EVENT_LIMIT` 调大就好」：容量再大也有被 working-defer 长尾堆满的可能，而方向错了等于「专门挤掉最要紧的那批」；先修方向再谈容量。
 
 ## 边界与权衡（残余窗口与已知取舍）
 
@@ -104,9 +136,11 @@ supersedes: ""
 4. **草稿检测只作用于 `triggerWakePrompt`**：`decision: continue` 的 immediate batch 不经过该检测（那条路径本来就不往输入框写文本）。
 5. **ack 游标下界是 hook 侧的自律，不是 daemon 侧的强制**：daemon 的 `#ack` 只在「下一个可投递事件是 `pending` 且 `input.eventId > next.id`」时抛 `ORCHESTRATOR_EVENT_OUT_OF_ORDER`；已经 `delivered` 给本 terminal 的行不构成阻塞，所以高 ID ack 在服务端是**合法**的，吞事件只可能在 hook 侧防。若将来有别的事务方（pi 扩展、其它 hook）也往同一 scope 发 ack，需要同样的下界保护，或把约束下沉到 daemon。
 6. **`pendingAckEventIds` 的滞留是有界的**：deferral 一直不解除（真·中间回合）时，被扣住的高 ID 事件会一直留在 `pendingAckEventIds` 里。它们已经 presented，不会重复注入；代价是这些行在 DB 里停在 `delivered`，以及 `presentedEventIds` 多占几项（该列表有 `slice(-500)` 上限）。
-7. **`resolveMinHoldbackEventId` 每轮 Stop 多一次 `agent.list`**：仅在 `allToAck` 非空时发生，且 `takeNextWakeBatch` 紧随其后本来就要发同样的 `agent.list`，增量成本是一次 RPC。
-8. **`retainedCandidateEvents` 是 hook 侧的第二真相来源（第三轮）**：它只保证 hook 自己不再丢事件，DB 里那条行仍停在 `delivered`，daemon 侧 reconciler / 重连重投逻辑照旧。若该行在此期间被 invalidated，`flushDeliveredAcks` 走 `isPermanentAckFailure` 分支把它按已消费处理并从快照淘汰，不会二次注入。快照上限 100 条，极端下超过部分从最旧开始被挤出去（与 `presentedEventIds` 的 `slice(-500)` 同类取舍）。
+7. **`resolveMinHoldbackEventId` 每轮 Stop 多一次 `agent.list`**：仅在 `allToAck` 非空时发生，且 `takeNextWakeBatch` 紧随其后本来就要发同样的 `agent.list`，增量成本是一次 RPC。第四轮保留了它的「无候选直接 `+Infinity`」早退，所以只有「确实还有未 presented 的已知事件」时才会多这一次调用。
+8. **`retainedCandidateEvents` 是 hook 侧的第二真相来源（第三轮）**：它只保证 hook 自己不再丢事件，DB 里那条行仍停在 `delivered`，daemon 侧 reconciler / 重连重投逻辑照旧。若该行在此期间被 invalidated，`flushDeliveredAcks` 走 `isPermanentAckFailure` 分支把它按已消费处理并从快照淘汰，不会二次注入。快照上限 100 条，超出时被挤出的是**最新**的高 ID 事件（第四轮第 12 条把截断方向从 `slice(-N)` 改成 `slice(0, N)`），低 ID 的 ack 游标下界始终留在快照里。
 9. **peek 的守卫只防写盘，不撤回已发出的 ack（第三轮）**：peek 在守卫之前可能已对永久抑制项发过 `agent.notifications.ack`；这些 id 本身就是要么已呈现要么噪声，新回合的 `takeNextWakeBatch` 会从刷新后的 `connState` 看到新游标，不会因此多注入。
+10. **快照资格核验只拿到 `agent.list` 的一次瞬时视图（第四轮）**：`agent.list` 成功但恰好漏掉某个刚重建的 peer（terminal 换代、索引尚未刷新）时，仅存在于快照的那条事件会被判为死窗格而淘汰——最坏结果是这一条不再注入，DB 行仍停在 `delivered`，等游标推进时由 daemon 侧结算；不会重复注入，也不会卡住后续 ack。`agent.list` 抛异常则整体保守保留（宁多一次无效叫醒，不少一次真叫醒）。
+11. **「全部已 presented 但仍有 delivered 批次」时每轮 peek 多一次 `agent.list`（第四轮）**：资格核验必须看实时 peer，而此时候选集已空，第三轮是不发这次 RPC 的。`WakeWaiter` 同一轮循环本来就要发一次 `inspectWorkspaceAgents`（同一个本地 socket），代价多一次同型 RPC；换来的是死快照条目会被主动清掉、`retainedCandidateEvents` 不会无限期滞留。
 
 ## 被放弃的方案（必填）
 
@@ -123,13 +157,16 @@ supersedes: ""
 - **（第三轮）peek 写盘前只重读 `presentedEventIds` 而不比较 epoch**：重读只能保证不抹掉磁盘已有值，不能阻止旧 waiter 去 `rearmDeliveredEvents` / 触发 `triggerWakePrompt`，也不能修正 `deferredEventIds` / `retainedCandidateEvents` 被旧集合覆盖；而 epoch 不匹配时根本不该写盘。
 - **（第三轮）把未消费事件只记 id、不记完整 `AgentEventRecord`**：注入需要的文本、`paneId` / `terminalId` / `paneGeneration` 全在事件记录里（同 terminal 去重与 fallback 抑制都依赖 `paneGeneration`），只存 id 就无法在 daemon 不再重列时重建 outcome。
 - **（第三轮）在 `flushDeliveredAcks` 里也重算并回写快照**：它不投影 outcome、也不改 presented 集合（只改 ack 进度），下一次 `takeNextWakeBatch` 本来就要根据刷新后的 `ackedEventId` 重算并淘汰已 ack 项；多写一次只增加写盘与丢字段的面积。
+- **（第四轮）把 `collectWakeCandidateEvents` 里的 `!presented.has(id)` 改成「presented 但仍在 `deliveredEventIds` 就保留」**：看起来一行就能堵住丢批次，但同一个集合同时要满足「哪些还能注入」（必须排除 presented，否则宿主已拿到批次会被重复注入）与「哪些还得记住」（必须包含 presented-but-unacked），一个集合承担两个语义就是本轮 bug 的形状；拆开后两处各自可读，`resolveMinHoldbackEventId` 才能拿得到真正的候选集。
+- **（第四轮）用快照里记录的 `status` / `invalidatedReason` 字段判投递资格**：`retainedCandidateEvents` 存的是事件首次被 hook 拿到时的副本，这些字段只会变旧，拿它当资格判断等于拿旧副本否定新事实；资格属于外部实时事实（窗格还在不在、工作区还归谁），只能问 `agent.orchestrator.get` / `agent.list`。
 
 ## 来源
 
 - 双审结论（verifier + reviewer）：同 terminal 多条完成事件同批重复注入（Should Fix 1）、草稿解析在长草稿与草稿含横线时退化（Should Fix 2）、缺 `.agents/notes/` 记录（Should Fix 3）、草稿推迟轮询与日志频率取舍（Consider 4）。
 - 第二轮双审结论（verifier + reviewer）：高 ID ack 顺带吞掉低 ID 未决 deferred 事件（Must Fix 1）、`readComposerDraft` 异步等待后未复核 `turnEpoch` / `waiterPid`（Must Fix 2）、`parseAgyComposerDraft` 在草稿含「横线 + `>` 行」时框顶误定位（Should Fix 3）。
 - 第三轮双审结论（verifier + reviewer）：`peekNextWakeBatch` 用调用前的旧 `presented` 集合覆盖写盘，抹掉并发 `PreInvocation` 写的 `presentedEventIds`（Must Fix 1）、hook 依赖的 `connState.events` 受 daemon `REDELIVERY_FRESHNESS_MS`（300s）重投窗口限制，长草稿 / 长时 working-defer 会丢事件或被高 ID ack 吞掉（Must Fix 2）。
-- 代码事实：`src/agy/hook.ts` 的 `projectAgyOutcomes`、`peekNextWakeBatch`、`takeNextWakeBatch`、`WakeWaiter` 分支、`defaultReadPaneText`、`readComposerDraft`、`parseAgyComposerDraft`、`flushDeliveredAcks`、`resolveMinHoldbackEventId`、`collectWakeCandidateEvents`、`retainWakeCandidates`、`isWaiterSuperseded`、`rearmDeliveredEvents`；`src/db/agent-events.ts` 的 `markAcked` / `listAfter` / `reservePending` / `REDELIVERY_FRESHNESS_MS`；`src/observability/agent-orchestrator-service.ts` 的 `#ack` / `#nextDeliverableAcrossScopes`；`src/daemon/agent-event-reconciler.ts` 对同一 300s 常量的 E6 判定。
+- 第四轮审查结论：`peekNextWakeBatch` / `takeNextWakeBatch` 的 `candidateEvents.length === 0` 分支会把仍留在 `deliveredEventIds` 里的快照清成 `[]`，宿主忽略 `decision: continue` + 超 300s 草稿时事件依旧丢失（Must Fix A：合并与 presented 过滤必须分离）；仅存在于 `retainedCandidateEvents` 的事件从未被校验过当前 scope 与源窗格投递资格，死窗格 / 被接管兄弟工作区的旧行会误注入并长期压住 ack 游标（Must Fix B）；快照 `slice(-RETAINED_CANDIDATE_EVENT_LIMIT)` 从低 ID 截断，挤掉的正是 ack 游标下界需要的那批事件（Must Fix C）。
+- 代码事实：`src/agy/hook.ts` 的 `projectAgyOutcomes`、`peekNextWakeBatch`、`takeNextWakeBatch`、`WakeWaiter` 分支、`defaultReadPaneText`、`readComposerDraft`、`parseAgyComposerDraft`、`flushDeliveredAcks`、`resolveMinHoldbackEventId`、`mergeKnownUnackedEvents`、`collectWakeCandidateEvents`、`filterEligibleRetainedEvents`、`resolveEligibleWakeEvents`、`retainWakeCandidates`、`retainedSnapshotKey`、`fetchLivePeerScope`（第四轮由 `fetchLiveWorkingTerminalIds` 扩展而来）、`isWaiterSuperseded`、`rearmDeliveredEvents`；`src/db/agent-events.ts` 的 `markAcked` / `listAfter` / `reservePending` / `REDELIVERY_FRESHNESS_MS`；`src/observability/agent-orchestrator-service.ts` 的 `#ack` / `#nextDeliverableAcrossScopes`；`src/daemon/agent-event-reconciler.ts` 对同一 300s 常量的 E6 判定。
 - 回归证据：`test/unit/agy-hook-and-cli.test.ts`
   - `intermediate agent.done while peer still working is deferred (not acked) and a later real completion wakes once`（修复前失败于「注入里同时出现中途轮文本 `已改完代码，继续跑测试。`」，修复后只注入 `event: 1126` 一条，旧中途事件被 suppressed 并在该轮 `Stop` 随批次 ack）。
   - `parseAgyComposerDraft covers empty, single-line, multi-line, placeholder-like, and missing box`（修复前对含 `--------` / `────────` 的多行草稿返回 `第三段` 或 `undefined`，修复后返回完整草稿）。
@@ -138,5 +175,7 @@ supersedes: ""
   - `WakeWaiter cancels the wake when turnEpoch advances while readComposerDraft is in flight`（受控 Promise 卡住 `readPaneText`，pending 期间把 `turnEpoch` 改成 2：`triggerWakePrompt` 不被调用，`presentedEventIds` 不被 `rearmDeliveredEvents` 清空）。修复前 `wakePrompts` 收到一次 `[herdsman-wake]`。
   - `parseAgyComposerDraft keeps a draft that contains a rule followed by a \> quote line`（`["output", rule, "> 草稿", "--------", ">", rule, ...]` 与同宽 `rule` 变体都返回非空草稿）。修复前两者都返回 `""`。
   - `peekNextWakeBatch does not wipe presentedEventIds written by a turn that started during agent.list`（受控 Promise 卡住 waiter 的第二次 `agent.list`，pending 期间把磁盘 state 改成 `turnEpoch: 2, presentedEventIds: [300], deliveredEventIds: [300]`：放行后旧 waiter 不发 wake，磁盘上的 `presentedEventIds` 仍为 `[300]`）。修复前该断言失败于 `presentedEventIds: []`。
-  - `an unconsumed event survives the daemon 300s redelivery window: long composer draft and long working-defer`（mock 复刻 `listAfter`：首次返回 `events: [9001]` 后不再重列该 `delivered` 行。阶段 1：草稿持续期间 daemon 返 `events: []`，草稿清空后仍靠 `retainedCandidateEvents` 叫醒，后续 `PreInvocation` 仍注入 9001；修复前该断言失败于 `draftWakePrompts` 为空。阶段 2：defer 的 event 100 不再被重列、只剩高 ID 噪声 event 105 时，`ackedIds` 仍为空（105 被 100 拦住），peer 转 `done` 后 100 正常注入并一并 ack 100、105；修复前第二条断言失败于 `expected [105] to deeply equal []`）。
+  - `an unconsumed event survives the daemon 300s redelivery window: long composer draft and long working-defer`（mock 复刻 `listAfter`：首次返回 `events: [9001]` 后不再重列该 `delivered` 行。阶段 1：草稿持续期间 daemon 返 `events: []`，草稿清空后仍靠 `retainedCandidateEvents` 叫醒，后续 `PreInvocation` 仍注入 9001；修复前该断言失败于 `draftWakePrompts` 为空。阶段 2：defer 的 event 100 不再被重列、只剩高 ID 噪声 event 105 时，`ackedIds` 仍为空（105 被 100 拦住），peer 转 `done` 后 100 正常注入并一并 ack 100、105；修复前第二条断言失败于 `expected [105] to deeply equal []`）。第四轮后该用例的 `agent.list` mock 额外保留源 peer 窗格（`term_peer`）——事件只是超 300s 重投窗口、窗格仍存活，正是资格核验要区分的真实场景。
+  - `a batch the host ignored survives repeated waiter peeks past the redelivery window and is still injected after the wake prompt`（第四轮 Must Fix A：`Stop` 已把 9500 标 presented + delivered 并返回 `decision: continue`，宿主忽略；waiter 在草稿推迟期间连续 peek，中途 daemon 停止重列该事件；断言多次 peek 后 `retainedCandidateEvents` 仍为 `[{id: 9500}]`、草稿清空后 `rearmDeliveredEvents` + `PreInvocation` 仍从快照重建并注入。修复前首次 peek 后快照即被清空，`readState().retainedCandidateEvents` 断言失败于 `[]`）。
+  - `retained rows whose source pane closed or whose sibling workspace was taken over are dropped, not injected and not holding the ack cursor`（第四轮 Must Fix B/C：快照里的 400（源窗格已从 `agent.list` 消失）与 410（兄弟工作区 `wC` 已被接管）不再被注入；ack 失败（`ORCHESTRATOR_EVENT_INVALIDATED`）与 ack 成功两种子场景下 `Stop` 都返回 `{}`，且已交付的 420 能正常 ack（`ackedIds: [420]`）而不被死低 ID 长压；第三阶段验证 daemon 本轮重列的死窗格行仍无条件保留。修复前 `Stop` 返回 `decision: continue` 并注入两条死事件文本，420 也被扣住不 ack）。
 - 前序决策：`.agents/notes/20261024-agy-smart-wake-standby-cross-workspace.md`（中间回合抑制与常驻 `WakeWaiter` 的原始设计，本笔记把其中「working 命中即永久静默 ack」一条改为 defer）。

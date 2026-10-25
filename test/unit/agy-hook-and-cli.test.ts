@@ -3102,6 +3102,20 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
       terminalId: "term_self",
       workspaceId: "wB",
     };
+    // The pane that produced the completion is still open — only its `agent.done`
+    // row left the daemon's redelivery window — so `agent.list` keeps reporting
+    // it. That is what `filterEligibleRetainedEvents` uses to tell "too old to be
+    // re-listed" apart from "source pane closed".
+    const peerAgent = {
+      agent: "pi",
+      agentStatus: "done" as const,
+      firstSeenAt: "2026-10-21T11:50:00.000Z",
+      herdrSessionName: "default",
+      id: "ag_peer",
+      paneId: "wB:p2",
+      terminalId: "term_peer",
+      workspaceId: "wB",
+    };
     const emptyComposer = [
       "assistant output",
       "─────────────────────────────────────────────────",
@@ -3143,7 +3157,7 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
     const draftConnect = async () => ({
       close: () => undefined,
       request: async (method: string) => {
-        if (method === "agent.list") return { agents: [selfAgent] };
+        if (method === "agent.list") return { agents: [selfAgent, peerAgent] };
         return {
           events: daemonListsDraftEvent ? [draftEvent] : [],
           presence: {
@@ -3372,6 +3386,340 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
     } finally {
       warnSpy.mockRestore();
       rmSync(draftDir, { force: true, recursive: true });
+    }
+  });
+
+  test("a batch the host ignored survives repeated waiter peeks past the redelivery window and is still injected after the wake prompt", async () => {
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-ignored-continue-retention-"));
+    const sessionId = "f4444444-2222-3333-4444-555555555555";
+    const statePath = join(dir, `${sessionId}.json`);
+    const peerEvent = makeDoneEvent(9500, "被忽略的批次结论。");
+    // `Stop` hands event 9500 to the host through `decision: continue`; the host
+    // ignores it, so the WakeWaiter is the only one left to surface the batch.
+    // After 300s the daemon stops re-listing the delivered row, leaving the
+    // persisted snapshot as the only source of the record.
+    let daemonListsEvent = true;
+    let composerHasDraft = true;
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    const readState = () =>
+      JSON.parse(readFileSync(statePath, "utf8")) as {
+        deliveredEventIds?: number[];
+        presentedEventIds?: number[];
+        retainedCandidateEvents?: Array<{ id: number }>;
+      };
+
+    const emptyComposer = [
+      "assistant output",
+      "─────────────────────────────────────────────",
+      ">",
+      "─────────────────────────────────────────────",
+      "? for shortcuts",
+    ].join("\n");
+    const draftComposer = [
+      "assistant output",
+      "─────────────────────────────────────────────",
+      "> 用户正在打的草稿",
+      "─────────────────────────────────────────────",
+      "? for shortcuts",
+    ].join("\n");
+
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string) => {
+        if (method === "agent.list") {
+          return {
+            agents: [
+              {
+                agent: "agy",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-21T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_self",
+                paneId: "wB:p1",
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              {
+                agent: "pi",
+                agentStatus: "done",
+                firstSeenAt: "2026-10-21T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_peer",
+                paneId: "wB:p2",
+                terminalId: "term_peer",
+                workspaceId: "wB",
+              },
+            ],
+          };
+        }
+        return {
+          events: daemonListsEvent ? [peerEvent] : [],
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId: 0,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-21T12:00:00.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    try {
+      const stopResult = await runAgyHook(
+        "Stop",
+        JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }),
+        {
+          connect,
+          environment: HERDR_ENV,
+          socketPath: "/tmp/herdsman.sock",
+          spawnWakeWaiter: () => ({ pid: process.pid }),
+          stateDir: dir,
+        },
+      );
+      expect(stopResult).toMatchObject({ decision: "continue" });
+      expect(String((stopResult as { reason?: string }).reason)).toContain("被忽略的批次结论。");
+      // The batch is presented (handed to the host) *and* delivered-but-unacked,
+      // so its record is retained even though it is no longer a candidate.
+      expect(readState()).toMatchObject({
+        deliveredEventIds: [9500],
+        presentedEventIds: [9500],
+        retainedCandidateEvents: [expect.objectContaining({ id: 9500 })],
+      });
+
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 20,
+        readPaneText: async () => (composerHasDraft ? draftComposer : emptyComposer),
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await vi.waitFor(() =>
+        expect(
+          warnSpy.mock.calls.some((call) => String(call[0]).includes("输入框有草稿，推迟叫醒")),
+        ).toBe(true),
+      );
+      // The user keeps typing past the redelivery window while the waiter peeks
+      // over the batch again and again. `candidateEvents` is empty from the first
+      // peek on (the id is presented), and that must not clear the snapshot: the
+      // pre-fix behaviour wiped it here and lost the batch for good.
+      daemonListsEvent = false;
+      await new Promise((resolve) => setTimeout(resolve, 120));
+      expect(wakePrompts).toEqual([]);
+      expect(readState().retainedCandidateEvents).toEqual([expect.objectContaining({ id: 9500 })]);
+
+      // Draft gone: the waiter re-arms the delivered batch and prompts.
+      composerHasDraft = false;
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+      expect(readState()).toMatchObject({
+        deliveredEventIds: [9500],
+        presentedEventIds: [],
+        retainedCandidateEvents: [expect.objectContaining({ id: 9500 })],
+      });
+
+      // The prompt starts the turn: `PreInvocation` has to rebuild the batch from
+      // the snapshot, because `agent.orchestrator.get` no longer returns it.
+      const preOut = await runAgyHook(
+        "PreInvocation",
+        JSON.stringify({ invocationNum: 2, sessionId }),
+        { connect, environment: HERDR_ENV, socketPath: "/tmp/herdsman.sock", stateDir: dir },
+      );
+      expect(
+        String(
+          (preOut as { injectSteps?: Array<{ ephemeralMessage: string }> }).injectSteps?.[0]
+            ?.ephemeralMessage,
+        ),
+      ).toContain("被忽略的批次结论。");
+      expect(readState()).toMatchObject({
+        deliveredEventIds: [9500],
+        presentedEventIds: [9500],
+      });
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("retained rows whose source pane closed or whose sibling workspace was taken over are dropped, not injected and not holding the ack cursor", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-retained-eligibility-"));
+    const sessionId = "f6666666-2222-3333-4444-555555555555";
+    const statePath = join(dir, `${sessionId}.json`);
+    // Only in the snapshot: its pane has been closed, so the row was reclaimed
+    // and the terminal left `agent.list` for good.
+    const closedPaneEvent = makeDoneEvent(400, "已关闭窗格的旧结论。", "term_gone");
+    // Only in the snapshot: the sibling workspace now has an orchestrator owner
+    // of its own, so it is no longer part of this owner's ownerless scope.
+    const takenOverSiblingEvent: AgentEventRecord = {
+      ...makeDoneEvent(410, "被接管兄弟工作区的旧结论。", "term_sibling"),
+      paneId: "wC:p9",
+      workspaceId: "wC",
+    };
+    // Still open, still this workspace: the peer of the delivered row 420 lives on.
+    const livePeerEvent = makeDoneEvent(420, "在线工人的结论。", "term_live");
+    const readState = () =>
+      JSON.parse(readFileSync(statePath, "utf8")) as {
+        deliveredEventIds?: number[];
+        pendingAckEventIds?: number[];
+        presentedEventIds?: number[];
+        retainedCandidateEvents?: Array<{ id: number }>;
+      };
+    const seed = () => {
+      writeFileSync(
+        statePath,
+        JSON.stringify({
+          deliveredEventIds: [420],
+          pendingAckEventIds: [],
+          presentedEventIds: [420],
+          retainedCandidateEvents: [closedPaneEvent, takenOverSiblingEvent, livePeerEvent],
+          turnEpoch: 0,
+        }),
+      );
+    };
+
+    // All three rows left the daemon's redelivery window: none of them comes back
+    // through `agent.orchestrator.get`, so only the eligibility check below can
+    // tell the two dead rows apart from the live one.
+    let listedEvents: AgentEventRecord[] = [];
+    let ackedEventId = 0;
+    let ackedIds: number[] = [];
+    let rejectAcks = false;
+
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string, params: unknown) => {
+        if (method === "agent.notifications.ack") {
+          const eventId = (params as { eventId: number }).eventId;
+          if (rejectAcks) {
+            throw { code: "ORCHESTRATOR_EVENT_INVALIDATED", message: "event invalidated" };
+          }
+          ackedIds.push(eventId);
+          ackedEventId = Math.max(ackedEventId, eventId);
+          return { acknowledged: true };
+        }
+        if (method === "agent.list") {
+          return {
+            agents: [
+              {
+                agent: "agy",
+                agentStatus: "idle",
+                firstSeenAt: "2026-10-21T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_self",
+                paneId: "wB:p1",
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              {
+                agent: "pi",
+                agentStatus: "done",
+                firstSeenAt: "2026-10-21T11:50:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_live",
+                paneId: "wB:p7",
+                terminalId: "term_live",
+                workspaceId: "wB",
+              },
+            ],
+          };
+        }
+        return {
+          events: listedEvents.filter((event) => event.id > ackedEventId),
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-21T12:00:00.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    const runStop = () =>
+      runAgyHook("Stop", JSON.stringify({ sessionId, terminationReason: "NO_TOOL_CALL" }), {
+        connect,
+        environment: HERDR_ENV,
+        socketPath: "/tmp/herdsman.sock",
+        spawnWakeWaiter: () => ({ pid: process.pid }),
+        stateDir: dir,
+      });
+
+    try {
+      // 1. The daemon rejects the ack (the row was invalidated), so the cursor
+      //    stays at 0 and the two dead rows keep showing up. They must be dropped
+      //    by the eligibility check instead of being injected as outcomes — the
+      //    pre-fix behaviour woke the orchestrator with a closed pane's text.
+      rejectAcks = true;
+      seed();
+      expect(await runStop()).toEqual({});
+      expect(readState()).toMatchObject({
+        deliveredEventIds: [],
+        pendingAckEventIds: [],
+        // Both stale records are gone; only the still-open peer's row was a
+        // candidate and it was already handed over.
+        retainedCandidateEvents: [],
+      });
+
+      // 2. Same snapshot, but the ack of the delivered row succeeds: a dead low
+      //    id must not hold the cursor back, so 420 is acknowledged right away
+      //    (pre-fix it stayed in `pendingAckEventIds` forever) and nothing stale
+      //    is injected on top of it.
+      rejectAcks = false;
+      ackedIds = [];
+      seed();
+      expect(await runStop()).toEqual({});
+      expect(ackedIds).toEqual([420]);
+      expect(ackedEventId).toBe(420);
+      expect(readState()).toMatchObject({
+        deliveredEventIds: [],
+        pendingAckEventIds: [],
+        retainedCandidateEvents: [],
+      });
+
+      // 3. A row the daemon re-listed is kept unconditionally, even for a peer
+      //    this `agent.list` response does not report: the daemon just validated
+      //    its scope and deliverability (a `retained invalidated` row inside the
+      //    grace window is exactly this case).
+      listedEvents = [closedPaneEvent];
+      ackedEventId = 0;
+      ackedIds = [];
+      writeFileSync(statePath, JSON.stringify({ turnEpoch: 0 }));
+      const listedStop = await runStop();
+      expect(String((listedStop as { reason?: string }).reason)).toContain("已关闭窗格的旧结论。");
+      expect(readState()).toMatchObject({
+        deliveredEventIds: [400],
+        presentedEventIds: [400],
+        retainedCandidateEvents: [expect.objectContaining({ id: 400 })],
+      });
+    } finally {
+      rmSync(dir, { force: true, recursive: true });
     }
   });
 });
