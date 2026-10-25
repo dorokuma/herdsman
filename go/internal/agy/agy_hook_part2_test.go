@@ -161,7 +161,7 @@ func TestStopSpawnsWaiterAndWakeWaiterWakesIdleMainPane(t *testing.T) {
 			},
 			"state": map[string]any{
 				"ackedEventId": ackedEventID, "herdrSessionName": "default",
-				"owner": map[string]any{"paneId": "wB:p1", "terminalId": "term_self"},
+				"owner":     map[string]any{"paneId": "wB:p1", "terminalId": "term_self"},
 				"updatedAt": "2026-10-21T12:00:00.000Z", "workspaceId": "wB",
 			},
 		}, nil
@@ -178,11 +178,11 @@ func TestStopSpawnsWaiterAndWakeWaiterWakesIdleMainPane(t *testing.T) {
 	// 1. Stop sees an active peer, writes the epochs, spawns the waiter and
 	// returns {} immediately.
 	stopResult := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, agy.RunAgyHookOptions{
-		Connect:          client.connect,
-		Environment:      herdrEnv,
-		SocketPath:       "/tmp/herdsman.sock",
-		SpawnWakeWaiter:  spawnWakeWaiter,
-		StateDir:         strPtr(dir),
+		Connect:         client.connect,
+		Environment:     herdrEnv,
+		SocketPath:      "/tmp/herdsman.sock",
+		SpawnWakeWaiter: spawnWakeWaiter,
+		StateDir:        strPtr(dir),
 	})
 	if !isEmptyHookOutput(stopResult) {
 		t.Fatalf("stop result = %+v, want {}", stopResult)
@@ -208,6 +208,8 @@ func TestStopSpawnsWaiterAndWakeWaiterWakesIdleMainPane(t *testing.T) {
 			PollIntervalMs: floatPtr(25),
 			SocketPath:     "/tmp/herdsman.sock",
 			StateDir:       strPtr(dir),
+			// readPaneText: no real `herdr pane read` in the fake-client cases.
+			ReadPaneText: func(string) (*string, error) { return nil, nil },
 			TriggerWakePrompt: func(paneID, promptText string) error {
 				client.mu.Lock()
 				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
@@ -334,7 +336,7 @@ func TestWakeWaiterSilentlyAcksSuppressedEvents(t *testing.T) {
 			},
 			"state": map[string]any{
 				"ackedEventId": ackedEventID, "herdrSessionName": "default",
-				"owner": map[string]any{"paneId": "wB:p1", "terminalId": "term_self"},
+				"owner":     map[string]any{"paneId": "wB:p1", "terminalId": "term_self"},
 				"updatedAt": "2026-10-21T12:00:00.000Z", "workspaceId": "wB",
 			},
 		}, nil
@@ -348,6 +350,8 @@ func TestWakeWaiterSilentlyAcksSuppressedEvents(t *testing.T) {
 			"HERDSMAN_AGY_WAITER_EPOCH", "1"),
 		SocketPath: "/tmp/herdsman.sock",
 		StateDir:   strPtr(dir),
+		// readPaneText: no real `herdr pane read` in the fake-client cases.
+		ReadPaneText: func(string) (*string, error) { return nil, nil },
 		TriggerWakePrompt: func(paneID, promptText string) error {
 			wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
 			return nil
@@ -445,7 +449,7 @@ func TestWakeWaiterExitsWithoutWakingWhenTurnEpochAdvances(t *testing.T) {
 			}}, nil
 		}
 		return map[string]any{
-			"events": pendingEvents,
+			"events":   pendingEvents,
 			"presence": map[string]any{"herdrSessionName": "default", "paneId": "wB:p1", "subscriberId": "agy:" + sessionID, "terminalId": "term_self", "workspaceId": "wB"},
 			"state":    map[string]any{"ackedEventId": 0, "herdrSessionName": "default", "owner": map[string]any{"paneId": "wB:p1", "terminalId": "term_self"}, "updatedAt": "2026-10-21T12:00:00.000Z", "workspaceId": "wB"},
 		}, nil
@@ -462,6 +466,8 @@ func TestWakeWaiterExitsWithoutWakingWhenTurnEpochAdvances(t *testing.T) {
 			PollIntervalMs: floatPtr(50),
 			SocketPath:     "/tmp/herdsman.sock",
 			StateDir:       strPtr(dir),
+			// readPaneText: no real `herdr pane read` in the fake-client cases.
+			ReadPaneText: func(string) (*string, error) { return nil, nil },
 			TriggerWakePrompt: func(paneID, promptText string) error {
 				client.mu.Lock()
 				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
@@ -515,7 +521,7 @@ func TestWakeWaiterWarnsOnWakePromptFailureAndPreservesEvents(t *testing.T) {
 			return map[string]any{"agents": []any{}}, nil
 		}
 		return map[string]any{
-			"events": pendingEvents,
+			"events":   pendingEvents,
 			"presence": map[string]any{"herdrSessionName": "default", "paneId": "wB:p1", "subscriberId": "agy:" + sessionID, "terminalId": "term_self", "workspaceId": "wB"},
 			"state":    map[string]any{"ackedEventId": 0, "herdrSessionName": "default", "owner": map[string]any{"paneId": "wB:p1", "terminalId": "term_self"}, "updatedAt": "2026-10-21T12:00:00.000Z", "workspaceId": "wB"},
 		}, nil
@@ -532,6 +538,8 @@ func TestWakeWaiterWarnsOnWakePromptFailureAndPreservesEvents(t *testing.T) {
 			PollIntervalMs: floatPtr(100),
 			SocketPath:     "/tmp/herdsman.sock",
 			StateDir:       strPtr(dir),
+			// readPaneText: no real `herdr pane read` in the fake-client cases.
+			ReadPaneText: func(string) (*string, error) { return nil, nil },
 			TriggerWakePrompt: func(paneID, promptText string) error {
 				client.mu.Lock()
 				wakeAttempts++
@@ -642,7 +650,7 @@ func TestStopDetectsUnsettledPeerAndWaiterStaysAliveAcrossSettleGrace(t *testing
 			}}, nil
 		}
 		return map[string]any{
-			"events": pendingEvents,
+			"events":   pendingEvents,
 			"presence": map[string]any{"herdrSessionName": "default", "paneId": "wB:p1", "subscriberId": "agy:" + sessionID, "terminalId": "term_self", "workspaceId": "wB"},
 			"state":    map[string]any{"ackedEventId": 0, "herdrSessionName": "default", "owner": map[string]any{"paneId": "wB:p1", "terminalId": "term_self"}, "updatedAt": "2026-10-22T12:00:00.000Z", "workspaceId": "wB"},
 		}, nil
@@ -665,11 +673,11 @@ func TestStopDetectsUnsettledPeerAndWaiterStaysAliveAcrossSettleGrace(t *testing
 	// message still null while a user message exists): Stop arms the next turn
 	// and spawns a waiter.
 	stopResult := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, agy.RunAgyHookOptions{
-		Connect:          client.connect,
-		Environment:      herdrEnv,
-		SocketPath:       "/tmp/herdsman.sock",
-		SpawnWakeWaiter:  spawnWakeWaiter,
-		StateDir:         strPtr(dir),
+		Connect:         client.connect,
+		Environment:     herdrEnv,
+		SocketPath:      "/tmp/herdsman.sock",
+		SpawnWakeWaiter: spawnWakeWaiter,
+		StateDir:        strPtr(dir),
 	})
 	if !isEmptyHookOutput(stopResult) {
 		t.Fatalf("stop result = %+v, want {}", stopResult)
@@ -756,13 +764,13 @@ func TestStopDetectsUnsettledPeerAndWaiterStaysAliveAcrossSettleGrace(t *testing
 			"HERDSMAN_AGY_SESSION_ID", sessionID,
 			"HERDSMAN_AGY_STATE_DIR", dir,
 			"HERDSMAN_AGY_WAITER_EPOCH", "2"),
-		ExitWhenNoPeers: boolPtr(true),
-		PollIntervalMs:  floatPtr(100),
-		SettleGraceMs:   floatPtr(300),
-		SocketPath:      "/tmp/herdsman.sock",
-		StateDir:        strPtr(dir),
+		ExitWhenNoPeers:   boolPtr(true),
+		PollIntervalMs:    floatPtr(100),
+		SettleGraceMs:     floatPtr(300),
+		SocketPath:        "/tmp/herdsman.sock",
+		StateDir:          strPtr(dir),
 		TriggerWakePrompt: triggerWakePrompt,
-		WaitTimeoutMs:   floatPtr(5000),
+		WaitTimeoutMs:     floatPtr(5000),
 	})
 	if !isEmptyHookOutput(expiringResult) {
 		t.Fatalf("expiring waiter result = %+v, want {}", expiringResult)

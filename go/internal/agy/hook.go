@@ -173,6 +173,10 @@ type RunAgyHookOptions struct {
 	TriggerWakePrompt  func(paneID string, promptText string) error
 	WaitTimeoutMs      *float64
 
+	// ReadPaneText reads the target pane's recent screen text (the
+	// composer-draft check). Nil means the production `herdr pane read` path.
+	ReadPaneText func(paneID string) (*string, error)
+
 	// Go-only seams (no TS counterpart): the console.warn sink, the process id
 	// used for the waiterPid race guard, and the platform/`/proc` readers used
 	// by ResolveWakeWaiterCwd. Nil means the production behaviour.
@@ -197,6 +201,7 @@ type runner struct {
 	connect           ConnectFunc
 	spawnWakeWaiter   func(input SpawnWakeWaiterInput) *SpawnWakeWaiterResult
 	triggerWakePrompt func(paneID, promptText string) error
+	readPaneText      func(paneID string) (*string, error)
 
 	// lastConnectionState carries the connState local of the TS code across the
 	// auto-claim reassignment.
@@ -250,6 +255,10 @@ func RunAgyHook(hookEventName HookEventName, rawStdin string, options RunAgyHook
 	r.triggerWakePrompt = options.TriggerWakePrompt
 	if r.triggerWakePrompt == nil {
 		r.triggerWakePrompt = defaultTriggerWakePrompt
+	}
+	r.readPaneText = options.ReadPaneText
+	if r.readPaneText == nil {
+		r.readPaneText = defaultReadPaneText
 	}
 
 	switch hookEventName {
@@ -581,23 +590,36 @@ func (r *runner) flushDeliveredAcks(
 	return decodeConnectionState(result), nil
 }
 
+// peekResult mirrors the `{ hasDeferredWorking, hasOutcomes }` return of
+// peekNextWakeBatch.
+type peekResult struct {
+	// HasDeferredWorking reports completions that are only suppressed because
+	// agent.list still lists the peer as working. The caller re-polls instead of
+	// treating the batch as consumed.
+	HasDeferredWorking bool
+	HasOutcomes        bool
+}
+
 // peekNextWakeBatch mirrors peekNextWakeBatch: it only evaluates whether a
-// batch exists, acking the events the projection suppressed.
+// batch exists, acking the events the projection permanently suppressed.
+// Working-deferred events stay unacked and unpresented so a later poll can
+// project them once agent.list catches up.
 func (r *runner) peekNextWakeBatch(
 	client rpcClient,
 	connState ConnectionState,
 	sessionState *SessionHookState,
-) (bool, error) {
+) (peekResult, error) {
 	candidates, presented := r.wakeCandidates(connState, sessionState)
 	sessionState.SetPresented(idsOf(presented))
 	if len(candidates) == 0 {
-		return false, nil
+		return peekResult{}, nil
 	}
 	projection := r.projectCandidates(client, connState.Presence, candidates)
+	deferredWorking := len(projection.DeferredWorkingEventIDs) > 0
 	if len(projection.Outcomes) == 0 {
 		if len(projection.SuppressedEventIDs) > 0 {
 			if err := r.ackSuppressed(client, connState, sessionState, presented, projection.SuppressedEventIDs); err != nil {
-				return false, err
+				return peekResult{}, err
 			}
 			// The suppressed ack path re-reads the state before persisting, so a
 			// concurrent writer's changes are not lost.
@@ -607,9 +629,9 @@ func (r *runner) peekNextWakeBatch(
 			sessionState.SetPresented(presentedIDs)
 			r.writeState(freshState)
 		}
-		return false, nil
+		return peekResult{HasDeferredWorking: deferredWorking, HasOutcomes: false}, nil
 	}
-	return true, nil
+	return peekResult{HasDeferredWorking: deferredWorking, HasOutcomes: true}, nil
 }
 
 // takeNextWakeBatch mirrors takeNextWakeBatch: it persists the presented and
@@ -640,6 +662,8 @@ func (r *runner) takeNextWakeBatch(
 	for _, outcome := range projection.Outcomes {
 		outcomeIDs = append(outcomeIDs, outcome.EventID)
 	}
+	// Only permanent suppressions and real outcomes are marked presented;
+	// working-deferred ids stay eligible for the next projection pass.
 	deliveredIDs := uniqueSortedIDs(append(append([]int64{}, projection.SuppressedEventIDs...), outcomeIDs...))
 	for _, id := range deliveredIDs {
 		presented[id] = struct{}{}
@@ -696,7 +720,7 @@ func (r *runner) projectCandidates(
 	presence Presence,
 	candidates []observability.AgentEventRecord,
 ) projection {
-	return projectAgyOutcomes(candidates, r.fetchLiveWorkingTerminalIDs(client, presence))
+	return projectAgyOutcomes(candidates, r.fetchLiveWorkingTerminalIDs(client, presence), r.warn)
 }
 
 // ackSuppressed mirrors the suppressed-ack loop: permanent failures still mark
@@ -748,19 +772,27 @@ func (r *runner) rearmDeliveredEvents() {
 	r.writeState(sessionState)
 }
 
-// projection mirrors the `{ outcomes, suppressedEventIds }` result.
+// projection mirrors the `{ deferredWorkingEventIds, outcomes,
+// suppressedEventIds }` result.
 type projection struct {
-	Outcomes           []Outcome
-	SuppressedEventIDs []int64
+	// DeferredWorkingEventIDs are completions a peer published while
+	// agent.list still reported it as working. They are neither outcomes nor
+	// permanent suppressions: a later poll re-checks them.
+	DeferredWorkingEventIDs []int64
+	Outcomes                []Outcome
+	SuppressedEventIDs      []int64
 }
 
-// projectAgyOutcomes mirrors projectAgyOutcomes.
+// projectAgyOutcomes mirrors projectAgyOutcomes. `warn` is the console.warn
+// sink used for the suppression / deferral log lines.
 func projectAgyOutcomes(
 	events []observability.AgentEventRecord,
 	liveWorkingTerminalIDs map[string]struct{},
+	warn func(message string),
 ) projection {
 	outcomes := []Outcome{}
 	suppressedEventIDs := []int64{}
+	deferredWorkingEventIDs := []int64{}
 	completedPanes := map[string]struct{}{}
 
 	for _, event := range events {
@@ -777,19 +809,30 @@ func projectAgyOutcomes(
 	for _, event := range events {
 		if isCompletionEvent(event) && event.TerminalID != nil {
 			if _, isWorking := liveWorkingTerminalIDs[*event.TerminalID]; isWorking {
-				suppressedEventIDs = append(suppressedEventIDs, event.ID)
+				// The peer still reports working: this completion may be an
+				// intermediate tool round *or* a race where agent.list has not yet
+				// flipped to idle/done. Defer (do not ack / present) so a later poll
+				// can decide.
+				deferredWorkingEventIDs = append(deferredWorkingEventIDs, event.ID)
+				logAgyEventSuppressed(warn, event.ID, "deferred: peer terminal "+*event.TerminalID+" still working in agent.list")
 				continue
 			}
 		}
 		kind, ok := outcomeKind(event)
 		if !ok || !truthyString(event.TerminalID) {
 			suppressedEventIDs = append(suppressedEventIDs, event.ID)
+			if !truthyString(event.TerminalID) {
+				logAgyEventSuppressed(warn, event.ID, "no terminalId")
+			} else {
+				logAgyEventSuppressed(warn, event.ID, "non-outcome event type "+string(event.Type))
+			}
 			continue
 		}
 		payload := asRecord(event.Payload)
 		if fallbackOutcome(payload) && truthyString(event.PaneID) && truthyString(event.PaneGeneration) {
 			if _, isCompleted := completedPanes[*event.PaneID+"\x00"+*event.PaneGeneration]; isCompleted {
 				suppressedEventIDs = append(suppressedEventIDs, event.ID)
+				logAgyEventSuppressed(warn, event.ID, "fallback outcome superseded by completion for pane "+*event.PaneID)
 				continue
 			}
 		}
@@ -801,10 +844,12 @@ func projectAgyOutcomes(
 		}
 		if isUpstreamErrorText(text) || (reason != nil && isUpstreamErrorText(*reason)) {
 			suppressedEventIDs = append(suppressedEventIDs, event.ID)
+			logAgyEventSuppressed(warn, event.ID, "upstream model error text")
 			continue
 		}
 		if kind == OutcomeCompleted && len(text) == 0 {
 			suppressedEventIDs = append(suppressedEventIDs, event.ID)
+			logAgyEventSuppressed(warn, event.ID, "empty completed assistant text")
 			continue
 		}
 		outcomes = append(outcomes, Outcome{
@@ -819,7 +864,22 @@ func projectAgyOutcomes(
 		})
 	}
 
-	return projection{Outcomes: outcomes, SuppressedEventIDs: suppressedEventIDs}
+	return projection{
+		DeferredWorkingEventIDs: deferredWorkingEventIDs,
+		Outcomes:                outcomes,
+		SuppressedEventIDs:      suppressedEventIDs,
+	}
+}
+
+// logAgyEventSuppressed mirrors logAgyEventSuppressed: the console.warn line
+// emitted for every event the projection drops or defers.
+func logAgyEventSuppressed(warn func(message string), eventID int64, reason string) {
+	message := "Herdsman agy wake suppressed eventId=" + strconv.FormatInt(eventID, 10) + ": " + reason
+	if warn != nil {
+		warn(message)
+		return
+	}
+	os.Stderr.WriteString(message + "\n")
 }
 
 // outcomeAgent mirrors the agent fallback chain of the projection:

@@ -410,9 +410,9 @@ func TestPreInvocationWakesOnStalledAndPiWaitingHistory(t *testing.T) {
 	}
 }
 
-// --- intermediate agent.done superseded by live working (lines 1593-1723) ----
+// --- intermediate agent.done while the peer still works (lines 1599-1731) ---
 
-func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
+func TestIntermediateAgentDoneWhilePeerStillWorkingIsDeferred(t *testing.T) {
 	dir := t.TempDir()
 	sessionID := "a1111111-2222-3333-4444-555555555555"
 	pendingEvents := []any{makeDoneEvent(1118, "已改完代码，继续跑测试。")}
@@ -421,6 +421,7 @@ func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
 	peerStatus := "working"
 	spawnedWaiters := []float64{}
 	wakePrompts := []wakePrompt{}
+	warns := []string{}
 
 	client := &concClient{}
 	client.respond = func(method string, params any) (any, error) {
@@ -440,6 +441,12 @@ func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
 		}
 		return orchestratorStateResponse(sessionID, pendingEvents, ackedEventID), nil
 	}
+	// collectWarn mirrors the TS console.warn spy.
+	collectWarn := func(message string) {
+		client.mu.Lock()
+		warns = append(warns, message)
+		client.mu.Unlock()
+	}
 
 	stopResult := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, agy.RunAgyHookOptions{
 		Connect:     client.connect,
@@ -450,19 +457,21 @@ func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
 			spawnedWaiters = append(spawnedWaiters, input.WaiterEpoch)
 			return &agy.SpawnWakeWaiterResult{PID: intPtr(os.Getpid())}
 		},
+		Warn: collectWarn,
 	})
 
-	// The intermediate completion is acked silently instead of being handed over
-	// as the final result, and a waiter guards the still-running turn.
+	// Intermediate completion must not be permanently acked while the peer works;
+	// a waiter still guards the running turn.
 	if !isEmptyHookOutput(stopResult) {
 		t.Fatalf("stop result = %+v, want {}", stopResult)
 	}
 	client.mu.Lock()
 	acked := append([]int64{}, ackedIDs...)
 	epochs := append([]float64{}, spawnedWaiters...)
+	stopWarns := append([]string{}, warns...)
 	client.mu.Unlock()
-	if want := []int64{1118}; !reflect.DeepEqual(acked, want) {
-		t.Fatalf("ackedIDs = %v, want %v", acked, want)
+	if len(acked) != 0 {
+		t.Fatalf("ackedIDs = %v, want none", acked)
 	}
 	if want := []float64{1}; !reflect.DeepEqual(epochs, want) {
 		t.Fatalf("spawnedWaiters = %v, want %v", epochs, want)
@@ -470,6 +479,9 @@ func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
 	assertStateMatches(t, readStateObject(t, sessionStatePath(dir, sessionID)), map[string]any{
 		"turnEpoch": float64(1), "waiterEpoch": float64(1), "waiterPid": float64(os.Getpid()),
 	})
+	if !anyWarnContains(stopWarns, "eventId=1118") {
+		t.Fatalf("warns = %v, want one mentioning eventId=1118", stopWarns)
+	}
 
 	done := make(chan agy.HookOutput, 1)
 	go func() {
@@ -482,6 +494,8 @@ func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
 			PollIntervalMs: floatPtr(25),
 			SocketPath:     "/tmp/herdsman.sock",
 			StateDir:       strPtr(dir),
+			// readPaneText: no real `herdr pane read` in the fake-client cases.
+			ReadPaneText: func(string) (*string, error) { return nil, nil },
 			TriggerWakePrompt: func(paneID, promptText string) error {
 				client.mu.Lock()
 				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
@@ -489,16 +503,22 @@ func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
 				return nil
 			},
 			WaitTimeoutMs: floatPtr(5000),
+			Warn:          collectWarn,
 		})
 	}()
 
-	// While the peer is still working the intermediate batch must not prompt.
-	time.Sleep(30 * time.Millisecond)
+	// While the peer is still working the deferred batch must neither prompt nor
+	// be acked.
+	time.Sleep(40 * time.Millisecond)
 	client.mu.Lock()
 	earlyPrompts := len(wakePrompts)
+	earlyAcked := append([]int64{}, ackedIDs...)
 	client.mu.Unlock()
 	if earlyPrompts != 0 {
 		t.Fatalf("wakePrompts = %d before the real completion, want 0", earlyPrompts)
+	}
+	if len(earlyAcked) != 0 {
+		t.Fatalf("ackedIDs = %v while the peer is working, want none", earlyAcked)
 	}
 
 	// The turn really finishes now: the peer goes idle and the real done lands.
@@ -517,6 +537,347 @@ func TestStopDefersIntermediateDoneUntilTheRealCompletion(t *testing.T) {
 	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(prompts, want) {
 		t.Fatalf("wakePrompts = %+v, want %+v", prompts, want)
 	}
+}
+
+// --- WakeWaiter working-race / composer-draft deferral (lines 1733-2079) ----
+
+// anyWarnContains mirrors
+// `warnSpy.mock.calls.some((call) => String(call[0]).includes(needle))`.
+func anyWarnContains(warns []string, needle string) bool {
+	for _, message := range warns {
+		if strings.Contains(message, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+// workingRaceClient answers the three RPC methods the wake waiter drives, with
+// a mutable peer status and ack cursor (the TS `connect` closure of the
+// working-race cases).
+func workingRaceClient(
+	t *testing.T,
+	sessionID string,
+	events []any,
+	peerStatus *string,
+	ackedEventID *int64,
+	ackedIDs *[]int64,
+) *concClient {
+	t.Helper()
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		switch method {
+		case "agent.notifications.ack":
+			eventID := asEventID(params.(map[string]any)["eventId"])
+			if ackedIDs != nil {
+				*ackedIDs = append(*ackedIDs, eventID)
+			}
+			if eventID > *ackedEventID {
+				*ackedEventID = eventID
+			}
+			return map[string]any{"acknowledged": true}, nil
+		case "agent.list":
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-25T05:06:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("agy", *peerStatus, "2026-10-25T05:06:00.000Z", "wB:p2", "term_peer"),
+			}}, nil
+		}
+		return orchestratorStateResponse(sessionID, events, *ackedEventID), nil
+	}
+	return client
+}
+
+// presentedEventIDsOf projects the persisted `presentedEventIds` field of a
+// session state file (missing means the TS `?? []`).
+func presentedEventIDsOf(t *testing.T, dir, sessionID string) []any {
+	t.Helper()
+	object := readStateObject(t, sessionStatePath(dir, sessionID))
+	ids, ok := object["presentedEventIds"].([]any)
+	if !ok {
+		return []any{}
+	}
+	return ids
+}
+
+func TestWakeWaiterRaceAgentDoneWhileWorkingNextPollWakesOnce(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "c1111111-2222-3333-4444-555555555555"
+	events := []any{makeDoneEvent(73501, "子代理最终结论，很长一段正文。")}
+	ackedEventID := int64(0)
+	ackedIDs := []int64{}
+	peerStatus := "working"
+	wakePrompts := []wakePrompt{}
+	warns := []string{}
+
+	writeStateFile(t, sessionStatePath(dir, sessionID), map[string]any{
+		"turnEpoch": float64(1), "waiterEpoch": float64(1), "waiterPid": float64(os.Getpid()),
+	})
+
+	client := workingRaceClient(t, sessionID, events, &peerStatus, &ackedEventID, &ackedIDs)
+	collectWarn := func(message string) {
+		client.mu.Lock()
+		warns = append(warns, message)
+		client.mu.Unlock()
+	}
+
+	done := make(chan agy.HookOutput, 1)
+	go func() {
+		done <- agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: client.connect,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", sessionID,
+				"HERDSMAN_AGY_STATE_DIR", dir,
+				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+			PollIntervalMs: floatPtr(30),
+			SocketPath:     "/tmp/herdsman.sock",
+			StateDir:       strPtr(dir),
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				client.mu.Lock()
+				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+				client.mu.Unlock()
+				return nil
+			},
+			ReadPaneText:  func(string) (*string, error) { return nil, nil },
+			WaitTimeoutMs: floatPtr(5000),
+			Warn:          collectWarn,
+		})
+	}()
+
+	// The first peek deferred the done event: no ack, no wake prompt, and the
+	// deferral is visible both in the warn output and in the untouched state.
+	time.Sleep(50 * time.Millisecond)
+	client.mu.Lock()
+	prompts := len(wakePrompts)
+	acked := append([]int64{}, ackedIDs...)
+	seenWarns := append([]string{}, warns...)
+	client.mu.Unlock()
+	if prompts != 0 {
+		t.Fatalf("wakePrompts = %d while the peer is working, want 0", prompts)
+	}
+	if len(acked) != 0 {
+		t.Fatalf("ackedIDs = %v, want none", acked)
+	}
+	if !anyWarnContains(seenWarns, "eventId=73501") || !anyWarnContains(seenWarns, "still working") {
+		t.Fatalf("warns = %v, want one deferring eventId=73501 as still working", seenWarns)
+	}
+	if ids := presentedEventIDsOf(t, dir, sessionID); len(ids) != 0 {
+		t.Fatalf("presentedEventIds = %v, want none", ids)
+	}
+
+	// Live status catches up on the next poll, so the deferred completion wakes.
+	client.mu.Lock()
+	peerStatus = "done"
+	client.mu.Unlock()
+
+	if result := awaitHookOutput(t, done); !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	client.mu.Lock()
+	promptsAfter := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(promptsAfter, want) {
+		t.Fatalf("wakePrompts = %+v, want %+v", promptsAfter, want)
+	}
+}
+
+func TestWakeWaiterDoesNotWakeWhileDeferredPeerStaysWorking(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "d1111111-2222-3333-4444-555555555555"
+	events := []any{makeDoneEvent(8001, "中途一轮工具结果。")}
+	ackedEventID := int64(0)
+	wakePrompts := []wakePrompt{}
+
+	writeStateFile(t, sessionStatePath(dir, sessionID), map[string]any{
+		"turnEpoch": float64(1), "waiterEpoch": float64(1), "waiterPid": float64(os.Getpid()),
+	})
+
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		switch method {
+		case "agent.notifications.ack":
+			eventID := asEventID(params.(map[string]any)["eventId"])
+			if eventID > ackedEventID {
+				ackedEventID = eventID
+			}
+			return map[string]any{"acknowledged": true}, nil
+		case "agent.list":
+			// The peer never leaves `working`: the completion is a mid-turn tool
+			// round, so it must stay deferred for the whole waiter lifetime.
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-21T11:50:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("pi", "working", "2026-10-21T11:50:00.000Z", "wB:p2", "term_peer"),
+			}}, nil
+		}
+		return orchestratorStateResponse(sessionID, events, ackedEventID), nil
+	}
+
+	result := agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+		Connect: client.connect,
+		Environment: mergeEnv(herdrEnv,
+			"HERDSMAN_AGY_SESSION_ID", sessionID,
+			"HERDSMAN_AGY_STATE_DIR", dir,
+			"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+		PollIntervalMs: floatPtr(20),
+		SocketPath:     "/tmp/herdsman.sock",
+		StateDir:       strPtr(dir),
+		TriggerWakePrompt: func(paneID, promptText string) error {
+			client.mu.Lock()
+			wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+			client.mu.Unlock()
+			return nil
+		},
+		ReadPaneText:  func(string) (*string, error) { return nil, nil },
+		WaitTimeoutMs: floatPtr(120),
+	})
+
+	if !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	client.mu.Lock()
+	prompts := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if len(prompts) != 0 {
+		t.Fatalf("wakePrompts = %+v, want none", prompts)
+	}
+	if ackedEventID != 0 {
+		t.Fatalf("ackedEventId = %d, want 0", ackedEventID)
+	}
+	if ids := presentedEventIDsOf(t, dir, sessionID); len(ids) != 0 {
+		t.Fatalf("presentedEventIds = %v, want none", ids)
+	}
+}
+
+func TestWakeWaiterDefersTriggerWakePromptWhileComposerHasDraft(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "e1111111-2222-3333-4444-555555555555"
+	events := []any{makeDoneEvent(9001, "工人完成。")}
+	ackedEventID := int64(0)
+	hasDraft := true
+	wakePrompts := []wakePrompt{}
+	warns := []string{}
+
+	writeStateFile(t, sessionStatePath(dir, sessionID), map[string]any{
+		"turnEpoch": float64(1), "waiterEpoch": float64(1), "waiterPid": float64(os.Getpid()),
+	})
+
+	rule := "───────────────────────────────────────────────────"
+	emptyComposer := strings.Join([]string{
+		"assistant output",
+		rule,
+		">",
+		rule,
+		"? for shortcuts             Gemini 4 Argon · medium",
+	}, "\n")
+	draftComposer := strings.Join([]string{
+		"assistant output",
+		rule,
+		"> 用户正在打的草稿",
+		rule,
+		"? for shortcuts             Gemini 4 Argon · medium",
+	}, "\n")
+
+	client := &concClient{}
+	client.respond = func(method string, _ any) (any, error) {
+		switch method {
+		case "agent.notifications.ack":
+			return map[string]any{"acknowledged": true}, nil
+		case "agent.list":
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-21T11:50:00.000Z", "wB:p1", "term_self"),
+			}}, nil
+		}
+		return orchestratorStateResponse(sessionID, events, ackedEventID), nil
+	}
+
+	done := make(chan agy.HookOutput, 1)
+	go func() {
+		done <- agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: client.connect,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", sessionID,
+				"HERDSMAN_AGY_STATE_DIR", dir,
+				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+			PollIntervalMs: floatPtr(25),
+			ReadPaneText: func(string) (*string, error) {
+				client.mu.Lock()
+				defer client.mu.Unlock()
+				if hasDraft {
+					return &draftComposer, nil
+				}
+				return &emptyComposer, nil
+			},
+			SocketPath: "/tmp/herdsman.sock",
+			StateDir:   strPtr(dir),
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				client.mu.Lock()
+				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+				client.mu.Unlock()
+				return nil
+			},
+			WaitTimeoutMs: floatPtr(5000),
+			Warn: func(message string) {
+				client.mu.Lock()
+				warns = append(warns, message)
+				client.mu.Unlock()
+			},
+		})
+	}()
+
+	// While the composer holds a draft the wake prompt must be deferred.
+	time.Sleep(50 * time.Millisecond)
+	client.mu.Lock()
+	prompts := len(wakePrompts)
+	seenWarns := append([]string{}, warns...)
+	client.mu.Unlock()
+	if prompts != 0 {
+		t.Fatalf("wakePrompts = %d while the composer has a draft, want 0", prompts)
+	}
+	if !anyWarnContains(seenWarns, "输入框有草稿，推迟叫醒") {
+		t.Fatalf("warns = %v, want the composer-draft deferral warning", seenWarns)
+	}
+
+	client.mu.Lock()
+	hasDraft = false
+	client.mu.Unlock()
+
+	if result := awaitHookOutput(t, done); !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	client.mu.Lock()
+	promptsAfter := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(promptsAfter, want) {
+		t.Fatalf("wakePrompts = %+v, want %+v", promptsAfter, want)
+	}
+}
+
+func TestParseAgyComposerDraft(t *testing.T) {
+	rule := "───────────────────────────────────────────────────"
+	assertDraft := func(t *testing.T, paneText string, want *string) {
+		t.Helper()
+		got := agy.ParseAgyComposerDraft(paneText)
+		if want == nil {
+			if got != nil {
+				t.Fatalf("ParseAgyComposerDraft(%q) = %q, want nil", paneText, *got)
+			}
+			return
+		}
+		if got == nil {
+			t.Fatalf("ParseAgyComposerDraft(%q) = nil, want %q", paneText, *want)
+		}
+		if *got != *want {
+			t.Fatalf("ParseAgyComposerDraft(%q) = %q, want %q", paneText, *got, *want)
+		}
+	}
+
+	assertDraft(t, strings.Join([]string{"output", rule, ">", rule, "? for shortcuts             Gemini 4 Argon · medium"}, "\n"), strPtr(""))
+	assertDraft(t, strings.Join([]string{"output", rule, "> hello draft", rule, "? for shortcuts"}, "\n"), strPtr("hello draft"))
+	assertDraft(t, strings.Join([]string{"output", rule, "> line one", "line two", "line three", rule, "? for shortcuts"}, "\n"), strPtr("line one\nline two\nline three"))
+	// A sole `>` with only whitespace is still empty (no placeholder observed).
+	assertDraft(t, strings.Join([]string{"output", rule, ">   ", rule, "footer"}, "\n"), strPtr(""))
+	// A composer box that cannot be located yields nil so wake keeps working.
+	assertDraft(t, "no separators here\n> orphan", nil)
+	assertDraft(t, rule+"\n"+rule, nil)
 }
 
 // --- Stop decision:continue + unacked delivered fallback (lines 1724-1881) ---

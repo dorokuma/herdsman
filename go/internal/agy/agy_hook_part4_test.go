@@ -84,6 +84,8 @@ func TestStopKeepsStandbyWaiterUntilFirstWorkerCompletion(t *testing.T) {
 			PollIntervalMs: floatPtr(25),
 			SocketPath:     "/tmp/herdsman.sock",
 			StateDir:       strPtr(dir),
+			// readPaneText: no real `herdr pane read` in the fake-client cases.
+			ReadPaneText: func(string) (*string, error) { return nil, nil },
 			TriggerWakePrompt: func(paneID, promptText string) error {
 				client.mu.Lock()
 				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})

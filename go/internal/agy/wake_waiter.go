@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/dorokuma/herdsman/go/internal/daemon"
 	"github.com/dorokuma/herdsman/go/internal/observability"
@@ -279,12 +280,18 @@ func (w *waiter) loop() error {
 				if peekErr != nil {
 					return peekErr
 				}
-				hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch
+				hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch.HasOutcomes
 				w.isFirstEventCheck = false
 				w.hasPushNotification.Store(false)
 				w.retryWakePending = false
+				// Completions deferred because agent.list still reports the peer as
+				// working must be re-checked on the next poll: a stale "working" row
+				// is the race that used to permanently ack the real done event.
+				if peekedBatch.HasDeferredWorking {
+					w.retryWakePending = true
+				}
 
-				if hasWakeBatch && hasUnackedDeliveredEvents && !peekedBatch && !w.deliveredBatchGracePending {
+				if hasWakeBatch && hasUnackedDeliveredEvents && !peekedBatch.HasOutcomes && !w.deliveredBatchGracePending {
 					// Give the host one poll interval to start the next invocation
 					// (which bumps turnEpoch and cancels this waiter) before falling
 					// back to a wake prompt.
@@ -296,37 +303,46 @@ func (w *waiter) loop() error {
 						stop = true
 						return nil
 					}
-					// The stop hook marked the batch presented before returning it
-					// to the host; the turn started by this prompt has to receive it
-					// in PreInvocation, so re-arm the unacked batch first.
-					w.runner.rearmDeliveredEvents()
-					if promptErr := w.runner.triggerWakePrompt(w.runner.launch.PaneID, wakePromptText); promptErr != nil {
-						w.wakePromptFailures++
-						w.runner.warn(fmt.Sprintf(
-							"Herdsman agy wake prompt failed (attempt %d/%d): %s",
-							w.wakePromptFailures, maxWakePromptAttempts, promptErr.Error(),
-						))
-						if w.wakePromptFailures >= maxWakePromptAttempts {
-							stop = true
-							return nil
-						}
+					// Avoid submitting the wake prompt on top of a half-typed draft
+					// in the agy composer. Deferring is safe: the next poll retries,
+					// and if the user submits the draft themselves PreInvocation
+					// still runs takeNextWakeBatch over the pending events.
+					if w.runner.readComposerDraft(w.runner.launch.PaneID) == composerDraftHasDraft {
+						w.runner.warn("Herdsman agy wake deferred: 输入框有草稿，推迟叫醒 (pane " + w.runner.launch.PaneID + ")")
 						w.retryWakePending = true
 					} else {
-						postTriggerState := readSessionState(w.stateDir, w.sessionID)
-						if turnEpoch, ok := postTriggerState.TurnEpochValue(); ok && turnEpoch != w.waiterEpoch {
+						// The stop hook marked the batch presented before returning it
+						// to the host; the turn started by this prompt has to receive
+						// it in PreInvocation, so re-arm the unacked batch first.
+						w.runner.rearmDeliveredEvents()
+						if promptErr := w.runner.triggerWakePrompt(w.runner.launch.PaneID, wakePromptText); promptErr != nil {
+							w.wakePromptFailures++
 							w.runner.warn(fmt.Sprintf(
-								"Herdsman agy wake prompt raced with a new turn (waiterEpoch=%s, turnEpoch=%s)",
-								formatJSNumber(w.waiterEpoch), formatJSNumber(turnEpoch),
+								"Herdsman agy wake prompt failed (attempt %d/%d): %s",
+								w.wakePromptFailures, maxWakePromptAttempts, promptErr.Error(),
 							))
+							if w.wakePromptFailures >= maxWakePromptAttempts {
+								stop = true
+								return nil
+							}
+							w.retryWakePending = true
+						} else {
+							postTriggerState := readSessionState(w.stateDir, w.sessionID)
+							if turnEpoch, ok := postTriggerState.TurnEpochValue(); ok && turnEpoch != w.waiterEpoch {
+								w.runner.warn(fmt.Sprintf(
+									"Herdsman agy wake prompt raced with a new turn (waiterEpoch=%s, turnEpoch=%s)",
+									formatJSNumber(w.waiterEpoch), formatJSNumber(turnEpoch),
+								))
+								stop = true
+								return nil
+							}
+							if pid, ok := postTriggerState.WaiterPIDValue(); ok && pid == w.runnerPID() {
+								postTriggerState.WaiterPID = nil
+								w.runner.writeState(postTriggerState)
+							}
 							stop = true
 							return nil
 						}
-						if pid, ok := postTriggerState.WaiterPIDValue(); ok && pid == w.runnerPID() {
-							postTriggerState.WaiterPID = nil
-							w.runner.writeState(postTriggerState)
-						}
-						stop = true
-						return nil
 					}
 				}
 			}
@@ -574,6 +590,108 @@ func defaultTriggerWakePrompt(paneID, promptText string) error {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	return exec.CommandContext(ctx, "herdr", "agent", "prompt", paneID, promptText).Run()
+}
+
+// defaultReadPaneText mirrors defaultReadPaneText: `herdr pane read <paneId>
+// --lines 12` with a 5s timeout. Any failure reads as "no text" (a nil result)
+// so the caller falls back to the pre-fix wake behaviour.
+func defaultReadPaneText(paneID string) (*string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	stdout, err := exec.CommandContext(ctx, "herdr", "pane", "read", paneID, "--lines", "12").Output()
+	if err != nil {
+		return nil, nil
+	}
+	text := string(stdout)
+	return &text, nil
+}
+
+// composerSeparatorPattern mirrors `/^[\s]*[─-]{8,}[\s]*$/`: a box-drawing
+// horizontal rule (an ASCII-dash fallback is tolerated the same way, so the
+// class is written `[-─]` for RE2).
+var composerSeparatorPattern = regexp.MustCompile(`^[\s]*[-─]{8,}[\s]*$`)
+
+// composerPromptPattern mirrors `/^(?:>\s?)(.*)$/` on the first composer line.
+var composerPromptPattern = regexp.MustCompile(`^(?:>\s?)(.*)$`)
+
+// composerTrailingWhitespacePattern mirrors `/[ \t]+$/gm`.
+var composerTrailingWhitespacePattern = regexp.MustCompile(`(?m)[ \t]+$`)
+
+// ParseAgyComposerDraft mirrors parseAgyComposerDraft: it parses the agy
+// composer at the bottom of a `herdr pane read` dump.
+//
+// An empty composer (observed on real panes) is a lone `>` between two `───`
+// rules with no placeholder text after the prompt; a non-empty draft is any
+// trimmed content after that `>` and/or extra lines between the rules.
+//
+// A nil result is the TS `undefined`: the composer region could not be located,
+// so callers fall back to the pre-fix wake behaviour instead of blocking.
+func ParseAgyComposerDraft(paneText string) *string {
+	lines := strings.Split(composerTrailingNewlinePattern.ReplaceAllString(paneText, "\n"), "\n")
+	separatorIndexes := make([]int, 0, 4)
+	for index, line := range lines {
+		if composerSeparatorPattern.MatchString(line) {
+			separatorIndexes = append(separatorIndexes, index)
+		}
+	}
+	if len(separatorIndexes) < 2 {
+		return nil
+	}
+	bottom := separatorIndexes[len(separatorIndexes)-1]
+	top := separatorIndexes[len(separatorIndexes)-2]
+	if bottom <= top+1 {
+		return nil
+	}
+	region := lines[top+1 : bottom]
+	if len(region) == 0 {
+		return nil
+	}
+	draftLines := make([]string, 0, len(region))
+	for index, line := range region {
+		if index == 0 {
+			if match := composerPromptPattern.FindStringSubmatch(line); match != nil {
+				draftLines = append(draftLines, match[1])
+				continue
+			}
+		}
+		draftLines = append(draftLines, line)
+	}
+	draft := composerTrailingWhitespacePattern.ReplaceAllString(strings.Join(draftLines, "\n"), "")
+	draft = strings.TrimRightFunc(draft, unicode.IsSpace)
+	return &draft
+}
+
+// composerTrailingNewlinePattern mirrors `replace(/\r\n?/g, "\n")`.
+var composerTrailingNewlinePattern = regexp.MustCompile(`\r\n?`)
+
+// composerDraftState mirrors the `"empty" | "has-draft" | "unknown"` result of
+// readComposerDraft.
+type composerDraftState int
+
+const (
+	composerDraftEmpty composerDraftState = iota
+	composerDraftHasDraft
+	composerDraftUnknown
+)
+
+// readComposerDraft mirrors readComposerDraft: a read or parse failure is
+// `unknown`, which keeps the pre-fix wake behaviour.
+func (r *runner) readComposerDraft(paneID string) composerDraftState {
+	if r.readPaneText == nil {
+		return composerDraftUnknown
+	}
+	paneText, err := r.readPaneText(paneID)
+	if err != nil || paneText == nil {
+		return composerDraftUnknown
+	}
+	draft := ParseAgyComposerDraft(*paneText)
+	if draft == nil {
+		return composerDraftUnknown
+	}
+	if len(strings.TrimSpace(*draft)) > 0 {
+		return composerDraftHasDraft
+	}
+	return composerDraftEmpty
 }
 
 // defaultSpawnWakeWaiter mirrors defaultSpawnWakeWaiter: the waiter is this

@@ -1448,7 +1448,11 @@ func withPaneRevision(agent any, overlayByPane map[string]paneOverlay) map[strin
 		result[key] = value
 	}
 	if revision != nil {
-		result["revision"] = *revision
+		// The snapshot payloads are JSON-shaped, so the overlaid number is written
+		// back as float64: the store's integerValue only accepts the JSON number
+		// type, and writing a Go int here made every overlaid pane revision read
+		// as NULL (each refresh then looked dirty and re-parsed the history).
+		result["revision"] = float64(*revision)
 	}
 	if terminalTitle != nil {
 		result["terminal_title"] = *terminalTitle
