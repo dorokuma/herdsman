@@ -1,0 +1,795 @@
+package agy
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"regexp"
+	"runtime"
+	"strconv"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/dorokuma/herdsman/go/internal/daemon"
+	"github.com/dorokuma/herdsman/go/internal/observability"
+)
+
+// This file ports the WakeWaiter half of src/agy/hook.ts: the standby loop, the
+// detached self-respawn, the wake-prompt trigger, the peer inspection helpers
+// and `resolveWakeWaiterCwd`.
+
+// RpcClient is the `Pick<ObservabilityRpcClient, "close" | "request">` seam the
+// hook is handed. `daemon.ObservabilityRpcClient` satisfies it, and callers
+// outside this package can plug in their own implementation through
+// RunAgyHookOptions.Connect.
+type RpcClient interface {
+	Close()
+	Call(method string, params any) (any, error)
+}
+
+// rpcClient is the package-internal spelling of RpcClient.
+type rpcClient = RpcClient
+
+// defaultConnect mirrors the production `connect` option.
+func defaultConnect(socketPath string, onNotification func(method string, params any)) (rpcClient, error) {
+	return daemon.NewObservabilityRpcClient(daemon.ObservabilityRpcClientOptions{
+		OnNotification: onNotification,
+		SocketPath:     socketPath,
+	})
+}
+
+// errStopWaiter is the Go spelling of the TS `return {}` inside the waiter
+// loop: the waiter stops without logging an error.
+var errStopWaiter = errors.New("agy wake waiter stopped")
+
+// AgentListItemView mirrors the AgentListItem projection the hook reads. The
+// optional fields stay optional so a missing key keeps the TS `undefined`
+// semantics the readiness checks rely on.
+type AgentListItemView struct {
+	AgentStatus *observability.AgentStatus `json:"agentStatus"`
+	FirstSeenAt *string                    `json:"firstSeenAt"`
+	History     PeerHistory                `json:"history"`
+	PaneID      string                     `json:"paneId"`
+	TerminalID  *string                    `json:"terminalId"`
+}
+
+// PeerHistory mirrors the `history` projection on AgentListItem.
+type PeerHistory struct {
+	LastAssistantMessage *PeerHistoryExcerpt `json:"lastAssistantMessage"`
+	LastUserMessage      *PeerHistoryExcerpt `json:"lastUserMessage"`
+	UpdatedAt            *string             `json:"updatedAt"`
+}
+
+// PeerHistoryExcerpt mirrors AgentHistoryExcerpt (the hook reads ref, stopReason
+// and timestamp).
+type PeerHistoryExcerpt struct {
+	Ref        *string `json:"ref"`
+	StopReason *string `json:"stopReason"`
+	Timestamp  *string `json:"timestamp"`
+}
+
+// runWakeWaiter mirrors the WakeWaiter branch of runAgyHook.
+func (r *runner) runWakeWaiter() HookOutput {
+	if IsDispatchedSubagent(r.env) {
+		return HookOutput{}
+	}
+	initialSessionState := r.readState()
+	rawEnvEpoch, hasEnvEpoch := nonEmptyStringValue(r.env["HERDSMAN_AGY_WAITER_EPOCH"])
+	parsedEnvEpoch := math.NaN()
+	if hasEnvEpoch {
+		parsedEnvEpoch = parseJSNumber(rawEnvEpoch)
+	}
+	waiterEpoch := 0.0
+	switch {
+	case isIntegerNumber(parsedEnvEpoch):
+		waiterEpoch = parsedEnvEpoch
+	default:
+		if value, ok := initialSessionState.WaiterEpochValue(); ok {
+			waiterEpoch = value
+		} else if value, ok := initialSessionState.TurnEpochValue(); ok {
+			waiterEpoch = value
+		}
+	}
+
+	waitTimeoutMs := defaultWaitTimeoutMs
+	if r.options.WaitTimeoutMs != nil {
+		waitTimeoutMs = *r.options.WaitTimeoutMs
+	}
+	requestTimeoutMs := defaultRequestTimeoutMs
+	if r.options.RequestTimeoutMs != nil {
+		requestTimeoutMs = *r.options.RequestTimeoutMs
+	}
+	pollIntervalMs := defaultPollIntervalMs
+	if r.options.PollIntervalMs != nil {
+		pollIntervalMs = *r.options.PollIntervalMs
+	}
+	idlePollIntervalMs := defaultIdlePollIntervalMs
+	if r.options.IdlePollIntervalMs != nil {
+		idlePollIntervalMs = *r.options.IdlePollIntervalMs
+	}
+	newAgentGraceMs := defaultNewAgentGraceMs
+	if r.options.NewAgentGraceMs != nil {
+		newAgentGraceMs = *r.options.NewAgentGraceMs
+	}
+	settleGraceMs := defaultSettleGraceMs
+	if r.options.SettleGraceMs != nil {
+		settleGraceMs = *r.options.SettleGraceMs
+	}
+	exitWhenNoPeers := r.options.ExitWhenNoPeers != nil && *r.options.ExitWhenNoPeers
+
+	w := &waiter{
+		runner:             r,
+		sessionID:          r.sessionID,
+		stateDir:           r.stateDir,
+		waiterEpoch:        waiterEpoch,
+		now:                r.now,
+		pollIntervalMs:     pollIntervalMs,
+		idlePollIntervalMs: idlePollIntervalMs,
+		exitWhenNoPeers:    exitWhenNoPeers,
+		newAgentGraceMs:    newAgentGraceMs,
+		settleGraceMs:      settleGraceMs,
+		deadline:           r.now() + waitTimeoutMs,
+		wakeCh:             make(chan struct{}, 1),
+		isFirstIteration:   true,
+		isFirstEventCheck:  true,
+	}
+
+	rawClient, err := r.connect(r.options.SocketPath, func(method string, params any) {
+		if method == "agent.event" || method == "agent.orchestrator.changed" {
+			w.hasPushNotification = true
+			select {
+			case w.wakeCh <- struct{}{}:
+			default:
+			}
+		}
+	})
+	if err != nil {
+		r.warn("Herdsman agy WakeWaiter exited after error: " + err.Error())
+		return HookOutput{}
+	}
+	w.client = &timeoutClient{client: rawClient, timeoutMs: requestTimeoutMs}
+	defer func() {
+		w.client.Close()
+		w.clearOwnWaiterPidSafely()
+	}()
+
+	connState, err := r.registerAgyPresence(w.client, false)
+	if err != nil {
+		r.warn("Herdsman agy WakeWaiter exited after error: " + err.Error())
+		return HookOutput{}
+	}
+	w.connState = connState
+
+	if err := w.loop(); err != nil && !errors.Is(err, errStopWaiter) {
+		r.warn("Herdsman agy WakeWaiter exited after error: " + err.Error())
+	}
+	return HookOutput{}
+}
+
+// waiter holds the standby loop state that the TS locals keep across
+// iterations.
+type waiter struct {
+	runner             *runner
+	client             rpcClient
+	connState          ConnectionState
+	sessionID          string
+	stateDir           string
+	waiterEpoch        float64
+	now                func() float64
+	pollIntervalMs     float64
+	idlePollIntervalMs float64
+	exitWhenNoPeers    bool
+	newAgentGraceMs    float64
+	settleGraceMs      float64
+	deadline           float64
+	wakeCh             chan struct{}
+
+	hasPushNotification        bool
+	isFirstIteration           bool
+	isFirstEventCheck          bool
+	retryWakePending           bool
+	deliveredBatchGracePending bool
+	wakePromptFailures         int
+	rpcFailures                int
+	sawActivePeers             bool
+	sawSelf                    bool
+	settleDeadline             *float64
+}
+
+// clearOwnWaiterPidSafely mirrors the `try { clearOwnWaiterPid(...) } catch {}`
+// of the finally block.
+func (w *waiter) clearOwnWaiterPidSafely() {
+	defer func() { _ = recover() }()
+	w.runner.clearOwnWaiterPid()
+}
+
+func (w *waiter) clearOwnWaiterPid() { w.runner.clearOwnWaiterPid() }
+
+func (w *waiter) runnerPID() int { return w.runner.pid }
+
+// loop is the `while (now() < deadline)` body of the TS implementation. It
+// returns errStopWaiter for a clean early stop and any other error for the
+// outer catch (which logs and returns an empty output).
+func (w *waiter) loop() error {
+	for w.now() < w.deadline {
+		sessionState := readSessionState(w.stateDir, w.sessionID)
+		if turnEpoch, ok := sessionState.TurnEpochValue(); ok && turnEpoch != w.waiterEpoch {
+			return errStopWaiter
+		}
+		if !w.isFirstIteration {
+			if pid, ok := sessionState.WaiterPIDValue(); ok && pid != w.runnerPID() {
+				return errStopWaiter
+			}
+		}
+		w.isFirstIteration = false
+
+		// Already-delivered but unacked events are a wake batch of their own.
+		hasUnackedDeliveredEvents := len(sessionState.Delivered()) > 0
+
+		hasActivePeers := false
+		hasPeers := false
+		var selfAgentStatus *observability.AgentStatus
+		hasWakeBatch := false
+		stop := false
+
+		err := func() error {
+			var inspectErr error
+			hasActivePeers, hasPeers, selfAgentStatus, inspectErr = w.runner.inspectWorkspaceAgents(w.client, w.connState.Presence)
+			if inspectErr != nil {
+				return inspectErr
+			}
+			if selfAgentStatus != nil {
+				w.sawSelf = true
+			}
+			if w.sawSelf && selfAgentStatus == nil {
+				// The orchestrator pane itself left the Herdr index.
+				w.clearOwnWaiterPid()
+				stop = true
+				return nil
+			}
+			if hasActivePeers {
+				w.sawActivePeers = true
+				w.settleDeadline = nil
+			}
+			selfReadyToWake := w.selfReadyToWake(selfAgentStatus)
+
+			if selfReadyToWake && (w.isFirstEventCheck ||
+				w.hasPushNotification ||
+				w.retryWakePending ||
+				w.deliveredBatchGracePending ||
+				!hasActivePeers) {
+				latestStateValue, callErr := w.client.Call("agent.orchestrator.get", map[string]any{})
+				if callErr != nil {
+					return callErr
+				}
+				latestState := decodeConnectionState(latestStateValue)
+				if !isLocalOwner(latestState) {
+					stop = true
+					return nil
+				}
+
+				peekedBatch, peekErr := w.runner.peekNextWakeBatch(w.client, latestState, &sessionState)
+				if peekErr != nil {
+					return peekErr
+				}
+				hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch
+				w.isFirstEventCheck = false
+				w.hasPushNotification = false
+				w.retryWakePending = false
+
+				if hasWakeBatch && hasUnackedDeliveredEvents && !peekedBatch && !w.deliveredBatchGracePending {
+					// Give the host one poll interval to start the next invocation
+					// (which bumps turnEpoch and cancels this waiter) before falling
+					// back to a wake prompt.
+					w.deliveredBatchGracePending = true
+				} else if hasWakeBatch {
+					w.deliveredBatchGracePending = false
+					preTriggerState := readSessionState(w.stateDir, w.sessionID)
+					if turnEpoch, ok := preTriggerState.TurnEpochValue(); ok && turnEpoch != w.waiterEpoch {
+						stop = true
+						return nil
+					}
+					// The stop hook marked the batch presented before returning it
+					// to the host; the turn started by this prompt has to receive it
+					// in PreInvocation, so re-arm the unacked batch first.
+					w.runner.rearmDeliveredEvents()
+					if promptErr := w.runner.triggerWakePrompt(w.runner.launch.PaneID, wakePromptText); promptErr != nil {
+						w.wakePromptFailures++
+						w.runner.warn(fmt.Sprintf(
+							"Herdsman agy wake prompt failed (attempt %d/%d): %s",
+							w.wakePromptFailures, maxWakePromptAttempts, promptErr.Error(),
+						))
+						if w.wakePromptFailures >= maxWakePromptAttempts {
+							stop = true
+							return nil
+						}
+						w.retryWakePending = true
+					} else {
+						postTriggerState := readSessionState(w.stateDir, w.sessionID)
+						if turnEpoch, ok := postTriggerState.TurnEpochValue(); ok && turnEpoch != w.waiterEpoch {
+							w.runner.warn(fmt.Sprintf(
+								"Herdsman agy wake prompt raced with a new turn (waiterEpoch=%s, turnEpoch=%s)",
+								formatJSNumber(w.waiterEpoch), formatJSNumber(turnEpoch),
+							))
+							stop = true
+							return nil
+						}
+						if pid, ok := postTriggerState.WaiterPIDValue(); ok && pid == w.runnerPID() {
+							postTriggerState.WaiterPID = nil
+							w.runner.writeState(postTriggerState)
+						}
+						stop = true
+						return nil
+					}
+				}
+			}
+			w.rpcFailures = 0
+			return nil
+		}()
+		if err != nil {
+			w.rpcFailures++
+			if w.rpcFailures >= maxWakePromptAttempts {
+				return err
+			}
+			w.runner.warn(fmt.Sprintf(
+				"Herdsman agy WakeWaiter transient RPC error (attempt %d/%d): %s",
+				w.rpcFailures, maxWakePromptAttempts, err.Error(),
+			))
+			remainingAfterErrMs := w.deadline - w.now()
+			if remainingAfterErrMs <= 0 {
+				return nil
+			}
+			w.waitForNotificationOrTimeout(math.Min(w.pollIntervalMs, math.Max(1, remainingAfterErrMs)))
+			continue
+		}
+		if stop {
+			return errStopWaiter
+		}
+
+		selfReadyToWake := w.selfReadyToWake(selfAgentStatus)
+		if !hasActivePeers && !hasWakeBatch && selfReadyToWake && !w.retryWakePending {
+			// Default: stay on standby for the next batch. Only an explicit
+			// `exitWhenNoPeers` restores the old exit-when-idle behaviour.
+			if w.exitWhenNoPeers {
+				if (w.sawActivePeers || hasPeers) && w.settleGraceMs > 0 {
+					if w.settleDeadline == nil {
+						settleDeadline := w.now() + w.settleGraceMs
+						w.settleDeadline = &settleDeadline
+					}
+					if w.now() >= *w.settleDeadline {
+						w.clearOwnWaiterPid()
+						return errStopWaiter
+					}
+				} else {
+					w.clearOwnWaiterPid()
+					return errStopWaiter
+				}
+			} else {
+				w.settleDeadline = nil
+			}
+		} else {
+			w.settleDeadline = nil
+		}
+
+		remainingMs := w.deadline - w.now()
+		if remainingMs <= 0 {
+			return nil
+		}
+		settleRemainingMs := remainingMs
+		if w.settleDeadline != nil {
+			settleRemainingMs = math.Max(0, *w.settleDeadline-w.now())
+		}
+		isIdleStandby := !w.exitWhenNoPeers &&
+			!hasActivePeers &&
+			!hasPeers &&
+			!hasWakeBatch &&
+			!hasUnackedDeliveredEvents &&
+			selfReadyToWake &&
+			!w.retryWakePending
+		baseSleepMs := w.pollIntervalMs
+		if isIdleStandby {
+			baseSleepMs = math.Max(w.pollIntervalMs, w.idlePollIntervalMs)
+		}
+		sleepMs := math.Min(math.Min(baseSleepMs, remainingMs), settleRemainingMs)
+		if sleepMs <= 0 {
+			continue
+		}
+		w.waitForNotificationOrTimeout(sleepMs)
+	}
+	return nil
+}
+
+// selfReadyToWake mirrors `selfAgentStatus === undefined || "idle" || "done"`.
+func (w *waiter) selfReadyToWake(status *observability.AgentStatus) bool {
+	if status == nil {
+		return true
+	}
+	return *status == observability.AgentStatusIdle || *status == observability.AgentStatusDone
+}
+
+// waitForNotificationOrTimeout mirrors waitForNotificationOrTimeout: only a
+// notification that arrives *during* the wait may cut it short (the TS
+// `notifyWakeWaiter` seam is armed for the duration of the wait only).
+func (w *waiter) waitForNotificationOrTimeout(timeoutMs float64) {
+	for drained := false; !drained; {
+		select {
+		case <-w.wakeCh:
+		default:
+			drained = true
+		}
+	}
+	limit := math.Min(math.Max(0, timeoutMs), maxSetTimeoutMs)
+	if limit <= 0 {
+		return
+	}
+	timer := time.NewTimer(time.Duration(limit * float64(time.Millisecond)))
+	defer timer.Stop()
+	select {
+	case <-w.wakeCh:
+	case <-timer.C:
+	}
+}
+
+// inspectWorkspaceAgents mirrors inspectWorkspaceAgents.
+func (r *runner) inspectWorkspaceAgents(
+	client rpcClient,
+	presence Presence,
+) (bool, bool, *observability.AgentStatus, error) {
+	result, err := client.Call("agent.list", map[string]any{
+		"herdrSessionName": presence.HerdrSessionName,
+		// Workers dispatched into a sibling workspace of the same Herdr session
+		// have no orchestrator owner of their own.
+		"includeOwnerlessWorkspaces": true,
+		"workspaceId":                presence.WorkspaceID,
+	})
+	if err != nil {
+		return false, false, nil, err
+	}
+	agents := decodeAgentList(result)
+	var selfAgentStatus *observability.AgentStatus
+	peers := make([]AgentListItemView, 0, len(agents))
+	for _, agent := range agents {
+		if agent.PaneID == presence.PaneID && selfAgentStatus == nil {
+			selfAgentStatus = agent.AgentStatus
+		}
+		if !terminalIDEquals(agent.TerminalID, presence.TerminalID) {
+			peers = append(peers, agent)
+		}
+	}
+	hasActivePeers := false
+	nowMs := r.now()
+	for _, peer := range peers {
+		if IsPeerActiveOrSettling(peer, nowMs, r.newAgentGraceMs(), r.settleGraceMs()) {
+			hasActivePeers = true
+			break
+		}
+	}
+	return hasActivePeers, len(peers) > 0, selfAgentStatus, nil
+}
+
+func (r *runner) newAgentGraceMs() float64 {
+	if r.options.NewAgentGraceMs != nil {
+		return *r.options.NewAgentGraceMs
+	}
+	return defaultNewAgentGraceMs
+}
+
+func (r *runner) settleGraceMs() float64 {
+	if r.options.SettleGraceMs != nil {
+		return *r.options.SettleGraceMs
+	}
+	return defaultSettleGraceMs
+}
+
+// fetchLiveWorkingTerminalIDs mirrors fetchLiveWorkingTerminalIDs: terminal ids
+// of peers whose live Herdr status is `working`. Failure is tolerated and reads
+// as "no live working peer".
+func (r *runner) fetchLiveWorkingTerminalIDs(client rpcClient, presence Presence) map[string]struct{} {
+	result, err := client.Call("agent.list", map[string]any{
+		"herdrSessionName":           presence.HerdrSessionName,
+		"includeOwnerlessWorkspaces": true,
+		"workspaceId":                presence.WorkspaceID,
+	})
+	if err != nil {
+		return map[string]struct{}{}
+	}
+	live := map[string]struct{}{}
+	for _, agent := range decodeAgentList(result) {
+		if agent.AgentStatus == nil || *agent.AgentStatus != observability.AgentStatusWorking {
+			continue
+		}
+		if !truthyString(agent.TerminalID) || terminalIDEquals(agent.TerminalID, presence.TerminalID) {
+			continue
+		}
+		live[*agent.TerminalID] = struct{}{}
+	}
+	return live
+}
+
+// decodeAgentList mirrors the `as { agents?: AgentListItem[] }` cast plus the
+// `?? []` fallback.
+func decodeAgentList(value any) []AgentListItemView {
+	encoded, err := json.Marshal(value)
+	if err != nil {
+		return nil
+	}
+	response := struct {
+		Agents []AgentListItemView `json:"agents"`
+	}{}
+	if err := json.Unmarshal(encoded, &response); err != nil {
+		return nil
+	}
+	return response.Agents
+}
+
+// timeoutClient mirrors withRequestTimeout.
+type timeoutClient struct {
+	client    rpcClient
+	timeoutMs float64
+}
+
+type rpcOutcome struct {
+	value any
+	err   error
+}
+
+func (c *timeoutClient) Close() { c.client.Close() }
+
+// Call mirrors the wrapped request: the client is closed on timeout, which is
+// what makes the racing request fail instead of leaking.
+func (c *timeoutClient) Call(method string, params any) (any, error) {
+	effectiveTimeoutMs := math.Max(1, math.Min(c.timeoutMs, maxSetTimeoutMs))
+	settled := make(chan rpcOutcome, 1)
+	go func() {
+		value, err := c.client.Call(method, params)
+		settled <- rpcOutcome{value: value, err: err}
+	}()
+	timer := time.NewTimer(time.Duration(effectiveTimeoutMs * float64(time.Millisecond)))
+	defer timer.Stop()
+	select {
+	case outcome := <-settled:
+		return outcome.value, outcome.err
+	case <-timer.C:
+		func() {
+			defer func() { _ = recover() }()
+			c.client.Close()
+		}()
+		return nil, fmt.Errorf(
+			"Herdsman agy WakeWaiter RPC request timed out after %sms: %s",
+			formatJSNumber(effectiveTimeoutMs), method,
+		)
+	}
+}
+
+// defaultTriggerWakePrompt mirrors defaultTriggerWakePrompt:
+// `herdr agent prompt <paneId> [herdsman-wake]` with a 5s timeout.
+func defaultTriggerWakePrompt(paneID, promptText string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, "herdr", "agent", "prompt", paneID, promptText).Run()
+}
+
+// defaultSpawnWakeWaiter mirrors defaultSpawnWakeWaiter: the waiter is this
+// binary re-entered as `agy-hook WakeWaiter`, detached from the hook process and
+// handed the three HERDSMAN_AGY_* variables.
+func (r *runner) defaultSpawnWakeWaiter(input SpawnWakeWaiterInput) *SpawnWakeWaiterResult {
+	executable, err := os.Executable()
+	if err != nil {
+		return nil
+	}
+	command := exec.Command(executable, "agy-hook", "WakeWaiter")
+	command.Dir = input.Cwd
+	command.Env = wakeWaiterEnvironment(input)
+	command.Stdin = nil
+	command.Stdout = nil
+	command.Stderr = nil
+	// detach: the waiter outlives the hook and is reparented to PID 1.
+	command.SysProcAttr = &syscall.SysProcAttr{Setsid: true}
+	if err := command.Start(); err != nil {
+		r.warn("Failed to spawn Herdsman AGY wake waiter: " + err.Error())
+		return nil
+	}
+	pid := command.Process.Pid
+	_ = command.Process.Release()
+	return &SpawnWakeWaiterResult{PID: &pid}
+}
+
+// wakeWaiterEnvironment mirrors the env object of the TS spawn: the input
+// environment plus the three waiter variables.
+func wakeWaiterEnvironment(input SpawnWakeWaiterInput) []string {
+	environment := make([]string, 0, len(input.Environment)+3)
+	for key, value := range input.Environment {
+		if key == "HERDSMAN_AGY_SESSION_ID" || key == "HERDSMAN_AGY_STATE_DIR" || key == "HERDSMAN_AGY_WAITER_EPOCH" {
+			continue
+		}
+		environment = append(environment, key+"="+value)
+	}
+	environment = append(environment,
+		"HERDSMAN_AGY_SESSION_ID="+input.SessionID,
+		"HERDSMAN_AGY_STATE_DIR="+input.StateDir,
+		"HERDSMAN_AGY_WAITER_EPOCH="+formatJSNumber(input.WaiterEpoch),
+	)
+	return environment
+}
+
+// ResolveWakeWaiterCwdOptions mirrors the `{ baseCwd, pid }` options of
+// resolveWakeWaiterCwd plus the Go-only platform and `/proc` seams.
+type ResolveWakeWaiterCwdOptions struct {
+	BaseCwd  *string
+	GOOS     string
+	PID      int
+	ReadCwd  func(pid int) (string, bool)
+	ReadPPID func(pid int) (int, bool)
+}
+
+// maxWakeCwdAncestorDepth mirrors MAX_WAKE_CWD_ANCESTOR_DEPTH; it is kept in
+// sync with the daemon's pane-binding ancestor walk.
+const maxWakeCwdAncestorDepth = 4
+
+// ResolveWakeWaiterCwd mirrors resolveWakeWaiterCwd:
+//
+//  1. `payload.cwd`;
+//  2. the first existing entry of `payload.workspacePaths` (else the first
+//     non-empty one);
+//  3. the cwd of this process' nearest ancestor that differs from `baseCwd`;
+//  4. `baseCwd` itself.
+func ResolveWakeWaiterCwd(payload map[string]any, options *ResolveWakeWaiterCwdOptions) string {
+	if explicitCwd, ok := payloadString(payload, "cwd"); ok {
+		return explicitCwd
+	}
+
+	candidates := []string{}
+	if workspacePaths, ok := payload["workspacePaths"].([]any); ok {
+		for _, candidate := range workspacePaths {
+			if value, ok := nonEmptyStringValue(candidate); ok {
+				candidates = append(candidates, value)
+			}
+		}
+	}
+	for _, candidate := range candidates {
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+	if len(candidates) > 0 {
+		return candidates[0]
+	}
+
+	baseCwd := ""
+	if options != nil && options.BaseCwd != nil && *options.BaseCwd != "" {
+		baseCwd = *options.BaseCwd
+	}
+	if baseCwd == "" {
+		if workingDir, err := os.Getwd(); err == nil {
+			baseCwd = workingDir
+		}
+	}
+	pid := os.Getpid()
+	goos := runtime.GOOS
+	readCwd := readProcessCwd
+	readPPID := readProcessParentPid
+	if options != nil {
+		if options.PID != 0 {
+			pid = options.PID
+		}
+		if options.GOOS != "" {
+			goos = options.GOOS
+		}
+		if options.ReadCwd != nil {
+			readCwd = options.ReadCwd
+		}
+		if options.ReadPPID != nil {
+			readPPID = options.ReadPPID
+		}
+	}
+	if ancestor, ok := ancestorCwdDifferingFrom(baseCwd, pid, goos, readCwd, readPPID); ok {
+		return ancestor
+	}
+	return baseCwd
+}
+
+// ancestorCwdDifferingFrom mirrors ancestorCwdDifferingFrom.
+func ancestorCwdDifferingFrom(
+	baseCwd string,
+	pid int,
+	goos string,
+	readCwd func(pid int) (string, bool),
+	readPPID func(pid int) (int, bool),
+) (string, bool) {
+	if goos != "linux" {
+		return "", false
+	}
+	if pid <= 1 {
+		return "", false
+	}
+	normalizedBase := normalizeWakeCwd(baseCwd)
+	current := pid
+	for step := 0; step <= maxWakeCwdAncestorDepth && current > 1; step++ {
+		currentCwd, ok := readCwd(current)
+		if !ok {
+			return "", false
+		}
+		if normalizeWakeCwd(currentCwd) != normalizedBase {
+			return currentCwd, true
+		}
+		parent, ok := readPPID(current)
+		if !ok || parent <= 1 || parent == current {
+			return "", false
+		}
+		current = parent
+	}
+	return "", false
+}
+
+// readProcessCwd mirrors readProcessCwd.
+func readProcessCwd(pid int) (string, bool) {
+	target, err := os.Readlink(fmt.Sprintf("/proc/%d/cwd", pid))
+	if err != nil {
+		return "", false
+	}
+	return target, true
+}
+
+// ppidPattern mirrors `/^PPid:\s*(\d+)\s*$/m`.
+var ppidPattern = regexp.MustCompile(`(?m)^PPid:[ \t]*([0-9]+)[ \t]*$`)
+
+// readProcessParentPid mirrors readProcessParentPid.
+func readProcessParentPid(pid int) (int, bool) {
+	status, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		return 0, false
+	}
+	match := ppidPattern.FindStringSubmatch(string(status))
+	if match == nil {
+		return 0, false
+	}
+	parent, err := strconv.Atoi(match[1])
+	if err != nil || parent < 0 {
+		return 0, false
+	}
+	return parent, true
+}
+
+// normalizeWakeCwd mirrors normalizeWakeCwd.
+func normalizeWakeCwd(value string) string {
+	if resolved, err := filepath.EvalSymlinks(value); err == nil {
+		return resolved
+	}
+	if len(value) > 1 && strings.HasSuffix(value, "/") {
+		return value[:len(value)-1]
+	}
+	return value
+}
+
+// parseJSNumber mirrors `Number(value)`.
+func parseJSNumber(value string) float64 {
+	trimmed := strings.TrimSpace(value)
+	if trimmed == "" {
+		return 0
+	}
+	parsed, err := strconv.ParseFloat(trimmed, 64)
+	if err != nil {
+		return math.NaN()
+	}
+	return parsed
+}
+
+// isIntegerNumber mirrors Number.isInteger.
+func isIntegerNumber(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value == math.Trunc(value)
+}
+
+// formatJSNumber mirrors `String(number)` for the numbers this package renders
+// (epochs, timeouts and durations): integers print without a fractional part.
+func formatJSNumber(value float64) string {
+	if isIntegerNumber(value) {
+		return strconv.FormatInt(int64(value), 10)
+	}
+	return strconv.FormatFloat(value, 'f', -1, 64)
+}

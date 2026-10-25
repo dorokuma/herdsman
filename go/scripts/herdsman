@@ -1,0 +1,45 @@
+#!/bin/sh
+# herdsman — in-repo wrapper that switches the CLI between the TypeScript
+# entrypoint and the Go port.
+#
+# Why this file exists: the host runs the published CLI from
+# /root/.local/bin/herdsman (the npm global install). Switching that symlink to
+# the Go binary would make a half-ported daemon the production CLI, so the
+# switch lives here, inside the repository, and the host install is never
+# touched.
+#
+#   HERDSMAN_IMPL=ts  (default) exec node on the built TS entrypoint
+#   HERDSMAN_IMPL=go            exec the compiled Go binary
+#
+# Overrides (mainly for tests and out-of-tree builds):
+#   HERDSMAN_GO_BIN   path of the Go binary      (default: <repo>/go/bin/herdsman)
+#   HERDSMAN_TS_ENTRY path of the TS entrypoint  (default: <repo>/dist/src/cli/herdsman.js)
+#   HERDSMAN_NODE     node binary for the TS entrypoint (default: node)
+set -eu
+
+script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
+impl=${HERDSMAN_IMPL:-ts}
+
+case "$impl" in
+  ts)
+    entry=${HERDSMAN_TS_ENTRY:-$repo_root/dist/src/cli/herdsman.js}
+    if [ ! -f "$entry" ]; then
+      echo "herdsman wrapper: TS entrypoint not found at $entry (run: pnpm build)" >&2
+      exit 1
+    fi
+    exec "${HERDSMAN_NODE:-node}" "$entry" "$@"
+    ;;
+  go)
+    go_bin=${HERDSMAN_GO_BIN:-$repo_root/go/bin/herdsman}
+    if [ ! -x "$go_bin" ]; then
+      echo "herdsman wrapper: Go binary not found at $go_bin (run: cd go && go build -o bin/herdsman ./cmd/herdsman)" >&2
+      exit 1
+    fi
+    exec "$go_bin" "$@"
+    ;;
+  *)
+    echo "herdsman wrapper: HERDSMAN_IMPL must be 'go' or 'ts' (got '$impl')" >&2
+    exit 1
+    ;;
+esac
