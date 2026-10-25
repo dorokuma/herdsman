@@ -32,11 +32,21 @@ type pendingFrame struct {
 	message map[string]any
 }
 
-// writeAll writes the collected frames. Each write is independently bounded, so
-// one wedged peer cannot delay the others.
-func writeAll(frames []pendingFrame) {
+// enqueueAll queues every collected frame on its target's send queue. It runs
+// with the server lock held: the append is the ordering point for the frames, so
+// it belongs where the server's own order is fixed.
+func enqueueAll(frames []pendingFrame) {
 	for _, frame := range frames {
-		frame.target.writeMessage(frame.message)
+		frame.target.enqueueMessage(frame.message)
+	}
+}
+
+// flushAll drains every connection that has frames queued. It runs with the
+// server lock released, so a wedged peer's write cannot stall the critical
+// section.
+func flushAll(frames []pendingFrame) {
+	for _, frame := range frames {
+		frame.target.flushQueue()
 	}
 }
 
@@ -47,24 +57,121 @@ func writeAll(frames []pendingFrame) {
 const rpcWriteTimeout = 2 * time.Second
 
 // rpcConnection is one accepted client connection, the Go counterpart of the TS
-// `Socket`. `destroyed` mirrors `socket.destroyed`, and `writeMu` keeps frames
-// written from different goroutines (a response and a pushed notification) from
-// interleaving inside one line.
+// `Socket`. `destroyed` mirrors `socket.destroyed`.
+//
+// Frames do not reach the socket from the goroutine that produced them. A frame
+// is built (and JSON-encoded) while its publisher holds whatever state produced
+// it, then appended to this connection's send queue; a single drainer takes the
+// queue in FIFO order and writes it. That is what keeps the peer's byte order
+// equal to the order the frames were *generated* in: two goroutines that race
+// for the socket after their generation order is fixed would otherwise reorder
+// them (a newer frame overtaking an older one).
 type rpcConnection struct {
-	conn      net.Conn
-	writeMu   sync.Mutex
+	conn net.Conn
+
+	queueMu sync.Mutex
+	queue   []string
+	// draining marks that a drainer owns the queue, so exactly one goroutine
+	// writes at a time and the queue is never left unclaimed while non-empty.
+	draining  bool
 	destroyed atomic.Bool
+}
+
+// enqueueMessage encodes one frame and appends it to the send queue, then
+// returns. It does no socket I/O of its own.
+//
+// The caller decides the order (this is called with the publisher's state held),
+// so the append is the ordering point: a peer's byte order matches the order
+// these appends happened in, not the order goroutines happened to be scheduled
+// in afterwards. Encoding belongs here rather than in the writer for the same
+// reason: an expensive-to-serialise frame must not be able to slip a newer,
+// cheaper frame past it, which is exactly what a write-after-unlock shape does.
+func (c *rpcConnection) enqueueMessage(message any) {
+	frame, err := shared.EncodeJSONLine(message)
+	if err != nil {
+		// A value JSON.stringify cannot produce (impossible for these payloads,
+		// which are built from decoded JSON and the port's own records) is dropped
+		// exactly like a TS write that never happens.
+		return
+	}
+	c.queueMu.Lock()
+	if c.destroyed.Load() {
+		c.queueMu.Unlock()
+		return
+	}
+	c.queue = append(c.queue, frame)
+	// Exactly one drainer at a time: the first append of a burst claims the
+	// queue, and every later append only grows it.
+	claim := !c.draining
+	if claim {
+		c.draining = true
+	}
+	c.queueMu.Unlock()
+	if claim {
+		go c.drain()
+	}
+}
+
+// flushQueue makes sure the send queue is being drained. It is the entry point
+// the publish paths call once they have released the server lock.
+//
+// It never writes a frame itself: a drainer already owns the queue whenever
+// frames are waiting, so this only starts one when the queue was left idle (a
+// connection whose drainer finished between the append and this call). Calling
+// it therefore cannot block the caller on a wedged peer — the append already
+// fixed the order, and the drain is the only part that touches the socket.
+func (c *rpcConnection) flushQueue() {
+	c.queueMu.Lock()
+	claim := !c.draining && len(c.queue) > 0
+	if claim {
+		c.draining = true
+	}
+	c.queueMu.Unlock()
+	if claim {
+		go c.drain()
+	}
+}
+
+// drain writes the send queue in strict FIFO order. It runs until the queue is
+// empty, then hands the ownership back so the next append can start a new
+// drainer. Exactly one goroutine is inside it per connection at any time.
+func (c *rpcConnection) drain() {
+	for {
+		c.queueMu.Lock()
+		if len(c.queue) == 0 {
+			c.draining = false
+			c.queueMu.Unlock()
+			return
+		}
+		frame := c.queue[0]
+		c.queue = c.queue[1:]
+		c.queueMu.Unlock()
+
+		if !c.writeFrame(frame) {
+			// The connection is gone: drop whatever is queued behind the failed
+			// frame instead of spending the write timeout on each of them.
+			c.queueMu.Lock()
+			c.queue = nil
+			c.draining = false
+			c.queueMu.Unlock()
+			return
+		}
+	}
 }
 
 // destroy mirrors `socket.destroy()`: idempotent, and the connection stops
 // accepting writes the moment it starts.
 func (c *rpcConnection) destroy() {
 	if c.destroyed.CompareAndSwap(false, true) {
+		c.queueMu.Lock()
+		c.queue = nil
+		c.queueMu.Unlock()
 		_ = c.conn.Close()
 	}
 }
 
-// writeFrame is the one place a frame reaches the socket.
+// writeFrame is the one place a frame reaches the socket. It reports whether
+// the frame was written.
 //
 // A peer that stops reading must not be able to block the daemon: net.Conn.Write
 // waits for the socket buffer, and the callers of this method are the server's
@@ -72,31 +179,22 @@ func (c *rpcConnection) destroy() {
 // therefore carries a deadline, and a failed write closes the connection — the
 // socket is unusable after a write error anyway, and destroying it here unblocks
 // the reader goroutine that is still parked on it.
-func (c *rpcConnection) writeFrame(frame string) {
+func (c *rpcConnection) writeFrame(frame string) bool {
 	if c.destroyed.Load() {
-		return
-	}
-	c.writeMu.Lock()
-	defer c.writeMu.Unlock()
-	if c.destroyed.Load() {
-		return
+		return false
 	}
 	_ = c.conn.SetWriteDeadline(time.Now().Add(rpcWriteTimeout))
 	if _, err := c.conn.Write([]byte(frame)); err != nil {
 		c.destroy()
+		return false
 	}
+	return true
 }
 
-// writeMessage encodes one RPC frame and writes it. A value JSON.stringify
-// cannot produce (impossible for these payloads, which are built from decoded
-// JSON and the port's own records) is dropped exactly like a TS write that
-// never happens.
+// writeMessage queues one RPC frame for writing. See enqueueMessage for why the
+// append, not the write, is the ordering point.
 func (c *rpcConnection) writeMessage(message any) {
-	frame, err := shared.EncodeJSONLine(message)
-	if err != nil {
-		return
-	}
-	c.writeFrame(frame)
+	c.enqueueMessage(message)
 }
 
 // rpcRequest is the decoded TS `RpcRequest`. `hasID` keeps "no id at all"
@@ -474,19 +572,20 @@ func (s *ObservabilityRpcServer) handleOrchestratorRegister(
 		if err != nil {
 			return nil, err
 		}
-		// The context publications are collected under the lock and written after
-		// it is released, exactly like PublishAgentContext: a frame write must
-		// never run inside the critical section a wedged peer could block.
+		// The context publications are collected under the lock and appended to
+		// the target queues under it as well, then drained after it is released,
+		// exactly like PublishAgentContext: a frame write must never run inside
+		// the critical section a wedged peer could block, and the order the
+		// server generated the frames in must survive the release.
 		contextFrames := make([]pendingFrame, 0, len(registration.ContextChangedScopes))
 		for _, scope := range registration.ContextChangedScopes {
 			if target, message, ok := s.publishAgentContextLocked(scope); ok {
 				contextFrames = append(contextFrames, pendingFrame{target: target, message: message})
 			}
 		}
+		enqueueAll(contextFrames)
 		s.mu.Unlock()
-		for _, frame := range contextFrames {
-			frame.target.writeMessage(frame.message)
-		}
+		flushAll(contextFrames)
 		s.mu.Lock()
 	}
 	return s.connectionStateLocked(presence)
@@ -524,19 +623,21 @@ func (s *ObservabilityRpcServer) handleOrchestratorSet(
 		return nil, err
 	}
 
-	// The orchestrator-change notifications are written after the lock is
+	// The orchestrator-change notifications are appended to their send queues
+	// while the lock is held (the ordering point) and drained after it is
 	// released: the TS original awaited its socket writes outside the critical
 	// section, and a Go write to a peer that stopped reading blocks.
 	frames, result, err := func() ([]pendingFrame, map[string]any, error) {
 		s.mu.Lock()
 		defer s.mu.Unlock()
-		return s.orchestratorSetLocked(connection, input.Enabled)
+		frames, result, err := s.orchestratorSetLocked(connection, input.Enabled)
+		enqueueAll(frames)
+		return frames, result, err
 	}()
+	flushAll(frames)
 	if err != nil {
-		writeAll(frames)
 		return nil, err
 	}
-	writeAll(frames)
 	return result, nil
 }
 

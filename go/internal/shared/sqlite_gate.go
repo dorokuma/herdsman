@@ -96,6 +96,19 @@ func RegisterSqliteGate(db *sql.DB, gate *SqliteGate) {
 	gates.mu.Unlock()
 }
 
+// UnregisterSqliteGate drops db from the registry. Called when the handle is
+// closed, so a long-running process whose daemons open and close databases does
+// not keep a gate (and the *sql.DB key itself) alive for every database it has
+// ever opened.
+func UnregisterSqliteGate(db *sql.DB) {
+	if db == nil {
+		return
+	}
+	gates.mu.Lock()
+	delete(gates.byDB, db)
+	gates.mu.Unlock()
+}
+
 // SqliteGateOf returns the gate registered for db, or nil when the handle was
 // not opened through OpenSqlite (a caller-supplied *sql.DB in a test, say).
 func SqliteGateOf(db *sql.DB) *SqliteGate {

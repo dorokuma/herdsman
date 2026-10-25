@@ -36,8 +36,11 @@
 | 21 | `39bf1c63b7bd5c43e5399c29d203858a62d7901a` | fix(go): resolve daemon startup-signal race and add batch 5 report |
 | 22 | `5fce55023119e8e1602585f4bed1640160932f39` | fix(go): resolve agy, cli, and agenthistory reviewer findings |
 | 23 | `5e8b7c80ee8594affbc2e50d684ab34ed65dc0a5` | fix(go): resolve db, observability, herdr, and daemon reviewer findings |
+| 24 | `b407ee30705be0bf95d0a9e9207f52b8e4ee6bf6` | test(go): saturate unix socket sndbuf in slow-client test and update report |
 
-第 21～23 条是本子批前三轮 reviewer 修复，各轮内容见第 6 节。第 24 条（`test(go): saturate unix socket sndbuf in slow-client test and update report`，本轮）是第 3D-3 精确收尾子批：让 `observability_rpc_slow_client_test.go` 真正填满 AF_UNIX `SO_SNDBUF`（见 6.5 的修订）并修正 6.1 节对 `8c4bd1b` 的记载。
+第 21～23 条是本子批前三轮 reviewer 修复，各轮内容见第 6 节。第 24 条（`b407ee3`，`test(go): saturate unix socket sndbuf in slow-client test and update report`）是第 3D-3 精确收尾子批：让 `observability_rpc_slow_client_test.go` 真正填满 AF_UNIX `SO_SNDBUF`（见 6.5 的修订）并修正 6.1 节对 `8c4bd1b` 的记载；该提交只动 `go/internal/daemon/observability_rpc_slow_client_test.go`（+26/-6）与本报告（+72/-14）。
+
+第 25 条（`fix(go): close final review findings on db lifecycle, rpc ordering, and herdr deadlines`，本轮 3E 终审收口）解决 `reviewer-final` 的全部 8 项问题：`sqlite_gate.go`/`db/client.go` 的 `sql.DB.Close()` 生命周期、`observability_server*.go` 的锁外写顺序、`herdr/socket_client.go` 的并发请求写锁与独立写超时、`turn_completion_test.go` 与 `sqlite_migrations_test.go` 的确定性回归、`agent_context_service_test.go` 的真实 `OccupiedSessionPaths` 边界、三个独立测试文件的合并，以及本报告 4.3 / 6.1 / 6.6 三节的更正与新增专节（见 6.8、6.9）。
 
 > **`8c4bd1b` 的更正**：任务书最初写作 `8c4bd1b`，经 `git show --stat` 核实，其对应的真实提交就是第 22 条 `5fce550`（`fix(go): resolve agy, cli, and agenthistory reviewer findings`）。6.1 节已据此改写，不再保留「短 SHA 不可解析」的旧结论。
 
@@ -517,7 +520,7 @@ No packages installed.
 ### 4.3 RPC 方法名与消息格式
 
 - 传输：Unix domain socket + JSON-lines（`internal/shared/json_lines.go` ↔ `src/shared/json-lines.ts`），帧上限与 `observability_server_frame_limit_test.go` 对应。
-- 方法名逐字一致。请求侧（`observability_server_handlers.go` 的 `#dispatch` switch，共 10 个 case）：`agent.list`、`agent.get`、`agent.read`、`agent.events`、`agent.orchestrator.register`、`agent.orchestrator.get`、`agent.orchestrator.set`、`agent.notifications.ack`、`agent.turn.completed`、`agent.ping`；服务端推送侧：`agent.event`、`agent.context.changed`。两个方法名注意都带 `agent.` 前缀：`agent.turn.completed`（`internal/agy/hook.go` 的 `client.Call("agent.turn.completed", …)`）与 `agent.notifications.ack`（`client.Call("agent.notifications.ack", …)`）；`internal/observability/contracts.go` 里不带前缀的 `turn.completed` 只是 params 的 type 判别名，不是线上方法名。双客户端用例断言的就是这套 pi 面向面。
+- 方法名逐字一致。请求侧（`observability_server_handlers.go` 的 `#dispatch` switch，共 10 个 case）：`agent.list`、`agent.get`、`agent.read`、`agent.events`、`agent.orchestrator.register`、`agent.orchestrator.get`、`agent.orchestrator.set`、`agent.notifications.ack`、`agent.turn.completed`、`agent.ping`；服务端推送侧共 **3** 个方法：`agent.event`（`PublishAgentEvent`）、`agent.context.changed`（`PublishAgentContext`）、`agent.orchestrator.changed`（`notifyOwnerChanged`），三者都带 `agent.` 前缀，与 `observability_server.go` 顶部 wire contract 注释所列一致。两个方法名注意都带 `agent.` 前缀：`agent.turn.completed`（`internal/agy/hook.go` 的 `client.Call("agent.turn.completed", …)`）与 `agent.notifications.ack`（`client.Call("agent.notifications.ack", …)`）；`internal/observability/contracts.go` 里不带前缀的 `turn.completed` 只是 params 的 type 判别名，不是线上方法名。双客户端用例断言的就是这套 pi 面向面。
 - 互操作实测：TS 客户端（`dist/`）经 Go 服务拿到 `agent list`/`daemon status`；`TestObservabilityRpcServerSimultaneousTsAndGoClients` 证明 TS 与 Go 客户端**同时在线**时彼此可见 presence、orchestrator 归属与 turn 信号，且只有持角色的一侧收到推送。
 
 ### 4.4 SQLite 表结构与 Drizzle 迁移兼容性
@@ -558,20 +561,20 @@ No packages installed.
 
 任务书最初写作短 SHA `8c4bd1b`。该短 SHA 在本仓 object 数据库中不可解析（`git cat-file -t 8c4bd1b` 在 worktree 与主仓均报 `Not a valid object name`），但按其描述的提交说明在 `go-port` 上可唯一对应到 **`5fce550`**（`git show --stat 5fce550` 核实：`fix(go): resolve agy, cli, and agenthistory reviewer findings`，9 文件 +705/-33）。**`8c4bd1b` 是任务书的笔误，本报告一律以 `5fce550` 为准。**
 
-`5fce550` 修复了第 1 轮 reviewer（`reviewer-1`）的全部 8 项问题：
+`5fce550` 修复了第 1 轮 reviewer（`reviewer-1`）的全部 8 项问题。下表按 `git show 5fce550 -- <file>` 的真实函数名与落点书写（任务书中的近似名称一律以本节为准）：
 
-| # | 面 | 问题与修复 |
-|---|----|-----------|
-| 1 | `internal/agy/state.go` | JSON `null` 防护：反序列化 `null` 时不再把字段写成零值覆盖既有状态，`null` 字段保持缺省语义 |
-| 2 | `internal/agenthistory/antigravity_proto.go` | 第 10 字节 varint 溢出拦截：protobuf varint 超过 10 字节即拒绝，避免 `int64` 位移溢出 |
-| 3 | `internal/cli/herdsman.go` | `--all` 清除显式 scope：`--all` 与显式 `--workspace`/`--session` 同时给出时，显式 scope 被清除而非静默合并 |
-| 4 | `internal/agy/hook.go` / `internal/cli/herdsman.go` | U+2028 / U+2029 原字符保留：不再把这两个 JS 行分隔符转义成 `\u2028`/`\u2029`，保持 TS `JSON.stringify` 的原字符输出 |
-| 5 | `internal/agy/hook.go` | `Environment == nil` 默认读 `os.Environ()`：环境未显式提供时回落进程环境，与 TS 的 `process.env` 一致 |
-| 6 | `internal/agenthistory/discovery_test.go` | 真实 `OccupiedSessionPaths` 边界测试：用实际占用路径构造边界，替换原先的空壳用例 |
-| 7 | `internal/agenthistory` | `parseJSNumber` 支持 `0x`/`0b`/`0o` 前缀：JS Number 文本可带十六进制/二进制/八进制字面量 |
+| # | 面 | 问题与修复（真实落点） |
+|---|----|----------------------|
+| 1 | `internal/agy/state.go` | `writeSessionState` 的 `readRawStateObject` 返回 nil map 时补一个空 map；`readRawStateObject` 在 `json.Unmarshal` 成功但结果是 JSON `null`（object == nil）时归一成空 map。此前 `overlayKnownStateFields` 往 nil map 赋值会 panic |
+| 2 | `internal/agenthistory/antigravity_proto.go` | `readVarint` 第 10 字节宽度拦截：`shift == 63 && (next&0x7f) > 1` 即返回 `errInvalidVarint`。TS 用 BigInt 累加，`2^64 + 154` 不会截断；Go 的 uint64 会丢掉高位，把越界 tag 变成合法 tag（`2^64 + 154` 截断成 154，即 field 19 / wireType 2） |
+| 3 | `internal/cli/herdsman.go` | `parseAgentList` 的 `--all` 分支：`command.All = true` 同时把 `HerdrSessionName` 与 `WorkspaceID` 置 nil。TS 的 `all ? { all: true } : scopedOrCurrent(...)` 替换整个 scope 对象，所以显式 `--session`/`--workspace` 是被丢弃而非与 `all` 并列发出 |
+| 4 | `internal/cli/herdsman.go` 与 `internal/agy/wake_waiter.go` | `parseJSNumber` 支持无符号 `0x`/`0b`/`0o` 前缀（`strconv.ParseUint` 按 16/2/8 基解析）；带符号前缀（`-0x14`）仍走 `ParseFloat` 得 NaN，与 JS 的 `Number()` 一致。两处各有一份同名实现 |
+| 5 | `internal/agy/hook.go` 与 `internal/cli/herdsman.go` | 新增 `restoreJSLineSeparators`：`encoding/json` 总是把 U+2028/U+2029 写成 `\u2028`/`\u2029`，该函数把它们还原成原字符，保持 TS `JSON.stringify` 的逐字节输出 |
+| 6 | `internal/agenthistory/discovery_test.go` | **删除**伪辅助测试：`occupiedBoundaryKey` 与 `TestOccupiedFallbackDiscoveryUsesAChangedOccupiedSetAsADiscoveryBoundary` 被整体删去（后者只在测试文件内构造两个 map 字面量、比较排序 join，完全不触达生产代码）。同时在文件顶部留下注释，说明该行为已迁居 agent context service；`discovery.go` 本身无改动。`OccupiedSessionPaths` 边界的真实覆盖见 6.8 的 Finding 5 |
+| 7 | `internal/agenthistory` | `parseJSNumber`（见第 4 项）：`0x`/`0b`/`0o` 前缀支持 |
 | 8 | `internal/agy` / `internal/cli` / `internal/agenthistory` | 三个包 5 轮 `-race` 全绿（见 6.6） |
 
-其中第 2、6、7 项各带新增/改写的单测（`antigravity_proto_test.go` +36、`discovery_test.go` ±36），第 8 项以 5 轮 `-race` 作为证据，其余为行为修正。
+其中第 1、2、4、5 项各带新增/改写的单测（`antigravity_proto_test.go` +36、`agy_hook_and_cli_test.go` +301、`cli_test.go` +158，`discovery_test.go` ±36 且净减少），第 8 项以 5 轮 `-race` 作为证据。
 
 ### 6.2 六项修复
 
@@ -670,7 +673,7 @@ No packages installed.
 
 ### 6.6 五轮 `-race` 实测
 
-`CGO_ENABLED=1 go test -buildvcs=false -count=1 -race ./...`，连跑 5 轮，每轮都覆盖全部 12 个包结果行（2 个 `no test files` + 10 个 `ok`）：
+`CGO_ENABLED=1 go test -buildvcs=false -count=1 -race ./...`，连跑 5 轮，每轮都覆盖全部 12 个包结果行（`go list -buildvcs=false ./...` 共 12 个包：2 个 `cmd/*` + 10 个 `internal/*`，其中 `cmd/herdsman` 与 `cmd/herdsman-daemon` 为 `no test files`，其余 10 个 `internal/*` 出 `ok`）：
 
 | 轮次 | 结果 | 耗时 |
 |------|------|------|
@@ -696,3 +699,68 @@ state: stopped
 ```
 
 RPC 命令（`on`/`off`/`status`、`agent list/get/read`）默认走 `formatHumanResult` 的人读视图，只有带 `--json` 才出单行 JSON；`daemon status` 不经过 `printResult`，由入口的 `runDaemonCommand` 按 `--text` 分流。
+
+---
+
+### 6.8 第 3E 终审收口子批（`reviewer-final` 全部 8 项）
+
+对应提交：`fix(go): close final review findings on db lifecycle, rpc ordering, and herdr deadlines`（第 1 节第 25 条）。本轮把 `reviewer-final` 的 8 项问题逐一闭环，并合并 3 个独立测试文件。
+
+### 8 项问题与落点
+
+| # | 问题 | 修复落点 |
+|---|------|---------|
+| 1 | `sql.DB.Close()` 不释放底层连接、不注销 `SqliteGate` | `internal/db/client.go` 的 `serializedConnector` 新增 `Close() error`（`sync.Once` 幂等）：调 `shared.UnregisterSqliteGate(db)`、关闭唯一底层 `modernc.org/sqlite` `driver.Conn`、置 `closed` 使后续 `Connect` 立即返回 `sql.ErrConnDone`；`internal/shared/sqlite_gate.go` 保持闸门本身的可重入语义，单个 `serializedConn.Close()` 仍是 no-op，供连接池复用 |
+| 2 | 锁外写帧时后进临界区的协程可能先抢到 `writeMu`，客户端先收新状态帧后收旧状态帧 | `internal/daemon/observability_server.go` 的 `rpcConnection` 增加按连接串行的发送队列（`queueMu` + `queue []string` + `draining`）：持 `s.mu` 期间 `enqueueMessage`/`enqueueAll` 只做内存追加（零网络 I/O，顺序严格由 `s.mu` 固定），释放 `s.mu` 后 `flushQueue`/`flushAll` 由单个 drainer 按 FIFO 取出、加 2s 写超时写入，写失败即 `destroy()` 清空队列 |
+| 3 | 持久连接共用 `conn.SetDeadline`，请求 A 完成时 `clearDeadline` 会清空并发请求 B 的 deadline；写失败未重置连接 | `internal/herdr/socket_client.go`：新增 `writeMu` 串行化持久连接的 `conn.Write`；持久连接不再设全局 `SetDeadline`，改为仅在 `writeMu` 内 `SetWriteDeadline(now+timeout)`、写完立即置零；`writeFrameLocked` 写失败即 `resetConnection()` 销毁连接（避免残留半截 JSON 帧）；读超时仍由各请求独立的 `time.NewTimer(timeout)` 与 `ctx.Done()` 控制；`requestOnce` 的独立短连接保持自己的 `SetDeadline`（`armDeadline`/`clearDeadline` 的注释已改写为「仅用于一次性连接」） |
+| 4 | `turn_completion` 晚到 finish 缺确定性回归；`RunSqliteTransaction` 的 COMMIT 失败回滚缺回归 | `internal/observability/turn_completion_test.go` 的 `TestFinishedWaiterIgnoresLateSignalAndReleasesListener` 强化为「waiter1 完成并移出注册表后，同 key 注册新 signal 与 waiter2，并触发 waiter1 残留的 timeout/cancel 路径」；`internal/db/sqlite_migrations_test.go` 新增基于 `PRAGMA defer_foreign_keys = ON` 触发真实 `COMMIT` 失败的回归 |
+| 5 | `OccupiedSessionPaths` 边界测试未触达生产代码 | `internal/observability/agent_context_service_test.go` 的 `TestAgentContextServiceRediscoversOnOccupiedChange` 改用真实 `agenthistory.CreateAgentHistoryService`（包内无 `NewService`，构造函数名以源码为准），配 `contextPiSession` 写合法 pi JSONL；`internal/agenthistory/discovery_test.go` 顶部注释保持 `5fce550` 的原样 |
+| 6 | 报告 6.1 节的函数名与落点不准 | 已按 `git show 5fce550 -- <file>` 逐项改写（见 6.1），不照抄任务书的近似名称 |
+| 7 | 3 个新增测试文件未合入既有测试文件 | `go/internal/db/sqlite_transaction_test.go` → `go/internal/db/sqlite_migrations_test.go`；`go/internal/observability/agent_index_refresh_sharing_test.go` → `go/internal/observability/agent_index_service_test.go`；`go/internal/daemon/observability_rpc_slow_client_test.go` → `go/internal/daemon/observability_rpc_test.go`。三个文件均已删除 |
+| 8 | 报告 4.3 推送方法列表不全、6.6 包数量表述不准、缺架构决策专节 | 4.3 补全 3 个推送方法；6.6 改为「`go list -buildvcs=false ./...` 共 12 个包：2 个 `cmd/*` + 10 个 `internal/*`」；新增 6.9 记录 `SqliteGate` 与 `rpcConnection` 的架构决策 |
+
+### 本轮新增回归的先 FAIL 后 PASS 取证
+
+**Finding 1（`connector.Close()`）**：退回「`serializedConnector` 无 `Close()`」后 `TestOpenSqliteCloseReleasesConnectionAndGate` FAIL——`db.Close()` 之后 `SqliteGate` 仍在注册表里，且底层连接未关；补上 `Close()` 后 PASS。
+
+**Finding 2（发送队列顺序）**：`TestObservabilityRpcPushedFramesKeepTheirGeneratedOrder` 在把 `enqueueAll` 移回锁外（恢复「锁内构造、锁外 encode+write」的旧形态）后确定性 FAIL，报出 `[2 1]`——客户端收到的帧序号非单调。关键在 payload：用 50 000 个 key 的 map 把单帧撑到约 770 KB、编码耗时约 18ms，临界区才长到足以让乱序稳定复现（900 KB 只有约 2ms 窗口，不够）。修复形态（锁内 enqueue、锁外单 drainer flush）下同一用例 PASS。
+
+**Finding 3（herdr 写锁与写超时）**：`TestHerdrSocketClientConcurrentRequestsKeepTheirOwnTimeouts` 三个子测试。「写失败重置连接」子测试在删掉 `writeFrameLocked` 里的 `resetConnection()` 后 FAIL：`getPane after a failed write err = write unix @->…: use of closed network connection, want Herdr socket closed`。注意「并发请求互不清 deadline」子测试**测不出**差异——请求自身的 `time.NewTimer` 仍是真正的边界，退回共享 `SetDeadline` 形态用例仍 PASS；这一项按防御性记录在案。
+
+**Finding 4（COMMIT 失败回滚）**：`TestRunSqliteTransactionRollsBackAfterFailedCommit` 在临时注释掉 `RunSqliteTransaction` 里 commit 失败后的 `rollback` 后 FAIL，第二次事务报 `cannot start a transaction within a transaction`，与任务书预期逐字一致；恢复后 PASS。
+
+**Finding 4（晚到 finish）**：删掉 abort 监听 goroutine 的 `case <-pending.doneCh` 分支后，`listener goroutine did not exit after the wait finished (4 goroutines, baseline 3)` 确定性 FAIL；恢复后 PASS。`finished` 守卫本身测不出差异（`stillPending` 判定已覆盖同一路径），按防御性记录。
+
+**Finding 5（真实 OccupiedSessionPaths 边界）**：把 `occupiedChanged` 临时恒置 false 后，`second call forceDiscovery = false, want true` FAIL；恢复后 PASS。该用例现在穿过真实的 `DiscoverAgentHistory` / `StatSourceFingerprint` / `ReadCompactRef` 链路，而不是只对着一个 fake 记录的 options 对象。
+
+### 本轮验证
+
+- `gofmt -w cmd internal` 后 `gofmt -l cmd internal` 为空（此前 3 个文件待格式化，均已格式化）。
+- `CGO_ENABLED=0 go build -buildvcs=false ./...` 通过；`CGO_ENABLED=0 go vet -buildvcs=false ./...` 通过。
+- `CGO_ENABLED=0 go test -buildvcs=false -count=1 ./...`：12 个包全绿（2 个 `no test files` + 10 个 `ok`），其中 `internal/daemon 12.701s`、`internal/observability 5.209s`、`internal/agy 2.805s`、`internal/herdr 1.162s`、`internal/db 0.565s`。
+- 5 轮 `-race`（`CGO_ENABLED=1 go test -race -buildvcs=false -count=5 ./internal/db/... ./internal/observability/... ./internal/herdr/... ./internal/daemon/... ./internal/agenthistory/...`）：全部 `ok`，无 `DATA RACE`、无 `FAIL`。耗时 `internal/observability 472.804s`、`internal/daemon 166.643s`、`internal/db 64.859s`、`internal/herdr 6.852s`、`internal/agenthistory 1.516s`、`internal/db/dedup 1.030s`。
+
+---
+
+### 6.9 架构决策：`SqliteGate` 生命周期与 `rpcConnection` 发送队列
+
+以下两项是本轮（第 3E 子批）落地的结构性决策。**因 `PLAN.md` 第 0 节规定 `go-port` 分支只能修改 `go/` 目录下的文件（`git diff --name-only main...HEAD | grep -v '^go/'` 必须为空），本节不写入仓根 `.agents/notes/`，只在本报告内记录。**
+
+### `SqliteGate`：`connector.Close()` 生命周期与 `runtime.Stack` GID 重入设计
+
+`internal/shared/sqlite_gate.go` 实现一个按 goroutine 可重入的数据库闸门：闸门按 OS 线程的 goroutine ID 记账，同一 goroutine 可多次 `Enter`，只有最外层 `Exit` 真正放行；跨 goroutine 的第二次进入则排队，从而把 `database/sql` 连接池退化成「一个时刻只有一个写入者」的串行语义，与 TS 单事件循环里两个 `await` 之间的块原子等价。
+
+- **GID 取自 `runtime.Stack`**：Go 没有暴露 goroutine ID 的公开 API，`sqlite_gate.go` 用一次受控的 `runtime.Stack(buf, false)` 抓取栈帧首行（`goroutine N [running]:`）解析出 N。这是该设计唯一的「非公开契约」依赖，但它是标准库内部实现的稳定格式，且失败时退化为「不识别为重入」而不是放行竞态。
+- **重入是必需的，不是优化**：`RunSqliteTransaction` 全程持闸，而事务回调 `fn()` 里还会调 `db.Query`/`db.Exec`；若闸门不可重入，第一次内层调用就会死锁。
+- **`connector.Close()` 的生命周期**：`database/sql` 在 `db.Close()` 时若发现 `db.connector` 实现 `io.Closer` 会自动调用 `connector.Close()`。`internal/db/client.go` 的 `OpenSqlite` 因此给自定义 `driver.Connector`（`serializedConnector`）加了 `Close() error`，用 `sync.Once` 保证幂等，在其中做三件事：`shared.UnregisterSqliteGate(db)`（把闸门从注册表摘掉，避免 `db` 被 GC 后注册表仍持引用）、关闭唯一的底层 `modernc.org/sqlite` `driver.Conn`、把 `closed` 置 true 使后续 `Connect` 立即返回 `sql.ErrConnDone`。单个 `serializedConn.Close()` 仍保持 no-op——它归连接池所有，池会反复开关它。
+- **为什么注册表需要注销**：闸门按 `*sql.DB` 注册，daemon 在测试或重载场景下会开多个 DB；不注销时注册表随 DB 数量无界增长，且旧 DB 的闸门状态会干扰新 DB 的判断。
+
+### `rpcConnection` 发送队列与 2s 写超时
+
+`internal/daemon/observability_server.go` 的 `rpcConnection` 维护一个按连接串行的发送队列（`queueMu sync.Mutex`、`queue []string`、`draining bool`）。
+
+- **为什么必须「锁内 enqueue、锁外 flush」**：TS 的事件循环保证两个 `await` 之间的块原子，所以「生成顺序」与「写出顺序」天然一致。Go 移植后如果在 `s.mu` 内直接 `conn.Write`，一个慢客户端就能把服务器锁堵住数秒（6.5 实测第 6 帧起阻塞 2.00068239s）；但如果改成「锁内构造帧、锁外写」，后进临界区的协程 B 可能在解锁后先抢到 `writeMu`，客户端就会先收到新状态帧、后收到旧状态帧。
+- **队列如何同时解决两者**：持 `s.mu` 期间只 `enqueueMessage`/`enqueueAll`（纯内存追加，零网络 I/O），顺序由 `s.mu` 严格固定；释放 `s.mu` 后 `flushQueue`/`flushAll` 由单个 drainer 按 FIFO 取出帧写入。写操作因此既不在锁内、也不与生成顺序竞争。
+- **单个 drainer**：`enqueueMessage` 在没有 drainer 时直接拉起一个，`flushQueue` 不重复拉起，避免两个 drainer 互相竞争把 FIFO 打破。drainer 退出前会重新检查队列，防「刚有新帧入队就退出」的竞态。
+- **2s 写超时**（`observability_server_handlers.go` 的 `rpcWriteTimeout = 2 * time.Second`）：每个帧写入前 `SetWriteDeadline(now+2s)`，超时即 `destroy()` 断开该连接并清空队列。取 2s 是因为推送帧本身很小（几十字节到几 KB），正常情况下写入是微秒级；2s 只可能被「对端停读且缓冲区已满」触发，那种连接本就应当被丢弃。
+- **与 6.5 的关系**：6.5 已证明慢客户端确实能把 `conn.Write` 堵在 `SO_SNDBUF` 上超过 2s，所以这个超时不是理论值，而是被真实阻塞窗口验证过的边界。

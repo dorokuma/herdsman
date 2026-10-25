@@ -66,13 +66,15 @@ func OpenSqlite(path string) (*sql.DB, error) {
 	}
 
 	gate := shared.NewSqliteGate()
-	db := sql.OpenDB(&serializedConnector{
+	connector := &serializedConnector{
 		conn: conn,
 		gate: gate,
-	})
+	}
+	db := sql.OpenDB(connector)
 	// The pool no longer serialises anything, so it must not cap itself at one
 	// connection: the gate hands out the one driver connection to one goroutine
 	// at a time, and the extra handles are only wrappers waiting on it.
+	connector.db = db
 	shared.RegisterSqliteGate(db, gate)
 	return db, nil
 }
@@ -90,16 +92,57 @@ func execOnConn(ctx context.Context, conn driver.Conn, statement string) error {
 
 // serializedConnector hands database/sql a serializedConn for every Connect. The
 // underlying driver connection is shared, never opened twice.
+//
+// It implements io.Closer, which database/sql calls automatically when the
+// *sql.DB handle is closed: that is the one place the handle's lifecycle reaches
+// the resources it owns, because the driver.Conn it hands out (serializedConn)
+// must stay closable without tearing down the shared connection. Closing the
+// handle therefore releases the single driver connection and drops the gate
+// registration here, not in serializedConn.Close.
 type serializedConnector struct {
 	conn driver.Conn
 	gate *shared.SqliteGate
+	db   *sql.DB
+
+	// mu guards closed: Connect reads it while Close writes it.
+	mu     sync.Mutex
+	closed bool
+	once   sync.Once
 }
 
 func (c *serializedConnector) Connect(context.Context) (driver.Conn, error) {
+	c.mu.Lock()
+	closed := c.closed
+	c.mu.Unlock()
+	if closed {
+		// A Connect after database/sql already closed the handle cannot be
+		// served: the shared driver connection is gone.
+		return nil, sql.ErrConnDone
+	}
 	return &serializedConn{conn: c.conn, gate: c.gate}, nil
 }
 
 func (c *serializedConnector) Driver() driver.Driver { return serializedDriver{} }
+
+// Close releases everything the open handle owned: the gate registration and the
+// one driver connection every wrapper shares. database/sql calls it from
+// (*sql.DB).Close, which is why a closed handle must not be used afterwards —
+// Connect reports sql.ErrConnDone from then on.
+//
+// It is idempotent: (*sql.DB).Close may be called more than once (and a caller
+// that never closed may still race a deferred cleanup), and closing a driver
+// connection twice is an error the caller must not see.
+func (c *serializedConnector) Close() error {
+	var err error
+	c.once.Do(func() {
+		c.mu.Lock()
+		c.closed = true
+		c.mu.Unlock()
+		shared.UnregisterSqliteGate(c.db)
+		err = c.conn.Close()
+	})
+	return err
+}
 
 type serializedDriver struct{}
 
@@ -141,9 +184,10 @@ func (c *serializedConn) prepareOnConn(ctx context.Context, query string) (drive
 }
 
 func (c *serializedConn) Close() error {
-	// The underlying connection is shared by every wrapper, so closing a handle
-	// must not close it; sql.DB closing its last wrapper leaves the driver
-	// connection for the process, like the one long-lived TS connection.
+	// The underlying connection is shared by every wrapper and is released by
+	// serializedConnector.Close when the handle itself is closed, so closing one
+	// pooled wrapper must not close it: sql.DB closing its last wrapper leaves
+	// the driver connection alive for the handle.
 	return nil
 }
 

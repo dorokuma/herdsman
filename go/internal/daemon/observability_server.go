@@ -446,29 +446,36 @@ func (s *ObservabilityRpcServer) acceptLoop(listener net.Listener) {
 // PublishAgentContext mirrors publishAgentContext: the owner's newest connection
 // gets the workspace context, unless the very same fingerprint was already sent.
 //
-// The frames are written with the lock released: a peer that stopped reading
-// blocks net.Conn.Write, and the TS original awaited its socket write outside
-// the critical section for the same reason.
+// The frame is appended to the target's send queue while the lock is held (a
+// memory append, no socket I/O) and drained after the lock is released. That
+// keeps the order the server generated the frame in: a peer that stopped reading
+// must not be able to block the critical section, but the frame must also not be
+// overtaken by a frame generated later.
 func (s *ObservabilityRpcServer) PublishAgentContext(scope observability.AgentScope) {
 	s.mu.Lock()
 	connection, message, ok := s.publishAgentContextLocked(scope)
+	if ok {
+		connection.enqueueMessage(message)
+	}
 	s.mu.Unlock()
 	if ok {
-		connection.writeMessage(message)
+		connection.flushQueue()
 	}
 }
 
 // PublishAgentEvent mirrors publishAgentEvent: a deliverable worker event is
 // routed to the workspace orchestrator's newest connection.
 //
-// The routing runs under the lock and the frames are written after it is
-// released: net.Conn.Write blocks when a peer stops reading, and holding the
-// server lock across it would stall every other RPC and the shutdown sequence.
+// The routing runs under the lock and the frames are queued under it as well
+// (memory appends), then drained once it is released: net.Conn.Write blocks when
+// a peer stops reading, and holding the server lock across it would stall every
+// other RPC and the shutdown sequence.
 func (s *ObservabilityRpcServer) PublishAgentEvent(event observability.AgentEventRecord) {
 	s.mu.Lock()
 	frames := s.publishAgentEventLocked(event)
+	enqueueAll(frames)
 	s.mu.Unlock()
-	writeAll(frames)
+	flushAll(frames)
 }
 
 // publishAgentEventLocked is publishAgentEvent's routing half, with the lock
@@ -604,17 +611,20 @@ type AgentLocationReconcile struct {
 func (s *ObservabilityRpcServer) ReconcileAgentLocations(
 	input AgentLocationReconcile,
 ) error {
-	// The frames collected by this pass are written once the lock is released:
-	// a peer that stopped reading must not be able to block every other RPC
-	// through the lock this function holds.
+	// The frames this pass produces are appended to their send queues while
+	// the lock is held (the ordering point), and drained once it is released: a
+	// peer that stopped reading must not be able to block every other RPC through
+	// the lock this function holds, and a frame generated here must not be
+	// overtaken by one generated later.
 	var frames []pendingFrame
 	var runErr error
 	func() {
 		s.mu.Lock()
 		defer s.mu.Unlock()
 		frames, runErr = s.reconcileAgentLocationsLocked(input)
+		enqueueAll(frames)
 	}()
-	writeAll(frames)
+	flushAll(frames)
 	return runErr
 }
 
@@ -1008,7 +1018,8 @@ func (s *ObservabilityRpcServer) scheduleDisconnect(presence PiPresence) error {
 			}
 			released = owned
 		}()
-		writeAll(released)
+		enqueueAll(released)
+		flushAll(released)
 	}, s.disconnectGraceMs)
 	s.disconnectTimers[key] = graceTimer{handle: handle}
 	return nil
@@ -1090,7 +1101,8 @@ func (s *ObservabilityRpcServer) armStartupGrace() {
 				}
 				released = owned
 			}()
-			writeAll(released)
+			enqueueAll(released)
+			flushAll(released)
 		}, s.startupReconnectMs)
 		s.startupTimers[key] = graceTimer{handle: handle}
 	}

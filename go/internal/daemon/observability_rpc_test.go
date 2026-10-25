@@ -29,6 +29,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
@@ -42,6 +43,7 @@ import (
 	"github.com/dorokuma/herdsman/go/internal/db"
 	"github.com/dorokuma/herdsman/go/internal/herdr"
 	"github.com/dorokuma/herdsman/go/internal/observability"
+	"github.com/dorokuma/herdsman/go/internal/shared"
 )
 
 // ---------------------------------------------------------------------------
@@ -1953,4 +1955,391 @@ func TestObservabilityRpcServerWarnsOnMissingPaneCwd(t *testing.T) {
 		}
 	}
 	t.Fatalf("expected a pane cwd warning, got %v", warnings)
+}
+
+// ---------------------------------------------------------------------------
+// The slow-reader half of the concurrency requirement
+// ---------------------------------------------------------------------------
+
+// obsWriteTimeoutCeiling mirrors the server's per-frame write deadline. A
+// publish path that holds the server lock across a socket write makes every
+// other RPC wait out most of that deadline, so the assertions below bound the
+// wait at half of it: a healthy local-UDS RPC answers in well under a
+// millisecond, so anything approaching the write timeout is the lock being held.
+const obsWriteTimeoutCeiling = 1 * time.Second
+
+// obsNonReadingClient dials the socket and never reads from it, so the kernel
+// receive buffer fills and a write to it blocks until the write deadline. It can
+// still send its own requests; it only refuses to drain what the server sends
+// back.
+type obsNonReadingClient struct {
+	conn net.Conn
+}
+
+func dialNonReadingClient(t *testing.T, socketPath string) *obsNonReadingClient {
+	t.Helper()
+	conn, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("dial %s: %v", socketPath, err)
+	}
+	// Shrink the receive buffer so a handful of pushed frames is enough to fill
+	// it; the default is far larger than the payloads a test produces.
+	if unix, ok := conn.(*net.UnixConn); ok {
+		_ = unix.SetReadBuffer(1024)
+	}
+	t.Cleanup(func() { _ = conn.Close() })
+	return &obsNonReadingClient{conn: conn}
+}
+
+// request writes one JSON-line frame and returns the first response line that
+// carries the matching id, draining any notification that precedes it.
+func (c *obsNonReadingClient) request(t *testing.T, method string, params any, id string) map[string]any {
+	t.Helper()
+	frame, err := json.Marshal(map[string]any{
+		"id":     id,
+		"method": method,
+		"params": params,
+	})
+	if err != nil {
+		t.Fatalf("marshal %s: %v", method, err)
+	}
+	if _, err := c.conn.Write(append(frame, '\n')); err != nil {
+		t.Fatalf("write %s: %v", method, err)
+	}
+
+	type readResult struct {
+		message map[string]any
+		err     error
+	}
+	done := make(chan readResult, 1)
+	go func() {
+		decoder, err := shared.NewJSONLineDecoder(shared.DefaultMaxFrameBytes)
+		if err != nil {
+			done <- readResult{err: err}
+			return
+		}
+		buffer := make([]byte, 32*1024)
+		for {
+			read, readErr := c.conn.Read(buffer)
+			if read > 0 {
+				frames, pushErr := decoder.Push(string(buffer[:read]))
+				if pushErr != nil {
+					done <- readResult{err: pushErr}
+					return
+				}
+				for _, decoded := range frames {
+					message, ok := decoded.(map[string]any)
+					if !ok {
+						continue
+					}
+					if message["id"] != id {
+						// A notification pushed before the response: skip it.
+						continue
+					}
+					done <- readResult{message: message}
+					return
+				}
+			}
+			if readErr != nil {
+				done <- readResult{err: readErr}
+				return
+			}
+		}
+	}()
+
+	select {
+	case result := <-done:
+		if result.err != nil {
+			t.Fatalf("read %s response: %v", method, result.err)
+		}
+		return result.message
+	case <-time.After(10 * time.Second):
+		t.Fatalf("%s was never answered", method)
+		return nil
+	}
+}
+
+// obsClaimOrchestrator registers a presence on paneID and claims ownership, so
+// the server has a route that pushes to this connection.
+func obsClaimOrchestrator(t *testing.T, client *obsNonReadingClient, paneID string) {
+	t.Helper()
+	client.request(t, "agent.orchestrator.register", obsRegisterParams(paneID), "register")
+	client.request(t, "agent.orchestrator.set", map[string]any{"enabled": true}, "claim")
+}
+
+// obsSlowClientFrameBytes is the size of one pushed agent.event payload. The
+// Linux AF_UNIX default send buffer is ~212 KB, and the buffer only grows to a
+// few hundred KB with the peer's receive buffer, so a payload of a handful of
+// bytes (the pre-3D shape: 64 frames of ~344 B = 22 KB) never fills it and the
+// server's Write returns immediately. A 48 KB body forces the kernel to accept
+// the first few frames and then park a Write on sndbuf.
+const obsSlowClientFrameBytes = 48 * 1024
+
+// obsSlowClientFloodCount is the number of frames the flood holds. With a
+// 48 KB payload each, the first frames fill the peer's receive buffer and the
+// kernel send buffer and the rest stay queued, so the publish path spends its
+// time inside a blocked Write instead of finishing the replay.
+const obsSlowClientFloodCount = 342
+
+// fillSlowClientBuffer pushes frames at the wedged peer until its socket write
+// has to block, so the server is inside a write that cannot drain. The events
+// come from term_b, which is never the owner, so every one of them is routed to
+// the owner's socket.
+//
+// The events are appended up front so the goroutine that replays them touches
+// nothing but the server: a helper that called t.Fatalf after the test had
+// already finished would panic the run.
+func fillSlowClientBuffer(
+	t *testing.T,
+	_ *daemon.ObservabilityRpcServer,
+	harness *obsHarness,
+) []observability.AgentEventRecord {
+	t.Helper()
+	body := strings.Repeat("s", obsSlowClientFrameBytes)
+	events := make([]observability.AgentEventRecord, 0, obsSlowClientFloodCount)
+	for index := 0; index < obsSlowClientFloodCount; index++ {
+		event := obsAppendRoutedEvent(t, harness, "term_b", obsWorkspaceB)
+		event.Payload = map[string]any{"body": body}
+		events = append(events, event)
+	}
+	return events
+}
+
+// replayEvents pushes the pre-built events at the server until stop is closed.
+// It is safe to run from a goroutine that outlives the test body, because it
+// never touches *testing.T.
+func replayEvents(server *daemon.ObservabilityRpcServer, events []observability.AgentEventRecord, stop <-chan struct{}) {
+	for _, event := range events {
+		select {
+		case <-stop:
+			return
+		default:
+		}
+		server.PublishAgentEvent(event)
+	}
+}
+
+// TestObservabilityRpcSlowClientDoesNotBlockOtherClients is the regression test
+// for the publish path: a client that stopped reading must not stop the daemon
+// from answering another client's RPC.
+//
+// The wedged peer's write is deliberately left in flight while the healthy
+// client's ping is issued, and the ping is required to come back well inside the
+// write timeout. Holding the server lock across the write — the shape this port
+// inherited from the TS critical section — makes the ping wait out that whole
+// timeout.
+func TestObservabilityRpcSlowClientDoesNotBlockOtherClients(t *testing.T) {
+	fixture := obsOpenRPCServerWithoutClient(t, obsRPCServerOptions{})
+	obsSeedRoutingAgents(t, fixture.harness)
+
+	// The wedged peer owns workspace wB, so every worker event is pushed to it.
+	slow := dialNonReadingClient(t, fixture.socketPath)
+	obsClaimOrchestrator(t, slow, "wB:p-a")
+	flood := fillSlowClientBuffer(t, fixture.server, fixture.harness)
+
+	// A healthy client on another pane, registered before the flood starts.
+	reader := obsDial(t, fixture.socketPath)
+	obsRegisterClient(t, reader, "wB:p-b", "pi-b", obsWorkspaceB)
+
+	flooding := make(chan struct{})
+	stopFlood := make(chan struct{})
+	defer func() {
+		close(stopFlood)
+		<-flooding
+	}()
+	go func() {
+		defer close(flooding)
+		replayEvents(fixture.server, flood, stopFlood)
+	}()
+
+	// Wait until the wedged peer's socket buffer is certainly full and the server
+	// is parked inside a write that cannot drain. Without this settle the ping can
+	// slip in before the first blocking write, and the test would pass against the
+	// very shape it is meant to catch.
+	time.Sleep(300 * time.Millisecond)
+
+	started := time.Now()
+	if _, err := reader.request("agent.ping", map[string]any{}); err != nil {
+		t.Fatalf("agent.ping on a healthy client: %v", err)
+	}
+	elapsed := time.Since(started)
+	if elapsed >= obsWriteTimeoutCeiling {
+		t.Fatalf(
+			"agent.ping took %v, which is not faster than the %v write timeout: "+
+				"the publish path is holding the server lock across a socket write",
+			elapsed, obsWriteTimeoutCeiling)
+	}
+}
+
+// TestObservabilityRpcSlowClientDoesNotBlockShutdown is the companion case: the
+// same wedged peer must not keep server.Stop() from returning either. Stop is
+// issued while the flood is still in flight and must not wait out the write
+// timeout.
+func TestObservabilityRpcSlowClientDoesNotBlockShutdown(t *testing.T) {
+	dir := t.TempDir()
+	socketPath := filepath.Join(dir, "rpc.sock")
+	harness := openObsHarness(t)
+	server := daemon.NewObservabilityRpcServer(daemon.ObservabilityRpcServerOptions{
+		Context:      obsRPCContextService(harness, newObsHistory(harness, dir)),
+		History:      newObsHistory(harness, dir),
+		Orchestrator: harness.orchestrator(),
+		SocketPath:   socketPath,
+		Stores:       obsRPCStores(harness),
+	})
+	if err := server.Start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+
+	slow := dialNonReadingClient(t, socketPath)
+	obsSeedRoutingAgents(t, harness)
+	obsClaimOrchestrator(t, slow, "wB:p-a")
+	flood := fillSlowClientBuffer(t, server, harness)
+
+	flooding := make(chan struct{})
+	stopFlood := make(chan struct{})
+	defer func() {
+		close(stopFlood)
+		<-flooding
+	}()
+	go func() {
+		defer close(flooding)
+		replayEvents(server, flood, stopFlood)
+	}()
+
+	// Same settle as the RPC case: the server must already be parked in a write
+	// that cannot drain before the shutdown is requested.
+	time.Sleep(300 * time.Millisecond)
+
+	started := time.Now()
+	stopped := make(chan error, 1)
+	go func() { stopped <- server.Stop() }()
+	select {
+	case err := <-stopped:
+		if err != nil {
+			t.Fatalf("stop: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("server.Stop was blocked by the non-reading client's socket write")
+	}
+	if elapsed := time.Since(started); elapsed >= obsWriteTimeoutCeiling {
+		t.Fatalf(
+			"server.Stop took %v, which is not faster than the %v write timeout: "+
+				"the publish path is holding the server lock across a socket write",
+			elapsed, obsWriteTimeoutCeiling)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Pushed-frame ordering
+// ---------------------------------------------------------------------------
+
+// TestObservabilityRpcPushedFramesKeepTheirGeneratedOrder is the ordering
+// regression for the publish paths.
+//
+// A frame used to be built under the server lock and serialised *after* it was
+// released. Two publishers that both left the critical section could then race
+// for the socket: the one generated *second* could finish its write first, so
+// the client received the newer state frame before the older one. The TS
+// original cannot do this — each `await socket.write` is ordered by the event
+// loop — so the Go port has to fix the order where it is decided (inside the
+// lock) instead of leaving it to goroutine scheduling.
+//
+// The race is made deterministic rather than statistical by giving the *first*
+// frame a payload large enough that serialising it takes far longer than the
+// second frame's:
+//
+//   - with the fix, the encode runs inside the critical section, so the second
+//     publisher cannot even enter until the first frame is already queued;
+//   - without it, the encode runs after the lock is released, so the second
+//     publisher overtakes the first one and its frame reaches the client first.
+//
+// The payload lives only in the published record (never in the database), so the
+// cost is paid once, by the frame that is meant to be slow.
+func TestObservabilityRpcPushedFramesKeepTheirGeneratedOrder(t *testing.T) {
+	fixture := obsOpenRPCServerWithoutClient(t, obsRPCServerOptions{})
+	obsSeedRoutingAgents(t, fixture.harness)
+	owner := obsDial(t, fixture.socketPath)
+	obsRegisterClient(t, owner, "wB:p-a", "pi-a", obsWorkspaceB)
+	claimed := obsRequest(t, owner, "agent.orchestrator.set", map[string]any{"enabled": true})
+	assertObsSubset(t, claimed, map[string]any{"changed": true})
+	assertObsSubset(t, obsAt(t, claimed, "state", "owner"), map[string]any{"terminalId": "term_a"})
+	obsWaitNotification(t, owner, "agent.orchestrator.changed")
+	owner.clearNotifications()
+
+	// obsRoutedEventRecord is the deliverable worker event publishAgentEvent
+	// routes to the owner of term_b's workspace, with the sequence and the body
+	// the client reads back.
+	obsRoutedEventRecord := func(sequence int, payload any) observability.AgentEventRecord {
+		return observability.AgentEventRecord{
+			Deliverable:      1,
+			HerdrSessionName: obsSessionName,
+			ID:               int64(sequence),
+			PaneID:           obsString("wB:p-b"),
+			Payload:          payload,
+			Status:           obsStatus(observability.AgentEventStatusPending),
+			TerminalID:       obsString("term_b"),
+			Type:             observability.AgentEventDone,
+			WorkspaceID:      obsString(obsWorkspaceB),
+		}
+	}
+
+	// obsSlowOrderingKeys is the number of map entries in the first frame's
+	// payload. encoding/json sorts and encodes every key, so a wide map is the
+	// compact way to make one frame expensive to serialise: ~50k entries render to
+	// ~770 KB (inside the 1 MiB frame limit the client decoder applies) and take
+	// an order of magnitude longer to encode than the whole of the second frame's
+	// publish path. That difference is what turns the race below into a
+	// deterministic assertion.
+	const obsSlowOrderingKeys = 50_000
+
+	slowPayload := make(map[string]any, obsSlowOrderingKeys+1)
+	for index := 0; index < obsSlowOrderingKeys; index++ {
+		slowPayload[fmt.Sprintf("key-%06d", index)] = index
+	}
+	slowPayload["sequence"] = 1
+	slow := obsRoutedEventRecord(1, slowPayload)
+	fast := obsRoutedEventRecord(2, map[string]any{"sequence": 2})
+
+	// The slow frame is published first, from its own goroutine, and the fast one
+	// follows as soon as the slow publisher is certainly inside its critical
+	// section. The settle below is orders of magnitude shorter than the slow
+	// frame's encode, so the slow publisher still holds the server lock when the
+	// fast one asks for it — which is exactly the window the ordering depends on.
+	published := make(chan struct{})
+	go func() {
+		defer close(published)
+		fixture.server.PublishAgentEvent(slow)
+	}()
+	time.Sleep(200 * time.Microsecond)
+	fixture.server.PublishAgentEvent(fast)
+	<-published
+
+	// Both frames are queued by now, and the drain writes them in queue order.
+	deadline := time.Now().Add(obsRPCTimeout)
+	for owner.notificationCount() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("received %d agent.event notifications, want 2", owner.notificationCount())
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	sequences := []int{}
+	for _, message := range obsNotificationsByMethod(owner, "agent.event") {
+		payload, ok := obsAt(t, message, "params", "event", "payload").(map[string]any)
+		if !ok {
+			t.Fatalf("expected the event payload to be an object, got %T",
+				obsAt(t, message, "params", "event", "payload"))
+		}
+		sequences = append(sequences, int(payload["sequence"].(float64)))
+	}
+
+	if len(sequences) != 2 {
+		t.Fatalf("agent.event frames = %v, want the two published sequences", sequences)
+	}
+	if sequences[0] != 1 || sequences[1] != 2 {
+		t.Fatalf(
+			"pushed frames arrived out of order: got sequences %v, want [1 2]\n"+
+				"the frame generated first must reach the client first",
+			sequences)
+	}
 }

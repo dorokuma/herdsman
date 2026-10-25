@@ -648,6 +648,180 @@ func TestHerdrSocketClientDeadlineCoversWriteAndRead(t *testing.T) {
 	})
 }
 
+// TestHerdrSocketClientConcurrentRequestsKeepTheirOwnTimeouts is the
+// regression test for the persistent connection's deadline handling.
+//
+// The persistent socket used to carry one `SetDeadline` for whichever request
+// happened to be in flight, and cleared it when that request's response arrived.
+// With two requests outstanding, the first one to finish removed the budget the
+// second one was still waiting under, so a peer that had already stopped
+// answering could park the second caller until the OS gave up on the socket.
+//
+// The write is now bounded by its own write-only deadline inside writeMu, and
+// the read is bounded by the request's own timer, so neither request can clear
+// the other's budget.
+func TestHerdrSocketClientConcurrentRequestsKeepTheirOwnTimeouts(t *testing.T) {
+	const timeoutMs = 400
+	budget := time.Duration(timeoutMs) * time.Millisecond
+
+	t.Run("a timed-out request does not clear the other request's deadline", func(t *testing.T) {
+		// The peer answers the request for w1:p1 only: the request for w1:p2 has
+		// nothing to read, so only its own timer can bring the caller back. Keying
+		// the answer on the request's own pane id (rather than on arrival order)
+		// keeps which goroutine is answered deterministic.
+		server := openFakeHerdrServer(t, func(conn net.Conn, request map[string]any) {
+			params, _ := request["params"].(map[string]any)
+			if paneID, _ := params["pane_id"].(string); paneID != "w1:p1" {
+				return
+			}
+			writeJSONLine(t, conn, map[string]any{"id": request["id"], "result": map[string]any{"pane_id": "w1:p1"}})
+		})
+
+		client, err := NewHerdrSocketClient(HerdrSocketClientOptions{
+			RequestTimeoutMs: timeoutMs,
+			SocketPath:       server.socketPath,
+		})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		defer client.Close()
+
+		// Both requests are in flight at the same time, so the first one's
+		// completion cannot be the only thing that ends the second one.
+		type outcome struct {
+			value any
+			err   error
+		}
+		first := make(chan outcome, 1)
+		second := make(chan outcome, 1)
+		go func() {
+			value, err := client.GetPane(map[string]any{"pane_id": "w1:p1"})
+			first <- outcome{value: value, err: err}
+		}()
+		go func() {
+			value, err := client.GetPane(map[string]any{"pane_id": "w1:p2"})
+			second <- outcome{value: value, err: err}
+		}()
+
+		select {
+		case got := <-first:
+			if got.err != nil {
+				t.Fatalf("first getPane: %v", got.err)
+			}
+			pane, ok := got.value.(map[string]any)
+			if !ok || pane["pane_id"] != "w1:p1" {
+				t.Fatalf("first getPane result = %v, want the answered pane", got.value)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the answered request never settled")
+		}
+
+		// The second request must settle on its own timer. If the first request's
+		// completion cleared the shared deadline, this read would block for the OS
+		// socket timeout instead, which is minutes rather than the budget.
+		started := time.Now()
+		select {
+		case got := <-second:
+			if got.err == nil || !strings.Contains(got.err.Error(), "timed out") {
+				t.Fatalf("second getPane err = %v, want a request timeout", got.err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("the unanswered request never settled: its deadline was cleared")
+		}
+		if elapsed := time.Since(started); elapsed > budget*4 {
+			t.Fatalf("the unanswered request took %v, want it bounded by the %v budget", elapsed, budget)
+		}
+	})
+
+	t.Run("the connection survives a timed-out request", func(t *testing.T) {
+		// The peer stays silent on the first request and answers the rest, so the
+		// reader must survive a timeout that no longer touches the socket
+		// deadline.
+		var mu sync.Mutex
+		answered := 0
+		server := openFakeHerdrServer(t, func(conn net.Conn, request map[string]any) {
+			mu.Lock()
+			answered++
+			count := answered
+			mu.Unlock()
+			if count == 1 {
+				return
+			}
+			writeJSONLine(t, conn, map[string]any{"id": request["id"], "result": map[string]any{"pane_id": "w1:p1"}})
+		})
+
+		client, err := NewHerdrSocketClient(HerdrSocketClientOptions{
+			RequestTimeoutMs: timeoutMs,
+			SocketPath:       server.socketPath,
+		})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		defer client.Close()
+
+		if _, err := client.GetPane(map[string]any{"pane_id": "w1:p1"}); err == nil {
+			t.Fatal("first getPane = nil error, want a timeout")
+		}
+		result, err := client.GetPane(map[string]any{"pane_id": "w1:p1"})
+		if err != nil {
+			t.Fatalf("second getPane after a timeout: %v", err)
+		}
+		pane, ok := result.(map[string]any)
+		if !ok || pane["pane_id"] != "w1:p1" {
+			t.Fatalf("second getPane result = %v, want the answered pane", result)
+		}
+	})
+
+	t.Run("a failed write resets the connection instead of reusing it", func(t *testing.T) {
+		// The peer accepts the constructor's dial and closes the connection
+		// without ever reading a frame, so the client's first write lands on a
+		// closed socket. A partial frame left on a reused connection would
+		// desynchronise the peer's JSON-line framing forever, so the write failure
+		// has to tear the connection down and report the client as closed.
+		socketPath := filepath.Join(t.TempDir(), "herdr.sock")
+		listener, err := net.Listen("unix", socketPath)
+		if err != nil {
+			t.Fatalf("listen: %v", err)
+		}
+		t.Cleanup(func() { _ = listener.Close() })
+		go func() {
+			conn, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			_ = conn.Close()
+		}()
+
+		client, err := NewHerdrSocketClient(HerdrSocketClientOptions{
+			RequestTimeoutMs: timeoutMs,
+			SocketPath:       socketPath,
+		})
+		if err != nil {
+			t.Fatalf("new client: %v", err)
+		}
+		defer client.Close()
+
+		// Let the peer's close reach this side before the first request, so the
+		// write is the operation that fails.
+		time.Sleep(50 * time.Millisecond)
+
+		_, firstErr := client.GetPane(map[string]any{"pane_id": "w1:p1"})
+		if firstErr == nil {
+			t.Fatal("getPane on a closed peer = nil error, want a write failure")
+		}
+		if !strings.Contains(firstErr.Error(), "closed network connection") {
+			t.Fatalf("first getPane err = %v, want the write to fail on the closed socket", firstErr)
+		}
+
+		// The connection is gone, so the next request must be refused as such
+		// rather than attempting another write onto the dead socket.
+		if _, err := client.GetPane(map[string]any{"pane_id": "w1:p1"}); err == nil ||
+			!strings.Contains(err.Error(), "Herdr socket closed") {
+			t.Fatalf("getPane after a failed write err = %v, want Herdr socket closed", err)
+		}
+	})
+}
+
 func TestHerdrSocketClientRejectsEventStreamOnSocketClose(t *testing.T) {
 	server := openFakeHerdrServer(t, func(conn net.Conn, request map[string]any) {
 		writeJSONLine(t, conn, map[string]any{"id": request["id"], "result": map[string]any{"subscribed": true}})

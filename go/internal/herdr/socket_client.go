@@ -142,17 +142,57 @@ func (c *HerdrSocketClient) requestTimeout() time.Duration {
 	return time.Duration(c.requestTimeoutMs) * time.Millisecond
 }
 
-// armDeadline bounds both the write and the read of one request with the same
-// budget, so a peer that accepts the frame and then never answers cannot park
-// the caller. A cleared deadline is applied once the response is in.
+// armDeadline bounds both the write and the read of a one-shot connection
+// with the request budget, so a peer that accepts the frame and then never
+// answers cannot park the caller. It is deliberately NOT used on the persistent
+// connection: that one is shared by every in-flight request, so a deadline set
+// for one request would also expire the reads of the others.
 func (c *HerdrSocketClient) armDeadline(conn net.Conn) {
 	_ = conn.SetDeadline(time.Now().Add(c.requestTimeout()))
 }
 
-// clearDeadline removes the deadline after a request has been answered, so a
-// long-lived persistent socket is not left holding an expired one.
+// clearDeadline removes the deadline of a one-shot connection after its request
+// has been answered, so the deferred close is never reported as a timeout.
 func (c *HerdrSocketClient) clearDeadline(conn net.Conn) {
 	_ = conn.SetDeadline(time.Time{})
+}
+
+// writeFrameLocked serialises one frame onto the persistent connection and
+// bounds it with a write-only deadline.
+//
+// The deadline is per write, not per socket: a persistent connection carries
+// every in-flight request, so `SetDeadline` here would also expire the reads of
+// the requests that are still waiting for their response. A write-only deadline
+// cannot touch the reader at all, and it is cleared again the moment the write
+// returns so no later write inherits it.
+//
+// A failed write (timeout, broken pipe, peer gone) leaves a half-written JSON
+// line on the socket, which would desynchronise the peer's framing forever, so
+// the connection is destroyed instead of being reused.
+func (c *HerdrSocketClient) writeFrameLocked(frame string) error {
+	_ = c.conn.SetWriteDeadline(time.Now().Add(c.requestTimeout()))
+	_, err := c.conn.Write([]byte(frame))
+	_ = c.conn.SetWriteDeadline(time.Time{})
+	if err != nil {
+		c.resetConnection()
+	}
+	return err
+}
+
+// resetConnection destroys the persistent connection. It is called after a
+// failed write, which leaves a partial JSON frame behind: the reader goroutine
+// is parked on that connection, so closing it is what wakes it and lets it
+// report the failure to every pending request.
+func (c *HerdrSocketClient) resetConnection() {
+	c.mu.Lock()
+	if c.closed {
+		c.mu.Unlock()
+		return
+	}
+	c.closed = true
+	c.mu.Unlock()
+	c.rejectAll(errHerdrSocketClosed)
+	c.conn.Close()
 }
 
 // NewHerdrSocketClient mirrors the TS constructor: it connects to the Herdr
@@ -341,11 +381,13 @@ func (c *HerdrSocketClient) removePending(id string) {
 	c.mu.Unlock()
 }
 
+// writeFrame serialises one frame onto the persistent connection. Every caller
+// takes writeMu first, so a concurrent request can never interleave two JSON
+// lines inside one write.
 func (c *HerdrSocketClient) writeFrame(frame string) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
-	_, err := c.conn.Write([]byte(frame))
-	return err
+	return c.writeFrameLocked(frame)
 }
 
 func (c *HerdrSocketClient) nextRequestID() string {
@@ -380,10 +422,11 @@ func (c *HerdrSocketClient) request(ctx context.Context, method string, params a
 		}
 	})
 
-	// The same budget bounds the write and the read: a peer that accepts the
-	// frame and then goes silent must not park this goroutine until the OS gives
-	// up on the socket.
-	c.armDeadline(c.conn)
+	// The read is bounded by this request's own timer (and by ctx), never by a
+	// deadline on the shared connection: the persistent socket serves every
+	// in-flight request, so a deadline set here would also expire the reads of
+	// the requests that are still waiting. The write is bounded separately, by a
+	// write-only deadline inside writeFrame.
 	frame, err := shared.EncodeJSONLine(map[string]any{"id": id, "method": method, "params": paramsOrEmpty(params)})
 	if err != nil {
 		timer.Stop()
@@ -399,9 +442,6 @@ func (c *HerdrSocketClient) request(ctx context.Context, method string, params a
 	select {
 	case outcome := <-ch:
 		timer.Stop()
-		// The response is in, so the socket is healthy again: drop the deadline
-		// before the next request re-arms it.
-		c.clearDeadline(c.conn)
 		return outcome.value, outcome.err
 	case <-ctx.Done():
 		timer.Stop()
@@ -438,6 +478,10 @@ func (c *HerdrSocketClient) requestOnce(method string, params any) (any, error) 
 	}
 	// One deadline for the write and the read of this one-shot connection, so a
 	// peer that accepts the frame and never answers cannot park the caller.
+	//
+	// Unlike the persistent connection this one belongs to a single request, so
+	// the deadline cannot expire anybody else's read — which is exactly why the
+	// persistent path no longer sets one.
 	c.armDeadline(conn)
 	if _, err := conn.Write([]byte(frame)); err != nil {
 		return nil, err

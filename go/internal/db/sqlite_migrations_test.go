@@ -3,19 +3,31 @@ package db
 import (
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/herdsman/go/internal/shared"
 )
 
 // The port of test/integration/sqlite-migrations.test.ts, plus the checks this
 // port adds on top: replaying the embedded migrations is idempotent (an
 // already-migrated database is reused untouched), and the consolidated
 // CreateSchema of schema.go is structurally identical to the replayed one.
+//
+// This file also carries the database-gate regressions that used to live in
+// sqlite_transaction_test.go: the TS side shares one DatabaseSync connection
+// with an event loop, so a `begin immediate ... commit` block is atomic against
+// every other statement. Go has no event loop, so without the gate two
+// goroutines interleave `BEGIN` ("cannot start a transaction within a
+// transaction") and a plain write can join somebody else's open transaction and
+// be discarded by its rollback.
 
 func openTestDB(t *testing.T) *sql.DB {
 	t.Helper()
@@ -464,4 +476,238 @@ func schemaFingerprint(t *testing.T, db *sql.DB) string {
 		}
 	}
 	return out.String()
+}
+
+// ---------------------------------------------------------------------------
+// Handle lifecycle and the database gate
+// ---------------------------------------------------------------------------
+
+// insertTestSession registers the Herdr session the workspace rows hang off.
+func insertTestSession(t *testing.T, db *sql.DB) {
+	t.Helper()
+	if _, err := db.Exec(
+		"insert into herdr_sessions (name, running, session_dir, socket_path, updated_at) " +
+			"values ('session', 1, '/tmp/session', '/tmp/session.sock', 1)",
+	); err != nil {
+		t.Fatalf("insert session: %v", err)
+	}
+}
+
+// insertTestWorkspace writes one workspace row of the test session.
+func insertTestWorkspace(db *sql.DB, workspace string) error {
+	_, err := db.Exec(
+		"insert into herdr_workspaces "+
+			"(herdr_session_name, workspace_id, focused, agent_status, last_seen_at) "+
+			"values ('session', ?, 0, 'active', 1)",
+		workspace,
+	)
+	return err
+}
+
+// TestOpenSqliteCloseReleasesConnectionAndGate is the regression test for the
+// handle lifecycle. database/sql calls connector.Close from (*sql.DB).Close, so
+// the connector is the one place that can release the single shared driver
+// connection and drop the gate registration.
+//
+// Before this, Close on the handle left both alive for the process: the gate
+// stayed in the registry under a handle nobody would use again (a leak per
+// database a daemon opens), and the driver connection was never closed.
+func TestOpenSqliteCloseReleasesConnectionAndGate(t *testing.T) {
+	db, err := OpenSqlite(filepath.Join(t.TempDir(), "close.sqlite"))
+	if err != nil {
+		t.Fatalf("openSqlite: %v", err)
+	}
+	gate := shared.SqliteGateOf(db)
+	if gate == nil {
+		t.Fatal("SqliteGateOf = nil after OpenSqlite, want the registered gate")
+	}
+
+	if err := db.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+
+	// The gate registration goes with the handle, so a later lookup by the same
+	// (now dead) handle finds nothing.
+	//
+	// SqliteGateOf reads the registry map, and the handle pointer is still a
+	// valid map key, so this really does ask about the closed handle rather than
+	// about a fresh one.
+	if lingering := shared.SqliteGateOf(db); lingering != nil {
+		t.Fatal("SqliteGateOf after Close returned the gate, want the registration to be dropped")
+	}
+
+	// The driver connection is closed too: a statement can no longer reach it.
+	if _, err := db.Exec("select 1"); err == nil {
+		t.Fatal("exec on a closed handle succeeded, want an error")
+	}
+
+	// Close is idempotent: (*sql.DB).Close may run more than once and a second
+	// call must not resurface an error from closing the driver connection twice.
+	if err := db.Close(); err != nil {
+		t.Fatalf("second close: %v", err)
+	}
+}
+
+// TestRunSqliteTransactionConcurrentDoesNotInterleave is the gate regression:
+// eight goroutines each run a two-statement transaction, so a transaction that
+// did not hold the gate across fn would let the next goroutine's BEGIN in.
+func TestRunSqliteTransactionConcurrentDoesNotInterleave(t *testing.T) {
+	db := openMigratedTestDB(t)
+	insertTestSession(t, db)
+
+	const goroutines = 8
+	var wait sync.WaitGroup
+	errs := make([]error, goroutines)
+	wait.Add(goroutines)
+	for index := 0; index < goroutines; index++ {
+		go func(index int) {
+			defer wait.Done()
+			errs[index] = RunSqliteTransaction(db, func() error {
+				// Two statements plus a yield: a transaction that does not hold the
+				// gate across fn would let the next goroutine's BEGIN in here.
+				if err := insertTestWorkspace(db, fmt.Sprintf("ws-%d", index)); err != nil {
+					return err
+				}
+				time.Sleep(5 * time.Millisecond)
+				return insertTestWorkspace(db, fmt.Sprintf("ws-%d-b", index))
+			})
+		}(index)
+	}
+	wait.Wait()
+
+	for index, err := range errs {
+		if err == nil {
+			continue
+		}
+		t.Fatalf("goroutine %d transaction failed: %v", index, err)
+	}
+
+	var workspaces int
+	if err := db.QueryRow("select count(*) from herdr_workspaces").Scan(&workspaces); err != nil {
+		t.Fatalf("count workspaces: %v", err)
+	}
+	if want := goroutines * 2; workspaces != want {
+		t.Fatalf("committed workspaces = %d, want %d", workspaces, want)
+	}
+}
+
+// TestRunSqliteTransactionRollbackDoesNotDiscardOtherGoroutineWrite asserts the
+// other half of the window: a plain write issued while a transaction is open
+// waits for the gate instead of joining the transaction and being rolled back.
+func TestRunSqliteTransactionRollbackDoesNotDiscardOtherGoroutineWrite(t *testing.T) {
+	db := openMigratedTestDB(t)
+	insertTestSession(t, db)
+
+	var wait sync.WaitGroup
+	started := make(chan struct{})
+	otherDone := make(chan error, 1)
+
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		// The transaction writes, then fails once the other goroutine has had
+		// time to try its own write, so its rollback covers the window the
+		// plain statement would otherwise slip into.
+		_ = RunSqliteTransaction(db, func() error {
+			if err := insertTestWorkspace(db, "rolled-back"); err != nil {
+				return err
+			}
+			close(started)
+			time.Sleep(20 * time.Millisecond)
+			return errors.New("rollback on purpose")
+		})
+	}()
+
+	<-started
+	go func() {
+		otherDone <- insertTestWorkspace(db, "survivor")
+	}()
+
+	wait.Wait()
+	if err := <-otherDone; err != nil {
+		t.Fatalf("concurrent plain write failed: %v", err)
+	}
+
+	var survivor, rolledBack int
+	if err := db.QueryRow(
+		"select count(*) from herdr_workspaces where workspace_id = 'survivor'",
+	).Scan(&survivor); err != nil {
+		t.Fatalf("count survivor: %v", err)
+	}
+	if err := db.QueryRow(
+		"select count(*) from herdr_workspaces where workspace_id = 'rolled-back'",
+	).Scan(&rolledBack); err != nil {
+		t.Fatalf("count rolled-back: %v", err)
+	}
+	if survivor != 1 {
+		t.Fatalf("survivor workspace count = %d, want 1 (the rollback discarded it)", survivor)
+	}
+	if rolledBack != 0 {
+		t.Fatalf("rolled-back workspace count = %d, want 0", rolledBack)
+	}
+}
+
+// TestRunSqliteTransactionRollsBackAfterFailedCommit is the regression test for
+// the commit-failure branch of RunSqliteTransaction.
+//
+// A deferred foreign-key check makes the INSERT succeed inside fn and the COMMIT
+// statement itself fail, which is the only way to reach a failed commit with a
+// transaction still open. Without the explicit rollback on that path the
+// transaction stays attached to the shared connection, the goroutine releases
+// the gate, and the next caller's `begin immediate` fails with "cannot start a
+// transaction within a transaction".
+func TestRunSqliteTransactionRollsBackAfterFailedCommit(t *testing.T) {
+	db := openMigratedTestDB(t)
+	insertTestSession(t, db)
+
+	commitErr := RunSqliteTransaction(db, func() error {
+		// defer_foreign_keys postpones the foreign-key check to COMMIT, so the
+		// insert below is accepted here and rejected by the COMMIT statement.
+		// It is a connection-scoped pragma on the one shared connection; the
+		// deferred check is per-transaction, so the next transaction starts
+		// clean.
+		if _, err := db.Exec("pragma defer_foreign_keys = on"); err != nil {
+			return err
+		}
+		_, err := db.Exec(
+			"insert into herdr_workspaces " +
+				"(herdr_session_name, workspace_id, focused, agent_status, last_seen_at) " +
+				"values ('no-such-session', 'orphan', 0, 'active', 1)",
+		)
+		return err
+	})
+	if commitErr == nil {
+		t.Fatal("RunSqliteTransaction = nil, want the COMMIT failure to surface")
+	}
+
+	// The rollback already ran, so the connection is free again: this second
+	// transaction must be able to BEGIN IMMEDIATE and commit. Without the
+	// rollback it fails with "cannot start a transaction within a transaction".
+	if err := RunSqliteTransaction(db, func() error {
+		return insertTestWorkspace(db, "after-failed-commit")
+	}); err != nil {
+		t.Fatalf("transaction after a failed commit: %v", err)
+	}
+
+	var committed int
+	if err := db.QueryRow(
+		"select count(*) from herdr_workspaces where workspace_id = 'after-failed-commit'",
+	).Scan(&committed); err != nil {
+		t.Fatalf("count committed: %v", err)
+	}
+	if committed != 1 {
+		t.Fatalf("committed workspaces = %d, want 1", committed)
+	}
+
+	// The failed transaction left nothing behind, and the deferred check was
+	// undone with it: the orphan row is gone and a valid row still inserts.
+	var orphans int
+	if err := db.QueryRow(
+		"select count(*) from herdr_workspaces where workspace_id = 'orphan'",
+	).Scan(&orphans); err != nil {
+		t.Fatalf("count orphans: %v", err)
+	}
+	if orphans != 0 {
+		t.Fatalf("orphan workspace count = %d, want 0 (the failed commit was rolled back)", orphans)
+	}
 }

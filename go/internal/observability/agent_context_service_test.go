@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/dorokuma/herdsman/go/internal/agenthistory"
@@ -149,6 +150,44 @@ func contextSource(t *testing.T, name string) sessionSource {
 	return contextSourceFile(t, t.TempDir(), name)
 }
 
+// contextPiSession mirrors a source() whose file the real pi reader can
+// actually resolve: a well-formed JSONL session carrying one assistant message.
+// contextSourceFile's "history\n" payload is only ever read through the fake, so
+// a test that drives the real agent-history service needs this shape instead.
+func contextPiSession(t *testing.T, name string) sessionSource {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, name)
+	payload := strings.Join([]string{
+		`{"type":"session","id":"s1"}`,
+		`{"type":"message","id":"u1","timestamp":"2026-07-09T12:00:00.000Z",` +
+			`"message":{"role":"user","content":"please inspect"}}`,
+		`{"type":"message","id":"a1","timestamp":"2026-07-09T12:00:02.000Z",` +
+			`"message":{"role":"assistant","content":[{"type":"text","text":"done"}],` +
+			`"stopReason":"stop"}}`,
+	}, "\n") + "\n"
+	if err := os.WriteFile(path, []byte(payload), 0o600); err != nil {
+		t.Fatalf("writeFile(%s): %v", path, err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat(%s): %v", path, err)
+	}
+	return sessionSource{
+		fingerprint: &observability.AgentHistorySourceFingerprint{
+			MtimeMs: float64(info.ModTime().UnixMilli()),
+			Path:    path,
+			Size:    float64(info.Size()),
+		},
+		ref: &observability.AgentHistoryRef{
+			Kind:   observability.HistoryRefAgentSession,
+			Path:   &path,
+			Source: observability.HistorySourcePiJSONL,
+			Value:  path,
+		},
+	}
+}
+
 // contextHistory mirrors history(): the compact history the fake resolves.
 func contextHistory(ref *observability.AgentHistoryRef, text string) observability.CompactAgentHistory {
 	compact := observability.CompactAgentHistory{}
@@ -242,6 +281,197 @@ func (f *fakeHistoryService) SafeAllowedSessionPath(value string) string {
 
 func (f *fakeHistoryService) SessionPathAllowedByShape(value string) bool {
 	return agenthistory.SessionPathAllowedByShape(value, nil)
+}
+
+// realHistoryService is the same AgentHistoryServiceLike surface, but backed by
+// the production agent-history service instead of a fixed answer. It records the
+// options of every resolve so the occupied-change assertions below can still see
+// what the context service asked for, while the discovery, the fingerprint stat
+// and the compact-history read all run through the real module.
+//
+// It exists because internal/agenthistory imports internal/observability, so the
+// records cannot be shared Go types and the mapping the production adapter in
+// internal/daemon performs has to be repeated here. Only the records the context
+// service actually round-trips are mapped.
+type realHistoryService struct {
+	service *agenthistory.AgentHistoryService
+	mu      sync.Mutex
+	calls   []observability.AgentHistoryResolveOptions
+}
+
+func newRealHistoryService() *realHistoryService {
+	return &realHistoryService{
+		service: agenthistory.CreateAgentHistoryService(agenthistory.AgentHistoryServiceOptions{}),
+	}
+}
+
+func (r *realHistoryService) recordedCalls() []observability.AgentHistoryResolveOptions {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]observability.AgentHistoryResolveOptions(nil), r.calls...)
+}
+
+func (r *realHistoryService) ResolveCompactHistory(
+	input observability.AgentHistoryLookupInput,
+	options observability.AgentHistoryResolveOptions,
+) observability.AgentHistoryResolved {
+	r.mu.Lock()
+	r.calls = append(r.calls, options)
+	r.mu.Unlock()
+
+	forceRefresh := false
+	if options.ForceRefresh != nil {
+		forceRefresh = *options.ForceRefresh
+	}
+	resolved := r.service.ResolveCompactHistory(
+		agenthistory.AgentHistoryLookupInput{
+			Agent:            input.Agent,
+			AgentSession:     input.AgentSession,
+			HerdrSessionName: optionalContextString(input.HerdrSessionName),
+			PaneID:           optionalContextString(input.PaneID),
+		},
+		agenthistory.ResolveCompactOptions{
+			ForceDiscovery: options.ForceDiscovery,
+			ForceRefresh:   forceRefresh,
+			PreferredRef:   contextHistoryRef(options.PreferredRef),
+		},
+	)
+	return observability.AgentHistoryResolved{
+		CompactHistory:    realCompactHistory(resolved.CompactHistory),
+		HistoryRef:        realHistoryRef(resolved.HistoryRef),
+		SourceFingerprint: realFingerprint(resolved.SourceFingerprint),
+	}
+}
+
+func (r *realHistoryService) StatSourceFingerprint(
+	path string,
+) *observability.AgentHistorySourceFingerprint {
+	return realFingerprint(agenthistory.StatSourceFingerprint(path))
+}
+
+func (r *realHistoryService) HistorySourceFromSessionRef(
+	ref observability.AgentSessionRef,
+) observability.AgentHistoryRefSource {
+	return observability.AgentHistoryRefSource(
+		agenthistory.HistorySourceFromSessionRef(ref))
+}
+
+func (r *realHistoryService) SafeOfficialSessionPath(value string) string {
+	return agenthistory.SafeOfficialSessionPath(value)
+}
+
+func (r *realHistoryService) SafeAllowedSessionPath(value string) string {
+	return agenthistory.SafeAllowedSessionPath(value, nil)
+}
+
+func (r *realHistoryService) SessionPathAllowedByShape(value string) bool {
+	return agenthistory.SessionPathAllowedByShape(value, nil)
+}
+
+// optionalContextString maps "" to "absent", the TS `undefined`: the
+// observability records carry herdrSessionName and paneId as plain strings while
+// agenthistory keeps them optional.
+func optionalContextString(value string) *string {
+	if value == "" {
+		return nil
+	}
+	return &value
+}
+
+func realHistoryRef(ref *agenthistory.HistoryRef) *observability.AgentHistoryRef {
+	if ref == nil {
+		return nil
+	}
+	return &observability.AgentHistoryRef{
+		Kind:   observability.AgentHistoryRefKind(ref.Kind),
+		Path:   ref.Path,
+		Source: observability.AgentHistoryRefSource(ref.Source),
+		Value:  ref.Value,
+	}
+}
+
+// contextHistoryRef is the reverse mapping: the observability ref the context
+// service hands back as a preferred ref, expressed as the agenthistory record
+// the real service expects.
+func contextHistoryRef(ref *observability.AgentHistoryRef) *agenthistory.HistoryRef {
+	if ref == nil {
+		return nil
+	}
+	return &agenthistory.HistoryRef{
+		Kind:   agenthistory.HistoryKind(ref.Kind),
+		Path:   ref.Path,
+		Source: agenthistory.HistorySource(ref.Source),
+		Value:  ref.Value,
+	}
+}
+
+func realFingerprint(
+	fingerprint *agenthistory.SourceFingerprint,
+) *observability.AgentHistorySourceFingerprint {
+	if fingerprint == nil {
+		return nil
+	}
+	return &observability.AgentHistorySourceFingerprint{
+		MtimeMs: fingerprint.MtimeMs,
+		Path:    fingerprint.Path,
+		Size:    float64(fingerprint.Size),
+	}
+}
+
+func realExcerpt(excerpt *agenthistory.HistoryExcerpt) *observability.AgentHistoryExcerpt {
+	if excerpt == nil {
+		return nil
+	}
+	return &observability.AgentHistoryExcerpt{
+		Ref:        excerpt.Ref,
+		StopReason: excerpt.StopReason,
+		Text:       excerpt.Text,
+		Timestamp:  excerpt.Timestamp,
+	}
+}
+
+func realToolResult(
+	result *agenthistory.CompactToolResult,
+) *observability.CompactToolResult {
+	if result == nil {
+		return nil
+	}
+	return &observability.CompactToolResult{
+		Compaction: observability.CompactToolResultCompaction{
+			Mode:          observability.CompactionMode(result.Compaction.Mode),
+			OriginalChars: result.Compaction.OriginalChars,
+			ReturnedChars: result.Compaction.ReturnedChars,
+		},
+		IsError:  result.IsError,
+		Ref:      result.Ref,
+		Text:     result.Text,
+		ToolName: result.ToolName,
+	}
+}
+
+func realUnreadyReason(
+	reason *agenthistory.UnreadyReason,
+) *observability.AgentHistoryUnreadyReason {
+	if reason == nil {
+		return nil
+	}
+	value := observability.AgentHistoryUnreadyReason(*reason)
+	return &value
+}
+
+func realCompactHistory(
+	history agenthistory.CompactAgentHistory,
+) observability.CompactAgentHistory {
+	return observability.CompactAgentHistory{
+		HistoryRef:           realHistoryRef(history.HistoryRef),
+		LastAssistantMessage: realExcerpt(history.LastAssistantMessage),
+		LastToolResult:       realToolResult(history.LastToolResult),
+		LastUserMessage:      realExcerpt(history.LastUserMessage),
+		MessageCount:         history.MessageCount,
+		Source:               history.Source,
+		UnreadyReason:        realUnreadyReason(history.UnreadyReason),
+		UpdatedAt:            history.UpdatedAt,
+	}
 }
 
 // historyMethodsThrow mirrors the TS Proxy: every method panics, so a cached
@@ -793,7 +1023,9 @@ func TestAgentContextServiceIgnoresDiscoveredFileRef(t *testing.T) {
 }
 
 func TestAgentContextServiceRediscoversOnOccupiedChange(t *testing.T) {
-	speculative := contextSource(t, "occupied-change.jsonl")
+	// A file the real pi reader can resolve, because this test drives the real
+	// agent-history service rather than the fake.
+	speculative := contextPiSession(t, "occupied-change.jsonl")
 	path := *speculative.ref.Path
 	harness := openContextAgent(t, contextAgentInput{revision: intPointer(1)})
 	if _, err := harness.snapshots.Put(contextSnapshotInput(
@@ -801,15 +1033,18 @@ func TestAgentContextServiceRediscoversOnOccupiedChange(t *testing.T) {
 	)); err != nil {
 		t.Fatalf("put snapshot: %v", err)
 	}
-	fake := newFakeHistoryService(contextResolved(speculative.ref, speculative.fingerprint))
-	service := newContextService(t, harness, fake)
+	// The real agent-history service, not the fake: the occupied-set change
+	// has to survive the production discovery, fingerprint and compact-history
+	// path, not just a recorded options object.
+	history := newRealHistoryService()
+	service := newContextService(t, harness, history)
 	if _, err := service.RefreshAgent(observability.RefreshAgentContextInput{
 		Agent:           harness.agent,
 		IdentityChanged: false,
 	}); err != nil {
 		t.Fatalf("refreshAgent: %v", err)
 	}
-	requireResolveCalls(t, fake.calls, expectedResolveCall{
+	requireResolveCalls(t, history.recordedCalls(), expectedResolveCall{
 		forceDiscovery: false,
 		preferredRef:   speculative.ref,
 	})
@@ -857,15 +1092,16 @@ func TestAgentContextServiceRediscoversOnOccupiedChange(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("refreshAgent (occupied change): %v", err)
 	}
-	if len(fake.calls) != 2 {
-		t.Fatalf("resolve calls = %d, want 2", len(fake.calls))
+	if len(history.recordedCalls()) != 2 {
+		t.Fatalf("resolve calls = %d, want 2", len(history.recordedCalls()))
 	}
-	if !fake.calls[1].ForceDiscovery {
+	calls := history.recordedCalls()
+	if !calls[1].ForceDiscovery {
 		t.Fatal("second call forceDiscovery = false, want true")
 	}
 	// An official ref belongs to the agent that reported it, so occupancy no
 	// longer suppresses it the way it suppressed a guessed discovered_file.
-	requireResolveCalls(t, fake.calls[1:], expectedResolveCall{
+	requireResolveCalls(t, calls[1:], expectedResolveCall{
 		forceDiscovery: true,
 		preferredRef:   speculative.ref,
 	})

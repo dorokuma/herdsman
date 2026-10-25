@@ -247,34 +247,38 @@ func TestExpectedTextCarriedWhenPresent(t *testing.T) {
 	}
 }
 
-// A finished waiter must stay finished: a timeout that fires after the waiter was
-// already resolved by a signal used to run its cleanup a second time, consuming
-// the signal the *next* wait had just registered. The goroutine watching the
-// caller's signal channel used to park on it forever for the same reason.
+// A finished waiter must stay finished: once waiter1 has been resolved and
+// removed from the registry, its leftover timeout and cancel paths must not
+// resolve it again — a second resolution would consume the signal the next
+// round registered on the same key, and would close an already-closed doneCh.
+// The goroutine watching the caller's signal channel used to park on it forever
+// for the same reason.
 func TestFinishedWaiterIgnoresLateSignalAndReleasesListener(t *testing.T) {
-	t.Run("late timeout does not consume the next round's signal", func(t *testing.T) {
-		// A timeout that only fires once the first wait is long over.
+	t.Run("a finished waiter's leftover paths do not consume the next round's signal", func(t *testing.T) {
+		// The timeout is short, so the leftover timer path is guaranteed to be
+		// still pending when the signal resolves the first wait.
 		registry := NewTurnCompletionRegistry(WithTurnSettimeout(120))
 
-		signal := make(chan struct{}, 1)
+		abort := make(chan struct{})
 		first := make(chan TurnCompletionWaitResult, 1)
 		go func() {
 			first <- registry.WaitForSignal(WaitForSignalInput{
 				HerdrSessionName: "default",
 				RecordedAfterMs:  time.Now().UnixMilli() - 1,
-				Signal:           signal,
+				Signal:           abort,
 				TerminalID:       "term_pi",
 			})
 		}()
 
-		// The signal resolves the first wait while its timeout is still pending.
+		// The signal resolves the first wait and removes it from the registry
+		// while both its timeout and its cancel path are still outstanding.
 		registry.Record(testSignal(nil))
 		if got := <-first; !got.Received {
 			t.Fatalf("first wait = %+v, want it resolved by the signal", got)
 		}
 
-		// The next round registers before the first waiter's timeout fires, so a
-		// non-idempotent finish would take its signal.
+		// The next round registers on the same key before anything leftover from
+		// the first one runs.
 		second := make(chan TurnCompletionWaitResult, 1)
 		go func() {
 			second <- registry.WaitForSignal(WaitForSignalInput{
@@ -283,18 +287,50 @@ func TestFinishedWaiterIgnoresLateSignalAndReleasesListener(t *testing.T) {
 				TerminalID:       "term_pi",
 			})
 		}()
+
+		// The next round's own signal, recorded while it is the only waiter.
 		registry.Record(testSignal(func(s *SessionScopedSignal) {
 			s.ExpectedText = "second round"
 			s.HasExpectedText = true
 		}))
 
+		// Now fire both leftover paths of the finished waiter: its cancel channel
+		// and, well past its budget, its timeout.
+		close(abort)
+		time.Sleep(300 * time.Millisecond)
+
+		// The second round must still hold its own signal: a finished waiter that
+		// stayed finished cannot have taken it.
 		select {
 		case got := <-second:
 			if !got.Received || got.ExpectedText != "second round" {
 				t.Fatalf("second wait = %+v, want the second round's signal", got)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatal("the first waiter's late finish consumed the second round's signal")
+			t.Fatal("the second round never settled after the first waiter's leftover paths ran")
+		}
+
+		// The registry is still usable, which also proves the leftover paths left
+		// neither a wedge nor a closed channel behind.
+		third := make(chan TurnCompletionWaitResult, 1)
+		go func() {
+			third <- registry.WaitForSignal(WaitForSignalInput{
+				HerdrSessionName: "default",
+				RecordedAfterMs:  time.Now().UnixMilli() - 1,
+				TerminalID:       "term_pi",
+			})
+		}()
+		registry.Record(testSignal(func(s *SessionScopedSignal) {
+			s.ExpectedText = "third round"
+			s.HasExpectedText = true
+		}))
+		select {
+		case got := <-third:
+			if !got.Received || got.ExpectedText != "third round" {
+				t.Fatalf("third wait = %+v, want the third round's signal", got)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("the registry stopped serving waits after the first waiter's leftover paths ran")
 		}
 	})
 
