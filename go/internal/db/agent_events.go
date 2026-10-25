@@ -25,12 +25,39 @@ const LogicalClockMetaKey = "logical_now_ms"
 
 // HasNonEmptyAssistantMessage mirrors hasNonEmptyAssistantMessage: the compact
 // history counts as carrying a turn only when its last assistant message has
-// non-blank text.
+// non-blank text. The implementation lives in internal/observability, which owns
+// the CompactAgentHistory contract.
 func HasNonEmptyAssistantMessage(compactHistory *observability.CompactAgentHistory) bool {
-	if compactHistory == nil || compactHistory.LastAssistantMessage == nil {
-		return false
+	return observability.HasNonEmptyAssistantMessage(compactHistory)
+}
+
+// parseCompactHistoryJSON and agentKindFromPayloadJSON forward to the
+// observability helpers of the same name, which internal/db cannot call
+// directly because they are unexported there.
+func parseCompactHistoryJSON(value *string) *observability.CompactAgentHistory {
+	if value == nil || *value == "" {
+		return nil
 	}
-	return strings.TrimSpace(compactHistory.LastAssistantMessage.Text) != ""
+	var compact observability.CompactAgentHistory
+	if err := json.Unmarshal([]byte(*value), &compact); err != nil {
+		return nil
+	}
+	return &compact
+}
+
+func agentKindFromPayloadJSON(value *string) *string {
+	if value == nil || *value == "" {
+		return nil
+	}
+	var payload any
+	if err := json.Unmarshal([]byte(*value), &payload); err != nil {
+		return nil
+	}
+	kind, ok := payload.(map[string]any)["agent"].(string)
+	if !ok {
+		return nil
+	}
+	return &kind
 }
 
 // IsDeliverableAgentEvent mirrors isDeliverableAgentEvent: the single delivery
@@ -165,36 +192,32 @@ func samePaneGeneration(agentGeneration *string, eventGeneration *string) bool {
 	return agentGeneration != nil && *agentGeneration == *eventGeneration
 }
 
-// AppendAgentEventInput mirrors the TS append input.
-type AppendAgentEventInput struct {
-	AgentID          *string
-	CompactHistory   *observability.CompactAgentHistory
-	HerdrSessionName string
-	IdempotencyKey   *string
-	PaneID           *string
-	PaneGeneration   *string
-	Payload          any
-	TerminalID       *string
-	Type             observability.AgentEventType
-	WorkspaceID      *string
-}
+// AppendAgentEventInput, InvalidatePaneInput and AckSelfOwnedInput live in
+// internal/observability, because internal/observability cannot import
+// internal/db (that would be an import cycle) yet its AgentIndexService needs
+// to speak them. The aliases keep the existing call sites and test names
+// unchanged.
+type AppendAgentEventInput = observability.AppendAgentEventInput
 
-// InvalidatePaneInput mirrors the TS invalidatePane / invalidatePaneDirect
-// input.
-type InvalidatePaneInput struct {
-	AcknowledgeDelivered *bool
-	HerdrSessionName     string
-	PaneID               string
-	PaneGeneration       *string
-	InvalidatedReason    *string
-}
+type InvalidatePaneInput = observability.InvalidatePaneInput
 
-// AckSelfOwnedInput mirrors the TS ackSelfOwned input.
-type AckSelfOwnedInput struct {
-	HerdrSessionName string
-	PaneID           string
-	WorkspaceID      string
-}
+type AckSelfOwnedInput = observability.AckSelfOwnedInput
+
+type PaneEventTailInput = observability.PaneEventTailInput
+
+type PaneEventTailRow = observability.PaneEventTailRow
+
+type PaneDeliveredTerminalBodiesInput = observability.PaneDeliveredTerminalBodiesInput
+
+type PaneDeliveredTerminalBodyRow = observability.PaneDeliveredTerminalBodyRow
+
+type DeliveredTerminalHistoriesInput = observability.DeliveredTerminalHistoriesInput
+
+type DeliveredTerminalHistoryRow = observability.DeliveredTerminalHistoryRow
+
+type LatestPaneEventScopeInput = observability.LatestPaneEventScopeInput
+
+type LatestPaneEventScopeRow = observability.LatestPaneEventScopeRow
 
 // ListAfterInput, NextDeliverableAfterInput and the orchestrator query inputs
 // live in internal/observability, because internal/observability cannot import
@@ -1081,6 +1104,214 @@ func (s *AgentEventStore) LatestEventID(scope observability.AgentQueryScope) (in
 		return 0, nil
 	}
 	return id.Int64, nil
+}
+
+// LatestPaneEventScope mirrors the newest-first pane read
+// #minimalAgentFromLatestEvent performs: the scope metadata of the newest event
+// of one pane + generation that predates the plan.
+func (s *AgentEventStore) LatestPaneEventScope(
+	input LatestPaneEventScopeInput,
+) (*LatestPaneEventScopeRow, error) {
+	generationClause := "pane_generation is null"
+	params := []any{input.HerdrSessionName, input.PaneID, input.CreatedBeforeMs}
+	if input.PaneGeneration != nil {
+		generationClause = "pane_generation = ?"
+		params = append(params, *input.PaneGeneration)
+	}
+	var row LatestPaneEventScopeRow
+	err := s.db.QueryRow(
+		`select pane_id, pane_generation, terminal_id, workspace_id, herdr_session_name
+		 from agent_events
+		 where herdr_session_name = ? and pane_id = ? and created_at <= ? and `+
+			generationClause+`
+		 order by id desc limit 1`,
+		params...,
+	).Scan(
+		&row.PaneID,
+		&row.PaneGeneration,
+		&row.TerminalID,
+		&row.WorkspaceID,
+		&row.HerdrSessionName,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+// EventIDByIdempotencyKey mirrors the `select id from agent_events where
+// idempotency_key = ? limit 1` probe #isAgentStalled performs.
+func (s *AgentEventStore) EventIDByIdempotencyKey(idempotencyKey string) (int64, bool, error) {
+	var id int64
+	err := s.db.QueryRow(
+		"select id from agent_events where idempotency_key = ? limit 1", idempotencyKey,
+	).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return id, true, nil
+}
+
+// PaneEventTail mirrors the newest-first read over one pane's own event
+// history that #salvageableTerminalBody performs. The generation clause is
+// `pane_generation is null` when the plan carries no generation, exactly like
+// the TS query.
+func (s *AgentEventStore) PaneEventTail(
+	input PaneEventTailInput,
+) ([]PaneEventTailRow, error) {
+	generationClause := "pane_generation is null"
+	params := []any{input.HerdrSessionName, input.PaneID, input.CreatedBeforeMs}
+	if input.PaneGeneration != nil {
+		generationClause = "pane_generation = ?"
+		params = append(params, *input.PaneGeneration)
+	}
+	limit := input.Limit
+	if limit <= 0 {
+		limit = 20
+	}
+	params = append(params, limit)
+	rows, err := s.db.Query(
+		`select compact_history_json, delivery_attempts from agent_events
+		 where herdr_session_name = ? and pane_id = ? and created_at <= ? and `+
+			generationClause+`
+		 order by id desc limit ?`,
+		params...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	tail := []PaneEventTailRow{}
+	for rows.Next() {
+		var compactHistoryJSON sql.NullString
+		var deliveryAttempts int
+		if err := rows.Scan(&compactHistoryJSON, &deliveryAttempts); err != nil {
+			return nil, err
+		}
+		tail = append(tail, PaneEventTailRow{
+			CompactHistory:   parseCompactHistoryJSON(nullableString(compactHistoryJSON)),
+			DeliveryAttempts: deliveryAttempts,
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return tail, nil
+}
+
+// PaneDeliveredTerminalBodies mirrors the bounded delivered/acked terminal
+// window read the salvage path compares against.
+func (s *AgentEventStore) PaneDeliveredTerminalBodies(
+	input PaneDeliveredTerminalBodiesInput,
+) ([]PaneDeliveredTerminalBodyRow, error) {
+	generationClause := "pane_generation is null"
+	params := []any{input.HerdrSessionName, input.PaneID, input.CreatedBeforeMs}
+	if input.PaneGeneration != nil {
+		generationClause = "pane_generation = ?"
+		params = append(params, *input.PaneGeneration)
+	}
+	limit := input.Limit
+	if limit <= 0 {
+		limit = observability.STALE_DUPLICATE_GUARD_SCAN_LIMIT
+	}
+	params = append(params, limit)
+	rows, err := s.db.Query(
+		`select compact_history_json, payload_json from agent_events
+		 where herdr_session_name = ? and pane_id = ? and created_at <= ? and `+
+			generationClause+`
+		   and type in ('agent.idle', 'agent.done', 'agent.blocked')
+		   and status in ('delivered', 'acked')
+		 order by id desc limit ?`,
+		params...,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	bodies := []PaneDeliveredTerminalBodyRow{}
+	for rows.Next() {
+		var compactHistoryJSON sql.NullString
+		var payloadJSON sql.NullString
+		if err := rows.Scan(&compactHistoryJSON, &payloadJSON); err != nil {
+			return nil, err
+		}
+		bodies = append(bodies, PaneDeliveredTerminalBodyRow{
+			AgentKind:      agentKindFromPayloadJSON(nullableString(payloadJSON)),
+			CompactHistory: parseCompactHistoryJSON(nullableString(compactHistoryJSON)),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return bodies, nil
+}
+
+// PlanOutcomeEventExists mirrors the `select 1 from agent_events where
+// herdr_session_name = ? and idempotency_key = ?` probe the failed/discarded
+// backfills run before appending.
+func (s *AgentEventStore) PlanOutcomeEventExists(
+	herdrSessionName string,
+	idempotencyKey string,
+) (bool, error) {
+	var marker int
+	err := s.db.QueryRow(
+		"select 1 from agent_events where herdr_session_name = ? and idempotency_key = ?",
+		herdrSessionName, idempotencyKey,
+	).Scan(&marker)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// DeliveredTerminalHistories mirrors the bounded delivered/acked terminal
+// window read the stale-baseline duplicate guard performs. The window is
+// restricted to rows that represent a deliverable terminal round, matching
+// isDeliverableAgentEvent: `agent.done`, `agent.blocked`, or `agent.idle` whose
+// payload `from` is `working`.
+func (s *AgentEventStore) DeliveredTerminalHistories(
+	input DeliveredTerminalHistoriesInput,
+) ([]DeliveredTerminalHistoryRow, error) {
+	limit := input.Limit
+	if limit <= 0 {
+		limit = observability.STALE_DUPLICATE_GUARD_SCAN_LIMIT
+	}
+	rows, err := s.db.Query(
+		`select compact_history_json from agent_events
+		 where agent_id = ? and herdr_session_name = ?
+		   and (type in ('agent.done', 'agent.blocked')
+		        or (type = 'agent.idle' and json_extract(payload_json, '$.from') = 'working'))
+		   and status in ('delivered', 'acked')
+		 order by id desc limit ?`,
+		input.AgentID, input.HerdrSessionName, limit,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	histories := []DeliveredTerminalHistoryRow{}
+	for rows.Next() {
+		var compactHistoryJSON sql.NullString
+		if err := rows.Scan(&compactHistoryJSON); err != nil {
+			return nil, err
+		}
+		histories = append(histories, DeliveredTerminalHistoryRow{
+			CompactHistory: parseCompactHistoryJSON(nullableString(compactHistoryJSON)),
+		})
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return histories, nil
 }
 
 // Get mirrors get: it fails when no event with that id exists.

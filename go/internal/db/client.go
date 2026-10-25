@@ -13,6 +13,8 @@ import (
 	"time"
 
 	_ "modernc.org/sqlite" // pure-Go driver: the port stays CGO_ENABLED=0 clean
+
+	"github.com/dorokuma/herdsman/go/internal/shared"
 )
 
 // OpenSqlite mirrors openSqlite of src/db/client.ts: it opens (creating the
@@ -51,26 +53,11 @@ func OpenSqlite(path string) (*sql.DB, error) {
 	return db, nil
 }
 
-// RunSqliteTransaction mirrors runSqliteTransaction: fn runs inside a
-// `begin immediate` transaction on the shared connection; a failing fn rolls
-// the transaction back and its error is returned to the caller.
-func RunSqliteTransaction(db *sql.DB, fn func() error) error {
-	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, "begin immediate"); err != nil {
-		return err
-	}
-	if err := fn(); err != nil {
-		// A rollback failure must not mask the original error, so it is
-		// ignored here — matching the TS control flow, where the caught error
-		// is rethrown after the rollback attempt.
-		_, _ = db.ExecContext(ctx, "rollback")
-		return err
-	}
-	if _, err := db.ExecContext(ctx, "commit"); err != nil {
-		return err
-	}
-	return nil
-}
+// RunSqliteTransaction mirrors runSqliteTransaction. The implementation lives
+// in internal/shared (aliased here, and used by internal/observability) because
+// internal/observability cannot import internal/db yet its AgentIndexService runs
+// the same multi-statement transactions the TS does.
+var RunSqliteTransaction = shared.RunSqliteTransaction
 
 // isoTimestampLayout is JavaScript's Date#toISOString millisecond layout, which
 // the TS contracts' Date fields serialize to.

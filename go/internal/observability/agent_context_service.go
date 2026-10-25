@@ -106,21 +106,24 @@ type AgentHistoryResolved struct {
 }
 
 // AgentHistoryServiceLike is the slice of the agent-history module the context
-// service depends on: the service itself plus the three module-level helpers
-// `agent-context-service.ts` imports from it. The production adapter forwards
-// ResolveCompactHistory to *agenthistory.AgentHistoryService (mapping the
-// agenthistory records onto the observability ones) and the helpers to
-// agenthistory.StatSourceFingerprint,
-// agenthistory.HistorySourceFromSessionRef and
-// agenthistory.SafeOfficialSessionPath.
+// service depends on: the service itself plus the module-level helpers
+// `agent-context-service.ts` and `agent-index-service.ts` import from it. The
+// production adapter forwards ResolveCompactHistory to
+// *agenthistory.AgentHistoryService (mapping the agenthistory records onto the
+// observability ones) and the helpers to agenthistory.StatSourceFingerprint,
+// agenthistory.HistorySourceFromSessionRef, agenthistory.SafeOfficialSessionPath,
+// agenthistory.SafeAllowedSessionPath and
+// agenthistory.SessionPathAllowedByShape.
 type AgentHistoryServiceLike interface {
 	ResolveCompactHistory(
 		input AgentHistoryLookupInput,
 		options AgentHistoryResolveOptions,
 	) AgentHistoryResolved
+	SafeAllowedSessionPath(value string) string
+	SafeOfficialSessionPath(value string) string
+	SessionPathAllowedByShape(value string) bool
 	StatSourceFingerprint(path string) *AgentHistorySourceFingerprint
 	HistorySourceFromSessionRef(ref AgentSessionRef) AgentHistoryRefSource
-	SafeOfficialSessionPath(value string) string
 }
 
 // ---------------------------------------------------------------------------

@@ -9,12 +9,10 @@ import (
 	"github.com/dorokuma/herdsman/go/internal/observability"
 )
 
-// UpsertRunningHerdrSessionInput mirrors the TS input of the same name.
-type UpsertRunningHerdrSessionInput struct {
-	Name       string
-	SessionDir string
-	SocketPath string
-}
+// UpsertRunningHerdrSessionInput mirrors the TS input of the same name. It lives
+// in internal/observability (aliased here) because AgentIndexService speaks it
+// across the import cycle.
+type UpsertRunningHerdrSessionInput = observability.UpsertRunningHerdrSessionInput
 
 // HerdrSessionStore ports src/db/herdr-sessions.ts.
 type HerdrSessionStore struct {

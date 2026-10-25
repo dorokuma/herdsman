@@ -236,6 +236,14 @@ func (f *fakeHistoryService) SafeOfficialSessionPath(value string) string {
 	return agenthistory.SafeOfficialSessionPath(value)
 }
 
+func (f *fakeHistoryService) SafeAllowedSessionPath(value string) string {
+	return agenthistory.SafeAllowedSessionPath(value, nil)
+}
+
+func (f *fakeHistoryService) SessionPathAllowedByShape(value string) bool {
+	return agenthistory.SessionPathAllowedByShape(value, nil)
+}
+
 // historyMethodsThrow mirrors the TS Proxy: every method panics, so a cached
 // read that touches the history service fails the test.
 type historyMethodsThrow struct{}
@@ -260,6 +268,14 @@ func (historyMethodsThrow) HistorySourceFromSessionRef(
 }
 
 func (historyMethodsThrow) SafeOfficialSessionPath(_ string) string {
+	panic("history must not run")
+}
+
+func (historyMethodsThrow) SafeAllowedSessionPath(_ string) string {
+	panic("history must not run")
+}
+
+func (historyMethodsThrow) SessionPathAllowedByShape(_ string) bool {
 	panic("history must not run")
 }
 

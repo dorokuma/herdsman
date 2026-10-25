@@ -27,20 +27,15 @@ type AgentOrchestratorScopeChange = observability.AgentOrchestratorScopeChange
 
 type AgentOrchestratorReleaseResult = observability.AgentOrchestratorReleaseResult
 
-// ReleaseIfOwnerIdentityInput mirrors the releaseIfOwnerIdentity input.
-type ReleaseIfOwnerIdentityInput struct {
-	AgentOrchestratorScopeKey
-	PaneID     string
-	TerminalID string
-}
+// ReleaseIfOwnerIdentityInput, like every other orchestrator scope input,
+// lives in internal/observability (which internal/db imports, and which cannot
+// import internal/db), so the service and the store share one type.
+type ReleaseIfOwnerIdentityInput = observability.ReleaseIfOwnerIdentityInput
 
-// ReleaseIfStaleOwnerInput mirrors the releaseIfStaleOwner input. The live id
-// sets are the panes and terminals a scan still sees.
-type ReleaseIfStaleOwnerInput struct {
-	AgentOrchestratorScopeKey
-	LivePaneIDs     map[string]struct{}
-	LiveTerminalIDs map[string]struct{}
-}
+// ReleaseIfStaleOwnerInput, like every other orchestrator scope input, lives in
+// internal/observability (which internal/db imports, and which cannot import
+// internal/db), so the service and the store share one type.
+type ReleaseIfStaleOwnerInput = observability.ReleaseIfStaleOwnerInput
 
 // AgentOrchestratorScopeStore ports src/db/agent-orchestrator-scopes.ts.
 type AgentOrchestratorScopeStore struct {

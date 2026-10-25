@@ -108,7 +108,8 @@ type DeliverabilityGuard interface {
 }
 
 // AgentEventStoreLike is the slice of *db.AgentEventStore the orchestrator
-// service depends on.
+// service depends on. AgentIndexEventStoreLike (the index service's slice)
+// embeds it.
 type AgentEventStoreLike interface {
 	DeliverabilityGuard
 	Get(id int64) (AgentEventRecord, error)
@@ -121,7 +122,7 @@ type AgentEventStoreLike interface {
 }
 
 // AgentStoreLike is the slice of *db.AgentStore the orchestrator service depends
-// on.
+// on. AgentIndexAgentStoreLike extends it for the index service.
 type AgentStoreLike interface {
 	Get(id string) (AgentIndexRecord, error)
 	List(scope AgentQueryScope) ([]AgentIndexRecord, error)

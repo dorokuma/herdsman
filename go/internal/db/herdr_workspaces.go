@@ -12,11 +12,12 @@ import (
 // a Herdr session snapshot, as it arrives from the Herdr client.
 type HerdrWorkspaceLike map[string]any
 
-// ReplaceForSessionInput mirrors the replaceForSession input.
-type ReplaceForSessionInput struct {
-	HerdrSessionName string
-	Workspaces       []HerdrWorkspaceLike
-}
+// ReplaceHerdrWorkspacesInput mirrors the replaceForSession input. It lives in
+// internal/observability (aliased here) because AgentIndexService speaks it
+// across the import cycle.
+type ReplaceHerdrWorkspacesInput = observability.ReplaceHerdrWorkspacesInput
+
+type ReplaceForSessionInput = observability.ReplaceHerdrWorkspacesInput
 
 // HerdrWorkspaceStore ports src/db/herdr-workspaces.ts.
 type HerdrWorkspaceStore struct {

@@ -5,90 +5,52 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/dorokuma/herdsman/go/internal/observability"
 )
 
+// StatusPlanMaxAttempts, StatusEventPlanStatus, StatusEventPlanRecord,
+// StatusEventPlanAgent, InsertPendingInput, MarkRetryOptions and
+// CancelSupersededPendingPlansInput live in internal/observability, because
+// internal/observability cannot import internal/db (that would be an import
+// cycle) yet its AgentIndexService needs to speak them. The aliases keep the
+// existing call sites and test names unchanged.
 // StatusPlanMaxAttempts mirrors STATUS_PLAN_MAX_ATTEMPTS.
-const StatusPlanMaxAttempts = 8
+const StatusPlanMaxAttempts = observability.StatusPlanMaxAttempts
 
-// StatusEventPlanStatus mirrors the TS union of the same name.
-type StatusEventPlanStatus string
+type StatusEventPlanStatus = observability.StatusEventPlanStatus
 
-const (
-	StatusPlanPending   StatusEventPlanStatus = "pending"
-	StatusPlanRunning   StatusEventPlanStatus = "running"
-	StatusPlanCompleted StatusEventPlanStatus = "completed"
-	StatusPlanCancelled StatusEventPlanStatus = "cancelled"
-	StatusPlanFailed    StatusEventPlanStatus = "failed"
-	StatusPlanDiscarded StatusEventPlanStatus = "discarded"
-)
+type StatusEventPlanRecord = observability.StatusEventPlanRecord
 
-// StatusEventPlanRecord mirrors the TS record of the same name. The timestamps
-// are ISO strings and the nullable columns stay pointers, so an absent value is
-// distinguishable from a stored one.
-type StatusEventPlanRecord struct {
-	AgentID          string                             `json:"agentId"`
-	Attempts         int                                `json:"attempts"`
-	CompactHistory   *observability.CompactAgentHistory `json:"compactHistory,omitempty"`
-	CreatedAt        string                             `json:"createdAt"`
-	FromStatus       observability.AgentStatus          `json:"fromStatus"`
-	HerdrEventKey    *string                            `json:"herdrEventKey"`
-	HerdrSessionName string                             `json:"herdrSessionName"`
-	ID               int64                              `json:"id"`
-	LastError        *string                            `json:"lastError"`
-	PaneGeneration   *string                            `json:"paneGeneration"`
-	PaneID           string                             `json:"paneId"`
-	Status           StatusEventPlanStatus              `json:"status"`
-	ToStatus         observability.AgentStatus          `json:"toStatus"`
-	UpdatedAt        string                             `json:"updatedAt"`
-}
+type StatusEventPlanAgent = observability.StatusEventPlanAgent
 
-// StatusEventPlanAgent mirrors the nested agent shape of the TS insertPending
-// overload.
-type StatusEventPlanAgent struct {
-	HerdrSessionName string
-	ID               string
-	PaneGeneration   *string
-	PaneID           string
-}
+type InsertPendingInput = observability.InsertPendingInput
 
-// InsertPendingInput mirrors the union the TS insertPending implementation
-// accepts: either the flat fields or the nested agent with from/to.
-type InsertPendingInput struct {
-	Agent            *StatusEventPlanAgent
-	AgentID          string
-	CompactHistory   *observability.CompactAgentHistory
-	From             observability.AgentStatus
-	FromStatus       observability.AgentStatus
-	HerdrEventKey    *string
-	HerdrSessionName string
-	PaneGeneration   *string
-	PaneID           string
-	To               observability.AgentStatus
-	ToStatus         observability.AgentStatus
-}
+type MarkRetryOptions = observability.MarkRetryOptions
 
-// MarkRetryOptions mirrors the TS markRetry options. The zero values mean "not
-// supplied": IsTargetWorking and StallDetected default to false, MaxAttempts to
-// StatusPlanMaxAttempts, and the window is only checked when TotalWindowMs is
-// set.
-type MarkRetryOptions struct {
-	IsTargetWorking bool
-	IsWindowExpired bool
-	MaxAttempts     int
-	StallDetected   bool
-	TotalWindowMs   *int64
-}
+type CancelSupersededPendingPlansInput = observability.CancelSupersededPendingPlansInput
 
-// CancelSupersededPendingPlansInput mirrors the TS input of the same name.
-type CancelSupersededPendingPlansInput struct {
-	AgentID          string
-	HerdrSessionName string
-	KeepID           int64
-	ToStatus         observability.AgentStatus
-}
+type StalledDiscardPlanRow = observability.StalledDiscardPlanRow
+
+// StatusPlanPending mirrors the TS union member of the same name.
+const StatusPlanPending StatusEventPlanStatus = observability.StatusPlanPending
+
+// StatusPlanRunning mirrors the TS union member of the same name.
+const StatusPlanRunning StatusEventPlanStatus = observability.StatusPlanRunning
+
+// StatusPlanCompleted mirrors the TS union member of the same name.
+const StatusPlanCompleted StatusEventPlanStatus = observability.StatusPlanCompleted
+
+// StatusPlanCancelled mirrors the TS union member of the same name.
+const StatusPlanCancelled StatusEventPlanStatus = observability.StatusPlanCancelled
+
+// StatusPlanFailed mirrors the TS union member of the same name.
+const StatusPlanFailed StatusEventPlanStatus = observability.StatusPlanFailed
+
+// StatusPlanDiscarded mirrors the TS union member of the same name.
+const StatusPlanDiscarded StatusEventPlanStatus = observability.StatusPlanDiscarded
 
 // StatusEventPlanStore ports src/db/status-event-plans.ts.
 type StatusEventPlanStore struct {
@@ -450,6 +412,58 @@ func (s *StatusEventPlanStore) DeleteSettledOlderThan(ageMs int64) (int, error) 
 	return int(affected), nil
 }
 
+// LatestStalledDiscard mirrors the newest discarded plan of one identity whose
+// last_error is in STALLED_PLAN_ERRORS, or nil when there is none.
+func (s *StatusEventPlanStore) LatestStalledDiscard(
+	agentID string,
+	herdrSessionName string,
+) (*StalledDiscardPlanRow, error) {
+	placeholders := make([]string, 0, len(observability.StalledPlanErrors))
+	params := []any{agentID, herdrSessionName}
+	for _, planError := range observability.StalledPlanErrors {
+		placeholders = append(placeholders, "?")
+		params = append(params, planError)
+	}
+	var row StalledDiscardPlanRow
+	err := s.db.QueryRow(
+		"select id, last_error, updated_at from status_event_plans"+
+			" where agent_id = ? and herdr_session_name = ? and status = 'discarded'"+
+			" and last_error in ("+strings.Join(placeholders, ", ")+")"+
+			" order by id desc limit 1",
+		params...,
+	).Scan(&row.ID, &row.LastError, &row.UpdatedAtMs)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &row, nil
+}
+
+// HasCompletedPlanAfter mirrors the `id > ? and status = 'completed'` existence
+// probe #isAgentStalled performs.
+func (s *StatusEventPlanStore) HasCompletedPlanAfter(
+	agentID string,
+	herdrSessionName string,
+	afterID int64,
+) (bool, error) {
+	var marker int
+	err := s.db.QueryRow(
+		"select id from status_event_plans"+
+			" where agent_id = ? and herdr_session_name = ? and id > ? and status = 'completed'"+
+			" limit 1",
+		agentID, herdrSessionName, afterID,
+	).Scan(&marker)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // statusEventPlanRow is one stored row of status_event_plans.
 type statusEventPlanRow struct {
 	agentID            string
@@ -581,6 +595,7 @@ func mapStatusEventPlan(row statusEventPlanRow) StatusEventPlanRecord {
 		Attempts:         row.attempts,
 		CompactHistory:   compactHistory,
 		CreatedAt:        formatTimestamp(row.createdAtMs),
+		CreatedAtMs:      row.createdAtMs,
 		FromStatus:       observability.AgentStatus(row.fromStatus),
 		HerdrEventKey:    nullableString(row.herdrEventKey),
 		HerdrSessionName: row.herdrSessionName,

@@ -13,9 +13,37 @@ import (
 	"github.com/dorokuma/herdsman/go/internal/observability"
 )
 
-// HerdrAgentLike mirrors the TS alias of the same name: one entry of the
-// snake_case `agent.list` / `session.snapshot` payload Herdr reports.
-type HerdrAgentLike = map[string]any
+// HerdrAgentLike, RetirePaneInput, IsPaneClosedInput,
+// ClearLegacyPaneTombstoneInput, HasGenerationScopedTombstoneInput,
+// SetSessionRefByTerminalInput, UpdateAgentStatusInput, ReplaceAgentsForSessionInput
+// and FindAgentByPaneInput live in internal/observability, because
+// internal/observability cannot import internal/db (that would be an import
+// cycle) yet its AgentIndexService needs to speak them. The aliases keep the
+// existing call sites and test names unchanged.
+type HerdrAgentLike = observability.HerdrAgentLike
+
+type RetirePaneInput = observability.RetirePaneInput
+
+type IsPaneClosedInput = observability.IsPaneClosedInput
+
+type ClearLegacyPaneTombstoneInput = observability.ClearLegacyPaneTombstoneInput
+
+type HasGenerationScopedTombstoneInput = observability.HasGenerationScopedTombstoneInput
+
+type SetSessionRefByTerminalInput = observability.SetSessionRefByTerminalInput
+
+type UpdateAgentStatusInput = observability.UpdateAgentStatusInput
+
+type ReplaceAgentsForSessionInput = observability.ReplaceAgentsForSessionInput
+
+type FindAgentByPaneInput = observability.FindAgentByPaneInput
+
+// FindAgentByTerminalInput mirrors the TS findByTerminal input. Like the other
+// agent-store inputs it lives in internal/observability (which internal/db
+// imports, and which cannot import internal/db), so the service and the store
+// share one type.
+type FindAgentByTerminalInput = observability.FindAgentByTerminalInput
+
 
 // AgentStore ports src/db/agents.ts.
 type AgentStore struct {
@@ -45,55 +73,6 @@ func NewAgentStore(db *sql.DB, agentEvents *AgentEventStore) *AgentStore {
 const agentColumns = "agent, agent_session_hint_json, agent_session_json, agent_status, cwd," +
 	" first_seen_at, focused, foreground_cwd, herdr_session_name, id, last_seen_at, name," +
 	" pane_id, pane_revision, pane_generation, grok_home, tab_id, terminal_id, workspace_id"
-
-// ReplaceAgentsForSessionInput mirrors the TS replaceForSession input.
-type ReplaceAgentsForSessionInput struct {
-	Agents           []HerdrAgentLike
-	HerdrSessionName string
-}
-
-// RetirePaneInput mirrors the TS retirePane / markPaneClosed input.
-type RetirePaneInput struct {
-	HerdrSessionName string
-	PaneGeneration   *string
-	PaneID           string
-}
-
-// IsPaneClosedInput mirrors the TS isPaneClosed / isPaneClosedSince input.
-type IsPaneClosedInput struct {
-	HerdrSessionName string
-	PaneGeneration   *string
-	PaneID           string
-	SinceMs          int64
-}
-
-// ClearLegacyPaneTombstoneInput mirrors the TS input of the same name.
-type ClearLegacyPaneTombstoneInput struct {
-	HerdrSessionName string
-	PaneID           string
-}
-
-// HasGenerationScopedTombstoneInput mirrors the TS input of the same name.
-type HasGenerationScopedTombstoneInput struct {
-	HerdrSessionName string
-	PaneGeneration   string
-	PaneID           string
-}
-
-// SetSessionRefByTerminalInput mirrors the TS input of the same name.
-type SetSessionRefByTerminalInput struct {
-	AgentSession     observability.AgentSessionRef
-	HerdrSessionName string
-	TerminalID       string
-}
-
-// UpdateAgentStatusInput mirrors the TS updateStatus input.
-type UpdateAgentStatusInput struct {
-	AgentStatus      observability.AgentStatus
-	HerdrSessionName string
-	PaneGeneration   *string
-	PaneID           string
-}
 
 // ReplaceForSession mirrors replaceForSession: the scan snapshot becomes the
 // authoritative agent index for one Herdr session. Stable terminals keep their
@@ -567,19 +546,6 @@ func (s *AgentStore) UpdateStatus(input UpdateAgentStatusInput) (*observability.
 		PaneGeneration:   input.PaneGeneration,
 		PaneID:           input.PaneID,
 	})
-}
-
-// FindAgentByPaneInput mirrors the TS findByPane input.
-type FindAgentByPaneInput struct {
-	HerdrSessionName string
-	PaneGeneration   *string
-	PaneID           string
-}
-
-// FindAgentByTerminalInput mirrors the TS findByTerminal input.
-type FindAgentByTerminalInput struct {
-	HerdrSessionName string
-	TerminalID       string
 }
 
 // List mirrors list: the agents of the running Herdr sessions, narrowed by the
