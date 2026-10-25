@@ -3,7 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
 import { createAgentHistoryService } from "@/agent-history/service.js";
-import { isPeerActiveOrSettling, resolveWakeWaiterCwd, runAgyHook } from "@/agy/hook.js";
+import {
+  isPeerActiveOrSettling,
+  parseAgyComposerDraft,
+  resolveWakeWaiterCwd,
+  runAgyHook,
+} from "@/agy/hook.js";
 import { parseCliArgs, runCliCommand } from "@/cli/herdsman.js";
 import { ObservabilityRpcServer } from "@/daemon/observability-server.js";
 import { isDeliverableAgentEvent } from "@/db/agent-events.js";
@@ -876,6 +881,8 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
           HERDSMAN_AGY_WAITER_EPOCH: "1",
         },
         pollIntervalMs: 100,
+        // Fake timers freeze herdr's exec timeout; skip the real pane read.
+        readPaneText: async () => undefined,
         socketPath: "/tmp/herdsman.sock",
         stateDir: dir,
         triggerWakePrompt: async () => {
@@ -1060,6 +1067,7 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
           HERDSMAN_AGY_WAITER_EPOCH: "1",
         },
         pollIntervalMs: 100,
+        readPaneText: async () => undefined,
         settleGraceMs: 500,
         socketPath: "/tmp/herdsman.sock",
         stateDir: dir,
@@ -1104,6 +1112,7 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
           HERDSMAN_AGY_WAITER_EPOCH: "2",
         },
         pollIntervalMs: 100,
+        readPaneText: async () => undefined,
         settleGraceMs: 300,
         // Explicit opt-in: the default WakeWaiter now stays on standby instead of
         // exiting as soon as no peer looks active.
@@ -1590,7 +1599,7 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
     }
   });
 
-  test("intermediate agent.done superseded by live working status is acked silently and the later real completion still wakes the main pane", async () => {
+  test("intermediate agent.done while peer still working is deferred (not acked) and a later real completion wakes once", async () => {
     const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-intermediate-done-"));
     const sessionId = "a1111111-2222-3333-4444-555555555555";
     let pendingEvents: AgentEventRecord[] = [makeDoneEvent(1118, "已改完代码，继续跑测试。")];
@@ -1600,6 +1609,7 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
     let pushNotification: ((method: string, params: unknown) => void) | undefined;
     const spawnedWaiters: number[] = [];
     const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
 
     const connect = async (
       _socketPath: string,
@@ -1678,16 +1688,18 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
         },
       );
 
-      // The intermediate completion is not handed over as the final result...
+      // Intermediate completion must not be permanently acked while the peer works.
       expect(stopResult).toEqual({});
-      expect(ackedIds).toEqual([1118]);
-      // ...and a waiter guards the still running turn.
+      expect(ackedIds).toEqual([]);
       expect(spawnedWaiters).toEqual([1]);
       expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8"))).toMatchObject({
         turnEpoch: 1,
         waiterEpoch: 1,
         waiterPid: process.pid,
       });
+      expect(warnSpy.mock.calls.some((call) => String(call[0]).includes("eventId=1118"))).toBe(
+        true,
+      );
 
       const waiterPromise = runAgyHook("WakeWaiter", "", {
         connect,
@@ -1706,8 +1718,9 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
         waitTimeoutMs: 5_000,
       });
 
-      await new Promise((resolve) => setTimeout(resolve, 30));
+      await new Promise((resolve) => setTimeout(resolve, 40));
       expect(wakePrompts).toEqual([]);
+      expect(ackedIds).toEqual([]);
 
       // The turn really finishes now: the peer goes idle and the real done lands.
       peerStatus = "idle";
@@ -1717,8 +1730,352 @@ describe("agy lifecycle hooks (PreInvocation & Stop)", () => {
       expect(await waiterPromise).toEqual({});
       expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
     } finally {
+      warnSpy.mockRestore();
       rmSync(dir, { force: true, recursive: true });
     }
+  });
+
+  test("WakeWaiter race: agent.done arrives while agent.list still says working, next poll sees done and wakes once", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-working-race-"));
+    const sessionId = "c1111111-2222-3333-4444-555555555555";
+    const pendingEvents: AgentEventRecord[] = [
+      makeDoneEvent(73501, "子代理最终结论，很长一段正文。"),
+    ];
+    let ackedEventId = 0;
+    const ackedIds: number[] = [];
+    let peerStatus: "done" | "idle" | "working" = "working";
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    writeFileSync(
+      join(dir, `${sessionId}.json`),
+      JSON.stringify({ turnEpoch: 1, waiterEpoch: 1, waiterPid: process.pid }),
+    );
+
+    const connect = async () => ({
+      close: () => undefined,
+      request: async (method: string, params: unknown) => {
+        if (method === "agent.notifications.ack") {
+          const eventId = (params as { eventId: number }).eventId;
+          ackedIds.push(eventId);
+          ackedEventId = Math.max(ackedEventId, eventId);
+          return { acknowledged: true };
+        }
+        if (method === "agent.list") {
+          return {
+            agents: [
+              {
+                agent: "agy",
+                agentStatus: "idle" as const,
+                firstSeenAt: "2026-10-25T05:06:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_self",
+                paneId: "wB:p1",
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              {
+                agent: "agy",
+                agentStatus: peerStatus,
+                firstSeenAt: "2026-10-25T05:06:00.000Z",
+                herdrSessionName: "default",
+                id: "ag_peer",
+                paneId: "wB:p2",
+                terminalId: "term_peer",
+                workspaceId: "wB",
+              },
+            ],
+          };
+        }
+        return {
+          events: pendingEvents,
+          presence: {
+            herdrSessionName: "default",
+            paneId: "wB:p1",
+            subscriberId: `agy:${sessionId}`,
+            terminalId: "term_self",
+            workspaceId: "wB",
+          },
+          state: {
+            ackedEventId,
+            herdrSessionName: "default",
+            owner: { paneId: "wB:p1", terminalId: "term_self" },
+            updatedAt: "2026-10-25T05:06:49.000Z",
+            workspaceId: "wB",
+          },
+        };
+      },
+    });
+
+    try {
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect,
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 30,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      // First peek deferred the done event; must not ack or wake yet.
+      expect(wakePrompts).toEqual([]);
+      expect(ackedIds).toEqual([]);
+      expect(
+        warnSpy.mock.calls.some(
+          (call) =>
+            String(call[0]).includes("eventId=73501") && String(call[0]).includes("still working"),
+        ),
+      ).toBe(true);
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8")).presentedEventIds ?? []).toEqual(
+        [],
+      );
+
+      // Live status catches up on the next poll.
+      peerStatus = "done";
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+      expect(wakePrompts).toHaveLength(1);
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("WakeWaiter does not wake while a deferred completion's peer stays working (true mid-turn)", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-midturn-nowake-"));
+    const sessionId = "d1111111-2222-3333-4444-555555555555";
+    const pendingEvents: AgentEventRecord[] = [makeDoneEvent(8001, "中途一轮工具结果。")];
+    let ackedEventId = 0;
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    writeFileSync(
+      join(dir, `${sessionId}.json`),
+      JSON.stringify({ turnEpoch: 1, waiterEpoch: 1, waiterPid: process.pid }),
+    );
+
+    try {
+      const result = await runAgyHook("WakeWaiter", "", {
+        connect: async () => ({
+          close: () => undefined,
+          request: async (method: string, params: unknown) => {
+            if (method === "agent.notifications.ack") {
+              const eventId = (params as { eventId: number }).eventId;
+              ackedEventId = Math.max(ackedEventId, eventId);
+              return { acknowledged: true };
+            }
+            if (method === "agent.list") {
+              return {
+                agents: [
+                  {
+                    agent: "agy",
+                    agentStatus: "idle" as const,
+                    firstSeenAt: "2026-10-21T11:50:00.000Z",
+                    herdrSessionName: "default",
+                    id: "ag_self",
+                    paneId: "wB:p1",
+                    terminalId: "term_self",
+                    workspaceId: "wB",
+                  },
+                  {
+                    agent: "pi",
+                    agentStatus: "working" as const,
+                    firstSeenAt: "2026-10-21T11:50:00.000Z",
+                    herdrSessionName: "default",
+                    id: "ag_peer",
+                    paneId: "wB:p2",
+                    terminalId: "term_peer",
+                    workspaceId: "wB",
+                  },
+                ],
+              };
+            }
+            return {
+              events: pendingEvents,
+              presence: {
+                herdrSessionName: "default",
+                paneId: "wB:p1",
+                subscriberId: `agy:${sessionId}`,
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              state: {
+                ackedEventId,
+                herdrSessionName: "default",
+                owner: { paneId: "wB:p1", terminalId: "term_self" },
+                updatedAt: "2026-10-21T12:00:00.000Z",
+                workspaceId: "wB",
+              },
+            };
+          },
+        }),
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 20,
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 120,
+      });
+
+      expect(result).toEqual({});
+      expect(wakePrompts).toEqual([]);
+      expect(ackedEventId).toBe(0);
+      expect(JSON.parse(readFileSync(join(dir, `${sessionId}.json`), "utf8")).presentedEventIds ?? []).toEqual(
+        [],
+      );
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("WakeWaiter defers triggerWakePrompt while the composer has a draft, then wakes once the draft clears", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "herdsman-agy-draft-defer-"));
+    const sessionId = "e1111111-2222-3333-4444-555555555555";
+    const pendingEvents: AgentEventRecord[] = [makeDoneEvent(9001, "工人完成。")];
+    let ackedEventId = 0;
+    let composerHasDraft = true;
+    const wakePrompts: Array<{ paneId: string; promptText: string }> = [];
+    const warnSpy = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+    writeFileSync(
+      join(dir, `${sessionId}.json`),
+      JSON.stringify({ turnEpoch: 1, waiterEpoch: 1, waiterPid: process.pid }),
+    );
+
+    const emptyComposer = [
+      "assistant output",
+      "───────────────────────────────────────────────────",
+      ">",
+      "───────────────────────────────────────────────────",
+      "? for shortcuts             Gemini 4 Argon · medium",
+    ].join("\n");
+    const draftComposer = [
+      "assistant output",
+      "───────────────────────────────────────────────────",
+      "> 用户正在打的草稿",
+      "───────────────────────────────────────────────────",
+      "? for shortcuts             Gemini 4 Argon · medium",
+    ].join("\n");
+
+    try {
+      const waiterPromise = runAgyHook("WakeWaiter", "", {
+        connect: async () => ({
+          close: () => undefined,
+          request: async (method: string, params: unknown) => {
+            if (method === "agent.notifications.ack") {
+              const eventId = (params as { eventId: number }).eventId;
+              ackedEventId = Math.max(ackedEventId, eventId);
+              return { acknowledged: true };
+            }
+            if (method === "agent.list") {
+              return {
+                agents: [
+                  {
+                    agent: "agy",
+                    agentStatus: "idle" as const,
+                    firstSeenAt: "2026-10-21T11:50:00.000Z",
+                    herdrSessionName: "default",
+                    id: "ag_self",
+                    paneId: "wB:p1",
+                    terminalId: "term_self",
+                    workspaceId: "wB",
+                  },
+                ],
+              };
+            }
+            return {
+              events: pendingEvents,
+              presence: {
+                herdrSessionName: "default",
+                paneId: "wB:p1",
+                subscriberId: `agy:${sessionId}`,
+                terminalId: "term_self",
+                workspaceId: "wB",
+              },
+              state: {
+                ackedEventId,
+                herdrSessionName: "default",
+                owner: { paneId: "wB:p1", terminalId: "term_self" },
+                updatedAt: "2026-10-21T12:00:00.000Z",
+                workspaceId: "wB",
+              },
+            };
+          },
+        }),
+        environment: {
+          ...HERDR_ENV,
+          HERDSMAN_AGY_SESSION_ID: sessionId,
+          HERDSMAN_AGY_STATE_DIR: dir,
+          HERDSMAN_AGY_WAITER_EPOCH: "1",
+        },
+        pollIntervalMs: 25,
+        readPaneText: async () => (composerHasDraft ? draftComposer : emptyComposer),
+        socketPath: "/tmp/herdsman.sock",
+        stateDir: dir,
+        triggerWakePrompt: async (input) => {
+          wakePrompts.push(input);
+        },
+        waitTimeoutMs: 5_000,
+      });
+
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      expect(wakePrompts).toEqual([]);
+      expect(
+        warnSpy.mock.calls.some((call) => String(call[0]).includes("输入框有草稿，推迟叫醒")),
+      ).toBe(true);
+
+      composerHasDraft = false;
+      expect(await waiterPromise).toEqual({});
+      expect(wakePrompts).toEqual([{ paneId: "wB:p1", promptText: "[herdsman-wake]" }]);
+    } finally {
+      warnSpy.mockRestore();
+      rmSync(dir, { force: true, recursive: true });
+    }
+  });
+
+  test("parseAgyComposerDraft covers empty, single-line, multi-line, placeholder-like, and missing box", () => {
+    const rule = "───────────────────────────────────────────────────";
+    expect(
+      parseAgyComposerDraft(
+        ["output", rule, ">", rule, "? for shortcuts             Gemini 4 Argon · medium"].join(
+          "\n",
+        ),
+      ),
+    ).toBe("");
+    expect(
+      parseAgyComposerDraft(
+        ["output", rule, "> hello draft", rule, "? for shortcuts"].join("\n"),
+      ),
+    ).toBe("hello draft");
+    expect(
+      parseAgyComposerDraft(
+        ["output", rule, "> line one", "line two", "line three", rule, "? for shortcuts"].join(
+          "\n",
+        ),
+      ),
+    ).toBe("line one\nline two\nline three");
+    // A sole `>` with only whitespace is still empty (no placeholder observed on real panes).
+    expect(parseAgyComposerDraft(["output", rule, ">   ", rule, "footer"].join("\n"))).toBe("");
+    // If the composer box cannot be found, return undefined so wake keeps original behaviour.
+    expect(parseAgyComposerDraft("no separators here\n> orphan")).toBeUndefined();
+    expect(parseAgyComposerDraft([rule, rule].join("\n"))).toBeUndefined();
   });
 
   test("Stop spawns a WakeWaiter alongside decision:continue, unacked delivered events prompt when the host ignores it, and a new PreInvocation epoch cancels the waiter", async () => {
