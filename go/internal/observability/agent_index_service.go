@@ -127,18 +127,50 @@ type planWindowTracker struct {
 	idleStartedAt int64
 }
 
-// refreshInFlight is one awaitable in-flight refresh, mirroring the promise the
-// TS keeps in #refreshInFlightBySession.
-type refreshInFlight struct {
-	epoch  int
+// RefreshSource is one awaitable refreshHerdrSession call: the Go form of the
+// promise refreshHerdrSession hands back in TS. Concurrent callers that observe
+// the same mutation epoch receive the same *RefreshSource, exactly as the TS
+// in-flight registry hands back the same promise, so a caller that keys work on
+// the identity of what it was handed — the watch manager's #refreshPublications
+// publication dedup — sees the same sharing the TS has.
+type RefreshSource struct {
 	done   chan struct{}
 	result *AgentIndexRefreshResult
 	err    error
 }
 
-func (r *refreshInFlight) await() (*AgentIndexRefreshResult, error) {
+// Await blocks until the refresh settles and returns its outcome. Every awaiter
+// of one source reads the same fields, closed over by the close of done.
+func (r *RefreshSource) Await() (*AgentIndexRefreshResult, error) {
 	<-r.done
 	return r.result, r.err
+}
+
+// NewRefreshSource returns one unsettled source together with the function that
+// settles it (idempotent, like a promise). The index service builds its own
+// sources internally; this exists so a caller of RefreshHerdrSessionSource can
+// hand the same source to concurrent refreshes, the way the TS fake index hands
+// back the same promise.
+func NewRefreshSource() (*RefreshSource, func(*AgentIndexRefreshResult, error)) {
+	source := &RefreshSource{done: make(chan struct{})}
+	var once sync.Once
+	return source, func(result *AgentIndexRefreshResult, err error) {
+		once.Do(func() {
+			source.result, source.err = result, err
+			close(source.done)
+		})
+	}
+}
+
+// refreshInFlight is one awaitable in-flight refresh, mirroring the promise the
+// TS keeps in #refreshInFlightBySession.
+type refreshInFlight struct {
+	epoch  int
+	source *RefreshSource
+}
+
+func (r *refreshInFlight) await() (*AgentIndexRefreshResult, error) {
+	return r.source.Await()
 }
 
 // AgentIndexServiceOptions mirrors the TS constructor options.
@@ -327,19 +359,32 @@ func (s *AgentIndexService) RefreshHerdrSessionFast(
 func (s *AgentIndexService) RefreshHerdrSession(
 	input RefreshInput,
 ) (*AgentIndexRefreshResult, error) {
+	return s.RefreshHerdrSessionSource(input).Await()
+}
+
+// RefreshHerdrSessionSource is refreshHerdrSession's in-flight registry seen
+// from the outside: it returns the source already running for the session's
+// current mutation epoch, or starts one and returns it. The TS hands every such
+// caller the same promise and its watch manager keys its publication dedup on
+// that promise identity, so the sharing has to be observable here instead of
+// only inside RefreshHerdrSession.
+func (s *AgentIndexService) RefreshHerdrSessionSource(
+	input RefreshInput,
+) *RefreshSource {
 	s.mu.Lock()
 	epoch := s.mutationEpochBySession[input.HerdrSessionName]
 	existing := s.refreshInFlightBySession[input.HerdrSessionName]
 	s.mu.Unlock()
 	if existing != nil && existing.epoch == epoch {
-		return existing.await()
+		return existing.source
 	}
-	inFlight := &refreshInFlight{epoch: epoch, done: make(chan struct{})}
+	source := &RefreshSource{done: make(chan struct{})}
+	inFlight := &refreshInFlight{epoch: epoch, source: source}
 	s.mu.Lock()
 	s.refreshInFlightBySession[input.HerdrSessionName] = inFlight
 	s.mu.Unlock()
 	go func() {
-		defer close(inFlight.done)
+		defer close(source.done)
 		intermediate, err := s.enqueueSessionOperation(
 			input.HerdrSessionName,
 			func() (*AgentIndexRefreshFastResult, error) {
@@ -347,24 +392,24 @@ func (s *AgentIndexService) RefreshHerdrSession(
 			},
 		)
 		if err != nil {
-			inFlight.err = err
+			source.err = err
 			s.clearRefreshInFlight(input.HerdrSessionName, inFlight)
 			return
 		}
 		events, err := s.runStatusEventPlans(intermediate.StatusEventPlans)
 		if err != nil {
-			inFlight.err = err
+			source.err = err
 			s.clearRefreshInFlight(input.HerdrSessionName, inFlight)
 			return
 		}
-		inFlight.result = &AgentIndexRefreshResult{
+		source.result = &AgentIndexRefreshResult{
 			Agents:               intermediate.Agents,
 			ContextChangedScopes: intermediate.ContextChangedScopes,
 			Events:               append(append([]AgentEventRecord{}, intermediate.Events...), events...),
 		}
 		s.clearRefreshInFlight(input.HerdrSessionName, inFlight)
 	}()
-	return inFlight.await()
+	return source
 }
 
 func (s *AgentIndexService) clearRefreshInFlight(sessionName string, inFlight *refreshInFlight) {
