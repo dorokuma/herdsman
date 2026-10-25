@@ -11,14 +11,11 @@ import (
 )
 
 // AgentContextSnapshotInput mirrors the TS put input: the record without the
-// store-assigned updatedAt.
-type AgentContextSnapshotInput struct {
-	AgentID           string
-	CompactHistory    observability.CompactAgentHistory
-	HistoryRef        *observability.AgentHistoryRef
-	PaneRevision      *int
-	SourceFingerprint *observability.AgentHistorySourceFingerprint
-}
+// store-assigned updatedAt. The type lives in internal/observability (which
+// internal/db imports, and which cannot import internal/db), so the context
+// service and the store share one type; the alias keeps the existing call sites
+// unchanged.
+type AgentContextSnapshotInput = observability.AgentContextSnapshotInput
 
 // AgentContextSnapshotStore ports src/db/agent-context-snapshots.ts.
 type AgentContextSnapshotStore struct {
