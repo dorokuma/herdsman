@@ -1,5 +1,20 @@
 ## [Unreleased]
 
+## 0.15.1
+
+- agy 回合完成通知防丢失与停滞重放（`src/observability/agent-index-service.ts`、`src/observability/contracts.ts`、`src/db/status-event-plans.ts`、`src/agent-history/*`、`src/config/*`、`packages/herdsman-pi/src/wake.ts`、`src/agy/hook.ts`，`39cbe73`）：状态事件计划等待重试升级为指数退避（5s→60s）与可配置的 15 分钟弹性窗口（扣除活跃 working 时长）；计划因等待历史或退化被丢弃时发射 `fallbackOutcome` 并投影为 `stalled`；停滞后晚到的 assistant 完成历史支持一次性重放并防止回合中误判；记录历史 `unreadyReason` 诊断，并将 pi 空 assistant 读取降级为 debug 计数（留痕 `.agents/notes/20261023-agy-turn-completion-notification-loss.md`）。
+- agy smart-wake waiter 工作目录解析、60s 待命与无主兄弟工作区作用域收敛（`src/agy/hook.ts`、`src/daemon/observability-server.ts`、`src/db/agent-events.ts`、`src/observability/agent-orchestrator-service.ts`、`src/observability/schemas.ts`，`82d6352`）：从 `payload.cwd` / `workspacePaths` / `/proc` 祖先链解析分离式 `WakeWaiter` 的 `cwd`，修复全局 `hooks.json` 触发 `ConnectorPaneMismatchError`；抑制仍在 working 的对端中间态 `agent.done` / `agent.idle`；`Stop` 时保留 `decision: continue` 宽限回退，无活跃对端时 60s 待命；支持向会话编排者投递无主兄弟工作区事件并提供单行跨工作区 ack 与单主推送（留痕 `.agents/notes/20261024-agy-smart-wake-standby-cross-workspace.md`）。
+- 终态历史守卫过滤非 working 来源 `agent.idle`（`src/observability/agent-index-service.ts`，`60a284a`，合并 `13cc677`）：过滤非 working 来源的 `agent.idle` 行，防止跨工作区单行 `markAcked` 后冻结基线守卫误拦合法终态正文（留痕 `.agents/notes/20261024-sibling-markacked-frozen-baseline-guard.md`）。
+- agy 叫醒 working 竞态推迟、输入框草稿防误触、ack 水位防吞与跨 300s 重投窗口候选保留（`src/agy/hook.ts`，`b0e5c6c`、`84fc8b1`、`adf6f09`、`74df962`、`3985333` 及合并提交）：
+  - 因 `agent.list` 仍报对端 `working` 而被暂时抑制的完成事件改为记入 `deferredWorkingEventIds` 留待下一轮重判，不再立即标记 `presented` 或永久 `ack`；同 `terminalId` 存在多条完成事件时仅保留最新有效完成并静默确认旧事件（`b0e5c6c`、`84fc8b1`）；
+  - 触发 `[herdsman-wake]` 前读取本窗格尾部 40 行解析 agy 输入框（`parseAgyComposerDraft`，按底边线向上向外定位紧跟 `>` 提示符行的顶框线），存在非空草稿时推迟叫醒并 `rearmDeliveredEvents`，读窗格失败或未定位到输入框时回退为正常叫醒；异步读草稿返回后复核 `turnEpoch` / `waiterEpoch` / `waiterPid`（`b0e5c6c`、`84fc8b1`、`adf6f09`）；
+  - 新增 `pendingAckEventIds`、`deferredEventIds` 与 `resolveMinHoldbackEventId`，阻止对高 ID 事件调 `agent.notifications.ack`（服务端按 `id <= ?` 水位确认）时顺带吞掉更低 ID 的未消费或推迟事件（`adf6f09`）；
+  - `peekNextWakeBatch` 写盘前复核 `expectedWaiter`（`turnEpoch` / `waiterEpoch` / `waiterPid`）并将 `presentedEventIds` 与磁盘状态取并集，防止并发 `PreInvocation` 写入的已呈现 ID 被覆盖（`74df962`）；
+  - 会话状态新增 `retainedCandidateEvents`（按低 ID 优先保留上限 100 条），将合并已知未 ack 事件（`mergeKnownUnackedEvents`）与未呈现候选过滤（`collectWakeCandidateEvents`）解耦，使未呈现候选及 `Stop` 已呈现但待宿主响应的 `deliveredEventIds` 跨越 daemon 300s 重投窗口（`REDELIVERY_FRESHNESS_MS`）持续保留；仅存于快照的事件通过单次 `agent.list`（`fetchLivePeerScope` + `filterEligibleRetainedEvents`）核验源窗格存活与无主兄弟工作区作用域，剔除已关窗格或已被接管工作区的陈旧行（`74df962`、`3985333`，留痕 `.agents/notes/20261025-agy-wake-working-race-and-composer-draft.md`）。
+- 测试：全量测试由 54 files / 903 tests 增至 54 files / 939 tests（`test/unit/agy-hook-and-cli.test.ts`、`test/integration/agent-index-service.test.ts`、`test/integration/agent-orchestrator-service.test.ts`、`test/integration/observability-rpc.test.ts`、`test/integration/turn-completion-signal.test.ts`、`test/unit/herdsman-pi-wake.test.ts` 等）。
+- 版本与引用同步：四个 manifest（`package.json`、`packages/herdsman-pi/package.json`、`packages/herdsman-herdr-plugin/package.json`、`packages/herdsman-herdr-plugin/herdr-plugin.toml`）同步至 0.15.1；`README.md` 与 `packages/herdsman-herdr-plugin/README.md` 的 Herdr 安装 tag 同步至 `v0.15.1`。
+- 范围：本版本包含 `v0.15.0` 之后的全部内容——`dc7d9d0`（0.15.0 发布记录）、`39cbe73`、`82d6352`、`60a284a`（合并 `13cc677`）以及 `fix/agy-wake-race-and-draft` 分支的 5 个提交（`b0e5c6c`、`84fc8b1`、`adf6f09`、`74df962`、`3985333`）与合并提交 `8dfd285`；`src/**` 与 `packages/herdsman-pi/src/**` 均有改动，`packages/herdsman-herdr-plugin` 无源码改动；无 schema 变更、无迁移。
+
 ## 0.15.0
 
 - agy 编排者支持与独立 WakeWaiter（`src/agy/hook.ts`、`src/daemon/service.ts`，`acb3acd`）：为 agy 运行环境增加编排者集成与分离式唤醒等待机制。
