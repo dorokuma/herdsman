@@ -1,0 +1,543 @@
+# 第 5 批 · herdsmand 全量 Go 迁移 · 第 3C-2 收官子批报告
+
+- 分支：`go-port`（worktree `/root/workspace/.wt/herdsman/go-port`）
+- 目标模块：`go/`（Go module `github.com/dorokuma/herdsman/go`，go 1.26.0）
+- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告
+- 未触碰：`/root/.local/bin/herdsman`、`herdsman.service`、`/root/.herdsman`（生产面保持原样，见第 5 节）
+
+---
+
+## 1. 提交列表（`go-port` 自 `main` 以来）
+
+`git log --reverse --pretty=format:'%H %s' main..HEAD`（本子批提交除外，见本节末）：
+
+| # | SHA | 说明 |
+|---|-----|------|
+| 1 | `a0d76b288bab23546e51eb8f29e3c4d8817fe93a` | feat(go): port shared, observability contracts, and config schema |
+| 2 | `c57c3190a81697ed826954c5a7be9ffea7ed645b` | feat(go): port daemon process manager and runtime config resolver |
+| 3 | `85fea4d6f1aa043c0cb92233c2b1ca34ba1dd029` | feat(go): port agent-history readers and antigravity parser |
+| 4 | `f8cfdcdbf1e6b42262c0b355929a1f114ba45fa8` | feat(go): port agent-history discovery and caching service |
+| 5 | `025220372a78b91c7331f5f452046eef59dffa8a` | feat(go): port sqlite client, schema, and foundational db stores |
+| 6 | `553814ff13cc9f17f23b005aed2c6a4dbdd47829` | feat(go): port agent-events and agents db stores |
+| 7 | `96f98f1b1788fd11236b96d6da6f8759cf0f548d` | feat(go): port herdr socket client, pane resolver, and rpc client |
+| 8 | `f45388137c33346bf7b0f5bf16db17e7bb247f23` | feat(go): port agent orchestrator service and delivery lifecycle tests |
+| 9 | `494e47b7e0ae9a76ad23d10a68d43919526af571` | feat(go): port agent context service and daemon event reconciler |
+| 10 | `b3f86f55acdb303e34a393c6c8dd87497f90a307` | feat(go): port agent index service and pane generation dedup tests |
+| 11 | `9aa05c337ca1154e27114a983a4ce7068ff03cf5` | feat(go): port herdr session watch manager and idle seam tests |
+| 12 | `29cda845c1fa6b04c0ff365cd2b9324025c60f23` | test(go): port herdr session watch manager unit tests |
+| 13 | `0d21f00137c1099042fadfebbe1d2361a4748af1` | feat(go): port observability rpc server and orchestrator disconnect/move tests |
+| 14 | `47b3a12321200f81dd1f2f46fed76261dff940ad` | test(go): port observability rpc integration tests |
+| 15 | `ae7035046c4e30ce0d9e3378888f4ce9634e702a` | feat(go): port daemon root service and herdsman-daemon entrypoint |
+| 16 | `7093f06eacfa4329d54548e61a33c9f4d73bd2ad` | feat(go): port agy-hook, herdsman cli, and wrapper script |
+| 17 | `83e14ed63ca9575b3891020fcbec41ca24d82080` | test(go): port agy-hook-and-cli unit tests part 1 |
+| 18 | `bcf56d380179e00764684278689974b0f9a871b7` | test(go): port agy-hook-and-cli unit tests part 2 |
+| 19 | `6af358c374e15305525321e3c883b31339024622` | Merge branch 'main' into go-port |
+| 20 | `7d5da2eaceea92a081daf44f044fd0d1f34cd0ae` | feat(go): sync agy draft check, port index/turn-signal tests |
+
+本子批提交（第 21 条）：
+
+| # | 说明 |
+|---|------|
+| 21 | `fix(go): resolve daemon startup-signal race and add batch 5 report` |
+
+变更面（`git diff --stat`，本子批）：
+
+```
+ go/internal/daemon/service.go | 168 +++++++++++++++++++++++++++++++-----------
+ go/internal/db/agents.go      |   1 -
+ 2 files changed, 126 insertions(+), 43 deletions(-)
+```
+
+`go/internal/db/agents.go` 的 1 行删除是纯 `gofmt` 结果（`type FindAgentByTerminalInput = ...` 后多出的一个空行），无行为变化。
+
+---
+
+## 2. 源码与测试映射表
+
+### 2.1 48 个 TS 源文件 → Go 包/文件
+
+`src/**/*.ts` 共 48 个（`find src -name '*.ts' | wc -l` = 48）：
+
+| # | TS 源文件 | Go 落点 |
+|---|-----------|---------|
+| 1 | `src/agent-history/antigravity-proto.ts` | `internal/agenthistory/antigravity_proto.go` |
+| 2 | `src/agent-history/antigravity-reader.ts` | `internal/agenthistory/antigravity_reader.go` |
+| 3 | `src/agent-history/discovery.ts` | `internal/agenthistory/discovery.go` |
+| 4 | `src/agent-history/pi-reader.ts` | `internal/agenthistory/pi_reader.go` |
+| 5 | `src/agent-history/readers.ts` | `internal/agenthistory/readers.go` |
+| 6 | `src/agent-history/service.ts` | `internal/agenthistory/service.go` |
+| 7 | `src/agent-history/source-fingerprint.ts` | `internal/agenthistory/source_fingerprint.go` |
+| 8 | `src/agent-history/text.ts` | `internal/agenthistory/text.go` |
+| 9 | `src/agent-history/tool-compaction.ts` | `internal/agenthistory/tool_compaction.go` |
+| 10 | `src/agy/hook.ts` | `internal/agy/hook.go` + `state.go` + `wake_waiter.go` |
+| 11 | `src/cli/herdsman-daemon.ts` | `cmd/herdsman-daemon/main.go` |
+| 12 | `src/cli/herdsman.ts` | `cmd/herdsman/main.go` + `internal/cli/herdsman.go` |
+| 13 | `src/config/load.ts` | `internal/config/load.go` |
+| 14 | `src/config/runtime.ts` | `internal/config/runtime.go` |
+| 15 | `src/config/schema.ts` | `internal/config/schema.go` |
+| 16 | `src/daemon/agent-event-reconciler.ts` | `internal/daemon/agent_event_reconciler.go` |
+| 17 | `src/daemon/client.ts` | `internal/daemon/client.go` |
+| 18 | `src/daemon/herdr-session-watch-manager.ts` | `internal/daemon/herdr_session_watch_manager.go` |
+| 19 | `src/daemon/observability-server.ts` | `internal/daemon/observability_server.go` + `observability_server_handlers.go` |
+| 20 | `src/daemon/process-manager.ts` | `internal/daemon/process_manager.go` |
+| 21 | `src/daemon/service-supervision.ts` | `internal/daemon/service_supervision.go` |
+| 22 | `src/daemon/service.ts` | `internal/daemon/service.go` |
+| 23 | `src/db/agent-context-snapshots.ts` | `internal/db/agent_context_snapshots.go` |
+| 24 | `src/db/agent-events.ts` | `internal/db/agent_events.go` |
+| 25 | `src/db/agent-history-cache.ts` | `internal/db/agent_history_cache.go` |
+| 26 | `src/db/agent-orchestrator-scopes.ts` | `internal/db/agent_orchestrator_scopes.go` |
+| 27 | `src/db/agents.ts` | `internal/db/agents.go` |
+| 28 | `src/db/apply-migrations.ts` | `internal/db/apply_migrations.go` |
+| 29 | `src/db/client.ts` | `internal/db/client.go` + `internal/shared/sqlite_transaction.go` |
+| 30 | `src/db/herdr-sessions.ts` | `internal/db/herdr_sessions.go` |
+| 31 | `src/db/herdr-workspaces.ts` | `internal/db/herdr_workspaces.go` |
+| 32 | `src/db/migrate.ts` | 无独立文件：`db:migrate` 开发脚本（openSqlite + applyMigrations），Go 侧能力由 `internal/db/apply_migrations.go` + `internal/db/client.go` 提供；daemon 启动时即调用 `ApplyMigrations` |
+| 33 | `src/db/schema.ts` | `internal/db/schema.go` |
+| 34 | `src/db/status-event-plans.ts` | `internal/db/status_event_plans.go` |
+| 35 | `src/herdr/pane-identity-resolver.ts` | `internal/herdr/pane_identity_resolver.go` |
+| 36 | `src/herdr/session-list.ts` | `internal/herdr/session_list.go` |
+| 37 | `src/herdr/session-snapshot.ts` | `internal/herdr/session_snapshot.go` |
+| 38 | `src/herdr/socket-client.ts` | `internal/herdr/socket_client.go` |
+| 39 | `src/observability/agent-context-service.ts` | `internal/observability/agent_context_service.go` |
+| 40 | `src/observability/agent-index-service.ts` | `internal/observability/agent_index_service.go` + `agent_index_events.go` + `agent_index_plans.go` + `agent_index_types.go` |
+| 41 | `src/observability/agent-orchestrator-service.ts` | `internal/observability/agent_orchestrator_service.go` |
+| 42 | `src/observability/contracts.ts` | `internal/observability/contracts.go`（+ `internal/agenthistory/types.go` 侧的共享类型别名） |
+| 43 | `src/observability/errors.ts` | `internal/observability/errors.go` |
+| 44 | `src/observability/interactive-pi.ts` | `internal/observability/interactive_pi.go` |
+| 45 | `src/observability/schemas.ts` | `internal/observability/schemas.go` |
+| 46 | `src/observability/turn-completion.ts` | `internal/observability/turn_completion.go` |
+| 47 | `src/shared/json-lines.ts` | `internal/shared/json_lines.go` |
+| 48 | `src/shared/unix-peercred.ts` | `internal/shared/unix_peercred.go` + `peercred_linux.go` + `peercred_other.go` |
+
+Go 侧无对应 TS 源、属移植基础设施的文件：`internal/daemon/agent_history_adapter.go`（`agenthistory` → `observability` 接口适配，绕开 Go 包循环依赖）、`internal/db/dedup/dedup.go`（移植 `scripts/clean-agent-event-duplicates-lib.ts`，非 `src/`）、`internal/agenthistory/types.go`。
+
+### 2.2 `test/unit/`（35 个文件）→ Go `*_test.go`
+
+| TS 测试 | Go 测试 |
+|---------|---------|
+| `agent-history-discovery.test.ts` / `agent-history-discovery-regressions.test.ts` | `internal/agenthistory/discovery_test.go` |
+| `agent-history-readers.test.ts` | `internal/agenthistory/readers_test.go` |
+| `agent-history-service.test.ts` | `internal/agenthistory/service_test.go` |
+| `agent-history-text.test.ts` | `internal/agenthistory/text_test.go` |
+| `antigravity-proto.test.ts` | `internal/agenthistory/antigravity_proto_test.go` |
+| `antigravity-reader.test.ts` | `internal/agenthistory/antigravity_reader_test.go` |
+| `history-has-advanced.test.ts` | `internal/agenthistory/history_has_advanced_test.go` |
+| `agy-hook-and-cli.test.ts`（2,826 行，`wc -l` 实测） | `internal/agy/agy_hook_and_cli_test.go` + `agy_hook_part2_test.go` + `agy_hook_part3_test.go` + `agy_hook_part4_test.go`（hook 侧）+ `internal/cli/cli_test.go`（CLI 侧） |
+| `cli.test.ts` | `internal/cli/cli_test.go` |
+| `config-loader.test.ts` | `internal/config/load_test.go` |
+| `config-runtime.test.ts` | `internal/config/runtime_test.go` |
+| `config-schema.test.ts` | `internal/config/schema_test.go` |
+| `daemon-process-manager.test.ts` | `internal/daemon/process_manager_test.go` + `process_manager_lock_test.go`（含真实子进程抢锁、`HERDSMAN_GO_LOCK_WORKER` 重执模式） |
+| `daemon-service.test.ts` | `internal/daemon/service_test.go`（含 `HERDSMAN_GO_DAEMON_WORKER` 子进程真实守护进程用例） |
+| `herdr-session-watch-manager.test.ts` | `internal/daemon/herdr_session_watch_manager_test.go` |
+| `observability-server-frame-limit.test.ts` | `internal/daemon/observability_server_frame_limit_test.go` |
+| `observability-contracts.test.ts` | `internal/observability/contracts_test.go` |
+| `turn-completion.test.ts` | `internal/observability/turn_completion_test.go` |
+| `interactive-pi.test.ts` | `internal/observability/interactive_pi_test.go` |
+| `json-lines.test.ts` | `internal/shared/json_lines_test.go` |
+| `unix-peercred.test.ts` | `internal/shared/unix_peercred_test.go` |
+| `status-event-plan-store.test.ts` | `internal/db/status_event_plan_store_test.go` |
+| `clean-agent-event-duplicates.test.ts` | `internal/db/dedup/dedup_test.go`（被测对象是 `scripts/clean-agent-event-duplicates-lib.ts`，非 `src/`） |
+
+**未在 `herdsman` 仓内重写的 unit 测试（属第 4 批 `herdsman-pi` 扩展侧 / 打包与文档面）**：
+
+| TS 测试 | 未重写原因 |
+|---------|-----------|
+| `herdsman-pi-extension.test.ts` | 第 4 批 `packages/herdsman-pi`（Pi 扩展）侧单测 |
+| `herdsman-pi-agent-update-ui.test.ts` | 同上（扩展 UI） |
+| `herdsman-pi-turn-signal.test.ts` | 同上（扩展侧 turn 信号；守护进程侧的等价语义由 `internal/observability/turn_completion_signal_test.go` 覆盖） |
+| `herdsman-pi-wake.test.ts` | 同上（扩展侧 wake） |
+| `upstream-error.test.ts` | 被测对象 `packages/herdsman-pi/src/upstream-error.ts`，扩展侧 |
+| `wake-filter-config.test.ts` | 被测对象 `packages/herdsman-pi/src/wake-filter-config.ts`，扩展侧 |
+| `final-audit-regressions.test.ts` | 混合：`JsonLineDecoder` 部分由 `internal/shared/json_lines_test.go` 覆盖，`packages/herdsman-pi/src/daemon-client.ts` 部分属扩展侧 |
+| `herdr-plugin-package.test.ts` | `packages/herdsman-herdr-plugin` 打包检查，第 4 批 |
+| `package-publication.test.ts` | npm 打包/发布面检查（tarball file allowlist） |
+| `deployment-guidance.test.ts` | 文档断言（README/AGENTS 部署指引文本） |
+| `shared-json-lines-sync.test.ts` | 仓内副本同步检查（`src/shared/json-lines.ts` 与 `packages/herdsman-pi` 副本一致性） |
+
+### 2.3 `test/integration/`（21 个文件，含 2 个 helper）→ Go `*_test.go`
+
+| TS 测试/辅助 | Go 测试 |
+|--------------|---------|
+| `agent-context-service.test.ts` | `internal/observability/agent_context_service_test.go` |
+| `agent-event-delivery-lifecycle.test.ts` | `internal/observability/agent_event_delivery_lifecycle_test.go` |
+| `agent-index-service.test.ts` | `internal/observability/agent_index_service_test.go` |
+| `agent-orchestrator-service.test.ts` | `internal/observability/agent_orchestrator_service_test.go` |
+| `event-dedup-pane-generation.test.ts` | `internal/observability/event_dedup_pane_generation_test.go` |
+| `turn-completion-signal.test.ts` | `internal/observability/turn_completion_signal_test.go` |
+| `agent-context-snapshot-store.test.ts` | `internal/db/agent_context_snapshot_store_test.go` |
+| `agent-orchestrator-scope-store.test.ts` | `internal/db/agent_orchestrator_scope_store_test.go` |
+| `agent-store-terminal-identity.test.ts` | `internal/db/agent_store_terminal_identity_test.go` |
+| `sqlite-migrations.test.ts` | `internal/db/sqlite_migrations_test.go` |
+| `herdr-pane-identity-resolver.test.ts` | `internal/herdr/pane_identity_resolver_test.go` |
+| `herdr-socket-client.test.ts` | `internal/herdr/socket_client_test.go` |
+| `herdr-session-watch-idle-seam.test.ts` | `internal/daemon/herdr_session_watch_idle_seam_test.go` |
+| `history-cache-ttl.test.ts` | `internal/daemon/history_cache_ttl_test.go` |
+| `observability-rpc.test.ts` | `internal/daemon/observability_rpc_test.go` |
+| `orchestrator-disconnect-grace.test.ts` | `internal/daemon/orchestrator_disconnect_grace_test.go` |
+| `orchestrator-pane-move.test.ts` | `internal/daemon/orchestrator_pane_move_test.go` |
+| `startup-reconcile.test.ts` | `internal/daemon/startup_reconcile_test.go` |
+| `observability-db-harness.ts`（helper） | Go 侧共享夹具：`obsHarness`（`internal/daemon/observability_server_frame_limit_test.go`）+ `internal/observability` 包内各 `*_test.go` 的建库辅助 |
+| `rpc-test-client.ts`（helper） | Go 侧 `internal/daemon/observability_rpc_test.go` 内的 `obsRPCFixture` / `obsOpenRPCServer` |
+| `herdsman-pi-daemon-client.test.ts` | **未重写**：pi 扩展侧 `ReconnectingDaemonClient`；Go 侧以 `internal/daemon/observability_rpc_dual_client_test.go` 覆盖真实 TS 客户端 ↔ Go 服务的互操作 |
+
+Go 侧多出、无 TS 对应用例：`internal/daemon/observability_rpc_dual_client_test.go`（TS+Go 双客户端同时在线，见 3.4）。
+
+---
+
+## 3. 测试与验证结果原文
+
+### 3.1 修复前的失败基线（先 FAIL 证据）
+
+在**未改动**的 `go-port@7d5da2e` 上执行全量 `-race`：
+
+```
+$ cd go && go test -race -buildvcs=false -count=1 ./...
+?   	github.com/dorokuma/herdsman/go/cmd/herdsman	[no test files]
+?   	github.com/dorokuma/herdsman/go/cmd/herdsman-daemon	[no test files]
+ok  	github.com/dorokuma/herdsman/go/internal/agenthistory	1.162s
+ok  	github.com/dorokuma/herdsman/go/internal/agy	4.437s
+ok  	github.com/dorokuma/herdsman/go/internal/cli	1.028s
+ok  	github.com/dorokuma/herdsman/go/internal/config	1.020s
+--- FAIL: TestDaemonServiceSecondDaemonOnSameHomeFailsOnInstanceLock (0.16s)
+    service_test.go:1058: daemon worker exit = exit status 1, want exit code 0 (stderr: Herdsman daemon worker failed: sql: database is closed
+        )
+...
+FAIL	github.com/dorokuma/herdsman/go/internal/daemon	26.362s
+ok  	github.com/dorokuma/herdsman/go/internal/db	12.249s
+ok  	github.com/dorokuma/herdsman/go/internal/db/dedup	1.021s
+ok  	github.com/dorokuma/herdsman/go/internal/herdr	1.188s
+ok  	github.com/dorokuma/herdsman/go/internal/observability	95.148s
+ok  	github.com/dorokuma/herdsman/go/internal/shared	1.100s
+FAIL
+```
+
+失败机理：子守护进程在 `WriteDaemonPidFile` 之后、`watchManager.Start()` 之前收到 `SIGTERM`；`stop()` 并发执行到 `sqlite.Close()`，仍在跑启动步骤的协程随即以 `sql: database is closed` 失败并走 `startupFailure` → 进程 `exit 1`（优雅关停被误判成启动失败）。此外 `stop()` 读取 `reconcileScheduler` 指针与启动路径的赋值构成数据竞态。
+
+### 3.2 修复内容（`go/internal/daemon/service.go`）
+
+1. **`reconcileScheduler` 提前构造**：`NewPeriodicReconcileScheduler(schedulerOptions)` 移到 `attachSignalHandlers(stop)` 之前（`shutdownBudgetMs` 之后），启动末尾只调用 `reconcileScheduler.Start()`。`stop()` 与 `runShutdownSequence` 读到的指针不再与启动协程的赋值竞争；`Start()` 仍在启动末尾，首个 tick 不会早于监听。
+2. **启动步骤与关停的显式交接（`startupMu`）**：
+   - `stop()` 置 `stopping = true` → `detachSignalHandlers()` / `attachSignalHandlers(onSecondSignal)` → **先 `shutdownController.Abort()`**，再 `startupMu.Lock()`，然后才执行 `runShutdownSequence`（含 `sqlite.Close()`）。正在执行的启动步骤先跑完，`stop()` 才关库；`stop()` 持锁期间后续步骤无法开始。
+   - 启动路径改为 6 个 `startupStep`：`server.Start` → `WriteDaemonPidFile` → `reconciler.Reconcile` → `index.DrainPendingPlans(startup)` → `reconcileScheduler.Start` → `watchManager.Start`。每步都在 `startupMu` 内先查 `shutdownOwnsDaemon()`（`shutdownController.Aborted()` 或 `stopping`）：已交接则返回哨兵 `errStartupHandedOver`，**不调用 `startupFailure`**，`RunObservabilityDaemonService` 返回 `nil`，由 `stop()` 以 `exitCode=0` 完成优雅关停。
+   - 真实启动失败仍走原 `startupFailure` 清理（在 `startupMu` 内完成，避免与稍后开始的关停序列交错）；错误照旧向上返回。
+3. **`gofmt -w cmd internal`**：仅修掉 `internal/db/agents.go` 一个多余空行；`gofmt -l cmd internal` 输出为空。
+
+未新增测试文件：回归由既有 `TestDaemonServiceSecondDaemonOnSameHomeFailsOnInstanceLock`（真实子进程 + 真实信号）承担，修复前 FAIL、修复后 PASS。
+
+### 3.3 修复后 Step 1 证据
+
+```
+$ cd go && gofmt -l cmd internal
+(空)
+```
+
+```
+$ cd go && go test -race -buildvcs=false -count=1 ./internal/daemon/...
+ok  	github.com/dorokuma/herdsman/go/internal/daemon	25.921s
+```
+
+单用例 5 连跑（`-race`，无 `-skip`）：
+
+```
+$ go test -race -buildvcs=false -count=5 -run TestDaemonServiceSecondDaemonOnSameHomeFailsOnInstanceLock -v ./internal/daemon/...
+=== RUN   TestDaemonServiceSecondDaemonOnSameHomeFailsOnInstanceLock
+Herdsman daemon listening on /tmp/TestDaemonServiceSecondDaemonOnSameHomeFailsOnInstanceLock3749145186/001/herdsman.sock
+Herdsman daemon shutdown starting (budgetMs=5000 pid=3333)
+Herdsman daemon shutdown aborted in-flight waits (elapsedMs=0)
+Herdsman daemon shutdown step starting (budgetRemainingMs=4999 step=index.drainInFlightPlans timeoutMs=4999)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=index.drainInFlightPlans)
+Herdsman daemon shutdown step starting (budgetRemainingMs=4999 step=reconcileScheduler.stop timeoutMs=4999)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=reconcileScheduler.stop)
+Herdsman daemon shutdown step starting (budgetRemainingMs=4999 step=watchManager.stop timeoutMs=4999)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=watchManager.stop)
+Herdsman daemon shutdown step starting (budgetRemainingMs=4999 step=server.stop timeoutMs=4999)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=server.stop)
+Herdsman daemon shutdown steps finished (budgetMs=5000 elapsedMs=0)
+Herdsman daemon shutdown finished (elapsedMs=1 exitCode=0)
+--- PASS: TestDaemonServiceSecondDaemonOnSameHomeFailsOnInstanceLock (1.18s)
+（… 同一用例连续 5 次，5/5 PASS，末行为 --- PASS: … (1.18s)）
+PASS
+ok  	github.com/dorokuma/herdsman/go/internal/daemon	6.899s
+```
+
+### 3.4 Step 2：全量编译 / vet / 测试
+
+```
+$ cd go && CGO_ENABLED=0 go build -buildvcs=false ./...
+(无输出，exit 0)
+```
+
+```
+$ cd go && CGO_ENABLED=0 go vet -buildvcs=false ./...
+(无输出，exit 0)
+```
+
+```
+$ cd go && CGO_ENABLED=0 go test -buildvcs=false -count=1 ./...
+?   	github.com/dorokuma/herdsman/go/cmd/herdsman	[no test files]
+?   	github.com/dorokuma/herdsman/go/cmd/herdsman-daemon	[no test files]
+ok  	github.com/dorokuma/herdsman/go/internal/agenthistory	0.030s
+ok  	github.com/dorokuma/herdsman/go/internal/agy	2.788s
+ok  	github.com/dorokuma/herdsman/go/internal/cli	0.007s
+ok  	github.com/dorokuma/herdsman/go/internal/config	0.005s
+ok  	github.com/dorokuma/herdsman/go/internal/daemon	11.158s
+ok  	github.com/dorokuma/herdsman/go/internal/db	0.394s
+ok  	github.com/dorokuma/herdsman/go/internal/db/dedup	0.004s
+ok  	github.com/dorokuma/herdsman/go/internal/herdr	0.157s
+ok  	github.com/dorokuma/herdsman/go/internal/observability	3.940s
+ok  	github.com/dorokuma/herdsman/go/internal/shared	0.020s
+```
+
+```
+$ cd go && go test -race -buildvcs=false -count=1 ./...
+?   	github.com/dorokuma/herdsman/go/cmd/herdsman	[no test files]
+?   	github.com/dorokuma/herdsman/go/cmd/herdsman-daemon	[no test files]
+ok  	github.com/dorokuma/herdsman/go/internal/agenthistory	1.180s
+ok  	github.com/dorokuma/herdsman/go/internal/agy	4.477s
+ok  	github.com/dorokuma/herdsman/go/internal/cli	1.023s
+ok  	github.com/dorokuma/herdsman/go/internal/config	1.025s
+ok  	github.com/dorokuma/herdsman/go/internal/daemon	29.324s
+ok  	github.com/dorokuma/herdsman/go/internal/db	12.243s
+ok  	github.com/dorokuma/herdsman/go/internal/db/dedup	1.017s
+ok  	github.com/dorokuma/herdsman/go/internal/herdr	1.179s
+ok  	github.com/dorokuma/herdsman/go/internal/observability	96.671s
+ok  	github.com/dorokuma/herdsman/go/internal/shared	1.132s
+```
+
+无 `-skip`、无 `-short`；全部 10 个有测试的包全绿。
+
+TS+Go 双客户端同时连 Go 守护进程（`internal/daemon/observability_rpc_dual_client_test.go`，TS 侧通过 `testdata/pi_client_driver.ts` 以真实 tsx 子进程运行未改动的 `packages/herdsman-pi/src/daemon-client.ts`；本 worktree 借用主 worktree 的 `/root/workspace/herdsman/node_modules/.bin/tsx`）：
+
+```
+$ go test -buildvcs=false -count=1 -run TestObservabilityRpcServerSimultaneousTsAndGoClients -v ./internal/daemon/
+=== RUN   TestObservabilityRpcServerSimultaneousTsAndGoClients
+--- PASS: TestObservabilityRpcServerSimultaneousTsAndGoClients (0.23s)
+PASS
+ok  	github.com/dorokuma/herdsman/go/internal/daemon	0.232s
+```
+
+（该用例找不到 tsx 时会 `t.Skipf` 而非静默通过；本次运行日志中没有 `--- SKIP`，即真实执行了 TS 子进程。）
+
+### 3.5 Step 3：端到端隔离实测
+
+编译产物（静态链接，零 CGO）：
+
+```
+$ cd go && CGO_ENABLED=0 go build -buildvcs=false -o /tmp/herdsman-go-bin/ ./cmd/...
+$ ls -l /tmp/herdsman-go-bin/
+-rwxr-xr-x 1 root root 11641943 10月26日 01:26 herdsman
+-rwxr-xr-x 1 root root 13556311 10月26日 01:26 herdsman-daemon
+$ file /tmp/herdsman-go-bin/herdsman /tmp/herdsman-go-bin/herdsman-daemon
+/tmp/herdsman-go-bin/herdsman:        ELF 64-bit LSB executable, x86-64, statically linked, ... not stripped
+/tmp/herdsman-go-bin/herdsman-daemon: ELF 64-bit LSB executable, x86-64, statically linked, ... not stripped
+```
+
+包装脚本 TS 分支（默认 `HERDSMAN_IMPL` 未设置 / 显式 `ts`；本 worktree 先 `pnpm install --frozen-lockfile --ignore-scripts` + `pnpm build` 生成 `dist/`，二者均被 `.gitignore` 覆盖）：
+
+```
+$ env -u HERDSMAN_IMPL ./go/scripts/herdsman --help
+Usage:
+  herdsman on [--if-unowned] [--json]
+  herdsman off [--json]
+  herdsman status [--json]
+  herdsman daemon status [--text]
+  herdsman agent list [--all] [--workspace <id>] [--session <name>] [--json]
+  herdsman agent get <target> [--workspace <id>] [--session <name>] [--json]
+  herdsman agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]
+  herdsman agy-hook <PreInvocation|Stop|WakeWaiter>
+  herdsman help
+... exit=0
+
+$ HERDSMAN_IMPL=ts ./go/scripts/herdsman --help
+（同上，exit=0）
+```
+
+（首次尝试时 `dist/` 未构建，包装脚本按设计报错：`herdsman wrapper: TS entrypoint not found at .../dist/src/cli/herdsman.js (run: pnpm build)`，exit 1。）
+
+Go 分支：临时 `HERDSMAN_HOME=/tmp/herdsman-e2e-0WMdsR`（`mktemp -d`），Go 守护进程 `/tmp/herdsman-go-bin/herdsman-daemon` 前台常驻，CLI 全程经包装脚本：
+
+```
+$ HERDSMAN_HOME=/tmp/herdsman-e2e-0WMdsR HERDSMAN_IMPL=go HERDSMAN_GO_BIN=/tmp/herdsman-go-bin/herdsman ./go/scripts/herdsman daemon status
+{"managedBy":"unmanaged","pid":2572258,"pidPath":"/tmp/herdsman-e2e-0WMdsR/herdsman.pid","socketPath":"/tmp/herdsman-e2e-0WMdsR/herdsman.sock","socketReachable":true,"state":"running"}
+exit=0
+
+$ ... ./go/scripts/herdsman daemon status --text
+state: running
+pid: 2572258
+socketReachable: true
+managedBy: unmanaged
+exit=0
+
+$ ... ./go/scripts/herdsman agent list --json
+{"agents":[{"agent":"agy","agentSession":{...},"agentStatus":"done","cwd":"/root/workspace/herdsman",...,"paneId":"w3E:p1",...},{"agent":"pi",...,"herdrSessionName":"default","history":{"lastAssistantMessage":{...},"lastUserMessage":{...}},...,"paneId":"w3E:pS",...}]}
+exit=0
+
+$ ... ./go/scripts/herdsman status --json          # orchestrator status（见下条说明）
+{"context":null,"events":[],"presence":{"connectedAt":1792949317426,"herdrSessionName":"default","paneId":"w3E:pS","subscriberId":"cli:w3E:pS","subscriberKind":"agy","terminalId":"term_65ead53ba759d35a","workspaceId":"w3E"},"state":null}
+exit=0
+
+$ ... ./go/scripts/herdsman orchestrator status    # 任务书里的这种拼写
+Unknown command: orchestrator
+exit=1
+
+$ printf '{"invocationNum":1}' | ... ./go/scripts/herdsman agy-hook PreInvocation
+{}
+exit=0
+
+$ printf '{}' | ... ./go/scripts/herdsman agy-hook Stop
+{}
+exit=0
+```
+
+关于 `orchestrator`：TS 与 Go 的 CLI 词表里都只有 `on | off | status`（orchestrator 命令组），没有 `orchestrator` 子命令前缀。用 TS 实现跑同一条命令得到**完全相同**的输出 `Unknown command: orchestrator`、exit 1（见 3.6 的 [P1]），因此这是两个实现一致的既有契约，不是 Go 侧缺陷。
+
+优雅关停临时 Go 守护进程（`kill -TERM 2572258`）后进程消失，home 目录只剩实例锁文件（设计如此：锁文件永不 unlink）与 `state.db`，pid 文件与 socket 均已清理：
+
+```
+Herdsman daemon shutdown starting (budgetMs=5000 pid=2572258)
+Herdsman daemon shutdown aborted in-flight waits (elapsedMs=0)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=index.drainInFlightPlans)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=reconcileScheduler.stop)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=watchManager.stop)
+Herdsman daemon shutdown step finished (elapsedMs=0 step=server.stop)
+Herdsman daemon shutdown steps finished (budgetMs=5000 elapsedMs=0)
+Herdsman daemon shutdown finished (elapsedMs=0 exitCode=0)
+
+$ ls -la /tmp/herdsman-e2e-0WMdsR/
+-rw------- 1 root root      0 01:28 herdsman.pid.instance.lock
+-rw------- 1 root root 278528 01:31 state.db
+```
+
+### 3.6 TS ↔ Go 交叉对照（同一 HERDSMAN_HOME，同一 Go 守护进程）
+
+TS 客户端连 Go 守护进程（跨实现互操作）：
+
+```
+[P1] $ HERDSMAN_IMPL=ts ./go/scripts/herdsman orchestrator status
+Unknown command: orchestrator
+exit=1
+
+[P2] $ HERDSMAN_IMPL=ts ./go/scripts/herdsman daemon status
+{"pidPath":"/tmp/herdsman-e2e-0WMdsR/herdsman.pid","socketPath":"/tmp/herdsman-e2e-0WMdsR/herdsman.sock","socketReachable":true,"stalePid":2572258,"state":"running"}
+exit=0
+
+[P3] $ HERDSMAN_IMPL=ts ./go/scripts/herdsman agent list --json
+{"agents":[{"agent":"agy","agentSession":{"agent":"agy","kind":"id","source":"herdr:antigravity_cli","value":"dc89730d-..."},...}]}
+exit=0
+
+[P4] $ printf '{"invocationNum":1}' | HERDSMAN_IMPL=ts ./go/scripts/herdsman agy-hook PreInvocation
+{}
+exit=0
+
+[P5] $ printf '{}' | HERDSMAN_IMPL=ts ./go/scripts/herdsman agy-hook Stop
+{}
+exit=0
+```
+
+`[P2]` 的字段差异是**有意且已文档化**的：TS 的 `DAEMON_ENTRYPOINT_NAMES = ["herdsman-daemon.js"]`，Go 的 `DaemonEntrypointNames = ["herdsman-daemon.js", "herdsman-daemon"]`（`process_manager.go` 注释：识别任一实现遗留的 pid 文件）。因此 TS 判断该 pid「身份不明」→ 输出 `stalePid` + `running`；Go 认得出 → 输出 `pid` + `managedBy`。两者都正确报告 `state: running`、`socketReachable: true`，也都能正常经 socket 通信。
+
+### 3.7 PiG 隔离实测（`/root/.pig-test/agent`）
+
+```
+$ ls -l /root/.local/bin/pig
+lrwxrwxrwx 1 root root 30 10月23日 12:21 /root/.local/bin/pig -> /root/.local/opt/pig/0.5.2/pig
+$ pig --version
+0.5.2+1.4.0
+exit=0
+
+$ ls -la /root/.pig-test/agent
+drwx------ 8 root root 4096 10月26日 00:50 .
+-rw------- 1 root root    2 10月23日 12:23 auth.json        # 仅列存在性/权限，未读取内容
+-rw-r--r-- 1 root root   62 10月24日 11:51 auto-continue.json
+-rw-r--r-- 1 root root  720 10月25日 16:40 exit.log
+drwxr-xr-x 2 root root 4096 10月23日 12:27 extensions
+drwxr-xr-x 2 root root 4096 10月25日 02:58 logs
+-rw------- 1 root root 8797 10月26日 00:50 models.json
+-rw-r--r-- 1 root root  198 10月25日 16:45 pi-vcc-config.json
+drwxr-xr-x 28 root root 4096 10月25日 23:11 sessions
+-rw------- 1 root root  299 10月23日 12:27 settings.json
+drwxr-xr-x 2 root root 4096 10月23日 12:27 skills
+drwxr-xr-x 2 root root 4096 10月23日 12:27 themes
+```
+
+配置目录切换：PiG 认 **`PIG_HOME`**，不认 pi 的 `PI_CODING_AGENT_DIR`（实测三组候选）：
+
+```
+$ PI_CODING_AGENT_DIR=/root/.pig-test/agent pig diagnose   → config root: /root/.pig        agent dir: /root/.pig/agent
+$ PIG_HOME=/root/.pig-test            pig diagnose         → config root: /root/.pig-test   agent dir: /root/.pig-test/agent
+$ PIG_AGENT_DIR=/root/.pig-test/agent pig diagnose         → config root: /root/.pig        agent dir: /root/.pig/agent
+```
+
+指向临时 Go 守护进程的真实模型调用：
+
+```
+$ cd /tmp && PIG_HOME=/root/.pig-test HERDSMAN_HOME=/tmp/herdsman-e2e-0WMdsR timeout 240 pig -p "回复 OK" > /tmp/pig-ok.out 2>/tmp/pig-ok.err
+exit=0
+--- stdout ---
+OK
+--- stderr ---
+(空)
+```
+
+```
+$ PIG_HOME=/root/.pig-test pig list
+No packages installed.
+```
+
+限制如实记录：`/root/.pig-test/agent/extensions/` 为空，`pig list` 报 `No packages installed.`，即该隔离配置**没有安装 `@dorokuma/herdsman-pi` 扩展**。所以本次 PiG 实测证明的是「隔离配置下的 PiG 在指向 Go 守护进程 `HERDSMAN_HOME` 时仍能正常运行并返回模型回复」，**没有**覆盖 herdsman-pi 扩展自身的 agent 快照/唤醒链路；扩展侧行为仍由第 4 批的 `packages/herdsman-pi` 单测（TS）与 `observability_rpc_dual_client_test.go`（真实 TS 客户端 ↔ Go 服务）承担。
+
+---
+
+## 4. 与 TS 版的行为对比
+
+### 4.1 CLI 参数
+
+| 面 | TS (`src/cli/herdsman.ts`) | Go (`cmd/herdsman` + `internal/cli`) | 一致性 |
+|----|---------------------------|--------------------------------------|--------|
+| 命令词表 | `on`/`off`/`status`、`daemon status [--text]`、`agent list/get/read`、`agy-hook <PreInvocation\|Stop\|WakeWaiter>`、`help` | 同上 | 一致（实测 [`--help`](../../go/internal/cli/herdsman.go)、`Unknown command: orchestrator` 两边逐字相同） |
+| scope 参数 | `--all` / `--workspace <id>` / `--session <name>` / `HERDR_ENV=1` 环境 | 同上，错误文案同（`CURRENT_HERDR_WORKSPACE_ERROR` / `CURRENT_HERDR_PANE_ERROR`） | 一致 |
+| `agent read` | `--limit N` | 同上 | 一致 |
+| 守护进程入口 | `herdsman-daemon.js` 无参数，多参数即报错退出 1 | `cmd/herdsman-daemon` 同样拒绝参数 | 一致 |
+| 包装脚本 | 无（发布物 bin 直指 `dist/src/cli/herdsman.js`） | `go/scripts/herdsman`，`HERDSMAN_IMPL=ts\|go` 切换，`HERDSMAN_GO_BIN` 覆盖二进制 | Go 侧新增的仓内切换器（生产 bin 未动） |
+
+### 4.2 stdout / stdin JSON 与退出码
+
+- stdout 一律单行 JSON（`daemon status` 默认 JSON，`--text` 为人读视图）；Go 侧 `printResult`/`DaemonStatusJSON` 复刻同一渲染。
+- stdin：仅 `agy-hook` 读取，`WakeWaiter` 例外（不读 stdin）；空白/非对象/不可解析 JSON 一律当作空 payload（`parseHookPayload`）。实测两边 `PreInvocation`/`Stop` 均输出 `{}`、exit 0。
+- 退出码：成功 0；CLI 错误经 `FormatCliError` 打印到 stderr 并 exit 1（`Unknown command: orchestrator` 实测两侧同为 1）。hook 的**所有**失败都被吞成 `{}` + exit 0（与 TS 同）。
+- 守护进程退出码：优雅关停 `0`，启动失败 `1`；第二个 `SIGTERM/SIGINT` 强制退出仍为 `0`（避免 `Restart=on-failure` 拉回），与 TS 一致。
+
+### 4.3 RPC 方法名与消息格式
+
+- 传输：Unix domain socket + JSON-lines（`internal/shared/json_lines.go` ↔ `src/shared/json-lines.ts`），帧上限与 `observability_server_frame_limit_test.go` 对应。
+- 方法名逐字一致：`agent.list`、`agent.get`、`agent.read`、`agent.orchestrator.register`、`agent.orchestrator.set`，以及通知 `agent.event`、`agent.context.changed`、`turn.completed`、`notifications.ack`（双客户端用例断言的就是这套 pi 面向面）。
+- 互操作实测：TS 客户端（`dist/`）经 Go 服务拿到 `agent list`/`daemon status`；`TestObservabilityRpcServerSimultaneousTsAndGoClients` 证明 TS 与 Go 客户端**同时在线**时彼此可见 presence、orchestrator 归属与 turn 信号，且只有持角色的一侧收到推送。
+
+### 4.4 SQLite 表结构与 Drizzle 迁移兼容性
+
+- drizzle 历史共 12 条 `CREATE TABLE`，迁移 `0002_worthless_energizer.sql` `DROP TABLE agent_notification_cursors / agent_notification_subscriptions`，**最终 10 张表**：`agents`、`agent_events`、`agent_history_cache`、`agent_context_snapshots`、`agent_orchestrator_scopes`、`agent_pane_tombstones`、`herdr_sessions`、`herdr_workspaces`、`daemon_meta`、`status_event_plans`。
+- Go 的 `ApplyMigrations`（`internal/db/apply_migrations.go`）重放的是与 `drizzle/` 逐字节相同的 SQL/`meta/_journal.json` 内嵌副本，记账表同为 `__drizzle_migrations`，语句分隔符按 drizzle 的 `--> statement-breakpoint` 处理 → 同一 home 目录可被 TS 与 Go 交替打开（本子批实测：同一 `HERDSMAN_HOME` 先由 Go 守护进程建库，TS CLI 正常读到 `state.db` 与 agent 数据）。`internal/db/sqlite_migrations_test.go` 覆盖全量迁移与中途版本（`ApplyMigrationsThrough`）。
+- 驱动：TS 用 `better-sqlite3`（native），Go 用 `modernc.org/sqlite v1.61.0`（纯 Go）。因此 `CGO_ENABLED=0` 可编译、可静态链接；SQL 语义按 SQLite 3 行为对齐，`internal/shared/sqlite_transaction.go` 复刻 TS 的事务辅助。
+
+### 4.5 内部机制差异（有意为之，非行为偏差）
+
+| 面 | TS | Go |
+|----|----|-----|
+| SQLite 驱动 | `better-sqlite3`（`node-gyp` 原生模块，需要 C ABI） | `modernc.org/sqlite`，零 CGO，`CGO_ENABLED=0` 静态二进制 |
+| 并发模型 | 单事件循环，`await` 之间的块原子 | 多 goroutine：`lifecycleMu` 守 `stopping`/`exitRequested`/信号注册，`startupMu` 做启动↔关停交接（本子批新增），`instanceLockMu` 守锁释放 |
+| `WakeWaiter` | 子进程 `node` + detached | `os.Executable()` 自执 + `syscall.SysProcAttr{Setsid: true}`（`internal/agy/wake_waiter.go:701,712`），脱离当前会话 |
+| 未捕获异常 | `unhandledRejection`/`uncaughtException` 仅记录 | Go 无全局钩子：每个 goroutine 自行上报（`service.go` 注释明示） |
+| 二期进程锁 | `proper-lockfile` 语义 | `AcquireDaemonLock` + `flock`，`${pidPath}.instance.lock`，锁文件不 unlink（实测残留即为设计） |
+| 守护进程身份识别 | 只认 `herdsman-daemon.js` | 同时认 `herdsman-daemon.js` 与 `herdsman-daemon`（见 3.6 的 `[P2]` 差异来源） |
+
+---
+
+## 5. 遗留问题与后续步骤
+
+1. **生产面未动**：`/root/.local/bin/herdsman`（npm 全局软链）与 `herdsman.service`（`ExecStart` → 全局 `herdsman-daemon.js`）按硬规矩保持原样，本子批只在临时 `HERDSMAN_HOME` 与 `/tmp` 产物上实测。切换 Go 实现需第 6 批经爸爸批准后另行执行（届时按 `docs/releasing.md` 走发布面门禁，`pnpm check` + `pnpm build` + `pnpm package:check`）。
+2. **包装脚本无 `HERDSMAN_DAEMON_GO_BIN`**：`go/scripts/herdsman` 只切换 CLI（`HERDSMAN_GO_BIN`），没有守护进程二进制开关；本次守护进程由 `/tmp/herdsman-go-bin/herdsman-daemon` 手工启动。任务书里提到的 `HERDSMAN_DAEMON_GO_BIN` 在当前实现中不存在（`grep -r HERDSMAN_DAEMON_GO_BIN go/` 无命中），如需纳入切换器需另开任务。
+3. **TS↔Go `daemon status` 字段差异**：TS 对非 `herdsman-daemon.js` 的 pid 报 `stalePid`，Go 认两种入口名报 `pid`/`managedBy`。若第 6 批要求两实现输出逐字段一致，需要单独决策（当前 Go 侧是有意放宽并已在代码注释中记录）。
+4. **PiG 隔离配置未装扩展**：`/root/.pig-test/agent/extensions/` 为空、`pig list` = `No packages installed.`，因此 PiG 实测只覆盖「隔离配置 + Go 守护进程 home 下正常问答」，未覆盖 herdsman-pi 扩展的 agent 快照/唤醒链路。需要覆盖时应在该隔离目录安装 `@dorokuma/herdsman-pi` 后复跑。
+5. **worktree 里的 TS 构建产物**：为验证包装脚本 TS 分支，本 worktree 执行了 `pnpm install --frozen-lockfile --ignore-scripts` 与 `pnpm build`，产生 `node_modules/`、`dist/`（均被 `.gitignore` 忽略，未进 commit）。`pnpm install` 首次带脚本版本因 `husky: not found` 失败，改用 `--ignore-scripts` 成功；husky 钩子因此未安装，对本子批的 `git commit` 无影响（提交规范由全局 commit-msg hook 校验）。
+6. **`src/db/migrate.ts` 无独立 Go 迁移命令**：`db:migrate` 是开发脚本，Go 侧能力由 `ApplyMigrations`（daemon 启动时自动执行）与 `ApplyMigrationsThrough` 提供；若需要等价的 `go` CLI 迁移子命令，属新增功能，需另立任务。

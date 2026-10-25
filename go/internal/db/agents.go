@@ -44,7 +44,6 @@ type FindAgentByPaneInput = observability.FindAgentByPaneInput
 // share one type.
 type FindAgentByTerminalInput = observability.FindAgentByTerminalInput
 
-
 // AgentStore ports src/db/agents.ts.
 type AgentStore struct {
 	db          *sql.DB

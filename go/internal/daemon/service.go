@@ -662,10 +662,42 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 		shutdownBudgetMs = *opts.ShutdownBudgetMs
 	}
 
-	// Register signal handlers before the first step that can block (server start,
-	// reconcile): once the pid file is written the daemon must always clean it up
-	// on a graceful shutdown, even if startup is still in progress.
-	var reconcileScheduler *PeriodicReconcileScheduler
+	// Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
+	// daemons; the in-flight guard inside the scheduler prevents overlapping runs.
+	// The scheduler is constructed here — before the signal handlers are attached
+	// and long before startup arms it — because stop() reads this pointer: a
+	// SIGTERM that lands mid-startup must never race the startup path's
+	// assignment. Start() still runs at the end of startup, so the first tick
+	// cannot fire before the daemon is listening.
+	schedulerOptions := PeriodicReconcileSchedulerOptions{
+		Run: func() error {
+			if _, err := reconciler.Reconcile(ReconcileOptions{
+				ReleaseStaleOwners: boolPointer(false),
+			}); err != nil {
+				return err
+			}
+			// Long-lived daemons must also keep retrying runtime-failed status
+			// event plans: drainPendingPlans is idempotent (pending/running rows
+			// only, per-agent serial, attempts capped) and the periodic cadence
+			// prevents a hot loop, so piggybacking it on the reconcile cycle
+			// completes the retry path that the startup-only drain leaves open.
+			return index.DrainPendingPlans(&observability.DrainPendingPlansOptions{
+				Reason: "periodic",
+			})
+		},
+	}
+	if opts.ReconcileClearInterval != nil {
+		schedulerOptions.ClearInterval = opts.ReconcileClearInterval
+	}
+	if opts.ReconcileSetInterval != nil {
+		schedulerOptions.SetInterval = opts.ReconcileSetInterval
+	}
+	schedulerOptions.IntervalMs = opts.ReconcileIntervalMs
+	reconcileScheduler := NewPeriodicReconcileScheduler(schedulerOptions)
+
+	// startupMu serialises the startup steps against the shutdown sequence; see
+	// startupStep below for why the hand-off has to be explicit in Go.
+	var startupMu sync.Mutex
 
 	// stopping, exitRequested and the live signal registration are touched from
 	// the signal goroutine and from the startup path, so they share one mutex.
@@ -706,6 +738,20 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 		}
 	}
 
+	// shutdownOwnsDaemon reports whether a shutdown has taken over the daemon:
+	// either stop() has been entered (stopping) or the shared abort controller —
+	// which both startupFailure and stop() abort — has fired. The startup steps
+	// consult it under startupMu, so a step never starts work that the shutdown
+	// already owns and never reports that teardown as its own failure.
+	shutdownOwnsDaemon := func() bool {
+		if shutdownController.Aborted() {
+			return true
+		}
+		lifecycleMu.Lock()
+		defer lifecycleMu.Unlock()
+		return stopping
+	}
+
 	// A second SIGTERM/SIGINT means the first shutdown is not converging (or the
 	// supervisor is about to SIGKILL). Re-arming through these handlers keeps that
 	// signal away from the OS default action, which would kill the process before
@@ -732,6 +778,17 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 		lifecycleMu.Unlock()
 		detachSignalHandlers()
 		attachSignalHandlers(onSecondSignal)
+
+		// Abort first, so the startup steps that consult this controller stand down
+		// instead of running to completion against a database this path is about to
+		// close; then take the startup hand-off. A step that is inside sqlite right
+		// now finishes before the shutdown sequence starts, and no later step can
+		// begin while the sequence holds the mutex — which is what keeps a SIGTERM
+		// that lands mid-startup from turning a graceful stop into `sql: database is
+		// closed` and exit code 1.
+		shutdownController.Abort()
+		startupMu.Lock()
+		defer startupMu.Unlock()
 
 		startedAt := time.Now()
 		exitCode := 0
@@ -762,6 +819,9 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 		requestExit(exitCode)
 	}
 
+	// Register signal handlers before the first step that can block (server start,
+	// reconcile): once the pid file is written the daemon must always clean it up
+	// on a graceful shutdown, even if startup is still in progress.
 	attachSignalHandlers(stop)
 
 	startupFailure := func(cause error) {
@@ -777,54 +837,78 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 		_ = sqlite.Close()
 	}
 
-	if err := server.Start(); err != nil {
+	// errStartupHandedOver is internal to this function: it marks a step that the
+	// shutdown preempted, so the start path returns nil instead of reporting the
+	// teardown as a startup failure.
+	errStartupHandedOver := errors.New("herdsman daemon shutdown took over startup")
+
+	// startupStep runs one startup step with the hand-off mutex held, so it can
+	// never overlap the shutdown sequence and its sqlite.Close. The step checks
+	// for a shutdown first (never starting work the shutdown already owns) and
+	// again after a failure (the failure may be the shutdown itself, e.g. a closed
+	// database); both report errStartupHandedOver and leave the cleanup to stop().
+	// A genuine failure is unwound here, still under the mutex, so the teardown
+	// cannot interleave with a shutdown that starts a moment later.
+	startupStep := func(run func() error) error {
+		startupMu.Lock()
+		defer startupMu.Unlock()
+		if shutdownOwnsDaemon() {
+			return errStartupHandedOver
+		}
+		err := run()
+		if err == nil {
+			return nil
+		}
+		if shutdownOwnsDaemon() {
+			return errStartupHandedOver
+		}
 		startupFailure(err)
 		return err
 	}
-	WriteDaemonPidFile(runtime.Paths.PIDPath, currentPid)
-	if _, err := reconciler.Reconcile(ReconcileOptions{
-		ReleaseStaleOwners: boolPointer(false),
+
+	// startupCause is what the start path returns for a failed step: nil when the
+	// shutdown took over — stop() then completes the graceful exit with code 0 —
+	// and otherwise the startup error, which the caller propagates after the
+	// teardown startupStep already performed.
+	startupCause := func(err error) error {
+		if errors.Is(err, errStartupHandedOver) {
+			return nil
+		}
+		return err
+	}
+
+	if err := startupStep(server.Start); err != nil {
+		return startupCause(err)
+	}
+	if err := startupStep(func() error {
+		WriteDaemonPidFile(runtime.Paths.PIDPath, currentPid)
+		return nil
 	}); err != nil {
-		startupFailure(err)
-		return err
+		return startupCause(err)
 	}
-	if err := index.DrainPendingPlans(&observability.DrainPendingPlansOptions{
-		Reason: "startup",
+	if err := startupStep(func() error {
+		_, err := reconciler.Reconcile(ReconcileOptions{
+			ReleaseStaleOwners: boolPointer(false),
+		})
+		return err
 	}); err != nil {
-		startupFailure(err)
-		return err
+		return startupCause(err)
 	}
-	// Periodic reconcile keeps the 7-day/30-day TTLs converging on long-running
-	// daemons; the in-flight guard inside the scheduler prevents overlapping runs.
-	schedulerOptions := PeriodicReconcileSchedulerOptions{
-		Run: func() error {
-			if _, err := reconciler.Reconcile(ReconcileOptions{
-				ReleaseStaleOwners: boolPointer(false),
-			}); err != nil {
-				return err
-			}
-			// Long-lived daemons must also keep retrying runtime-failed status
-			// event plans: drainPendingPlans is idempotent (pending/running rows
-			// only, per-agent serial, attempts capped) and the periodic cadence
-			// prevents a hot loop, so piggybacking it on the reconcile cycle
-			// completes the retry path that the startup-only drain leaves open.
-			return index.DrainPendingPlans(&observability.DrainPendingPlansOptions{
-				Reason: "periodic",
-			})
-		},
+	if err := startupStep(func() error {
+		return index.DrainPendingPlans(&observability.DrainPendingPlansOptions{
+			Reason: "startup",
+		})
+	}); err != nil {
+		return startupCause(err)
 	}
-	if opts.ReconcileClearInterval != nil {
-		schedulerOptions.ClearInterval = opts.ReconcileClearInterval
+	if err := startupStep(func() error {
+		reconcileScheduler.Start()
+		return nil
+	}); err != nil {
+		return startupCause(err)
 	}
-	if opts.ReconcileSetInterval != nil {
-		schedulerOptions.SetInterval = opts.ReconcileSetInterval
-	}
-	schedulerOptions.IntervalMs = opts.ReconcileIntervalMs
-	reconcileScheduler = NewPeriodicReconcileScheduler(schedulerOptions)
-	reconcileScheduler.Start()
-	if err := watchManager.Start(); err != nil {
-		startupFailure(err)
-		return err
+	if err := startupStep(watchManager.Start); err != nil {
+		return startupCause(err)
 	}
 	fmt.Fprintf(os.Stdout, "Herdsman daemon listening on %s\n", runtime.Paths.SocketPath)
 	return nil
