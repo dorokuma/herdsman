@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"net"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -127,6 +128,20 @@ func obsClaimOrchestrator(t *testing.T, client *obsNonReadingClient, paneID stri
 	client.request(t, "agent.orchestrator.set", map[string]any{"enabled": true}, "claim")
 }
 
+// obsSlowClientFrameBytes is the size of one pushed agent.event payload. The
+// Linux AF_UNIX default send buffer is ~212 KB, and the buffer only grows to a
+// few hundred KB with the peer's receive buffer, so a payload of a handful of
+// bytes (the pre-3D shape: 64 frames of ~344 B = 22 KB) never fills it and the
+// server's Write returns immediately. A 48 KB body forces the kernel to accept
+// the first few frames and then park a Write on sndbuf.
+const obsSlowClientFrameBytes = 48 * 1024
+
+// obsSlowClientFloodCount is the number of frames the flood holds. With a
+// 48 KB payload each, the first frames fill the peer's receive buffer and the
+// kernel send buffer and the rest stay queued, so the publish path spends its
+// time inside a blocked Write instead of finishing the replay.
+const obsSlowClientFloodCount = 342
+
 // fillSlowClientBuffer pushes frames at the wedged peer until its socket write
 // has to block, so the server is inside a write that cannot drain. The events
 // come from term_b, which is never the owner, so every one of them is routed to
@@ -137,13 +152,16 @@ func obsClaimOrchestrator(t *testing.T, client *obsNonReadingClient, paneID stri
 // already finished would panic the run.
 func fillSlowClientBuffer(
 	t *testing.T,
-	server *daemon.ObservabilityRpcServer,
+	_ *daemon.ObservabilityRpcServer,
 	harness *obsHarness,
 ) []observability.AgentEventRecord {
 	t.Helper()
-	events := make([]observability.AgentEventRecord, 0, 64)
-	for index := 0; index < 64; index++ {
-		events = append(events, obsAppendRoutedEvent(t, harness, "term_b", obsWorkspaceB))
+	body := strings.Repeat("s", obsSlowClientFrameBytes)
+	events := make([]observability.AgentEventRecord, 0, obsSlowClientFloodCount)
+	for index := 0; index < obsSlowClientFloodCount; index++ {
+		event := obsAppendRoutedEvent(t, harness, "term_b", obsWorkspaceB)
+		event.Payload = map[string]any{"body": body}
+		events = append(events, event)
 	}
 	return events
 }

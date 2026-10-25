@@ -2,7 +2,7 @@
 
 - 分支：`go-port`（worktree `/root/workspace/.wt/herdsman/go-port`）
 - 目标模块：`go/`（Go module `github.com/dorokuma/herdsman/go`，go 1.26.0）
-- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告；其后追加第 4 轮 reviewer 修复（db 闸门 / observability / herdr / daemon 共 6 项，见第 6 节）与 4.2、4.3 两节描述修正
+- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告；其后追加第 4 轮 reviewer 修复（db 闸门 / observability / herdr / daemon 共 6 项，见第 6 节）与 4.2、4.3 两节描述修正；最后追加第 3D-3 精确收尾子批（`observability_rpc_slow_client_test.go` 填满 AF_UNIX `SO_SNDBUF` 并取得真实先 FAIL 后 PASS，见 6.5；`8c4bd1b` 更正为 `5fce550`，见 6.1）
 - 未触碰：`/root/.local/bin/herdsman`、`herdsman.service`、`/root/.herdsman`（生产面保持原样，见第 5 节）
 
 ---
@@ -35,8 +35,11 @@
 | 20 | `7d5da2eaceea92a081daf44f044fd0d1f34cd0ae` | feat(go): sync agy draft check, port index/turn-signal tests |
 | 21 | `39bf1c63b7bd5c43e5399c29d203858a62d7901a` | fix(go): resolve daemon startup-signal race and add batch 5 report |
 | 22 | `5fce55023119e8e1602585f4bed1640160932f39` | fix(go): resolve agy, cli, and agenthistory reviewer findings |
+| 23 | `5e8b7c80ee8594affbc2e50d684ab34ed65dc0a5` | fix(go): resolve db, observability, herdr, and daemon reviewer findings |
 
-第 21、22 条是本子批前两轮 reviewer 修复；第 23 条（`fix(go): resolve db, observability, herdr, and daemon reviewer findings`，本轮）见第 6 节。
+第 21～23 条是本子批前三轮 reviewer 修复，各轮内容见第 6 节。第 24 条（`test(go): saturate unix socket sndbuf in slow-client test and update report`，本轮）是第 3D-3 精确收尾子批：让 `observability_rpc_slow_client_test.go` 真正填满 AF_UNIX `SO_SNDBUF`（见 6.5 的修订）并修正 6.1 节对 `8c4bd1b` 的记载。
+
+> **`8c4bd1b` 的更正**：任务书最初写作 `8c4bd1b`，经 `git show --stat` 核实，其对应的真实提交就是第 22 条 `5fce550`（`fix(go): resolve agy, cli, and agenthistory reviewer findings`）。6.1 节已据此改写，不再保留「短 SHA 不可解析」的旧结论。
 
 变更面（`git diff --stat`，本子批）：
 
@@ -551,9 +554,24 @@ No packages installed.
 
 对应提交：`fix(go): resolve db, observability, herdr, and daemon reviewer findings`（本子批第 23 条）。前一节 4.2/4.3 的两处描述错误也在本轮一并修正。
 
-### 6.1 参照提交 `8c4bd1b`
+### 6.1 参照提交 `5fce550`（`fix(go): resolve agy, cli, and agenthistory reviewer findings`）
 
-任务书要求补记 `8c4bd1b`。该短 SHA **在本仓与其 object 数据库中不可解析**：`git cat-file -t 8c4bd1b` 在 worktree（`go-port`，HEAD `5fce550`）与主仓（`main`，HEAD `6ec2c27`）均报 `Not a valid object name`，`git ls-remote origin HEAD` 为 `6ec2c271e8b471b16a3293d10c3f7db0929f09ef`，两个 worktree（`git worktree list`）也没有包含它的分支。因此此处只登记该 SHA 本身，不臆测其内容；若它指向本仓之外的提交（另一仓库/另一分支/尚未 fetch），需主代理指明来源后再补字段。
+任务书最初写作短 SHA `8c4bd1b`。该短 SHA 在本仓 object 数据库中不可解析（`git cat-file -t 8c4bd1b` 在 worktree 与主仓均报 `Not a valid object name`），但按其描述的提交说明在 `go-port` 上可唯一对应到 **`5fce550`**（`git show --stat 5fce550` 核实：`fix(go): resolve agy, cli, and agenthistory reviewer findings`，9 文件 +705/-33）。**`8c4bd1b` 是任务书的笔误，本报告一律以 `5fce550` 为准。**
+
+`5fce550` 修复了第 1 轮 reviewer（`reviewer-1`）的全部 8 项问题：
+
+| # | 面 | 问题与修复 |
+|---|----|-----------|
+| 1 | `internal/agy/state.go` | JSON `null` 防护：反序列化 `null` 时不再把字段写成零值覆盖既有状态，`null` 字段保持缺省语义 |
+| 2 | `internal/agenthistory/antigravity_proto.go` | 第 10 字节 varint 溢出拦截：protobuf varint 超过 10 字节即拒绝，避免 `int64` 位移溢出 |
+| 3 | `internal/cli/herdsman.go` | `--all` 清除显式 scope：`--all` 与显式 `--workspace`/`--session` 同时给出时，显式 scope 被清除而非静默合并 |
+| 4 | `internal/agy/hook.go` / `internal/cli/herdsman.go` | U+2028 / U+2029 原字符保留：不再把这两个 JS 行分隔符转义成 `\u2028`/`\u2029`，保持 TS `JSON.stringify` 的原字符输出 |
+| 5 | `internal/agy/hook.go` | `Environment == nil` 默认读 `os.Environ()`：环境未显式提供时回落进程环境，与 TS 的 `process.env` 一致 |
+| 6 | `internal/agenthistory/discovery_test.go` | 真实 `OccupiedSessionPaths` 边界测试：用实际占用路径构造边界，替换原先的空壳用例 |
+| 7 | `internal/agenthistory` | `parseJSNumber` 支持 `0x`/`0b`/`0o` 前缀：JS Number 文本可带十六进制/二进制/八进制字面量 |
+| 8 | `internal/agy` / `internal/cli` / `internal/agenthistory` | 三个包 5 轮 `-race` 全绿（见 6.6） |
+
+其中第 2、6、7 项各带新增/改写的单测（`antigravity_proto_test.go` +36、`discovery_test.go` ±36），第 8 项以 5 轮 `-race` 作为证据，其余为行为修正。
 
 ### 6.2 六项修复
 
@@ -604,17 +622,51 @@ No packages installed.
 **仅防御性、不可独立观测**
 
 - **Finding 2**：`doneCh` 的 `select` 是真承重的（退回 `<-signal` 后 `listener goroutine did not exit after the wait finished` FAIL，4 > 3 个 goroutine）；但 `finished` 守卫**测不出来**——删掉它用例仍 PASS，因为 `finishLocked` 里的 `stillPending` 判定已经覆盖了「已完成即已移出注册表」这条路径。`finished` 只是让「二次 finish / 二次 close」显式不可能，不依赖该不变式。
-- **Finding 6**：`armDeadline`/`clearDeadline` 的 socket 截止时间同理是防御性的——置空后用例仍 PASS，因为逻辑层 `time.AfterFunc` 已经给出了可观测的超时契约（小帧也不会把 `conn.Write` 堵住，见 6.5）。
+- **Finding 6**：`armDeadline`/`clearDeadline` 的 socket 截止时间同理是防御性的——置空后用例仍 PASS，因为逻辑层 `time.AfterFunc` 已经给出了可观测的超时契约（就本子批的小帧而言不会把 `conn.Write` 堵住；大帧会堵，见 6.5）。
 
-### 6.5 Finding 3 的用例未能复现缺陷（重要保留项）
+### 6.5 Finding 3 的用例已填满 `SO_SNDBUF`（第 3D-3 子批修订）
 
-`observability_rpc_slow_client_test.go` 的两条用例**通不过「退回修复前形态」这一关**：把 `writeAll(frames)` 放回 `s.mu.Lock()` 与 `s.mu.Unlock()` 之间（即修复前的持锁写帧形态），两条用例仍然 PASS。
+**本节是第 3D-3 精确收尾子批对 6.5 的改写。** 修订前此处记的是「用例空转、无法把修复前形态判红，需另立任务」；该结论已被本轮实测推翻，现按实测结果重写。
 
-原因已定位到平台语义，而非用例写法：用例靠 `unix.SetReadBuffer(1024)` 缩小不读数据那端的接收缓冲，指望服务器的 `conn.Write` 堵死。但 **AF_UNIX 流式套接字的流控跟随发送方的 `SO_SNDBUF`，接收方的 `SO_RCVBUF` 不构成上限**。用独立小程序实测（同样 1024 字节接收缓冲、64 × 344 字节帧、对端全程不读）：`wrote 64 frames, blocked=false elapsed=76.537µs`。服务器侧实测同样如此——64 帧写入全部在微秒级返回，`writeFrame` 既未阻塞也未触发 `destroy()`，因此用例注释里「服务器已停在一个无法排空的写里」这个前提从未成立，`time.Sleep(300ms)` 的 settle 等的其实是一个空窗口。
+#### 修订前的判断为何不成立
 
-作为对照，把发布路径改成**真的长时间持锁**（锁内 `time.Sleep(1500ms)`）后两条用例都 FAIL：`agent.ping on a healthy client: timed out`（3.03s）与 `server.Stop took 2.700789076s`。说明用例对「持锁」是灵敏的，只是它构造不出触发该持锁的那个阻塞写。
+原判断称「AF_UNIX 流式套接字的流控只跟发送方 `SO_SNDBUF`，接收方 `SO_RCVBUF` 不构成上限」，并以「64 帧 × 344 字节 = 22 KB 全部微秒级写完」为据。这个实测本身没错，**错在它把「payload 太小」当成了「平台不可能阻塞」**：22 KB 远未触及 AF_UNIX 默认 `SO_SNDBUF`（本机约 212 KB），写不阻塞是当然的，不能据此推断放大 payload 后仍不阻塞。
 
-**结论**：Finding 3 的修复本身成立（锁外写帧是正确的形状，TS 原版也是在临界区外 await 写），但这两条回归用例是**空转的**——它们无法把修复前形态判红。需要真正的「堵住的写」时，应改为限制**服务器侧**连接的 `SO_SNDBUF`，或直接用一对 `net.Pipe()`/预先填满的管道替代 Unix socket。此项需另立任务，本子批未改测试。
+#### 修订后的构造
+
+`fillSlowClientBuffer` 不再推 64 帧 344 字节的小帧，改为：
+
+- 单条消息体（`event.Payload` 里的 `body` 字段）放大到 **48 KB**；
+- 连续推 **342** 帧（总量约 16 MB，远超 `SO_SNDBUF` 与对端 `SO_RCVBUF` 之和）；
+- 保留 `dialNonReadingClient` 的 `unix.SetReadBuffer(1024)`，进一步压低对端接收缓冲。
+
+#### 先 FAIL 后 PASS 实测
+
+**反证（退回修复前形态）**：把 `writeAll(frames)` 放回 `s.mu.Lock()` 与 `s.mu.Unlock()` 之间，即恢复「持锁写帧」，两条用例**双双 FAIL**，且失败信息正是锁被写占住：
+
+```
+--- FAIL: TestObservabilityRpcSlowClientDoesNotBlockOtherClients (2.11s)
+    observability_rpc_slow_client_test.go:233: agent.ping took 1.701173152s, which is not faster than
+    the 1s write timeout: the publish path is holding the server lock across a socket write
+--- FAIL: TestObservabilityRpcSlowClientDoesNotBlockShutdown (2.07s)
+    observability_rpc_slow_client_test.go:291: server.Stop took 1.702051103s, which is not faster than
+    the 1s write timeout: the publish path is holding the server lock across a socket write
+```
+
+**恢复锁外写帧后两条用例 PASS**：
+
+```
+--- PASS: TestObservabilityRpcSlowClientDoesNotBlockOtherClients (2.07s)
+--- PASS: TestObservabilityRpcSlowClientDoesNotBlockShutdown (0.37s)
+```
+
+#### 阻塞写确实存在的直接证据
+
+用临时诊断程序（已删除）量得：342 帧 flood 启动后，**第 6 帧就阻塞，且一卡就是 2.00068239s**——正是 `rpcWriteTimeout`（`observability_server_handlers.go` 的 `rpcWriteTimeout = 2 * time.Second`）超时后 `writeFrame` 走 `destroy()` 断开的时长；`PublishAgentEvent` 逐帧同步推时，前 5 帧（约 120 KB）填满缓冲，第 6 帧起 `conn.Write` 真正停在内核 `SO_SNDBUF` 上。
+
+关停用例的时序同样落在阻塞窗口内：flood goroutine 在 50ms / 150ms / 300ms 三个采样点都停在 **pushed = 6**（一帧未多推），`server.Stop()` 随后 **106µs** 返回——`Stop()` 的 `connection.destroy()` 立即解除了那个阻塞写。这正是「关停不被停读客户端拖慢」想要的状态。
+
+**结论**：Finding 3 的修复与它的回归用例现在都是承重的。6.5 修订前记的「用例空转、需另立任务」不再成立，该任务已在第 3D-3 子批闭环。
 
 ### 6.6 五轮 `-race` 实测
 
