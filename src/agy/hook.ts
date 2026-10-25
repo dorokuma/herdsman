@@ -56,8 +56,28 @@ export type AgyHookOutput = AgyPreInvocationOutput & AgyStopOutput;
 type AgySessionHookState = {
   autoClaimAttempted?: boolean;
   awaitingNextTurn?: boolean;
+  // Completions `projectAgyOutcomes` deferred because `agent.list` still reports
+  // the peer as `working`. They stay unacked and unpresented so a later poll can
+  // project them once the live status catches up; the ids are recorded so the
+  // acknowledgement cursor can be held below them.
+  deferredEventIds?: number[];
   deliveredEventIds?: number[];
+  // Events that are already presented (permanently suppressed or handed to the
+  // host) whose `agent.notifications.ack` RPC is *held back* because a lower-id
+  // event is still waiting to be projected. Deliberately separate from
+  // `deliveredEventIds`: `rearmDeliveredEvents` re-arms the latter, and an event
+  // that was already delivered must never be injected twice.
+  pendingAckEventIds?: number[];
   presentedEventIds?: number[];
+  // Snapshot of candidate events that are still waiting to be projected.
+  // `agent.orchestrator.get` only re-lists `delivered` rows whose
+  // `last_attempt_at` is within `REDELIVERY_FRESHNESS_MS` (300s) and
+  // `reservePending` never refreshes it for an already delivered row, so an
+  // unacked event vanishes from `connState.events` after that window while it
+  // is still unacked. The snapshot keeps it injectable and keeps it visible to
+  // the acknowledgement hold-back bound. See `mergeKnownUnackedEvents` and
+  // `filterEligibleRetainedEvents`.
+  retainedCandidateEvents?: AgentEventRecord[];
   turnEpoch?: number;
   waiterEpoch?: number;
   waiterPid?: number;
@@ -99,6 +119,12 @@ const DEFAULT_SETTLE_GRACE_MS = 12_000;
 const UNSETTLED_TURN_MAX_AGE_MS = 10 * 60_000;
 const MAX_WAKE_PROMPT_ATTEMPTS = 3;
 const WAKE_PROMPT_TEXT = "[herdsman-wake]";
+// Upper bound of the persisted candidate snapshot (`retainedCandidateEvents`).
+// A wake batch is a handful of peer completions, so 100 records cover even a
+// long working-defer streak while keeping the session state file bounded. When
+// the bound is hit the *lowest* ids are kept (see `retainWakeCandidates`),
+// because those are the ones the acknowledgement cursor must not pass.
+const RETAINED_CANDIDATE_EVENT_LIMIT = 100;
 // `PLAN_WAITING_HISTORY` / `PLAN_STALLED` / `DEGRADED_PLAN_ERROR` are imported
 // from `@/observability/contracts.js` above: the string values are the contract
 // and the projection below has to stay in sync with `STALLED_PLAN_ERRORS` there
@@ -223,6 +249,26 @@ export async function runAgyHook(
       if (!isLocalOwner(connState)) {
         if ((sessionState.deliveredEventIds?.length ?? 0) > 0) {
           sessionState.deliveredEventIds = [];
+        }
+        // Ownership moved elsewhere: held-back acknowledgements belong to the new
+        // owner now, and this session may not ack them out of scope anyway.
+        if ((sessionState.pendingAckEventIds?.length ?? 0) > 0) {
+          sessionState.pendingAckEventIds = [];
+        }
+        // Same for the unacked batch and its candidate snapshot: the new owner
+        // decides when those events are delivered.
+        if ((sessionState.deferredEventIds?.length ?? 0) > 0) {
+          sessionState.deferredEventIds = [];
+        }
+        if ((sessionState.retainedCandidateEvents?.length ?? 0) > 0) {
+          sessionState.retainedCandidateEvents = [];
+        }
+        if (
+          sessionState.deliveredEventIds !== undefined ||
+          sessionState.pendingAckEventIds !== undefined ||
+          sessionState.deferredEventIds !== undefined ||
+          sessionState.retainedCandidateEvents !== undefined
+        ) {
           writeSessionState(stateDir, sessionId, sessionState);
         }
         return {};
@@ -359,6 +405,7 @@ export async function runAgyHook(
               sessionState,
               stateDir,
               sessionId,
+              { waiterEpoch, waiterPid: process.pid },
             );
             hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch.hasOutcomes;
             isFirstEventCheck = false;
@@ -404,6 +451,23 @@ export async function runAgyHook(
                 );
                 retryWakePending = true;
               } else {
+                // `readComposerDraft` is async I/O (up to 5s). While it was in
+                // flight the user may have submitted a new turn (bumping
+                // `turnEpoch`) or a fresh Stop may have started a new waiter, so
+                // the state this loop decided on can already be superseded.
+                // Re-check before touching shared state: rearming the batch or
+                // prompting on behalf of a stale turn would duplicate an
+                // injection the host already received.
+                const postReadState = readSessionState(stateDir, sessionId);
+                if (
+                  (postReadState.turnEpoch !== undefined &&
+                    postReadState.turnEpoch !== waiterEpoch) ||
+                  (postReadState.waiterEpoch !== undefined &&
+                    postReadState.waiterEpoch !== waiterEpoch) ||
+                  (postReadState.waiterPid !== undefined && postReadState.waiterPid !== process.pid)
+                ) {
+                  return {};
+                }
                 // The stop hook marked the batch presented before returning it to
                 // the host; the turn started by this prompt has to receive it in
                 // PreInvocation, so re-arm the unacked batch first.
@@ -837,7 +901,7 @@ async function defaultTriggerWakePrompt(input: {
 
 async function defaultReadPaneText(paneId: string): Promise<string | undefined> {
   try {
-    const { stdout } = await execFileAsync("herdr", ["pane", "read", paneId, "--lines", "12"], {
+    const { stdout } = await execFileAsync("herdr", ["pane", "read", paneId, "--lines", "40"], {
       timeout: 5_000,
     });
     return stdout;
@@ -868,20 +932,49 @@ export function parseAgyComposerDraft(paneText: string): string | undefined {
   }
   if (separatorIndexes.length < 2) return undefined;
   const bottom = separatorIndexes[separatorIndexes.length - 1];
-  const top = separatorIndexes[separatorIndexes.length - 2];
-  if (bottom === undefined || top === undefined || bottom <= top + 1) return undefined;
+  if (bottom === undefined) return undefined;
+  // The rule right above the status bar is the bottom of the composer box.
+  const bottomLine = (lines[bottom] ?? "").trim();
+  // The top rule is *not* simply the previous rule: a multi-line draft may itself
+  // contain a `--------` / `────────` line followed by a `>` quote line, which then
+  // looks exactly like a composer top rule and would collapse the box (and, for an
+  // empty `>`, return an empty draft). The composer frame is drawn by one TUI
+  // component, so its top and bottom rules share the same characters and width:
+  // prefer candidates that match the bottom rule byte for byte, and among those
+  // walk outwards until one yields a non-empty draft.
+  const followedByPrompt = separatorIndexes
+    .slice(0, -1)
+    .filter((separatorIndex) => /^>(?:\s|$)/.test(lines[separatorIndex + 1] ?? ""));
+  if (followedByPrompt.length === 0) return undefined;
+  const matchingFrame = followedByPrompt.filter(
+    (separatorIndex) => (lines[separatorIndex] ?? "").trim() === bottomLine,
+  );
+  const topCandidates = matchingFrame.length > 0 ? matchingFrame : followedByPrompt;
 
-  const region = lines.slice(top + 1, bottom);
-  if (region.length === 0) return undefined;
-
-  const draftLines = region.map((line, index) => {
-    if (index === 0) {
-      const match = /^(?:>\s?)(.*)$/.exec(line);
-      if (match) return match[1] ?? "";
-    }
-    return line;
-  });
-  return draftLines.join("\n").replace(/[ \t]+$/gm, "").trimEnd();
+  let sawCandidate = false;
+  for (let index = topCandidates.length - 1; index >= 0; index -= 1) {
+    const separatorIndex = topCandidates[index];
+    if (separatorIndex === undefined) continue;
+    const region = lines.slice(separatorIndex + 1, bottom);
+    if (region.length === 0) continue;
+    sawCandidate = true;
+    const draft = region
+      .map((line, regionIndex) => {
+        if (regionIndex === 0) {
+          const match = /^(?:>\s?)(.*)$/.exec(line);
+          if (match) return match[1] ?? "";
+        }
+        return line;
+      })
+      .join("\n")
+      .replace(/[ \t]+$/gm, "")
+      .trimEnd();
+    // An innermost candidate that parses to an empty draft is the rule the user
+    // typed inside the composer; the real frame is the enclosing one.
+    if (draft.trim().length > 0) return draft;
+  }
+  // Every same-frame candidate is an empty `>` prompt line: the composer is empty.
+  return sawCandidate ? "" : undefined;
 }
 
 async function readComposerDraft(
@@ -920,6 +1013,273 @@ async function registerAgyPresence(
   })) as OrchestratorConnectionState;
 }
 
+/**
+ * Every event of this session that still owes a projection *or* an ack.
+ *
+ * `agent.orchestrator.get` only returns rows with `id > ackedEventId`, so an id
+ * that survives this merge is by definition not acknowledged yet.
+ *
+ * `retained` is the snapshot persisted in the session state. A `delivered` row
+ * leaves `connState.events` once it is older than `REDELIVERY_FRESHNESS_MS`
+ * (`src/db/agent-events.ts: listAfter`; `reservePending` does not refresh
+ * `last_attempt_at` for rows that are already delivered), yet it stays unacked
+ * until the hook really hands it over. Merging the snapshot back in keeps such
+ * an event injectable after a long composer draft, and keeps it in front of
+ * `resolveMinHoldbackEventId` so a higher id cannot ack past it. For an id the
+ * daemon still reports, the daemon's current copy wins.
+ *
+ * Deliberately **not** filtered by `presentedEventIds`: the Stop hook marks the
+ * batch presented *and* records it in `deliveredEventIds` before handing it to
+ * the host via `decision: continue`, so a presented-filtered view would report
+ * "nothing to do" for exactly the batch that still has to survive — and would
+ * then let the snapshot (and the event with it) be cleared while the host has
+ * not started the turn yet. Callers apply the presented filter themselves via
+ * `collectWakeCandidateEvents`, and `retainWakeCandidates` uses the unfiltered
+ * view to keep the delivered-but-unacked records alive.
+ */
+function mergeKnownUnackedEvents(
+  connState: OrchestratorConnectionState,
+  retained?: readonly AgentEventRecord[],
+): AgentEventRecord[] {
+  const ackedEventId = connState.state?.ackedEventId ?? 0;
+  const byId = new Map<number, AgentEventRecord>();
+  for (const event of retained ?? []) {
+    if (Number.isInteger(event?.id)) byId.set(event.id, event);
+  }
+  for (const event of connState.events ?? []) {
+    byId.set(event.id, event);
+  }
+  return [...byId.values()]
+    .filter(
+      (event) =>
+        event.id > ackedEventId &&
+        event.terminalId !== connState.presence.terminalId &&
+        // A state file can outlive the workspace it was written for; never
+        // project an event that belongs to a different Herdr session.
+        (typeof event.herdrSessionName !== "string" ||
+          event.herdrSessionName === connState.presence.herdrSessionName),
+    )
+    .sort((left, right) => left.id - right.id);
+}
+
+/**
+ * The subset of `knownUnackedEvents` that may still be handed to the host,
+ * i.e. everything that has not been presented (suppressed or delivered) yet.
+ */
+function collectWakeCandidateEvents(
+  knownUnackedEvents: readonly AgentEventRecord[],
+  presented: ReadonlySet<number>,
+): AgentEventRecord[] {
+  return knownUnackedEvents.filter((event) => !presented.has(event.id));
+}
+
+/**
+ * Retained-only rows that are no longer deliverable in this scope are dropped.
+ *
+ * A row the daemon re-listed in *this* `agent.orchestrator.get` response was
+ * just validated by the daemon itself (workspace scope, deliverable state, and
+ * the `INVALIDATED_GRACE_MS` grace for a `retained invalidated` / orphan row),
+ * so it is kept unconditionally. A row that only survives in the local snapshot
+ * has not been validated for a while, and absence from `connState.events` means
+ * more than "older than `REDELIVERY_FRESHNESS_MS`":
+ *
+ * - the event may belong to a sibling workspace that has an orchestrator owner
+ *   of its own by now, so it left this owner's `ownerlessSiblingScopes`;
+ * - its pane may have been closed and the row reclaimed / invalidated meanwhile
+ *   (`PANE_CLOSED_RECLAIM`, `LEGACY_CLOSE_WITHOUT_GENERATION`), so it is not
+ *   deliverable any more — a row that merely stays inside the grace window would
+ *   still have been re-listed by the daemon.
+ *
+ * Injecting such a row would wake the orchestrator with an outcome it cannot act
+ * on, and keeping it would hold `resolveMinHoldbackEventId` back forever. When
+ * `agent.list` failed (`liveScope === undefined`) nothing is known, so every row
+ * is kept: losing a real completion is worse than one more useless wake.
+ */
+function filterEligibleRetainedEvents(
+  events: readonly AgentEventRecord[],
+  liveConnEventIds: ReadonlySet<number>,
+  presenceWorkspaceId: string,
+  liveScope:
+    | { liveScopeWorkspaces: ReadonlySet<string>; liveTerminalIds: ReadonlySet<string> }
+    | undefined,
+): AgentEventRecord[] {
+  if (liveScope === undefined) return [...events];
+  return events.filter((event) => {
+    if (liveConnEventIds.has(event.id)) return true;
+    if (
+      typeof event.workspaceId === "string" &&
+      event.workspaceId !== presenceWorkspaceId &&
+      !liveScope.liveScopeWorkspaces.has(event.workspaceId)
+    ) {
+      return false;
+    }
+    if (event.terminalId !== null && !liveScope.liveTerminalIds.has(event.terminalId)) {
+      return false;
+    }
+    return true;
+  });
+}
+
+/**
+ * The candidates that still have to be handed over, for the persisted snapshot.
+ *
+ * Takes the *unfiltered* `knownUnackedEvents` (not the presented-filtered
+ * candidates) and keeps an unacked event that is either not presented yet (never
+ * handed to the host) or still waiting for its RPC ack after delivery
+ * (`deliveredEventIds`): `rearmDeliveredEvents` makes exactly those ids
+ * injectable again, so `takeNextWakeBatch` must be able to rebuild their records
+ * even after the daemon stopped re-listing them and even while the WakeWaiter is
+ * peeking in between. Once `flushDeliveredAcks` settles the ack the id leaves
+ * `deliveredEventIds`, is presented, and drops out of the snapshot.
+ *
+ * `knownUnackedEvents` is sorted by id, so the capacity bound trims from the
+ * top: the oldest ids — the ones the acknowledgement cursor must not pass — are
+ * the ones that stay.
+ */
+function retainWakeCandidates(
+  knownUnackedEvents: readonly AgentEventRecord[],
+  presented: ReadonlySet<number>,
+  deliveredEventIds: readonly number[] | undefined,
+): AgentEventRecord[] {
+  const unackedDelivered = new Set(deliveredEventIds ?? []);
+  return knownUnackedEvents
+    .filter((event) => !presented.has(event.id) || unackedDelivered.has(event.id))
+    .slice(0, RETAINED_CANDIDATE_EVENT_LIMIT);
+}
+
+/**
+ * Identity of a persisted snapshot, used to skip no-op state writes.
+ */
+function retainedSnapshotKey(events: readonly AgentEventRecord[] | undefined): string {
+  return (events ?? []).map((event) => event?.id).join(",");
+}
+
+/**
+ * Known-unacked events that are still eligible for projection, together with
+ * the peers whose live Herdr status is `working`.
+ *
+ * One `agent.list` round trip serves both consumers: `projectAgyOutcomes` needs
+ * the live `working` set to defer intermediate rounds, and
+ * `filterEligibleRetainedEvents` needs the live peer/scope sets to re-validate
+ * the rows that only survive in the local snapshot. With nothing known to be
+ * unacked there is nothing to validate, so the RPC is skipped.
+ */
+async function resolveEligibleWakeEvents(
+  client: Pick<ObservabilityRpcClient, "request">,
+  connState: OrchestratorConnectionState,
+  sessionState: AgySessionHookState,
+): Promise<{
+  eligibleKnownEvents: AgentEventRecord[];
+  liveWorkingTerminalIds: ReadonlySet<string>;
+}> {
+  const knownUnackedEvents = mergeKnownUnackedEvents(
+    connState,
+    sessionState.retainedCandidateEvents,
+  );
+  if (knownUnackedEvents.length === 0) {
+    return { eligibleKnownEvents: [], liveWorkingTerminalIds: new Set() };
+  }
+  const liveScope = await fetchLivePeerScope(client, connState.presence);
+  return {
+    eligibleKnownEvents: filterEligibleRetainedEvents(
+      knownUnackedEvents,
+      new Set((connState.events ?? []).map((event) => event.id)),
+      connState.presence.workspaceId,
+      liveScope,
+    ),
+    // `agent.list` failed: no live status is known, so completions are projected
+    // (the tolerated pre-fix behaviour) and retained rows are kept.
+    liveWorkingTerminalIds: liveScope?.workingTerminalIds ?? new Set(),
+  };
+}
+
+/**
+ * Whether the caller's turn/waiter generation has already been superseded.
+ *
+ * `peekNextWakeBatch` awaits `agent.list` (and possibly suppression acks) before
+ * it writes. A `PreInvocation` that started in the meantime bumps `turnEpoch`
+ * and may already have marked this very batch presented on disk, so the stale
+ * in-memory sets must not be written back over the newer state.
+ */
+function isWaiterSuperseded(
+  state: AgySessionHookState,
+  expectedWaiter: { waiterEpoch: number; waiterPid: number } | undefined,
+): boolean {
+  if (expectedWaiter === undefined) return false;
+  // `waiterPid` / `waiterEpoch` may not be on disk yet: `Stop` writes the
+  // epochs, spawns, and only then records the pid.
+  return (
+    (state.turnEpoch !== undefined && state.turnEpoch !== expectedWaiter.waiterEpoch) ||
+    (state.waiterEpoch !== undefined && state.waiterEpoch !== expectedWaiter.waiterEpoch) ||
+    (state.waiterPid !== undefined && state.waiterPid !== expectedWaiter.waiterPid)
+  );
+}
+
+function minDeferredEventId(deferredEventIds: readonly number[] | undefined): number {
+  if (deferredEventIds === undefined || deferredEventIds.length === 0) {
+    return Number.POSITIVE_INFINITY;
+  }
+  return Math.min(...deferredEventIds);
+}
+
+function mergeEventIds(...lists: Array<readonly number[] | undefined>): number[] {
+  return [...new Set(lists.flatMap((list) => list ?? []))].sort((left, right) => left - right);
+}
+
+/**
+ * Lowest event id that must not be acknowledged yet.
+ *
+ * `agent.notifications.ack` settles *every* row with `id <= eventId` and advances
+ * the workspace cursor to it (`src/db/agent-events.ts: markAcked`), so
+ * acknowledging a high id silently swallows every lower id that is still waiting
+ * to be projected — exactly the working-race event that `deferredWorkingEventIds`
+ * protects. The bound is recomputed from the *current* candidate set instead of
+ * trusting the recorded deferral: a peer that stopped reporting `working` turns
+ * its deferred completion into a real outcome that has not been consumed yet, and
+ * that must hold the ack back just as firmly.
+ */
+async function resolveMinHoldbackEventId(
+  client: Pick<ObservabilityRpcClient, "request">,
+  connState: OrchestratorConnectionState,
+  sessionState: AgySessionHookState,
+): Promise<number> {
+  const ackedEventId = connState.state?.ackedEventId ?? 0;
+  const presented = new Set(
+    (sessionState.presentedEventIds ?? []).filter((id) => id > ackedEventId),
+  );
+  // Nothing to project can hold the cursor back, and eligibility can only remove
+  // candidates — so with no candidate at all the bound is unbounded and the
+  // `agent.list` round trip below is not needed.
+  if (
+    collectWakeCandidateEvents(
+      mergeKnownUnackedEvents(connState, sessionState.retainedCandidateEvents),
+      presented,
+    ).length === 0
+  ) {
+    return Number.POSITIVE_INFINITY;
+  }
+  const { eligibleKnownEvents, liveWorkingTerminalIds } = await resolveEligibleWakeEvents(
+    client,
+    connState,
+    sessionState,
+  );
+  // Recomputed through the eligibility filter: a retained row that is no longer
+  // deliverable must not hold the cursor back forever.
+  const candidateEvents = collectWakeCandidateEvents(eligibleKnownEvents, presented);
+  if (candidateEvents.length === 0) return Number.POSITIVE_INFINITY;
+  const { deferredWorkingEventIds, outcomes } = projectAgyOutcomes(
+    candidateEvents,
+    liveWorkingTerminalIds,
+    // The following `takeNextWakeBatch` / `peekNextWakeBatch` pass logs these very
+    // suppressions; logging them here too would only duplicate the warn lines.
+    () => undefined,
+  );
+  return minDeferredEventId([
+    ...deferredWorkingEventIds,
+    ...outcomes.map((outcome) => outcome.eventId),
+  ]);
+}
+
 async function flushDeliveredAcks(
   client: Pick<ObservabilityRpcClient, "request">,
   connState: OrchestratorConnectionState,
@@ -927,14 +1287,31 @@ async function flushDeliveredAcks(
   stateDir: string,
   sessionId: string,
 ): Promise<OrchestratorConnectionState> {
-  const delivered = [...new Set(sessionState.deliveredEventIds ?? [])].sort((a, b) => a - b);
-  if (delivered.length === 0) return connState;
+  const allToAck = mergeEventIds(sessionState.pendingAckEventIds, sessionState.deliveredEventIds);
+  // Nothing to settle, but a recorded deferral may have been resolved by the
+  // latest poll: drop it so it cannot hold back future acknowledgements forever.
+  if (allToAck.length === 0) {
+    if ((sessionState.deferredEventIds ?? []).length > 0) {
+      sessionState.deferredEventIds = [];
+      writeSessionState(stateDir, sessionId, sessionState);
+    }
+    return connState;
+  }
+  const minHoldbackEventId = await resolveMinHoldbackEventId(client, connState, sessionState);
   const presented = new Set(sessionState.presentedEventIds ?? []);
   const remaining: number[] = [];
+  const stillPendingAck: number[] = [];
   let ackedAny = false;
-  for (let index = 0; index < delivered.length; index += 1) {
-    const eventId = delivered[index];
+  for (let index = 0; index < allToAck.length; index += 1) {
+    const eventId = allToAck[index];
     if (eventId === undefined) continue;
+    if (eventId >= minHoldbackEventId) {
+      // Already presented, so it will never be injected again; only the RPC ack is
+      // postponed until the lower-id event stops blocking the cursor.
+      presented.add(eventId);
+      stillPendingAck.push(eventId);
+      continue;
+    }
     try {
       await client.request("agent.notifications.ack", { eventId });
       presented.add(eventId);
@@ -944,12 +1321,22 @@ async function flushDeliveredAcks(
         presented.add(eventId);
         continue;
       }
-      remaining.push(...delivered.slice(index));
+      // Transient failure: keep this id and every later one for the next attempt.
+      // Ids above the hold-back bound stay in `pendingAckEventIds` so
+      // `rearmDeliveredEvents` can never re-inject them.
+      for (const restId of allToAck.slice(index)) {
+        if (restId >= minHoldbackEventId) {
+          stillPendingAck.push(restId);
+        } else {
+          remaining.push(restId);
+        }
+      }
       break;
     }
   }
   sessionState.presentedEventIds = [...presented].slice(-500);
   sessionState.deliveredEventIds = remaining;
+  sessionState.pendingAckEventIds = stillPendingAck;
   writeSessionState(stateDir, sessionId, sessionState);
   if (!ackedAny) return connState;
   try {
@@ -965,6 +1352,10 @@ async function peekNextWakeBatch(
   sessionState: AgySessionHookState,
   stateDir: string,
   sessionId: string,
+  // Identity of the WakeWaiter that is peeking. Both the `agent.list` wait and
+  // the suppression acks below are asynchronous, so the batch this call decided
+  // on can already belong to a superseded turn by the time it writes.
+  expectedWaiter?: { waiterEpoch: number; waiterPid: number },
 ): Promise<{ hasDeferredWorking: boolean; hasOutcomes: boolean }> {
   const ackedEventId = connState.state?.ackedEventId ?? 0;
   const presented = new Set(
@@ -972,54 +1363,112 @@ async function peekNextWakeBatch(
   );
   sessionState.presentedEventIds = [...presented];
 
-  const candidateEvents = (connState.events ?? [])
-    .filter(
-      (event) =>
-        event.id > ackedEventId &&
-        !presented.has(event.id) &&
-        event.terminalId !== connState.presence.terminalId,
-    )
-    .sort((left, right) => left.id - right.id);
+  const { eligibleKnownEvents, liveWorkingTerminalIds } = await resolveEligibleWakeEvents(
+    client,
+    connState,
+    sessionState,
+  );
+  const candidateEvents = collectWakeCandidateEvents(eligibleKnownEvents, presented);
 
   if (candidateEvents.length === 0) {
+    // Re-read before writing: `sessionState` may predate a turn that started
+    // while this poll was in flight, and the on-disk copy is the newer one.
+    const freshState = readSessionState(stateDir, sessionId);
+    if (isWaiterSuperseded(freshState, expectedWaiter)) {
+      return { hasDeferredWorking: false, hasOutcomes: false };
+    }
+    // No candidate does *not* mean nothing left to retain: a batch the Stop hook
+    // handed to the host is presented (so it is no longer a candidate) while it
+    // waits in `deliveredEventIds` for its ack or for `rearmDeliveredEvents`.
+    // Wiping the snapshot here would drop exactly that batch when the host
+    // ignores `decision: continue` and the draft outlives the redelivery window.
+    const retainedEvents = retainWakeCandidates(
+      eligibleKnownEvents,
+      presented,
+      freshState.deliveredEventIds,
+    );
+    if (
+      (freshState.deferredEventIds ?? []).length > 0 ||
+      retainedSnapshotKey(freshState.retainedCandidateEvents) !==
+        retainedSnapshotKey(retainedEvents)
+    ) {
+      freshState.deferredEventIds = [];
+      freshState.retainedCandidateEvents = retainedEvents;
+      sessionState.deferredEventIds = [];
+      sessionState.retainedCandidateEvents = retainedEvents;
+      writeSessionState(stateDir, sessionId, freshState);
+    }
     return { hasDeferredWorking: false, hasOutcomes: false };
   }
 
-  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
   const { deferredWorkingEventIds, outcomes, suppressedEventIds } = projectAgyOutcomes(
     candidateEvents,
     liveWorkingTerminalIds,
   );
+  // An ack settles `id <= eventId`, so acknowledging a suppressed id above a
+  // still-deferred id would advance the cursor past the deferred event and
+  // permanently swallow it.
+  const minDeferredId = minDeferredEventId(deferredWorkingEventIds);
   // Working-deferred completions must stay unacked and unpresented so a later
   // poll can project them once agent.list catches up to idle/done.
+  const heldAckEventIds: number[] = [];
   if (outcomes.length === 0) {
-    if (suppressedEventIds.length > 0) {
-      for (const suppressedId of suppressedEventIds) {
-        try {
-          await client.request("agent.notifications.ack", { eventId: suppressedId });
-          presented.add(suppressedId);
-        } catch (error) {
-          if (isPermanentAckFailure(error)) {
-            presented.add(suppressedId);
-            continue;
-          }
-          break;
-        }
+    for (const suppressedId of suppressedEventIds) {
+      if (suppressedId > minDeferredId) {
+        // Held back: mark it presented (so the suppression is not logged or
+        // re-projected every poll) but leave the RPC ack for a later pass.
+        presented.add(suppressedId);
+        heldAckEventIds.push(suppressedId);
+        continue;
       }
-      const freshState = readSessionState(stateDir, sessionId);
-      freshState.presentedEventIds = [...presented].slice(-500);
-      sessionState.presentedEventIds = freshState.presentedEventIds;
-      writeSessionState(stateDir, sessionId, freshState);
+      try {
+        await client.request("agent.notifications.ack", { eventId: suppressedId });
+        presented.add(suppressedId);
+      } catch (error) {
+        if (isPermanentAckFailure(error)) {
+          presented.add(suppressedId);
+          continue;
+        }
+        break;
+      }
     }
-    return {
-      hasDeferredWorking: deferredWorkingEventIds.length > 0,
-      hasOutcomes: false,
-    };
   }
+  const freshState = readSessionState(stateDir, sessionId);
+  // A `PreInvocation` may have run while `agent.list` and the acks above were in
+  // flight: it bumps `turnEpoch` and `takeNextWakeBatch` can already have marked
+  // this very batch presented on disk. Writing the sets collected before the
+  // await would drop those ids and let the next turn inject the batch twice, so
+  // a superseded waiter just backs off.
+  if (isWaiterSuperseded(freshState, expectedWaiter)) {
+    return { hasDeferredWorking: false, hasOutcomes: false };
+  }
+  // Union, never an overwrite: ids that only the on-disk state knows about were
+  // written by a newer turn and must survive.
+  freshState.presentedEventIds = mergeEventIds(
+    freshState.presentedEventIds?.filter((id) => id > ackedEventId),
+    [...presented],
+  ).slice(-500);
+  freshState.deferredEventIds = deferredWorkingEventIds;
+  freshState.pendingAckEventIds = mergeEventIds(freshState.pendingAckEventIds, heldAckEventIds);
+  // `peek` never marks outcomes presented, so the batch it just reported stays in
+  // the snapshot: the composer draft may outlive the daemon's redelivery window
+  // before `takeNextWakeBatch` consumes it. The input is the *unfiltered*
+  // eligible view, so a batch that is already presented but still unacked is
+  // retained for the whole polling round instead of being dropped here.
+  freshState.retainedCandidateEvents = retainWakeCandidates(
+    eligibleKnownEvents,
+    presented,
+    freshState.deliveredEventIds,
+  );
+  sessionState.presentedEventIds = freshState.presentedEventIds;
+  sessionState.deferredEventIds = freshState.deferredEventIds;
+  sessionState.pendingAckEventIds = freshState.pendingAckEventIds;
+  sessionState.retainedCandidateEvents = freshState.retainedCandidateEvents;
+  writeSessionState(stateDir, sessionId, freshState);
 
   return {
     hasDeferredWorking: deferredWorkingEventIds.length > 0,
-    hasOutcomes: true,
+    hasOutcomes: outcomes.length > 0,
   };
 }
 
@@ -1036,39 +1485,76 @@ async function takeNextWakeBatch(
   );
   sessionState.presentedEventIds = [...presented];
 
-  const candidateEvents = (connState.events ?? [])
-    .filter(
-      (event) =>
-        event.id > ackedEventId &&
-        !presented.has(event.id) &&
-        event.terminalId !== connState.presence.terminalId,
-    )
-    .sort((left, right) => left.id - right.id);
+  const { eligibleKnownEvents, liveWorkingTerminalIds } = await resolveEligibleWakeEvents(
+    client,
+    connState,
+    sessionState,
+  );
+  const candidateEvents = collectWakeCandidateEvents(eligibleKnownEvents, presented);
 
-  if (candidateEvents.length === 0) return undefined;
+  if (candidateEvents.length === 0) {
+    // Same reasoning as `peekNextWakeBatch`: a presented-but-unacked batch is
+    // not a candidate, yet its records must stay in the snapshot until
+    // `flushDeliveredAcks` settles the ack (or `rearmDeliveredEvents` makes it
+    // injectable again), otherwise a later turn cannot rebuild it.
+    const retainedEvents = retainWakeCandidates(
+      eligibleKnownEvents,
+      presented,
+      sessionState.deliveredEventIds,
+    );
+    if (
+      (sessionState.deferredEventIds ?? []).length > 0 ||
+      retainedSnapshotKey(sessionState.retainedCandidateEvents) !==
+        retainedSnapshotKey(retainedEvents)
+    ) {
+      sessionState.deferredEventIds = [];
+      sessionState.retainedCandidateEvents = retainedEvents;
+      writeSessionState(stateDir, sessionId, sessionState);
+    }
+    return undefined;
+  }
 
-  const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
-  const { outcomes, suppressedEventIds } = projectAgyOutcomes(
+  const { deferredWorkingEventIds, outcomes, suppressedEventIds } = projectAgyOutcomes(
     candidateEvents,
     liveWorkingTerminalIds,
   );
+  // An ack settles `id <= eventId`: acknowledging a suppressed id above a
+  // still-deferred id would advance the cursor past the deferred event and
+  // permanently swallow it.
+  const minDeferredId = minDeferredEventId(deferredWorkingEventIds);
   if (outcomes.length === 0) {
-    if (suppressedEventIds.length > 0) {
-      for (const suppressedId of suppressedEventIds) {
-        try {
-          await client.request("agent.notifications.ack", { eventId: suppressedId });
-          presented.add(suppressedId);
-        } catch (error) {
-          if (isPermanentAckFailure(error)) {
-            presented.add(suppressedId);
-            continue;
-          }
-          break;
-        }
+    const heldAckEventIds: number[] = [];
+    for (const suppressedId of suppressedEventIds) {
+      if (suppressedId > minDeferredId) {
+        // Presented so it is neither re-logged nor re-projected, but the RPC
+        // ack waits for `flushDeliveredAcks` until the deferral clears.
+        presented.add(suppressedId);
+        heldAckEventIds.push(suppressedId);
+        continue;
       }
-      sessionState.presentedEventIds = [...presented].slice(-500);
-      writeSessionState(stateDir, sessionId, sessionState);
+      try {
+        await client.request("agent.notifications.ack", { eventId: suppressedId });
+        presented.add(suppressedId);
+      } catch (error) {
+        if (isPermanentAckFailure(error)) {
+          presented.add(suppressedId);
+          continue;
+        }
+        break;
+      }
     }
+    sessionState.presentedEventIds = [...presented].slice(-500);
+    sessionState.deferredEventIds = deferredWorkingEventIds;
+    sessionState.pendingAckEventIds = mergeEventIds(
+      sessionState.pendingAckEventIds,
+      heldAckEventIds,
+    );
+    sessionState.retainedCandidateEvents = retainWakeCandidates(
+      eligibleKnownEvents,
+      presented,
+      sessionState.deliveredEventIds,
+    );
+    writeSessionState(stateDir, sessionId, sessionState);
     // Working-deferred completions stay unacked/unpresented for the next poll.
     return undefined;
   }
@@ -1076,14 +1562,23 @@ async function takeNextWakeBatch(
   const outcomeIds = outcomes.map((outcome) => outcome.eventId);
   // Only permanent suppressions and real outcomes are marked presented.
   // Working-deferred ids must remain eligible for the next projection pass.
-  const deliveredIds = [...new Set([...suppressedEventIds, ...outcomeIds])].sort(
-    (left, right) => left - right,
-  );
+  const deliveredIds = mergeEventIds(suppressedEventIds, outcomeIds);
   for (const id of deliveredIds) presented.add(id);
   sessionState.presentedEventIds = [...presented].slice(-500);
-  sessionState.deliveredEventIds = [
-    ...new Set([...(sessionState.deliveredEventIds ?? []), ...deliveredIds]),
-  ].sort((left, right) => left - right);
+  sessionState.deliveredEventIds = mergeEventIds(sessionState.deliveredEventIds, deliveredIds);
+  // Recorded for the acknowledgement hold-back bound; `flushDeliveredAcks` moves
+  // any id above it from `deliveredEventIds` into `pendingAckEventIds`.
+  sessionState.deferredEventIds = deferredWorkingEventIds;
+  // The batch is presented *and* delivered-but-unacked here: `rearmDeliveredEvents`
+  // can hand it back to a later `PreInvocation`, possibly after a draft outlived
+  // the daemon's redelivery window, so its records have to survive in the state.
+  // The unfiltered eligible view is what keeps them in even though the ids are
+  // already presented by now.
+  sessionState.retainedCandidateEvents = retainWakeCandidates(
+    eligibleKnownEvents,
+    presented,
+    sessionState.deliveredEventIds,
+  );
   writeSessionState(stateDir, sessionId, sessionState);
 
   return formatAgyOutcomeUpdates(outcomes);
@@ -1255,20 +1750,32 @@ async function inspectWorkspaceAgents(
 }
 
 /**
- * Terminal ids of peers whose live Herdr status is `working`.
+ * Live peer view of this orchestrator scope, straight from `agent.list`.
  *
- * Used to defer completions that may belong to an intermediate round of a still
- * running turn: `agent.done` / `agent.idle` rows are written for every internal
- * tool round, so the live status is the only signal that the turn is not over
- * (`agent.status.changed` rows never reach the hook's event batch). Failure is
- * tolerated: the completion is then projected as a real outcome (the pre-fix
- * behaviour) instead of dropping the whole batch.
+ * The request is issued as the orchestrator owner with
+ * `includeOwnerlessWorkspaces: true`, so the daemon answers with the agents of
+ * this workspace *plus* the sibling workspaces that still have no owner of their
+ * own — one response therefore carries three different facts:
  *
- * A stale `working` row right after a real `agent.done` is also possible; those
- * events are deferred (not permanently acked) so the next poll can wake once
- * the live status catches up.
+ * - `workingTerminalIds`: peers whose live Herdr status is `working`. Used to
+ *   defer completions that may belong to an intermediate round of a still
+ *   running turn: `agent.done` / `agent.idle` rows are written for every
+ *   internal tool round, so the live status is the only signal that the turn is
+ *   not over (`agent.status.changed` rows never reach the hook's event batch).
+ *   A stale `working` row right after a real `agent.done` is also possible;
+ *   those events are deferred (not permanently acked) so the next poll can wake
+ *   once the live status catches up.
+ * - `liveTerminalIds`: every peer terminal still present in the index. A
+ *   retained snapshot row whose terminal is gone has lost its source pane, so it
+ *   is no longer deliverable (`filterEligibleRetainedEvents`).
+ * - `liveScopeWorkspaces`: the workspaces this owner may still project, used for
+ *   the same check against sibling-workspace rows that were taken over.
+ *
+ * Failure is tolerated and reported as `undefined`: completions are then
+ * projected as real outcomes (the pre-fix behaviour) instead of dropping the
+ * whole batch, and unvalidated snapshot rows are kept.
  */
-async function fetchLiveWorkingTerminalIds(
+async function fetchLivePeerScope(
   client: Pick<ObservabilityRpcClient, "request">,
   presence: {
     herdrSessionName: string;
@@ -1276,24 +1783,47 @@ async function fetchLiveWorkingTerminalIds(
     terminalId: string;
     workspaceId: string;
   },
-): Promise<Set<string>> {
+): Promise<
+  | {
+      liveScopeWorkspaces: Set<string>;
+      liveTerminalIds: Set<string>;
+      workingTerminalIds: Set<string>;
+    }
+  | undefined
+> {
   try {
     const response = (await client.request("agent.list", {
       herdrSessionName: presence.herdrSessionName,
       includeOwnerlessWorkspaces: true,
       workspaceId: presence.workspaceId,
     })) as { agents?: AgentListItem[] };
-    return new Set(
-      (response.agents ?? []).flatMap((agent) =>
-        agent.agentStatus === "working" &&
-        agent.terminalId &&
-        agent.terminalId !== presence.terminalId
-          ? [agent.terminalId]
-          : [],
-      ),
+    const agents = response.agents ?? [];
+    const peers = agents.filter(
+      (agent) => typeof agent.terminalId === "string" && agent.terminalId !== presence.terminalId,
     );
+    const peerTerminalIds = peers.flatMap((agent) =>
+      typeof agent.terminalId === "string" ? [agent.terminalId] : [],
+    );
+    return {
+      liveScopeWorkspaces: new Set([
+        presence.workspaceId,
+        ...agents.flatMap((agent) =>
+          typeof agent.workspaceId === "string" && agent.workspaceId.length > 0
+            ? [agent.workspaceId]
+            : [],
+        ),
+      ]),
+      liveTerminalIds: new Set(peerTerminalIds),
+      workingTerminalIds: new Set(
+        peers.flatMap((agent) =>
+          agent.agentStatus === "working" && typeof agent.terminalId === "string"
+            ? [agent.terminalId]
+            : [],
+        ),
+      ),
+    };
   } catch {
-    return new Set();
+    return undefined;
   }
 }
 
@@ -1304,6 +1834,9 @@ function logAgyEventSuppressed(eventId: number, reason: string): void {
 function projectAgyOutcomes(
   events: AgentEventRecord[],
   liveWorkingTerminalIds: ReadonlySet<string> = new Set(),
+  // Injectable so internal re-projections (the acknowledgement hold-back bound)
+  // can stay silent instead of logging the same suppression twice.
+  logSuppressed: (eventId: number, reason: string) => void = logAgyEventSuppressed,
 ): {
   deferredWorkingEventIds: number[];
   outcomes: AgyOutcome[];
@@ -1321,6 +1854,33 @@ function projectAgyOutcomes(
     }
   }
 
+  // One terminal may legally emit several completion events inside a single
+  // Stop-to-Stop window (an intermediate tool round deferred above, then the
+  // real final round). Once the peer stops reporting `working` they all become
+  // projectable at once, which would inject the same peer twice with two
+  // different round texts. Keep only the newest completion that actually yields
+  // a usable `completed` outcome and suppress everything older for that terminal.
+  const newestCompletionId = new Map<string, number>();
+  for (const event of events) {
+    if (!isCompletionEvent(event) || event.terminalId === null) continue;
+    if (outcomeKind(event) !== "completed") continue;
+    const payload = asRecord(event.payload);
+    if (
+      payload.fallbackOutcome === true &&
+      event.paneId &&
+      event.paneGeneration &&
+      completedPanes.has(`${event.paneId}\0${event.paneGeneration}`)
+    ) {
+      continue;
+    }
+    const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
+    if (text.length === 0 || isUpstreamErrorText(text)) continue;
+    const current = newestCompletionId.get(event.terminalId);
+    if (current === undefined || event.id > current) {
+      newestCompletionId.set(event.terminalId, event.id);
+    }
+  }
+
   for (const event of events) {
     if (
       isCompletionEvent(event) &&
@@ -1331,20 +1891,26 @@ function projectAgyOutcomes(
       // tool round *or* a race where agent.list has not yet flipped to idle/done.
       // Defer (do not ack / present) so a later poll can decide.
       deferredWorkingEventIds.push(event.id);
-      logAgyEventSuppressed(
+      logSuppressed(
         event.id,
         `deferred: peer terminal ${event.terminalId} still working in agent.list`,
       );
       continue;
     }
+    if (isCompletionEvent(event) && event.terminalId !== null) {
+      const newest = newestCompletionId.get(event.terminalId);
+      if (newest !== undefined && event.id < newest) {
+        suppressedEventIds.push(event.id);
+        logSuppressed(event.id, `superseded by newer completion for terminal ${event.terminalId}`);
+        continue;
+      }
+    }
     const kind = outcomeKind(event);
     if (!kind || !event.terminalId) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(
+      logSuppressed(
         event.id,
-        !event.terminalId
-          ? "no terminalId"
-          : `non-outcome event type ${event.type}`,
+        !event.terminalId ? "no terminalId" : `non-outcome event type ${event.type}`,
       );
       continue;
     }
@@ -1356,10 +1922,7 @@ function projectAgyOutcomes(
       completedPanes.has(`${event.paneId}\0${event.paneGeneration}`)
     ) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(
-        event.id,
-        `fallback outcome superseded by completion for pane ${event.paneId}`,
-      );
+      logSuppressed(event.id, `fallback outcome superseded by completion for pane ${event.paneId}`);
       continue;
     }
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
@@ -1367,12 +1930,12 @@ function projectAgyOutcomes(
       kind === "failed" || kind === "stalled" ? normalizeExcerpt(payload.reason) : undefined;
     if (isUpstreamErrorText(text) || (reason !== undefined && isUpstreamErrorText(reason))) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(event.id, "upstream model error text");
+      logSuppressed(event.id, "upstream model error text");
       continue;
     }
     if (kind === "completed" && text.length === 0) {
       suppressedEventIds.push(event.id);
-      logAgyEventSuppressed(event.id, "empty completed assistant text");
+      logSuppressed(event.id, "empty completed assistant text");
       continue;
     }
     outcomes.push({
