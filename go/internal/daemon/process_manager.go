@@ -81,8 +81,11 @@ type DaemonStatus struct {
 }
 
 // DaemonEntrypointNames are the process basenames accepted as the daemon
-// entrypoint.
-var DaemonEntrypointNames = []string{"herdsman-daemon.js"}
+// entrypoint. Both spellings are accepted: the TS daemon runs as
+// `herdsman-daemon.js` under node, while this port's binary is `herdsman-daemon`,
+// so the identity probe recognises a pid file left behind by either
+// implementation.
+var DaemonEntrypointNames = []string{"herdsman-daemon.js", "herdsman-daemon"}
 
 // DaemonInstanceLockPath is the instance lock path for the daemon's bare
 // entrypoint (herdsman-daemon.js). Kept distinct from the plain

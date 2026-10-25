@@ -12,6 +12,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/dorokuma/herdsman/go/internal/herdr"
 )
 
 // lockWorkerEnv selects the re-exec worker mode inside this test binary. The TS
@@ -20,6 +22,13 @@ import (
 // contender runs the real AcquireDaemonLock in its own process.
 const lockWorkerEnv = "HERDSMAN_GO_LOCK_WORKER"
 
+// daemonWorkerEnv selects the daemon-service worker mode: the process runs the
+// real RunObservabilityDaemonService on the HERDSMAN_HOME named by the value,
+// which is how the ported daemon-service suite gets a real second daemon
+// process holding the instance lock (the TS suite spawns
+// `node --import tsx herdsman-daemon.js`). service_test.go spawns it.
+const daemonWorkerEnv = "HERDSMAN_GO_DAEMON_WORKER"
+
 // TestMain doubles as the contender entry point: when lockWorkerEnv is set the
 // process behaves as a lock worker instead of running the suite.
 func TestMain(m *testing.M) {
@@ -27,7 +36,28 @@ func TestMain(m *testing.M) {
 		runLockWorker(mode, os.Args[len(os.Args)-1])
 		os.Exit(0)
 	}
+	if home := os.Getenv(daemonWorkerEnv); home != "" {
+		runDaemonWorker(home)
+		os.Exit(0)
+	}
 	os.Exit(m.Run())
+}
+
+// runDaemonWorker starts the real daemon service on homeDir and blocks. The
+// spawning test drives it with a real SIGTERM, so the production signal path
+// (real handlers, pid file, instance lock, graceful shutdown, exit code) runs
+// exactly as it does under systemd.
+func runDaemonWorker(homeDir string) {
+	if err := RunObservabilityDaemonService(&DaemonServiceOptions{
+		// The process environment is inherited, HERDSMAN_HOME included, exactly
+		// like the TS child's `environment: process.env`. Only the Herdr session
+		// list is stubbed out, so no real Herdr socket is contacted.
+		SessionList: func() ([]herdr.HerdrSessionListEntry, error) { return nil, nil },
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "Herdsman daemon worker failed: %v\n", err)
+		os.Exit(1)
+	}
+	select {}
 }
 
 // runLockWorker implements the contender modes:
