@@ -144,6 +144,8 @@ export type RunAgyHookOptions = {
     waiterEpoch: number;
   }) => { pid?: number } | undefined;
   stateDir?: string;
+  /** Read the target pane's recent screen text (for composer-draft checks). */
+  readPaneText?: (paneId: string) => Promise<string | undefined>;
   triggerWakePrompt?: (input: { paneId: string; promptText: string }) => Promise<void>;
   waitTimeoutMs?: number;
 };
@@ -278,6 +280,7 @@ export async function runAgyHook(
       const newAgentGraceMs = options.newAgentGraceMs ?? DEFAULT_NEW_AGENT_GRACE_MS;
       const settleGraceMs = options.settleGraceMs ?? DEFAULT_SETTLE_GRACE_MS;
       const triggerWakePrompt = options.triggerWakePrompt ?? defaultTriggerWakePrompt;
+      const readPaneText = options.readPaneText ?? defaultReadPaneText;
       const deadline = now() + waitTimeoutMs;
       let isFirstIteration = true;
       let isFirstEventCheck = true;
@@ -357,15 +360,21 @@ export async function runAgyHook(
               stateDir,
               sessionId,
             );
-            hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch;
+            hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch.hasOutcomes;
             isFirstEventCheck = false;
             hasPushNotification = false;
             retryWakePending = false;
+            // Completions deferred because agent.list still reports the peer as
+            // working must be re-checked on the next poll: a stale "working" row
+            // is the race that used to permanently ack the real done event.
+            if (peekedBatch.hasDeferredWorking) {
+              retryWakePending = true;
+            }
 
             if (
               hasWakeBatch &&
               hasUnackedDeliveredEvents &&
-              !peekedBatch &&
+              !peekedBatch.hasOutcomes &&
               !deliveredBatchGracePending
             ) {
               // The batch only exists as delivered-but-unacked events, i.e. the
@@ -384,39 +393,51 @@ export async function runAgyHook(
               ) {
                 return {};
               }
-              // The stop hook marked the batch presented before returning it to
-              // the host; the turn started by this prompt has to receive it in
-              // PreInvocation, so re-arm the unacked batch first.
-              rearmDeliveredEvents(stateDir, sessionId);
-              try {
-                await triggerWakePrompt({
-                  paneId: launch.paneId,
-                  promptText: WAKE_PROMPT_TEXT,
-                });
-                const postTriggerState = readSessionState(stateDir, sessionId);
-                if (
-                  postTriggerState.turnEpoch !== undefined &&
-                  postTriggerState.turnEpoch !== waiterEpoch
-                ) {
-                  console.warn(
-                    `Herdsman agy wake prompt raced with a new turn (waiterEpoch=${waiterEpoch}, turnEpoch=${postTriggerState.turnEpoch})`,
-                  );
-                  return {};
-                }
-                if (postTriggerState.waiterPid === process.pid) {
-                  delete postTriggerState.waiterPid;
-                  writeSessionState(stateDir, sessionId, postTriggerState);
-                }
-                return {};
-              } catch (error) {
-                wakePromptFailures += 1;
+              // Avoid submitting the wake prompt on top of a half-typed draft in
+              // the agy composer. Deferring is safe: the next poll retries, and if
+              // the user submits the draft themselves PreInvocation still runs
+              // takeNextWakeBatch over the pending events.
+              const composerDraft = await readComposerDraft(launch.paneId, readPaneText);
+              if (composerDraft === "has-draft") {
                 console.warn(
-                  `Herdsman agy wake prompt failed (attempt ${wakePromptFailures}/${MAX_WAKE_PROMPT_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
+                  `Herdsman agy wake deferred: 输入框有草稿，推迟叫醒 (pane ${launch.paneId})`,
                 );
-                if (wakePromptFailures >= MAX_WAKE_PROMPT_ATTEMPTS) {
-                  return {};
-                }
                 retryWakePending = true;
+              } else {
+                // The stop hook marked the batch presented before returning it to
+                // the host; the turn started by this prompt has to receive it in
+                // PreInvocation, so re-arm the unacked batch first.
+                rearmDeliveredEvents(stateDir, sessionId);
+                try {
+                  await triggerWakePrompt({
+                    paneId: launch.paneId,
+                    promptText: WAKE_PROMPT_TEXT,
+                  });
+                  const postTriggerState = readSessionState(stateDir, sessionId);
+                  if (
+                    postTriggerState.turnEpoch !== undefined &&
+                    postTriggerState.turnEpoch !== waiterEpoch
+                  ) {
+                    console.warn(
+                      `Herdsman agy wake prompt raced with a new turn (waiterEpoch=${waiterEpoch}, turnEpoch=${postTriggerState.turnEpoch})`,
+                    );
+                    return {};
+                  }
+                  if (postTriggerState.waiterPid === process.pid) {
+                    delete postTriggerState.waiterPid;
+                    writeSessionState(stateDir, sessionId, postTriggerState);
+                  }
+                  return {};
+                } catch (error) {
+                  wakePromptFailures += 1;
+                  console.warn(
+                    `Herdsman agy wake prompt failed (attempt ${wakePromptFailures}/${MAX_WAKE_PROMPT_ATTEMPTS}): ${error instanceof Error ? error.message : String(error)}`,
+                  );
+                  if (wakePromptFailures >= MAX_WAKE_PROMPT_ATTEMPTS) {
+                    return {};
+                  }
+                  retryWakePending = true;
+                }
               }
             }
           }
@@ -814,6 +835,70 @@ async function defaultTriggerWakePrompt(input: {
   });
 }
 
+async function defaultReadPaneText(paneId: string): Promise<string | undefined> {
+  try {
+    const { stdout } = await execFileAsync("herdr", ["pane", "read", paneId, "--lines", "12"], {
+      timeout: 5_000,
+    });
+    return stdout;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Parses the agy composer at the bottom of a `herdr pane read` dump.
+ *
+ * Empty composer (observed on real panes): a lone `>` between two `───` rules,
+ * with no placeholder text after the prompt. A non-empty draft is any trimmed
+ * content after that `>` and/or extra lines between the rules.
+ *
+ * Returns `undefined` when the composer region cannot be located so callers can
+ * fall back to the pre-fix wake behaviour instead of blocking forever.
+ */
+export function parseAgyComposerDraft(paneText: string): string | undefined {
+  const lines = paneText.replace(/\r\n?/g, "\n").split("\n");
+  const separatorIndexes: number[] = [];
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    // Box-drawing horizontal rules; tolerate an ASCII dash fallback.
+    if (/^[\s]*[─-]{8,}[\s]*$/.test(line)) {
+      separatorIndexes.push(index);
+    }
+  }
+  if (separatorIndexes.length < 2) return undefined;
+  const bottom = separatorIndexes[separatorIndexes.length - 1];
+  const top = separatorIndexes[separatorIndexes.length - 2];
+  if (bottom === undefined || top === undefined || bottom <= top + 1) return undefined;
+
+  const region = lines.slice(top + 1, bottom);
+  if (region.length === 0) return undefined;
+
+  const draftLines = region.map((line, index) => {
+    if (index === 0) {
+      const match = /^(?:>\s?)(.*)$/.exec(line);
+      if (match) return match[1] ?? "";
+    }
+    return line;
+  });
+  return draftLines.join("\n").replace(/[ \t]+$/gm, "").trimEnd();
+}
+
+async function readComposerDraft(
+  paneId: string,
+  readPaneText: (paneId: string) => Promise<string | undefined>,
+): Promise<"empty" | "has-draft" | "unknown"> {
+  try {
+    const paneText = await readPaneText(paneId);
+    if (paneText === undefined) return "unknown";
+    const draft = parseAgyComposerDraft(paneText);
+    if (draft === undefined) return "unknown";
+    return draft.trim().length > 0 ? "has-draft" : "empty";
+  } catch {
+    return "unknown";
+  }
+}
+
 async function registerAgyPresence(
   client: Pick<ObservabilityRpcClient, "request">,
   launch: { herdrSocketPath: string; paneId: string; workspaceId: string },
@@ -880,7 +965,7 @@ async function peekNextWakeBatch(
   sessionState: AgySessionHookState,
   stateDir: string,
   sessionId: string,
-): Promise<boolean> {
+): Promise<{ hasDeferredWorking: boolean; hasOutcomes: boolean }> {
   const ackedEventId = connState.state?.ackedEventId ?? 0;
   const presented = new Set(
     (sessionState.presentedEventIds ?? []).filter((id) => id > ackedEventId),
@@ -896,13 +981,17 @@ async function peekNextWakeBatch(
     )
     .sort((left, right) => left.id - right.id);
 
-  if (candidateEvents.length === 0) return false;
+  if (candidateEvents.length === 0) {
+    return { hasDeferredWorking: false, hasOutcomes: false };
+  }
 
   const liveWorkingTerminalIds = await fetchLiveWorkingTerminalIds(client, connState.presence);
-  const { outcomes, suppressedEventIds } = projectAgyOutcomes(
+  const { deferredWorkingEventIds, outcomes, suppressedEventIds } = projectAgyOutcomes(
     candidateEvents,
     liveWorkingTerminalIds,
   );
+  // Working-deferred completions must stay unacked and unpresented so a later
+  // poll can project them once agent.list catches up to idle/done.
   if (outcomes.length === 0) {
     if (suppressedEventIds.length > 0) {
       for (const suppressedId of suppressedEventIds) {
@@ -922,10 +1011,16 @@ async function peekNextWakeBatch(
       sessionState.presentedEventIds = freshState.presentedEventIds;
       writeSessionState(stateDir, sessionId, freshState);
     }
-    return false;
+    return {
+      hasDeferredWorking: deferredWorkingEventIds.length > 0,
+      hasOutcomes: false,
+    };
   }
 
-  return true;
+  return {
+    hasDeferredWorking: deferredWorkingEventIds.length > 0,
+    hasOutcomes: true,
+  };
 }
 
 async function takeNextWakeBatch(
@@ -974,10 +1069,13 @@ async function takeNextWakeBatch(
       sessionState.presentedEventIds = [...presented].slice(-500);
       writeSessionState(stateDir, sessionId, sessionState);
     }
+    // Working-deferred completions stay unacked/unpresented for the next poll.
     return undefined;
   }
 
   const outcomeIds = outcomes.map((outcome) => outcome.eventId);
+  // Only permanent suppressions and real outcomes are marked presented.
+  // Working-deferred ids must remain eligible for the next projection pass.
   const deliveredIds = [...new Set([...suppressedEventIds, ...outcomeIds])].sort(
     (left, right) => left - right,
   );
@@ -1159,12 +1257,16 @@ async function inspectWorkspaceAgents(
 /**
  * Terminal ids of peers whose live Herdr status is `working`.
  *
- * Used to suppress completions that belong to an intermediate round of a still
+ * Used to defer completions that may belong to an intermediate round of a still
  * running turn: `agent.done` / `agent.idle` rows are written for every internal
  * tool round, so the live status is the only signal that the turn is not over
  * (`agent.status.changed` rows never reach the hook's event batch). Failure is
  * tolerated: the completion is then projected as a real outcome (the pre-fix
  * behaviour) instead of dropping the whole batch.
+ *
+ * A stale `working` row right after a real `agent.done` is also possible; those
+ * events are deferred (not permanently acked) so the next poll can wake once
+ * the live status catches up.
  */
 async function fetchLiveWorkingTerminalIds(
   client: Pick<ObservabilityRpcClient, "request">,
@@ -1195,15 +1297,21 @@ async function fetchLiveWorkingTerminalIds(
   }
 }
 
+function logAgyEventSuppressed(eventId: number, reason: string): void {
+  console.warn(`Herdsman agy wake suppressed eventId=${eventId}: ${reason}`);
+}
+
 function projectAgyOutcomes(
   events: AgentEventRecord[],
   liveWorkingTerminalIds: ReadonlySet<string> = new Set(),
 ): {
+  deferredWorkingEventIds: number[];
   outcomes: AgyOutcome[];
   suppressedEventIds: number[];
 } {
   const outcomes: AgyOutcome[] = [];
   const suppressedEventIds: number[] = [];
+  const deferredWorkingEventIds: number[] = [];
   const completedPanes = new Set<string>();
 
   for (const event of events) {
@@ -1219,18 +1327,25 @@ function projectAgyOutcomes(
       event.terminalId !== null &&
       liveWorkingTerminalIds.has(event.terminalId)
     ) {
-      // The peer is working right now: its completion belongs to an intermediate
-      // round of the same turn, so it must not end the orchestrator's wait. The
-      // live `agent.list` status is the *only* intermediate-round signal: the
-      // `agent.status.changed` rows that would carry event-chain evidence are
-      // never part of a delivered batch (see `isDeliverableAgentEvent`), so there
-      // is no in-batch supersede to evaluate.
-      suppressedEventIds.push(event.id);
+      // The peer still reports working: this completion may be an intermediate
+      // tool round *or* a race where agent.list has not yet flipped to idle/done.
+      // Defer (do not ack / present) so a later poll can decide.
+      deferredWorkingEventIds.push(event.id);
+      logAgyEventSuppressed(
+        event.id,
+        `deferred: peer terminal ${event.terminalId} still working in agent.list`,
+      );
       continue;
     }
     const kind = outcomeKind(event);
     if (!kind || !event.terminalId) {
       suppressedEventIds.push(event.id);
+      logAgyEventSuppressed(
+        event.id,
+        !event.terminalId
+          ? "no terminalId"
+          : `non-outcome event type ${event.type}`,
+      );
       continue;
     }
     const payload = asRecord(event.payload);
@@ -1241,6 +1356,10 @@ function projectAgyOutcomes(
       completedPanes.has(`${event.paneId}\0${event.paneGeneration}`)
     ) {
       suppressedEventIds.push(event.id);
+      logAgyEventSuppressed(
+        event.id,
+        `fallback outcome superseded by completion for pane ${event.paneId}`,
+      );
       continue;
     }
     const text = normalizeExcerpt(event.compactHistory?.lastAssistantMessage?.text);
@@ -1248,10 +1367,12 @@ function projectAgyOutcomes(
       kind === "failed" || kind === "stalled" ? normalizeExcerpt(payload.reason) : undefined;
     if (isUpstreamErrorText(text) || (reason !== undefined && isUpstreamErrorText(reason))) {
       suppressedEventIds.push(event.id);
+      logAgyEventSuppressed(event.id, "upstream model error text");
       continue;
     }
     if (kind === "completed" && text.length === 0) {
       suppressedEventIds.push(event.id);
+      logAgyEventSuppressed(event.id, "empty completed assistant text");
       continue;
     }
     outcomes.push({
@@ -1270,7 +1391,7 @@ function projectAgyOutcomes(
     });
   }
 
-  return { outcomes, suppressedEventIds };
+  return { deferredWorkingEventIds, outcomes, suppressedEventIds };
 }
 
 function isCompletionEvent(event: AgentEventRecord): boolean {
