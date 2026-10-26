@@ -12,7 +12,8 @@
 #   HERDSMAN_IMPL=go            exec the compiled Go binary
 #
 # Overrides (mainly for tests and out-of-tree builds):
-#   HERDSMAN_GO_BIN   path of the Go binary      (default: <repo>/go/bin/herdsman)
+#   HERDSMAN_GO_BIN   path of the Go binary      (default: <repo>/go/bin/herdsman,
+#                    falling back to /root/.local/lib/herdsman-go/herdsman)
 #   HERDSMAN_TS_ENTRY path of the TS entrypoint  (default: <repo>/dist/src/cli/herdsman.js)
 #   HERDSMAN_NODE     node binary for the TS entrypoint (default: node)
 set -eu
@@ -31,9 +32,16 @@ case "$impl" in
     exec "${HERDSMAN_NODE:-node}" "$entry" "$@"
     ;;
   go)
-    go_bin=${HERDSMAN_GO_BIN:-$repo_root/go/bin/herdsman}
-    if [ ! -x "$go_bin" ]; then
-      echo "herdsman wrapper: Go binary not found at $go_bin (run: cd go && go build -o bin/herdsman ./cmd/herdsman)" >&2
+    go_bin=${HERDSMAN_GO_BIN:-}
+    if [ -z "$go_bin" ]; then
+      if [ -x "$repo_root/go/bin/herdsman" ]; then
+        go_bin=$repo_root/go/bin/herdsman
+      elif [ -x /root/.local/lib/herdsman-go/herdsman ]; then
+        go_bin=/root/.local/lib/herdsman-go/herdsman
+      fi
+    fi
+    if [ -z "$go_bin" ] || [ ! -x "$go_bin" ]; then
+      echo "herdsman wrapper: Go binary not found (looked at HERDSMAN_GO_BIN, $repo_root/go/bin/herdsman, /root/.local/lib/herdsman-go/herdsman)" >&2
       exit 1
     fi
     exec "$go_bin" "$@"
