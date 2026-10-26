@@ -250,7 +250,16 @@ type HerdsmanState = {
 
 type PiContext = {
   abort?: () => void;
+  /**
+   * Whether a dialog-capable UI is attached to this run. Pi reports `false` for
+   * the non-interactive `print` and `json` modes and for `--no-session` runs.
+   * Left optional because it is only read as an explicit `false`: an absent
+   * field means "unknown" and must not disable the daemon client.
+   */
+  hasUI?: boolean;
   isIdle?: () => boolean;
+  /** Current run mode (`"tui" | "rpc" | "json" | "print"`), when Pi reports it. */
+  mode?: string;
   sessionManager: { getSessionFile(): string; getSessionId(): string };
   ui: {
     notify?: (message: string, level?: "error" | "info" | "warning") => void;
@@ -441,6 +450,36 @@ function defaultHerdsmanHome() {
 
 export function defaultSocketPath() {
   return `${defaultHerdsmanHome().replace(/\/$/, "")}/herdsman.sock`;
+}
+
+/**
+ * Whether this `session_start` must not open a daemon connection at all.
+ *
+ * Two shapes qualify, and both are one-shot or session-less runs where a
+ * daemon client can only ever be a liability:
+ *
+ * - no session file (`--no-session`): there is no path to register presence
+ *   against, and `agent.orchestrator.register` rejects, so the client would
+ *   spend the rest of the run in a reconnect loop;
+ * - a non-interactive `print`/`json` run: the process is about to exit and
+ *   nothing will ever read the stream, so the connection outlives the run and
+ *   holds the event loop open.
+ *
+ * `hasUI` is only honoured as an explicit `false` (Pi's own signal for a
+ * non-interactive mode); an absent field means "unknown" and keeps the old
+ * behaviour. The mode is read from the event first and the context second
+ * because Pi reports it on both.
+ */
+function shouldSkipDaemonClient(
+  event: unknown,
+  ctx: PiContext,
+  sessionRef: { value: string } | undefined,
+): boolean {
+  if (!sessionRef?.value) return true;
+  if (ctx.hasUI === false) return true;
+  const record = typeof event === "object" && event !== null ? (event as Record<string, unknown>) : {};
+  const mode = record.mode ?? ctx.mode;
+  return mode === "print" || mode === "json";
 }
 
 export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
@@ -2129,6 +2168,18 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       };
       state.launchIdentity = herdrLaunchIdentity(process.env);
       if (!state.launchIdentity) {
+        state.connected = false;
+        loseRole(ctx);
+        return;
+      }
+      if (shouldSkipDaemonClient(_event, ctx, state.sessionRef)) {
+        // Nothing to register against: an ephemeral `--no-session` run has no
+        // session file to report, and a `print`/`json` run is a one-shot
+        // non-interactive process whose only remaining work is to exit. Building
+        // a client here is what kept `pi --print` hanging on `herdsman.sock`.
+        stopKeepalive();
+        state.client?.close();
+        state.client = undefined;
         state.connected = false;
         loseRole(ctx);
         return;

@@ -4873,6 +4873,121 @@ describe("herdsman-pi daemon keepalive", () => {
   });
 });
 
+// X3 fix ②: a session-less (`--no-session`) run and a non-interactive
+// `print`/`json` run must never open a daemon connection. Pre-fix, both did:
+// the one-shot process then hung on the `herdsman.sock` connection at exit, and
+// the session-less one spun on `agent.orchestrator.register` rejections.
+describe("herdsman-pi non-interactive and session-less sessions", () => {
+  test("does not create a daemon client without a session file (--no-session)", async () => {
+    const pi = createFakePi();
+    let clients = 0;
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({
+      clientFactory: () => {
+        clients += 1;
+        return createFakeClient();
+      },
+    })(pi);
+    const previous = withHerdrEnv();
+    try {
+      await pi.emit("session_start", {}, fakeCtx({ sessionFile: undefined }));
+      expect(clients).toBe(0);
+
+      // A later interactive session in the same process still connects.
+      const client = createFakeClient();
+      clients = 0;
+      createHerdsmanPiExtension({
+        clientFactory: () => {
+          clients += 1;
+          return client;
+        },
+      })(pi);
+      await pi.emit("session_start", {}, fakeCtx({ sessionId: "pi-real" }));
+      await client.connect();
+      expect(clients).toBe(1);
+      expect(client.calls[0]?.[0]).toBe("agent.orchestrator.register");
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+
+  test("does not create a daemon client in print mode", async () => {
+    const pi = createFakePi();
+    let clients = 0;
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({
+      clientFactory: () => {
+        clients += 1;
+        return createFakeClient();
+      },
+    })(pi);
+    const previous = withHerdrEnv();
+    try {
+      // Pi reports `hasUI: false` for print/json runs and names the mode on
+      // both the event and the context.
+      await pi.emit(
+        "session_start",
+        { reason: "startup", type: "session_start" },
+        fakeCtx({ hasUI: false, mode: "print" }),
+      );
+      expect(clients).toBe(0);
+
+      await pi.emit(
+        "session_start",
+        { reason: "startup", type: "session_start" },
+        fakeCtx({ hasUI: false, mode: "json" }),
+      );
+      expect(clients).toBe(0);
+
+      // The mode is honoured from the event alone as well.
+      await pi.emit(
+        "session_start",
+        { mode: "print", reason: "startup", type: "session_start" },
+        fakeCtx(),
+      );
+      expect(clients).toBe(0);
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+
+  test("an interactive session with no reported mode still connects", async () => {
+    // Backward compatibility: existing contexts do not set `hasUI`/`mode`, and
+    // an absent field must not be read as non-interactive.
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx();
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
+    const previous = withHerdrEnv();
+    try {
+      await pi.emit("session_start", {}, ctx);
+      await client.connect();
+      expect(client.calls[0]?.[0]).toBe("agent.orchestrator.register");
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+
+  test("closes an existing client when a session-less session starts", async () => {
+    const first = createFakeClient();
+    const pi = createFakePi();
+    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
+    createHerdsmanPiExtension({ clientFactory: () => first })(pi);
+    const previous = withHerdrEnv();
+    try {
+      await pi.emit("session_start", {}, fakeCtx({ sessionId: "pi-old" }));
+      await first.connect();
+      expect(first.closed).toBe(false);
+
+      await pi.emit("session_start", {}, fakeCtx({ sessionFile: undefined }));
+      expect(first.closed).toBe(true);
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+});
+
 function createWakeClient(replayedEvents: AgentEventWireRecord[] = [], ackedEventId?: number) {
   const client = createFakeClient();
   for (const ev of replayedEvents) {
@@ -5094,17 +5209,30 @@ function createFakePi() {
   };
 }
 
-function fakeCtx(options: { idle?: boolean; sessionFile?: string; sessionId?: string } = {}) {
+function fakeCtx(
+  options: {
+    hasUI?: boolean;
+    idle?: boolean;
+    mode?: string;
+    sessionFile?: string | undefined;
+    sessionId?: string;
+  } = {},
+) {
   const runtime = { idle: options.idle ?? false };
   const ctx = {
     abort() {
       ctx.aborts += 1;
     },
     aborts: 0,
+    hasUI: options.hasUI,
     isIdle: () => runtime.idle,
+    mode: options.mode,
     notifications: [] as Array<[string, string | undefined]>,
     sessionManager: {
-      getSessionFile: () => options.sessionFile ?? "/tmp/pi-session.jsonl",
+      // `--no-session` runs have no session file at all, so the option may
+      // deliberately hold `undefined`.
+      getSessionFile: (): string | undefined =>
+        Object.hasOwn(options, "sessionFile") ? options.sessionFile : "/tmp/pi-session.jsonl",
       getSessionId: () => options.sessionId ?? "pi-session",
     },
     setIdle(value: boolean) {

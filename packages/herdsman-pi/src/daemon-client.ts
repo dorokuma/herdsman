@@ -132,6 +132,12 @@ export class ReconnectingDaemonClient {
     if (this.#state === "closed") return;
     this.#incompatible = false;
     this.#reconnectAttempt = 0;
+    // A session reset reconnects, so it must first release what this client
+    // still holds: a pending reconnect timer would fire against the new socket
+    // (an extra connection and a reconnect loop), and an old socket that is
+    // merely overwritten stays ESTABLISHED forever with nobody closing it.
+    this.#clearReconnectTimer();
+    this.#destroySocket();
     this.#connect();
   }
 
@@ -139,10 +145,8 @@ export class ReconnectingDaemonClient {
     if (this.#state === "closed") return;
     this.#state = "closed";
     this.#generation += 1;
-    if (this.#reconnectTimer) clearTimeout(this.#reconnectTimer);
-    this.#reconnectTimer = undefined;
-    this.#socket?.destroy();
-    this.#socket = undefined;
+    this.#clearReconnectTimer();
+    this.#destroySocket();
     this.#rejectAll(new Error("Herdsman daemon client is closed"));
   }
 
@@ -172,11 +176,23 @@ export class ReconnectingDaemonClient {
 
   #connect(): void {
     if (this.#state === "closed" || this.#incompatible) return;
+    // Every entry point that starts a new connection supersedes the previous
+    // one. Overwriting `#socket` without closing the old one is what left an
+    // orphan ESTAB connection on `herdsman.sock` when the constructor's
+    // queued connect raced a synchronous `resetForSession()`; a pending
+    // reconnect timer must go for the same reason.
+    this.#clearReconnectTimer();
+    this.#destroySocket();
     this.#state = "connecting";
     this.#generation += 1;
     const generation = this.#generation;
     this.#decoder = new JsonLineDecoder();
     const socket = createConnection(this.#socketPath);
+    // The daemon client must never be the reason a finished Pi process stays
+    // alive: print/json runs end without an explicit `process.exit()`, so the
+    // socket has to be taken out of the event loop's reference count or the
+    // process hangs on an idle connection.
+    socket.unref?.();
     this.#socket = socket;
     let disconnected = false;
     const disconnect = (error: Error) => {
@@ -185,7 +201,13 @@ export class ReconnectingDaemonClient {
       this.#handleDisconnect(error, generation);
     };
     socket.on("connect", () => {
-      if (generation !== this.#generation || this.#state === "closed") return;
+      if (generation !== this.#generation || this.#state === "closed") {
+        // Backstop: a socket that reached "connect" after this client moved to
+        // a newer generation (or closed) is not the live connection, and
+        // returning without destroying it is exactly the orphan leak.
+        socket.destroy();
+        return;
+      }
       this.#state = "connected";
       this.#reconnectAttempt = 0;
       Promise.resolve(this.onConnected?.()).catch((error) => {
@@ -193,7 +215,12 @@ export class ReconnectingDaemonClient {
       });
     });
     socket.on("data", (chunk) => {
-      if (generation !== this.#generation || this.#state === "closed") return;
+      if (generation !== this.#generation || this.#state === "closed") {
+        // Same backstop as "connect": stale-generation bytes must not keep a
+        // superseded socket open.
+        socket.destroy();
+        return;
+      }
       try {
         this.#handleData(chunk.toString("utf8"));
       } catch (error) {
@@ -220,6 +247,24 @@ export class ReconnectingDaemonClient {
       this.#reconnectTimer = undefined;
       this.#connect();
     }, delay);
+    // A pending reconnect must not hold the process open either.
+    this.#reconnectTimer?.unref?.();
+  }
+
+  /** Drop the pending reconnect timer, if any, so it cannot fire against a
+   * connection this client has already replaced. */
+  #clearReconnectTimer(): void {
+    if (!this.#reconnectTimer) return;
+    clearTimeout(this.#reconnectTimer);
+    this.#reconnectTimer = undefined;
+  }
+
+  /** Close the socket this client currently holds and forget it. */
+  #destroySocket(): void {
+    const socket = this.#socket;
+    if (!socket) return;
+    this.#socket = undefined;
+    socket.destroy();
   }
 
   #handleData(chunk: string): void {
