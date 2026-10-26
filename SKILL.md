@@ -1,12 +1,12 @@
 ---
 name: herdsman
 description: "Inspect the status, progress, latest messages, compact structured history, and recent tool results of coding agents managed by Herdr using Herdsman. Use whenever the user asks what another Herdr-managed coding agent is doing, whether it is working, blocked, idle, or done, what it recently reported or changed, or needs structured context before coordinating with that agent. Also use outside Herdr when the user provides an explicit Herdr workspace or session scope for agent inspection."
-compatibility: "Requires the Herdsman CLI and daemon. Current-workspace lookup requires HERDR_ENV=1 and HERDR_WORKSPACE_ID. Explicit Herdsman workspace or session scopes work outside Herdr."
+compatibility: "Requires the Herdsman CLI and daemon. Probe Herdr via `herdr pane current` / `herdr session list` (nested shells often lack HERDR_ENV). Explicit Herdsman workspace or session scopes work outside Herdr."
 ---
 
 # Herdsman agent inspection
 
-Use Herdsman for structured coding-agent status, compact message history, and recent compact tool results. Use the official `herdr` skill for live workspace, tab, pane, terminal input/output, focus, spawn, and wait operations.
+Use Herdsman for structured coding-agent status, compact message history, and recent compact tool results. Use the local `herdr` skill for live workspace, tab, pane, terminal input/output, focus, spawn, and wait operations.
 
 ## Ensure the daemon is running
 
@@ -33,13 +33,13 @@ When `HERDSMAN_AUTO_ON=1` is set on main-agent startup (`pi` or `agy`), the sess
 
 ## Select the scope
 
-Use the current workspace only when both `HERDR_ENV=1` and `HERDR_WORKSPACE_ID` are set:
+Prefer the current Herdr workspace when the CLI can see it (probe with `herdr pane current --current` / `herdr session list`; nested shells often lack `HERDR_ENV`):
 
 ```bash
 herdsman agent list --json
 ```
 
-If either value is missing, do not guess the workspace or fall back to `--all`. Ask for an explicit scope.
+If the current workspace cannot be determined, do not guess or fall back to `--all`. Ask for an explicit scope.
 
 Outside Herdr, or when the user names a scope, pass it explicitly:
 
@@ -67,23 +67,13 @@ Add the same `--workspace` and `--session` scope used for `agent list` when oper
 
 Agent status uses `working`, `blocked`, `idle`, `done`, or `unknown`. `done` means the agent finished and its pane has not yet been viewed.
 
-## Coordinate through the official Herdr skill
+## Coordinate through the local Herdr skill
 
-When a task also requires live terminal output, pane control, input, spawning, focus, or waiting, load and follow the installed official `herdr` skill as the source of truth:
-
-https://github.com/ogulcancelik/herdr/blob/master/SKILL.md
-
-If that skill is unavailable, stop the Herdr-control portion and ask the user to install it:
-
-```bash
-npx skills add ogulcancelik/herdr --skill herdr -g
-```
-
-Do not copy or guess Herdr CLI commands in this skill.
+When a task also requires live terminal output, pane control, input, spawning, focus, or waiting, use the local `herdr` skill (`~/.pi/agent/skills/herdr/SKILL.md`). Probe with `herdr session list` / `herdr pane current --current`. Do not treat `herdr --skill` upstream text as authoritative when it conflicts with the local skill.
 
 ## Boundaries
 
 - Herdsman returns agents from running Herdr sessions only.
 - Use Herdsman for structured semantic history, not raw terminal fidelity.
 - Herdsman does not start, prompt, wait for, focus, or send terminal input to agents.
-- Use the official `herdr` skill for live terminal state and control.
+- Use the local `herdr` skill for live terminal state and control.
