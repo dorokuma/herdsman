@@ -688,9 +688,12 @@ func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
 	// DriverConnClosed while (*sql.DB).Close runs — what WaitDriverConnClosed
 	// does, and what every subtest above does while a Close is in flight — used
 	// to read those fields with no synchronisation at all, a data race -race
-	// flags. The poller below is parked against a held gate so it is already
-	// spinning when the driver Close actually starts: the overlap window is the
-	// lifetime of the driver's own Close, which a poller starting only after
+	// flags. The poller and the WaitDriverConnClosed waiter below are both
+	// parked against a held gate and held at a readiness barrier before the
+	// gate is released: both are already observing a live connection (the
+	// waiter already inside WaitDriverConnClosed's own 1ms poll cycle) when
+	// the driver Close actually starts, so the overlap window is the lifetime
+	// of the driver's own Close — which an observer starting only after
 	// (*sql.DB).Close returned could never observe.
 	t.Run("DriverConnClosed does not race the driver Close", func(t *testing.T) {
 		db := openMigratedTestDB(t)
@@ -717,9 +720,21 @@ func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
 		closed := make(chan error, 1)
 		go func() { closed <- db.Close() }()
 
+		// Both observers must be started (and already observing a live
+		// connection) before the gate is released: a goroutine that is only
+		// scheduled after db.Close() has already run can never overlap the
+		// driver Close, so the overlap window below would be empty on a slow
+		// scheduler. pollerReady proves the tight poller read the still-open
+		// connection; waiterReady proves the WaitDriverConnClosed goroutine
+		// checked !DriverConnClosed and entered its 1ms poll cycle.
 		pollerDone := make(chan struct{})
+		pollerReady := make(chan struct{})
 		go func() {
 			defer close(pollerDone)
+			if DriverConnClosed(db) {
+				return
+			}
+			close(pollerReady)
 			// No sleep between the reads: the point is to overlap the poller's
 			// driver.Validator reads with the driver Close running under the
 			// gate, not to step over it a millisecond at a time.
@@ -727,16 +742,43 @@ func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
 			}
 		}()
 
+		waiterResult := make(chan bool, 1)
+		waiterReady := make(chan struct{})
+		go func() {
+			if DriverConnClosed(db) {
+				close(waiterResult)
+				close(waiterReady)
+				return
+			}
+			close(waiterReady)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			waiterResult <- WaitDriverConnClosed(ctx, db)
+		}()
+
+		<-pollerReady
+		<-waiterReady
+		// Give the waiter the chance to enter WaitDriverConnClosed's own 1ms
+		// poll cycle, then assert it has not returned yet: the connection is
+		// still open behind the held gate.
+		time.Sleep(5 * time.Millisecond)
+		select {
+		case result := <-waiterResult:
+			t.Fatalf("WaitDriverConnClosed = %v while the gate still held the close back, want it still polling", result)
+		default:
+		}
+
 		close(release)
 		<-holderDone
 		<-pollerDone
 
-		// The waiter shape the rest of the suite uses, now that the connection
-		// is known closed: it must report so without waiting for the timeout.
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if !WaitDriverConnClosed(ctx, db) {
-			t.Fatal("WaitDriverConnClosed = false after Close, want the driver connection closed")
+		select {
+		case result := <-waiterResult:
+			if !result {
+				t.Fatal("WaitDriverConnClosed = false after Close, want the driver connection closed")
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("WaitDriverConnClosed did not return after Close finished")
 		}
 
 		select {
