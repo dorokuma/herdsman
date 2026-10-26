@@ -1593,3 +1593,435 @@ c1e23a992d8aaa37928478c03df51d6e56d6940ebbc2e3a82c447852c221e726  /root/.local/l
 
 与 6.12.2 记录的值逐字节一致，故 6.12.2 的 sha256 对提交 `7e1a6cc` 同样成立。
 
+
+---
+
+## 6.13 第 6 批第 1 步：PiG + 全部 Go 扩展隔离试用环境与 `pig-trial` 冒烟
+
+> 本节记录任务书 `[MARK-B6-PIG-TRIAL-1]` 的全部实测。命令输出均为**本会话亲自跑过**的原文；
+> 未跑的都写明「未跑」并给原因。全程未打印任何密钥；未修改 `/root/.pi/agent`、
+> `/root/.gemini/config/hooks.json`、`/root/workspace/pi-extensions` 的 git 跟踪文件，
+> 未重启或干扰现役 `herdsman.service`。
+
+### 6.13.1 范围与产物
+
+| 项 | 落点 |
+|---|---|
+| 一键启动脚本（入库） | `go/scripts/pig-trial`（本 worktree，`chore/pig-trial`） |
+| 一键启动脚本（安装） | `/root/.local/bin/pig-trial`、`/root/.local/lib/herdsman-go/pig-trial` |
+| 隔离 PiG 配置目录 | `/root/.pig-test`（`PIG_HOME`），扩展经 `/root/.pig-test/agent/extensions/` 自动加载 |
+| 备份 | `/root/.pig-test/agent.bak-20261026-trial`（`cp -a`） |
+| 隔离 Go 守护进程 | `/root/.herdsman-go-trial`（`HERDSMAN_HOME`），启停用 `/root/.local/lib/herdsman-go/herdsman-go-trial` |
+| 新增测试 | `go/internal/cli/cli_test.go` 的 `TestWrapperAndTrialScripts`（pig-trial 子项） |
+
+日常用法（一键启动，隔离守护进程由脚本自动拉起）：
+
+```bash
+# 日常交互试用（TUI）
+/root/.local/bin/pig-trial
+
+# 单次命令（prompt 走 stdin，stdout 只属于 pig 自己）
+printf '%s' '回复 OK' | /root/.local/bin/pig-trial -p --no-session
+
+# 想带隔离 Herdr 身份（让 herdsman-pi 认当前 pane）时再加四个环境变量
+printf '%s' '回复 OK' | env HERDR_ENV=1 \
+  HERDR_SOCKET_PATH=/tmp/herdr-default.sock \
+  HERDR_PANE_ID=wTrialSmoke:p99 \
+  HERDR_WORKSPACE_ID=w3E \
+  HERDR_TERMINAL_ID=term_pig_trial_smoke \
+  /root/.local/bin/pig-trial -p --no-session
+```
+
+隔离守护进程也可单独管理（脚本就是 6.12.4 那个）：
+
+```bash
+/root/.local/lib/herdsman-go/herdsman-go-trial {init|start|stop|status|smoke}
+```
+
+### 6.13.2 备份（先备份后改动）
+
+```console
+$ ls -d /root/.pig-test/agent.bak-20261026-trial 2>/dev/null && echo BACKUP_EXISTS || echo NO_BACKUP
+NO_BACKUP
+$ cp -a /root/.pig-test/agent /root/.pig-test/agent.bak-20261026-trial
+$ du -sh /root/.pig-test/agent.bak-20261026-trial
+3.5M	/root/.pig-test/agent.bak-20261026-trial
+$ ls -e /root/.local/bin/pig-trial 2>/dev/null && echo PIG_TRIAL_EXISTS || echo NO_PIG_TRIAL
+NO_PIG_TRIAL
+```
+
+（`/root/.local/bin/pig-trial` 事前不存在，故无需备份；本次为首次创建。）
+
+改动后与备份的差异（只有 `extensions/` 多出 17 个软链，另有一个扩展自身写的日志）：
+
+```console
+$ diff -rq /root/.pig-test/agent.bak-20261026-trial /root/.pig-test/agent
+只在 /root/.pig-test/agent/extensions 中存在：auto-continue
+...（共 17 条，名单见 6.13.3）
+文件 /root/.pig-test/agent.bak-20261026-trial/logs/ctx-orchestrate.log 和 /root/.pig-test/agent/logs/ctx-orchestrate.log 不同
+```
+
+### 6.13.3 17 个 Go 扩展的加载方式
+
+**发现机制**（依据 PiG 0.5.2 自带文档 `/root/.pig-test/docs/bundle-bef283d5f1f7c3a5/extensions.md`「Discovery」）：
+
+> PiG collects extensions from these sources: 1. `~/.pig/agent/extensions` 2. trusted
+> `<cwd>/.pig/extensions` … 5. exact paths in settings 6. explicit `-e` paths …
+> `--no-extensions` disables ambient discovery and settings, but it preserves explicit `-e` paths.
+
+所以 `PIG_HOME=/root/.pig-test` 时，`/root/.pig-test/agent/extensions/` 就是用户级扩展目录，
+**默认启动即自动加载，无需每次手传 17 个 `-e`**。每个条目是指向 Go module 目录的软链；
+PiG 对软链按目标解析（`coding/extension/source/resolve.go`：`filepath.WalkDir` 不以软链为根遍历，
+故对链接根做 `EvalSymlinks` 后走目标），目录名即扩展身份，与各扩展 `sdk.New(...)` 注册名一致。
+
+软链清单（17 个，全部指向 `/root/workspace/pi-extensions/go/<组件>`；**不含** `pigsdk` 与 `examples/hello`）：
+
+```console
+$ ls -l /root/.pig-test/agent/extensions/
+lrwxrwxrwx auto-continue -> /root/workspace/pi-extensions/go/auto-continue
+lrwxrwxrwx cache-stats -> /root/workspace/pi-extensions/go/cache-stats
+lrwxrwxrwx codegraph-go -> /root/workspace/pi-extensions/go/codegraph-go
+lrwxrwxrwx ctxmode -> /root/workspace/pi-extensions/go/ctxmode
+lrwxrwxrwx ctx-orchestrate -> /root/workspace/pi-extensions/go/ctx-orchestrate
+lrwxrwxrwx exclude-tools-guard -> /root/workspace/pi-extensions/go/exclude-tools-guard
+lrwxrwxrwx herdr-agent-state -> /root/workspace/pi-extensions/go/herdr-agent-state
+lrwxrwxrwx herdsman-pi -> /root/workspace/pi-extensions/go/herdsman-pi
+lrwxrwxrwx jev-gate -> /root/workspace/pi-extensions/go/jev-gate
+lrwxrwxrwx moshi-hooks -> /root/workspace/pi-extensions/go/moshi-hooks
+lrwxrwxrwx no-tables -> /root/workspace/pi-extensions/go/no-tables
+lrwxrwxrwx pi-context-pruning -> /root/workspace/pi-extensions/go/pi-context-pruning
+lrwxrwxrwx pi-env -> /root/workspace/pi-extensions/go/pi-env
+lrwxrwxrwx pi-my-compact-ui -> /root/workspace/pi-extensions/go/pi-my-compact-ui
+lrwxrwxrwx pi-tinyfish -> /root/workspace/pi-extensions/go/pi-tinyfish
+lrwxrwxrwx pi-vcc -> /root/workspace/pi-extensions/go/pi-vcc
+lrwxrwxrwx rpiv-ask-user-question -> /root/workspace/pi-extensions/go/rpiv-ask-user-question
+```
+
+`/root/workspace/pi-extensions` 的 git 跟踪文件在改动前后均干净：
+
+```console
+$ git -C /root/workspace/pi-extensions status --short
+（无输出，EXIT=0）
+```
+
+### 6.13.4 全部 17 个扩展的加载 / 注册实测
+
+**(a) 资源发现**（`pig status --json`，`PIG_HOME=/root/.pig-test`）：
+
+```console
+$ cd /tmp && PIG_HOME=/root/.pig-test /root/.local/bin/pig status --json
+{"healthy":true,"paths":{"home":"/root/.pig-test","agent":"/root/.pig-test/agent","project":"/tmp/.pig"},
+ "packages":{"total":0,"user":0,"project":0},
+ "resources":{"total":17,"enabled":17,"disabled":0,"byKind":{"extensions":17},"items":[
+   {"kind":"extensions","name":"auto-continue","path":"/root/workspace/pi-extensions/go/auto-continue","scope":"user","origin":"top-level","source":"auto","enabled":true,"health":""},
+   ...
+   {"kind":"extensions","name":"rpiv-ask-user-question","path":"/root/workspace/pi-extensions/go/rpiv-ask-user-question","scope":"user","origin":"top-level","source":"auto","enabled":true,"health":""}],
+ "errors":[]}
+```
+
+17/17 全部 `source=auto`（用户扩展目录自动发现）、`enabled=true`、`health` 为空。
+
+**(b) 构建 + 运行时注册**（PiG 自己的校验路径，一次把 17 个全部 build、启动、读回注册）：
+
+```console
+$ cd /tmp && PIG_HOME=/root/.pig-test /root/.local/bin/pig install --validate-only --json \
+    /root/workspace/pi-extensions/go/{auto-continue,cache-stats,codegraph-go,ctx-orchestrate,ctxmode,
+exclude-tools-guard,herdr-agent-state,herdsman-pi,jev-gate,moshi-hooks,no-tables,pi-context-pruning,
+pi-env,pi-my-compact-ui,pi-tinyfish,pi-vcc,rpiv-ask-user-question}
+EXIT=0
+```
+
+逐条摘录（`registered=true` 即「构建成功 + 启动成功 + 运行时报回注册」）：
+
+| # | 扩展 | 源码 digest 前 12 位 | 注册工具 | 注册命令 | 事件钩子数 |
+|---|---|---|---|---|---|
+| 1 | herdr-agent-state | `9610ac44a9ec` | — | — | 3 |
+| 2 | exclude-tools-guard | `477a906048f3` | — | — | 2 |
+| 3 | no-tables | `b5141f3fec15` | — | — | 1 |
+| 4 | pi-env | `9b70f90621de` | — | `env` | 2 |
+| 5 | pi-tinyfish | `788243d44c72` | `tinyfish_search`、`tinyfish_fetch` | — | 0 |
+| 6 | pi-context-pruning | `3d2042d94731` | — | `prune`、`prune-config`、`prune-stats`、`prune-toggle` | 2 |
+| 7 | moshi-hooks | `745f06098d9b` | — | — | 6 |
+| 8 | ctxmode | `da8cf1e7efb1` | — | `ctxmode-start`、`ctxmode-stop` | 3 |
+| 9 | jev-gate | `23d68624df2f` | — | — | 0 |
+| 10 | ctx-orchestrate | `5f6cf22fdcb7` | `ctx_search_digest` | — | 1 |
+| 11 | auto-continue | `a978b7157c9f` | — | `auto-continue` | 13 |
+| 12 | codegraph-go | `6c691e649a4f0` | — | `codegraph-info`、`codegraph-start`、`codegraph-stop` | 3 |
+| 13 | cache-stats | `c57c20e56e21` | — | `cache-stats` | 12 |
+| 14 | pi-my-compact-ui | `208f026528cc` | — | `compact-inspect`、`compact-ui-config` | 11 |
+| 15 | pi-vcc | `806678b28083` | `vcc_recall` | `pi-vcc`、`pi-vcc-recall` | 4 |
+| 16 | rpiv-ask-user-question | `506eecabb817` | `ask_user_question` | — | 1 |
+| 17 | herdsman-pi | `609193f3ca98` | — | `herdsman` | 9 |
+
+整体结论字段：`{"valid": true, "extensions": [ … 17 条，全部 valid=true … ], "errors": null}`。
+
+**(c) 运行时形态**：17 个 Go 扩展由 PiG 打进**同一个 Go runtime cell**（一个 packed `runner`），
+不是 17 个独立二进制；cell 按输入内容寻址，缓存在 `$PIG_HOME/cache/cells/go/<digest>/`：
+
+```console
+$ ls -l /root/.pig-test/cache/cells/go/268da42970700603716e4fa5a5f2ab42543140563989e5b4b4db42a5260a79c0/
+-rw-r--r-- 1 root root  262 ready.json
+-rwxr-xr-x 1 root root 11112610 runner
+-rw-r--r-- 1 root root   23 usage.json
+$ cat .../ready.json
+{"inputDigest":"268da42970700603716e4fa5a5f2ab42543140563989e5b4b4db42a5260a79c0","artifactDigest":"98dc25ceb53fe4ff3aad53fbde755f5bdc300f3f397b03b5f98731a9f094c13b","size":11112610,"artifact":"runner","language":"go","target":"linux/amd64","created":1793008019}
+```
+
+「全部 17 个均为最新构建并通过校验」的证据即上面的 (b)：本次会话内 PiG 用当前源码重新 build 并读回注册，
+cell 的 `created` 时间戳 `1793008019`（= 2026-10-26 17:46:59）落在本次会话内。
+
+### 6.13.5 `herdsman-pi` 连接隔离 socket 的机制与铁证
+
+**机制**（源码 `/root/workspace/pi-extensions/go/herdsman-pi/extension.go`）：
+
+```go
+func DefaultHerdsmanHome() string {
+	if home := getenv("HERDSMAN_HOME"); home != "" { return home }
+	return getenv("HOME") + "/.herdsman"
+}
+func DefaultSocketPath() string {
+	return strings.TrimSuffix(DefaultHerdsmanHome(), "/") + "/herdsman.sock"
+}
+```
+
+`extensionlifecycle.go` 的 `HandleSessionStart` 用 `NewReconnectingDaemonClient(DefaultSocketPath(), nil)` 建连接，
+并在 `OnConnected` 里发 `agent.orchestrator.register`（`extensionlifecycle.go:407`）。
+该扩展**不读** `HERDSMAN_SOCKET_PATH`（全目录 grep 无命中），socket 只由 `HERDSMAN_HOME` 推导；
+`pig-trial` 导出 `HERDSMAN_HOME=/root/.herdsman-go-trial`，故 100% 只连
+`/root/.herdsman-go-trial/herdsman.sock`。（`HERDSMAN_SOCKET_PATH` / `HERDSMAN_PID_PATH` /
+`HERDSMAN_LOG_PATH` / `HERDSMAN_AGY_STATE_DIR` 仍按任务书导出，供其他组件使用。）
+
+**铁证（连接对）**：冒烟时旁路采样 `ss -xp` + `ps`，抓到扩展宿主进程连的正是隔离 socket，
+且与隔离守护进程的监听端互为 peer：
+
+```console
+# 隔离守护进程侧（server）
+u_str ESTAB 0 0  /root/.herdsman-go-trial/herdsman.sock 446897331  * 446895628 users:(("herdsman-daemon",pid=1007251,fd=12))
+# PiG 扩展宿主侧（client），peer inode 446897331 即上面那个隔离 socket
+u_str ESTAB 0 0  * 446895628  * 446897331 users:(("runner",pid=1060815,fd=23))
+```
+
+进程树（同一份 `ps` 采样）：
+
+```console
+1060743 1060740 /root/.local/bin/pig -p --no-session
+1060815 1060743 /root/.pig-test/cache/cells/go/268da42970700603716e4fa5a5f2ab42543140563989e5b4b4db42a5260a79c0/runner
+1060833 1060815 ctxmode -workdir /root/workspace/.wt/herdsman/chore-pig-trial
+```
+
+即：`pig-trial` → `pig` → 隔离 `PIG_HOME` 下的 Go 扩展 runner；runner 全程只与
+`/root/.herdsman-go-trial/herdsman.sock` 建立 ESTAB 连接（采样命中 118 次）。
+同一份采样里连现役 `/root/.herdsman/herdsman.sock` 的进程只有现役 `node`/`pi`
+（`pid=987377/1009459/1054880/1059822/986686`），**没有** trial runner。
+
+### 6.13.6 `go/scripts/pig-trial`（硬门禁 + 自动拉起 + 注入隔离环境）
+
+安装落点（三处逐字节一致）：
+
+```console
+$ sha256sum go/scripts/pig-trial /root/.local/bin/pig-trial /root/.local/lib/herdsman-go/pig-trial
+41eca8061e9aa6d62019395b9bf05d94b9006e7479e99b1c513cd8d8956b6364  go/scripts/pig-trial
+41eca8061e9aa6d62019395b9bf05d94b9006e7479e99b1c513cd8d8956b6364  /root/.local/bin/pig-trial
+41eca8061e9aa6d62019395b9bf05d94b9006e7479e99b1c513cd8d8956b6364  /root/.local/lib/herdsman-go/pig-trial
+```
+
+脚本行为（与 6.13.9 的单测一一对应）：
+
+1. `PIG_TRIAL_HOME`（默认 `/root/.pig-test`）经 `realpath -m` 解析，为空或解析到
+   `/root/.pi`、`/root/.pi/agent`、`$HOME/.pi`、`$HOME/.pi/agent` → 退出码 `2`；
+2. `HERDSMAN_TRIAL_HOME`（默认 `/root/.herdsman-go-trial`）同理，为空或解析到
+   `/root/.herdsman`、`$HOME/.herdsman` → 退出码 `2`；
+3. `unset PIG_CODING_AGENT_DIR PIG_CODING_AGENT_SESSION_DIR PIG_USE_PI_DIRS`；
+4. 调 `herdsman-go-trial start`（可用 `HERDSMAN_GO_TRIAL_BIN` 覆盖；**stdout 重定向到 stderr**，
+   保证 `pig -p` 的 stdout 纯净），失败即非零退出；
+5. 复核隔离 socket 存在且位于 `$HERDSMAN_TRIAL_HOME` 之下；
+6. 导出 `PIG_HOME` / `HERDSMAN_IMPL=go` / `HERDSMAN_HOME` / `HERDSMAN_SOCKET_PATH` /
+   `HERDSMAN_PID_PATH` / `HERDSMAN_LOG_PATH` / `HERDSMAN_AGY_STATE_DIR`，
+   `exec "${PIG_BIN:-/root/.local/bin/pig}" "$@"`。
+
+### 6.13.7 `pig-trial -p --no-session` 冒烟实测
+
+冒烟前记录（现役守护进程与现役数据库）：
+
+```console
+$ systemctl show -p MainPID --value herdsman.service
+2714759
+$ stat -c '%i %s %Y' /root/.herdsman/state.db
+19815117 139001856 1793008187
+```
+
+冒烟命令（driver 同时做 ps/ss 旁路取证，冒烟后停隔离守护进程并复核现役）：
+
+```bash
+printf '%s' '请依次做三件事，每件一行：1) 调用 ctx_run 执行 `herdsman --help`，把输出的前 3 行原文贴回来；2) 用一个 2 列 2 行的 markdown 表格回答 A=1，B=2；3) 列出你现在可用的全部工具名（逗号分隔）。' |
+  env HERDR_ENV=1 \
+      HERDR_SOCKET_PATH=/tmp/herdr-default.sock \
+      HERDR_PANE_ID=wTrialSmoke:p99 \
+      HERDR_WORKSPACE_ID=w3E \
+      HERDR_TERMINAL_ID=term_pig_trial_smoke \
+      /root/.local/bin/pig-trial -p --no-session
+```
+
+原文输出（stdout）：
+
+```text
+1) `herdsman --help` 前 3 行原文：
+```
+Usage:
+  herdsman on [--if-unowned] [--json]
+  herdsman off [--json]
+```
+
+2)
+
+- **B** — 1: 2
+
+3) read, edit, write, tinyfish_search, tinyfish_fetch, vcc_recall, codegraph, ctx_run, ctx_fs, ctx_git, ctx_kb, ctx_bg, ctx_stats
+```
+
+stderr（隔离守护进程拉起信息，按设计不污染 stdout）：
+
+```text
+herdsman-go-trial: already running (pid 1007251)
+{"managedBy":"unmanaged","pid":1007251,"pidPath":"/root/.herdsman-go-trial/herdsman.pid","socketPath":"/root/.herdsman-go-trial/herdsman.sock","socketReachable":true,"state":"running"}
+```
+
+退出码：`SMOKE_EXIT=0`。
+
+从这段输出能直接读出的加载证据：
+
+- `ctx_run`（ctxmode 扩展）**真的被执行了**，且它 exec 的 `herdsman --help` 返回的是
+  **Go 版 CLI** 的 usage（与 `/root/.local/lib/herdsman-go/herdsman --help` 逐字一致），
+  证明 `HERDSMAN_IMPL=go` 在试用环境里生效；
+- 第 2 件要求 markdown 表格，模型交回来的是 bullet（`- **B** — 1: 2`），即 `no-tables` 的
+  `message_end` 钩子真的改了输出；
+- 工具清单里 `tinyfish_search`/`tinyfish_fetch`（pi-tinyfish）、`vcc_recall`（pi-vcc）、
+  `codegraph`（codegraph-go）、`ctx_run`/`ctx_fs`/`ctx_git`/`ctx_kb`/`ctx_bg`/`ctx_stats`（ctxmode）
+  共 4 个扩展的工具在会话里活跃。
+
+### 6.13.8 冒烟后停掉隔离守护进程 + 现役未受影响
+
+```console
+$ /root/.local/lib/herdsman-go/herdsman-go-trial stop
+herdsman-go-trial: stopping the isolated daemon (pid 1007251)
+herdsman-go-trial: isolated daemon stopped
+{"pidPath":"/root/.herdsman-go-trial/herdsman.pid","socketPath":"/root/.herdsman-go-trial/herdsman.sock","state":"stopped"}
+$ /root/.local/lib/herdsman-go/herdsman-go-trial status
+{"pidPath":"/root/.herdsman-go-trial/herdsman.pid","socketPath":"/root/.herdsman-go-trial/herdsman.sock","state":"stopped"}
+$ systemctl show -p MainPID --value herdsman.service
+2714759
+$ stat -c '%i %s %Y' /root/.herdsman/state.db
+19815117 139001856 1793008187
+```
+
+`state` 为 `stopped`；现役 `MainPID` 与现役 `state.db` 的 inode/大小/mtime 与冒烟前完全一致。
+（说明：本会话更早的一次记录里 `state.db` mtime 是 `1793007267`，那之后的变化来自现役守护进程自身的
+正常写入——试用全程只读现役库，且 `herdsman-go-trial` 的只读备份路径本次**没有**被执行，
+因为隔离 home 里的 `state.db` 副本在 6.12 批已存在。）
+
+### 6.13.9 新增测试与先 FAIL 后 PASS
+
+`go/internal/cli/cli_test.go` 的 `TestWrapperAndTrialScripts` 新增 pig-trial 子项（脚本清单里加入
+`go/scripts/pig-trial` 的可执行位检查）：
+
+- 拒绝 `PIG_TRIAL_HOME=/root/.pi/agent`、`/root/.pi`、空值（退出码 2）；
+- 拒绝 `HERDSMAN_TRIAL_HOME=/root/.herdsman`、空值（退出码 2）；
+- 正常路径（假 `herdsman-go-trial` + 假 `pig` 探针）：先调 `herdsman-go-trial start`，
+  `PIG_CODING_AGENT_DIR`/`PIG_CODING_AGENT_SESSION_DIR`/`PIG_USE_PI_DIRS` 被清除，
+  `PIG_HOME`/`HERDSMAN_IMPL=go`/`HERDSMAN_HOME`/`HERDSMAN_SOCKET_PATH` 已导出，
+  `-p --no-session` 原样传给 `pig`，且 `pig` 的 stdout 里没有守护进程横幅；
+- 附加一项：假守护进程起来了但没建 socket → 退出码 1 并报 missing-socket。
+
+先 FAIL（把脚本移走，模拟「脚本不存在」的改动前状态）：
+
+```console
+$ mv scripts/pig-trial /tmp/pig-trial.hidden
+$ go test -race -buildvcs=false -count=1 -run TestWrapperAndTrialScripts ./internal/cli
+--- FAIL: TestWrapperAndTrialScripts (0.00s)
+    cli_test.go:1131: stat /root/workspace/.wt/herdsman/chore-pig-trial/go/scripts/pig-trial: ...: no such file or directory
+FAIL
+$ mv /tmp/pig-trial.hidden scripts/pig-trial
+```
+
+后 PASS（脚本就位）：
+
+```console
+$ go test -race -buildvcs=false -count=1 -run TestWrapperAndTrialScripts -v ./internal/cli
+=== RUN   TestWrapperAndTrialScripts
+...
+--- PASS: TestWrapperAndTrialScripts/pig-trial_starts_the_isolated_daemon_and_hands_the_arguments_to_pig (0.01s)
+--- PASS: TestWrapperAndTrialScripts/pig-trial_fails_when_the_isolated_socket_never_appears (0.01s)
+PASS
+ok  github.com/dorokuma/herdsman/go/internal/cli  1.070s
+```
+
+### 6.13.10 本轮验证输出
+
+```console
+$ cd go && gofmt -l cmd internal
+（无输出）
+$ CGO_ENABLED=0 go vet -buildvcs=false ./...
+（无输出）
+$ CGO_ENABLED=0 go build -buildvcs=false ./...
+（无输出）
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH go test -race -buildvcs=false -count=1 ./internal/cli
+ok  github.com/dorokuma/herdsman/go/internal/cli  1.079s
+```
+
+（`go test -v` 统计：`--- PASS` 46 条、`--- FAIL` 0 条。）
+
+### 6.13.11 完整回滚方法
+
+```bash
+# 1) 停掉隔离 Go 守护进程（现役 herdsman.service 不受影响，不要动它）
+/root/.local/lib/herdsman-go/herdsman-go-trial stop
+/root/.local/lib/herdsman-go/herdsman-go-trial status   # 期待 "state":"stopped"
+
+# 2) 移除一键启动脚本
+rm -f /root/.local/bin/pig-trial /root/.local/lib/herdsman-go/pig-trial
+
+# 3) 从备份恢复 /root/.pig-test/agent（先清掉扩展软链，再整目录还原）
+rm -rf /root/.pig-test/agent
+cp -a /root/.pig-test/agent.bak-20261026-trial /root/.pig-test/agent
+
+# 4) 需要时连隔离 home 一起清掉（可选；里面只有 state.db 副本、日志与配置）
+rm -rf /root/.herdsman-go-trial
+```
+
+回滚后 `/root/.pig-test` 回到「扩展一个都不加载」的第 0 批状态，原版 pi 与现役 herdsman 全程未动。
+
+### 6.13.12 与任务书字面描述的偏差（如实记录，未擅改目标）
+
+1. **`agent.orchestrator.register` 未成功落库**：任务书给的 `HERDR_SOCKET_PATH=/tmp/herdr-default.sock`
+   在隔离库副本里**不是**任何 running herdr session 的 socket（副本里 running 的只有
+   `/root/.config/herdr/herdr.sock`），守护进程因此回
+   `Herdr socket is not registered as a running session`。拨号与 RPC 请求**确实发生了**
+   （6.13.5 的 socket 对即证据），只是没走到注册成功。没有为此改隔离库、也没有去连现役 herdr socket
+   （那会碰生产 herdr），而是用 socket 对作为「连的是隔离 socket」的铁证。
+2. **Go 版 `herdsman-pi` 注册的是斜杠命令 `/herdsman`，没有 `herdsman_status` 工具**
+   （全目录 grep 无该工具名；TS 版的工具名不适用于 Go 版）。相应地，工具侧验证换成：
+   校验输出里 `herdsman-pi` 的 `commands=["herdsman"]`、`handlers=9`，加上冒烟里模型用 `ctx_run`
+   跑通的 `herdsman --help`（Go CLI）。
+3. **「预编译二进制」未采用**：PiG 0.5.2 对 Go 扩展的官方路径是「源码 + 版本匹配的 staged SDK
+   现场编进 runtime cell」，cell 按内容寻址并缓存（17 个共用一个 `runner`）。预编译二进制不参与该
+   机制，故采用官方推荐方式；「最新构建并通过校验」由 6.13.4(b) 的一次全量 build+register 证明。
+4. **`PIG_DEBUG` 未产出调试日志**：按 `pig diagnose` 的说法应写 `/tmp/pig-debug.log`，实测
+   `PIG_DEBUG=1` 跑完一次 `-p` 仍无该文件，故逐扩展证据改用 6.13.4 的两条 PiG 自带路径
+   （`pig status --json` + `pig install --validate-only --json`）。
+5. **prompt 走 stdin**：`pig -p` 不带 message 时从管道读 prompt，故一键命令写成
+   `printf '%s' '…' | pig-trial -p --no-session`；`--mode json` 的输出是 JSONL 流（105 行），不是单个 JSON 文档。
+
+### 6.13.13 提交与门禁
+
+```console
+$ git -C /root/workspace/.wt/herdsman/chore-pig-trial diff --stat main...HEAD
+ go/internal/cli/cli_test.go | … +…
+ go/reports/batch-5-herdsmand.md | … +…
+ go/scripts/pig-trial | … (new, mode 100755)
+$ git -C /root/workspace/pi-extensions status --short
+（无输出）
+$ /root/.git-hooks/commit-msg /tmp/cm.txt
+（退出码 0）
+```
+
+全部改动都在 `go/` 下；未使用 `--no-verify`。
