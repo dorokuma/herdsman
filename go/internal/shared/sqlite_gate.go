@@ -46,7 +46,11 @@ func NewSqliteGate() *SqliteGate {
 func (g *SqliteGate) Acquire(gid int64) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	for g.depth > 0 && g.owner != gid {
+	// gid 0 is the unparsable fallback of goroutineID, and it is also the free
+	// gate's owner value — comparing a 0 gid against the owner would therefore
+	// let every unparsable goroutine share one hold. A gid of 0 never re-enters:
+	// it degrades to a plain, non-reentrant mutex — stricter, never looser.
+	for g.depth > 0 && (gid == 0 || g.owner != gid) {
 		g.cond.Wait()
 	}
 	g.owner = gid
@@ -69,11 +73,13 @@ func (g *SqliteGate) Release(gid int64) {
 }
 
 // HeldBy reports whether gid currently holds the gate. It exists for the tests
-// that assert the release path actually ran.
+// that assert the release path actually ran. A gid of 0 identifies no
+// goroutine (it is goroutineID's unparsable fallback), so it is never reported
+// as a holder even when an unparsable goroutine owns the gate.
 func (g *SqliteGate) HeldBy(gid int64) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	return g.depth > 0 && g.owner == gid
+	return g.depth > 0 && gid != 0 && g.owner == gid
 }
 
 // gates is the registry mapping an open *sql.DB to the gate that serialises it.

@@ -104,7 +104,11 @@ type serializedConnector struct {
 	gate *shared.SqliteGate
 	db   *sql.DB
 
-	// mu guards closed: Connect reads it while Close writes it.
+	// mu guards closed and the teardown of the driver connection: Connect reads
+	// closed while Close writes it, and DriverConnClosed asks the driver
+	// connection itself whether it is still valid — exactly the state
+	// modernc.org/sqlite mutates inside its own Close — so the teardown runs
+	// under the same mutex those reads take.
 	mu     sync.Mutex
 	closed bool
 	once   sync.Once
@@ -156,15 +160,24 @@ func (c *serializedConnector) Close() error {
 		c.gate.Acquire(gid)
 		defer c.gate.Release(gid)
 
-		c.mu.Lock()
-		c.closed = true
-		c.mu.Unlock()
-
 		// The observation point: the driver connection is released here, and
 		// DriverConnClosed asks the driver itself whether it still is usable. That
 		// is what makes the lifecycle test able to tell a real release from
 		// database/sql merely refusing statements on a handle it shut.
+		//
+		// The close runs under c.mu, not beside it: DriverConnClosed reads the
+		// driver connection's own state through driver.Validator, and
+		// modernc.org/sqlite mutates exactly that state inside Close (the sqlite3
+		// handle goes to 0, the TLS state is dropped). Taking c.mu across the
+		// teardown serialises it against those reads, so a waiter polling
+		// DriverConnClosed while (*sql.DB).Close tears the connection down never
+		// reads the driver's fields mid-mutation. This does not lengthen the wait
+		// for a gate holder: c.mu is only taken once the gate is already ours, so
+		// a Close parked on gate.Acquire holds nothing the poller would block on.
+		c.mu.Lock()
+		c.closed = true
 		err = c.conn.Close()
+		c.mu.Unlock()
 
 		shared.UnregisterSqliteGate(c.db)
 	})
@@ -188,6 +201,13 @@ func DriverConnClosed(db *sql.DB) bool {
 	if connector == nil {
 		return false
 	}
+	// The read below must not overlap the teardown: serializedConnector.Close
+	// closes the driver connection under connector.mu, and modernc.org/sqlite
+	// mutates the state IsValid reads inside that close. Connector.mu is free
+	// while a Close is still parked on the gate, so polling from a waiter stays
+	// unblocked until the teardown actually starts, then serialises against it.
+	connector.mu.Lock()
+	defer connector.mu.Unlock()
 	validator, ok := connector.conn.(driver.Validator)
 	if !ok {
 		return false

@@ -712,7 +712,7 @@ RPC 命令（`on`/`off`/`status`、`agent list/get/read`）默认走 `formatHuma
 
 | # | 问题 | 修复落点 |
 |---|------|---------|
-| 1 | `sql.DB.Close()` 不释放底层连接、不注销 `SqliteGate` | `internal/db/client.go` 的 `serializedConnector` 新增 `Close() error`（`sync.Once` 幂等）：调 `shared.UnregisterSqliteGate(db)`、关闭唯一底层 `modernc.org/sqlite` `driver.Conn`、置 `closed` 使后续 `Connect` 立即返回 `sql.ErrConnDone`；`internal/shared/sqlite_gate.go` 保持闸门本身的可重入语义，单个 `serializedConn.Close()` 仍是 no-op，供连接池复用。**第 3F 子批追加**：`Close()` 现在先 `gid := shared.CurrentGoroutineID()`、`c.gate.Acquire(gid)`（`defer c.gate.Release(gid)`），在闸门内 `c.mu.Lock()` 置 `closed`、调 `c.conn.Close()`、`shared.UnregisterSqliteGate(c.db)`，释放闸门后才返回；并新增 `DriverConnClosed(db *sql.DB) bool` / `WaitDriverConnClosed(ctx, db) bool` 两个观测点，直接问底层 `driver.Conn`（`driver.Validator.IsValid()`，modernc 连接 Close 后 `c.db == 0` 即返回 false）而不是看本包自己记的旗标 |
+| 1 | `sql.DB.Close()` 不释放底层连接、不注销 `SqliteGate` | `internal/db/client.go` 的 `serializedConnector` 新增 `Close() error`（`sync.Once` 幂等）：调 `shared.UnregisterSqliteGate(db)`、关闭唯一底层 `modernc.org/sqlite` `driver.Conn`、置 `closed` 使后续 `Connect` 立即返回 `sql.ErrConnDone`；`internal/shared/sqlite_gate.go` 保持闸门本身的可重入语义，单个 `serializedConn.Close()` 仍是 no-op，供连接池复用。**第 3F 子批追加**：`Close()` 现在先 `gid := shared.CurrentGoroutineID()`、`c.gate.Acquire(gid)`（`defer c.gate.Release(gid)`），在闸门内 `c.mu.Lock()` 置 `closed`、调 `c.conn.Close()`、`shared.UnregisterSqliteGate(c.db)`，释放闸门后才返回；并新增 `DriverConnClosed(db *sql.DB) bool` / `WaitDriverConnClosed(ctx, db) bool` 两个观测点，直接问底层 `driver.Conn`（`driver.Validator.IsValid()`，modernc 连接 Close 后 `c.db == 0` 即返回 false）而不是看本包自己记的旗标。**第 3G 子批追加**：`c.conn.Close()` 再移入 `c.mu` 保护块（`c.mu.Lock(); c.closed = true; err = c.conn.Close(); c.mu.Unlock()`），`DriverConnClosed(db)` 在访问 `connector.conn` / 调 `validator.IsValid()` 前先 `connector.mu.Lock()` + `defer Unlock`——teardown 与观测读取经 `c.mu` 严格串行化，消除与 `modernc.org/sqlite` `*conn.db` 的无同步读写；`c.mu` 只在 `Close` 已拿到闸门后才被占用，停在 `gate.Acquire` 上的 `Close` 不阻塞轮询方。`-race` 先 FAIL 后 PASS 取证见 6.8 的 3G 段与 6.10 |
 | 2 | 锁外写帧时后进临界区的协程可能先抢到 `writeMu`，客户端先收新状态帧后收旧状态帧 | `internal/daemon/observability_server.go` 的 `rpcConnection` 增加按连接串行的发送队列（`queueMu` + `queue []string` + `draining`）：持 `s.mu` 期间 `enqueueMessage`/`enqueueAll` 只做内存追加（零网络 I/O，顺序严格由 `s.mu` 固定），释放 `s.mu` 后 `flushQueue`/`flushAll` 由单个 drainer 按 FIFO 取出、加 2s 写超时写入，写失败即 `destroy()` 清空队列 |
 | 3 | 持久连接共用 `conn.SetDeadline`，请求 A 完成时 `clearDeadline` 会清空并发请求 B 的 deadline；写失败未重置连接 | `internal/herdr/socket_client.go`：新增 `writeMu` 串行化持久连接的 `conn.Write`；持久连接不再设全局 `SetDeadline`，改为仅在 `writeMu` 内 `SetWriteDeadline(now+timeout)`、写完立即置零；`writeFrameLocked` 写失败即 `resetConnection()` 销毁连接（避免残留半截 JSON 帧）；读超时仍由各请求独立的 `time.NewTimer(timeout)` 与 `ctx.Done()` 控制；`requestOnce` 的独立短连接保持自己的 `SetDeadline`（`armDeadline`/`clearDeadline` 的注释已改写为「仅用于一次性连接」） |
 | 4 | `turn_completion` 晚到 finish 缺确定性回归；`RunSqliteTransaction` 的 COMMIT 失败回滚缺回归 | `internal/observability/turn_completion_test.go` 的 `TestFinishedWaiterIgnoresLateSignalAndReleasesListener` 强化为「waiter1 完成并移出注册表后，同 key 注册新 signal 与 waiter2，并触发 waiter1 残留的 timeout/cancel 路径」；`internal/db/sqlite_migrations_test.go` 新增基于 `PRAGMA defer_foreign_keys = ON` 触发真实 `COMMIT` 失败的回归。**第 3F 子批追加**：晚到 finish 一项改写为 100% 确定性的白盒用例 `TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal`（`package observability`，见 6.10），原「time.Sleep + close(abort)」形态删除；原用例只保留监听 goroutine 泄漏那半个子测试并改名 `TestFinishedWaiterReleasesListenerGoroutine` |
@@ -736,6 +736,28 @@ RPC 命令（`on`/`off`/`status`、`agent list/get/read`）默认走 `formatHuma
 - **门控互斥**：另两个子测试分别用「另一 goroutine 持 `SqliteGate`」和「`db.Query` 出的 `Rows` 游标未关」占住闸门，`db.Close()` 在 200ms 内不得返回、`DriverConnClosed` 不得为 true；释放后才允许完成。当前实现下两者均 PASS。
 
 **如实记录**：`driver.Validator` 这层观测没有单独的 FAIL→PASS 取证（它是观测手段，不是被修的行为）；门控互斥那两项目前也没有对应 FAIL 证据——先前的 3 轮 `-race`（含 `TestRunSqliteTransactionConcurrentDoesNotInterleave` 等并发用例）未暴露 `Close` 与在途语句的交错，属防御性加固，按实情记在案。
+
+**Finding 1（第 3G 子批追加：`DriverConnClosed` 与 driver Close 的数据竞争回归）**：新增第 4 个子测试 `DriverConnClosed does not race the driver Close`——先让另一 goroutine 持住闸门、再启动 `db.Close()`（停在 `gate.Acquire`），随后起一个**无 sleep 的紧循环轮询** `DriverConnClosed(db)`，最后放行闸门让 teardown 与轮询真正交叠。轮询先于 teardown 就位是刻意的：`database/sql` 的 `(*sql.DB).Close` 在锁外调 `connector.Close()`、`db.Driver()` 也不持 `db.mu`，所以交叠窗口就是 modernc 自身 `Close` 的存活期，`Close` 返回后才起轮询永远碰不到它。断言轮询收敛、`WaitDriverConnClosed(ctx, db)` 立即报 true、`db.Close()` 无错返回。
+
+修复前（`c.conn.Close()` 在 `c.mu` 之外、`DriverConnClosed` 无锁）该子测试**首轮即复现 DATA RACE**（`go test -race -buildvcs=false -count=1 -run TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate ./internal/db`）：
+
+```
+WARNING: DATA RACE
+Write at 0x00c0002be300 by goroutine 24:
+  modernc.org/sqlite.(*conn).Close()
+      /root/go/pkg/mod/modernc.org/sqlite@v1.61.0/conn.go:1083
+  .../internal/db.(*serializedConnector).Close.func1()
+      .../go/internal/db/client.go:167
+Previous read at 0x00c0002be300 by goroutine 25:
+  modernc.org/sqlite.(*conn).usable()
+      /root/go/pkg/mod/modernc.org/sqlite@v1.61.0/conn.go:1122
+  modernc.org/sqlite.(*conn).IsValid()
+      /root/go/pkg/mod/modernc.org/sqlite@v1.61.0/conn.go:1118
+  .../go/internal/db.DriverConnClosed()
+      .../go/internal/db/client.go:195
+```
+
+同一轮共报出两组竞争对（`conn.go:1083/1088` 的写 vs `conn.go:1122/1133` 的读，即 `c.db` 及相邻字段）；加上 `c.mu` 保护后 `-count=1` → `ok 1.721s`、`-count=3` → `ok 2.871s`，无 `DATA RACE`。
 
 **Finding 2（发送队列顺序）**：`TestObservabilityRpcPushedFramesKeepTheirGeneratedOrder` 在把 `enqueueAll` 移回锁外（恢复「锁内构造、锁外 encode+write」的旧形态）后确定性 FAIL，报出 `[2 1]`——客户端收到的帧序号非单调。关键在 payload：用 50 000 个 key 的 map 把单帧撑到约 770 KB、编码耗时约 18ms，临界区才长到足以让乱序稳定复现（900 KB 只有约 2ms 窗口，不够）。修复形态（锁内 enqueue、锁外单 drainer flush）下同一用例 PASS。
 
@@ -785,7 +807,7 @@ turn_completion_test.go:328: the late finishLocked dropped round 2's stored sign
 `internal/shared/sqlite_gate.go` 实现一个**按 goroutine ID**（不是 OS 线程 ID）可重入的数据库闸门：闸门按 `runtime.Stack` 解析出的 goroutine ID 记账，同一 goroutine 可多次 `Acquire`，只有最外层 `Release` 真正放行；跨 goroutine 的第二次进入则排队，从而把 `database/sql` 连接池退化成「一个时刻只有一个写入者」的串行语义，与 TS 单事件循环里两个 `await` 之间的块原子等价。方法名是 `Acquire` / `Release`（另有供测试用的 `HeldBy`），不是 `Enter` / `Exit`。
 
 - **GID 取自 `runtime.Stack`**：Go 没有暴露 goroutine ID 的公开 API，`sqlite_gate.go` 的 `goroutineID()` 用一次受控的 `runtime.Stack(buf, false)` 抓取栈帧首行（`goroutine N [running]:`），`strconv.ParseInt` 解析出 N（`CurrentGoroutineID()` 是对外暴露）。这是该设计唯一的「非公开契约」依赖，但它是标准库内部实现的稳定格式。
-- **解析失败退化为非重入互斥，不是放行竞态**：`goroutineID()` 解析失败返回 `0`；闸门的重入判定是 `g.owner == gid`（`Acquire` 的等待条件是 `g.depth > 0 && g.owner != gid`），因此 `gid == 0` 时同一个 goroutine 的第二次 `Acquire` 也会排队——退化为「不可重入的互斥」，语义变严但绝不放行竞态。
+- **解析失败退化为非重入互斥，不是放行竞态**：`goroutineID()` 解析失败返回 `0`；`Acquire` 的等待条件是 `g.depth > 0 && (gid == 0 || g.owner != gid)`（`HeldBy` 同样要求 `gid != 0`），因此 `gid == 0` 时第二次 `Acquire` 一定排队——退化为「不可重入的互斥」，语义变严但绝不放行竞态。**第 3G 子批修正**：等待条件原写作 `g.depth > 0 && g.owner != gid`，而空闸门的 `owner` 恰是 `0`，`gid == 0` 对上 `owner == 0` 时条件为假，任意 `gid == 0` 的 goroutine 反而互相可「重入」——与本节的描述（也与其意图）相反；修正后 `gid == 0` 真正退化为不可重入互斥，本条按新条件改写。
 - **第 3F 子批追加：`Close()` 也先过闸门**：`serializedConnector.Close()` 现在先 `gid := shared.CurrentGoroutineID()` → `c.gate.Acquire(gid)`（`defer c.gate.Release(gid)`），再在闸门内置 `closed`、关底层 `driver.Conn`、`UnregisterSqliteGate`。每条语句和每个事务本来就全程持闸，所以不过闸门的 `Close` 会在 `modernc.org/sqlite` 的 `Close`（清零 `c.db`、释放 TLS）与在途语句之间制造并发。`Close` 由调用 `(*sql.DB).Close` 的 goroutine 执行、不持有任何语句级资源，等待上界就是调用方在途语句的长度，与任何其他语句相同。
 - **重入是必需的，不是优化**：`RunSqliteTransaction` 全程持闸，而事务回调 `fn()` 里还会调 `db.Query`/`db.Exec`；若闸门不可重入，第一次内层调用就会死锁。
 - **`connector.Close()` 的生命周期**：`database/sql` 在 `db.Close()` 时若发现 `db.connector` 实现 `io.Closer` 会自动调用 `connector.Close()`。`internal/db/client.go` 的 `OpenSqlite` 因此给自定义 `driver.Connector`（`serializedConnector`）加了 `Close() error`，用 `sync.Once` 保证幂等，在其中做三件事：`shared.UnregisterSqliteGate(db)`（把闸门从注册表摘掉，避免 `db` 被 GC 后注册表仍持引用）、关闭唯一的底层 `modernc.org/sqlite` `driver.Conn`、把 `closed` 置 true 使后续 `Connect` 立即返回 `sql.ErrConnDone`。单个 `serializedConn.Close()` 仍保持 no-op——它归连接池所有，池会反复开关它。
@@ -798,8 +820,8 @@ turn_completion_test.go:328: the late finishLocked dropped round 2's stored sign
 `rpcConnection` 定义在 `internal/daemon/observability_server_handlers.go`（不是 `observability_server.go`），维护一个按连接串行的发送队列（`queueMu sync.Mutex`、`queue []string`、`draining bool`）。`enqueueAll` / `flushAll` 两个包级辅助函数也在 `observability_server_handlers.go`。
 
 - **为什么必须「锁内 enqueue、锁外 flush」**：TS 的事件循环保证两个 `await` 之间的块原子，所以「生成顺序」与「写出顺序」天然一致。Go 移植后如果在 `s.mu` 内直接 `conn.Write`，一个慢客户端就能把服务器锁堵住数秒（6.5 实测第 6 帧起阻塞 2.00068239s）；但如果改成「锁内构造帧、锁外写」，后进临界区的协程 B 可能在解锁后先抢到 `writeMu`，客户端就会先收到新状态帧、后收到旧状态帧。
-- **队列如何同时解决两者**：持 `s.mu` 期间只 `enqueueMessage`/`enqueueAll`（纯内存追加，零网络 I/O），顺序由 `s.mu` 严格固定；释放 `s.mu` 后 `flushQueue`/`flushAll` 由单个 drainer 按 FIFO 取出帧写入。写操作因此既不在锁内、也不与生成顺序竞争。
-- **单个 drainer**：`enqueueMessage` 在没有 drainer 时直接拉起一个，`flushQueue` 不重复拉起，避免两个 drainer 互相竞争把 FIFO 打破。drainer 退出前会重新检查队列，防「刚有新帧入队就退出」的竞态。
+- **队列如何同时解决两者**：持 `s.mu` 期间 `enqueueMessage`/`enqueueAll` 先同步完成 `shared.EncodeJSONLine` 编码，再在 `c.queueMu` 下把帧追加到 `c.queue`——发布方 goroutine 持 `s.mu` 期间**不做任何 socket I/O**，也不会因慢客户端阻塞 `s.mu`；全部推送帧的生成顺序在 `s.mu` 临界区内被固定（编码放在入队之前，昂贵的序列化不能让更新的帧抢到前面）。若此时 `!c.draining` 则置 `c.draining = true` 并拉起后台 `go c.drain()` 异步消费队列（drain 只取 `queueMu`、不碰 `s.mu`，因此不阻塞仍在持锁的发布方）。释放 `s.mu` 后的 `flushQueue`/`flushAll` 是兜底：只负责给「非空且未处于 draining」的队列补起一个 drainer，自己从不写帧。写操作因此既不在锁内、也不与生成顺序竞争。**第 3G 子批按源码逐句校准**（原描述「只做内存追加」漏了同步编码与入队即拉起 drainer 两点）。
+- **单个 drainer**：首个 append（`!c.draining` 时）即置 `c.draining = true` 并拉起 `go c.drain()`；`flushQueue` 只在队列非空且无 drainer 时兜底拉起。两者经同一 `draining` 旗标在 `c.queueMu` 下互斥，避免两个 drainer 互相竞争把 FIFO 打破。drainer 在同一 `queueMu` 临界区内发现队列已空则置回 `draining = false` 退出（入队与退出检查同锁，故没有「刚有新帧入队就退出」的竞态）。
 - **2s 写超时**（`observability_server_handlers.go` 的 `rpcWriteTimeout = 2 * time.Second`）：每个帧写入前 `SetWriteDeadline(now+2s)`，超时即 `destroy()` 断开该连接并清空队列。取 2s 是因为推送帧本身很小（几十字节到几 KB），正常情况下写入是微秒级；2s 只可能被「对端停读且缓冲区已满」触发，那种连接本就应当被丢弃。
 - **与 6.5 的关系**：6.5 已证明慢客户端确实能把 `conn.Write` 堵在 `SO_SNDBUF` 上超过 2s，所以这个超时不是理论值，而是被真实阻塞窗口验证过的边界。
 - **第 3F 子批追加：7 个发布点 100% 锁内入队**：`observability_server.go` 与 `observability_server_handlers.go` 两文件共 6 处 `enqueueAll(...)`（`PublishAgentEvent`、`ReconcileAgentLocations`、disconnect grace timer 回调、startup grace timer 回调、register handler 的 context 帧、`agent.orchestrator.set`），加上 `PublishAgentContext` 直接调 `connection.enqueueMessage(message)`，共 **7 个发布点**。推送辅助函数名是 `publishOrchestratorChange`（**不是** `notifyOwnerChanged`），定义在 `observability_server.go:1265`。第 3F 子批前，disconnect grace timer 回调（原 1021 行）与 startup grace timer 回调（原 1104 行）的 `enqueueAll(released)` 落在 `s.mu.Unlock()` **之后**，与其余 5 处不一致；本轮已把这两处移进持锁闭包，`flushAll(released)` 仍留在锁外。复核方式：对两文件逐行回溯最近的 `s.mu.Lock()` / `s.mu.Unlock()`（排除 `defer s.mu.Unlock()`），6 处 `enqueueAll` 全部判为 `INSIDE-LOCK`。
@@ -892,4 +914,27 @@ agent_context_service_test.go:1188: third call forceDiscovery = false, want true
 ```
 
 生产代码净改动很小（`client.go` 的 `Close()` 加闸门 + 两个观测函数、`observability_server.go` 两行位置），其余是测试与报告。未新增测试文件，未新增生产行为。
+
+#### 第 3G 子批追加（`reviewer-final5`：1 个 Must-Fix + 1 个报告/实现对齐 Should-Fix）
+
+本轮基线为 `b7d64ad`（3F 收口后的 HEAD）；本轮改动随本报告所在的提交入库（提交主题见第 1 节第 27 条，短 SHA 以仓库 `git log -1` 为准——报告随同一提交入库，无法在提交前写下自己的 SHA）。只改 `go/` 下的文件，红线同 3F；测试全部使用 `t.TempDir()`。
+
+| # | 级别 | 问题 | 修复落点 |
+|---|------|------|---------|
+| 1 | Must-Fix | `serializedConnector.Close()` 在 `c.mu.Unlock()` 之后才调 `c.conn.Close()`（modernc 的 `Close()` 写 `c.db = 0`、`c.tls = nil`），而 `DriverConnClosed(db)` 无锁直读 `validator.IsValid()`（读 `c.db`）；`WaitDriverConnClosed` 或并发的 `DriverConnClosed` 与 `db.Close()` 交叠时，对底层 `modernc` `*conn.db` 构成无同步读写 | `internal/db/client.go`：`Close()` 把 `err = c.conn.Close()` 移入 `c.mu` 保护块（`c.mu.Lock(); c.closed = true; err = c.conn.Close(); c.mu.Unlock()`）；`DriverConnClosed(db)` 在访问 `connector.conn` / 调 `IsValid()` 前先 `connector.mu.Lock()` + `defer connector.mu.Unlock()`。`Close` 只有在拿到 `c.gate` 之后才碰 `c.mu`，停在 `gate.Acquire` 上的 `Close` 不阻塞轮询方；一旦 `Close` 进入 `c.conn.Close()`，两者经 `c.mu` 严格串行化。回归：`sqlite_migrations_test.go` 新增第 4 个子测试 `DriverConnClosed does not race the driver Close`（持闸门停住 `db.Close()` → 无 sleep 紧循环轮询 → 放行闸门让 teardown 与轮询交叠 → 断言 `WaitDriverConnClosed` 收敛、`Close` 无错），`-race` 先 FAIL 后 PASS 见下 |
+| 2 | Should-Fix | 代码与报告不一致：2a — 6.9 称 `gid == 0` 退化为不可重入互斥，但 `Acquire` 等待条件原为 `g.depth > 0 && g.owner != gid`，空闸门 `owner` 恰为 `0`，任意 `gid == 0` 实际互相可「重入」；2b — 6.8 表第 2 行与 6.9 对 `enqueueMessage`/`flushQueue` 的描述不夠精确 | 2a（`internal/shared/sqlite_gate.go`）：`Acquire` 改为 `for g.depth > 0 && (gid == 0 \|\| g.owner != gid)`，`HeldBy` 改为 `return g.depth > 0 && gid != 0 && g.owner == gid`，`gid == 0` 真正退化为不可重入互斥（`Release` 的守卫未动：生产路径的 gid 恒为真实 goroutine 号，本项只为对齐报告语义）；6.9 同步按新条件改写。2b：6.8 表第 2 行与 6.9 两条按 `observability_server_handlers.go` 实现改写——`enqueueMessage` 在持 `s.mu` 期间先同步完成 `EncodeJSONLine`、在 `c.queueMu` 下追加 `c.queue`（发布方持锁期间零 socket I/O），`!c.draining` 时置 `c.draining = true` 并拉起 `go c.drain()`；锁外 `flushAll`/`flushQueue` 只给非空且未 draining 的队列兜底补起 drainer、从不自己写帧。6.9 的「两文件共 6 处 `enqueueAll` + 1 处 `PublishAgentContext` 直接调 `connection.enqueueMessage`，共 7 个发布点」经本轮逐行复核（`observability_server.go:476/625/1023/1108` + `observability_server_handlers.go:586/634`，以及 `observability_server.go:458`）确认与源码一致，未改动 |
+
+**Finding 1 的先 FAIL 后 PASS 取证**（时间线；详细竞争报告另见 6.8 的 3G 段）：
+
+1. 只加测试、不动生产代码：`go test -race -buildvcs=false -count=1 -run TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate ./internal/db` → **首轮即 DATA RACE**。写侧：`modernc.org/sqlite.(*conn).Close()`（`conn.go:1083/1088`）← `client.go:167`（`serializedConnector.Close`）；读侧：`(*conn).usable()`（`conn.go:1122/1133`）← `(*conn).IsValid()`（`conn.go:1118`）← `DriverConnClosed`（`client.go:195`）——正是任务书指出的 `c.db` 无同步读写对。
+2. 加上 `c.mu` 保护后：`-count=1` → `ok 1.721s`；`-count=3` → `ok 2.871s`。无 `DATA RACE`、无 `FAIL`。
+
+**第 3G 子批验证**：
+
+- `gofmt -l cmd internal` 为空。
+- `CGO_ENABLED=0 go vet -buildvcs=false ./...` 通过；`CGO_ENABLED=0 go build -buildvcs=false ./...` 通过。
+- `CGO_ENABLED=0 go test -buildvcs=false -count=1 ./...`：12 个包全绿（2 个 `no test files` + 10 个 `ok`），其中 `internal/daemon 12.733s`、`internal/observability 4.498s`、`internal/agy 2.812s`、`internal/herdr 1.162s`、`internal/db 1.051s`、`internal/agenthistory 0.036s`。
+- 3 轮 `-race`：`CGO_ENABLED=1 go test -race -buildvcs=false -count=3 -run 'TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate|TestRunSqliteTransactionRollsBackAfterFailedCommit|TestObservabilityRpcPushedFramesKeepTheirGeneratedOrder|TestObservabilityRpcSlow|TestHerdrSocketClientConcurrentRequestsKeepTheirOwnTimeouts|TestTurnCompletionLateFinishDoesNotConsumeNextTurnSignal|TestAgentContextServiceRediscoversOnOccupiedChange' ./internal/...` → `internal/daemon 10.808s`、`internal/db 3.449s`、`internal/herdr 3.595s`、`internal/observability 1.556s` 均 `ok`（其余 6 包 `[no tests to run]`），无 `DATA RACE`、无 `FAIL`。
+
+**第 3G 变更面**（`git diff --stat`）：`go/internal/db/client.go` +30−3（teardown 入 `c.mu` + `DriverConnClosed` 取锁 + 注释）、`go/internal/shared/sqlite_gate.go` +12−2（`Acquire`/`HeldBy` 的 `gid == 0` 语义）、`go/internal/db/sqlite_migrations_test.go` +73−0（并发回归子测试、导入、文档注释）、`go/reports/batch-5-herdsmand.md`（本节及 6.8/6.9 对齐）。新增测试 73 行对生产代码约 47 行改动（`client.go` +30−3、`sqlite_gate.go` +12−2）不足 3 倍：并发数据竞争回归需要持闸、启停轮询与放行三段 goroutine 编排才能把交叠窗口对准 modernc 自身 `Close` 的存活期，其余为注释。
 
