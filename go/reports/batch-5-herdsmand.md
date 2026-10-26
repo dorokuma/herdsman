@@ -1181,4 +1181,24 @@ ok  	github.com/dorokuma/herdsman/go/internal/config	1.024s
 
 `ParseAgyComposerDraft` 回溯循环的先 FAIL 后 PASS 取证见 6.11.4 表格末行：变异后新增的第 2 条同宽 `rule` + `>` 断言 FAIL（实得 `""`，期望 `草稿\n<rule>\n>`），还原后 PASS。
 
-**本次修订的提交说明**：本次修订单独提交入库，提交信息为 `test(go): cover agy draft parser backtrack and lock composer reads`（Conventional Commits 白名单类型、冒号后一空格、长度 ≤ 72 字、不含 hook 噪声词、不含密钥字面量），未使用 `--no-verify`，由全局 `commit-msg` hook 正常放行。报告与测试随同一提交入库，无法在提交前写下自己的 SHA，故同上文处理：只写明提交信息，SHA 见 `git log`。
+**本次修订的提交说明**：本次修订的测试改动随提交 `696da0d`（`test(go): cover agy draft parser backtrack and lock composer reads`）入库，未使用 `--no-verify`，由全局 `commit-msg` hook 正常放行（提交成功即 hook exit 0）。本报告的本次修订说明（含本提交 SHA）随紧随其后的 docs-only 提交入库。
+
+**`main...HEAD` 全量的 commit-msg 规则扫描**（对全部 71719 行新增行，含本报告文件）：
+
+```
+$ git diff main...HEAD | <hook 的 added_lines_only 过滤> > /tmp/main-head-added.txt
+$ wc -l /tmp/main-head-added.txt
+71719 /tmp/main-head-added.txt
+
+$ <hook 的 13 条 secret 模式合并为一次 grep -niE>
+命中行数：0
+
+$ grep -niE '<hook 的 credential 关键字正则>' /tmp/main-head-added.txt
+CRED_CANDIDATES=5
+
+$ /root/.git-hooks/commit-msg 的 check_credential_assignments 逐行复核这 5 行
+CRED_CHECK_DONE: 0 hard hits
+CRED_EXIT=0
+```
+
+secret 模式 0 命中；credential 关键字正则的 5 行候选（测试夹具里的「口令/密钥」字面量）经 hook 原函数复核，右值首 token 去引号后均低于 6 字符门槛，0 硬命中，退出码 0。扫描脚本为从 `/root/.git-hooks/commit-msg` 抽取函数到 `/tmp` 的副本，hook 原件未被修改。
