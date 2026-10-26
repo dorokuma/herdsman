@@ -1,12 +1,17 @@
 package cli
 
 import (
+	"bytes"
+	"errors"
+	"fmt"
 	"math"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dorokuma/herdsman/go/internal/agy"
 	"github.com/dorokuma/herdsman/go/internal/daemon"
@@ -1049,3 +1054,200 @@ func writeTestJSON(t *testing.T, path string, value any) {
 func strPtr(value string) *string { return &value }
 
 func intPtr(value int) *int { return &value }
+
+// ---------------------------------------------------------------------------
+// The shell scripts: the CLI switch (go/scripts/herdsman) and the isolated
+// trial daemon (go/scripts/herdsman-go-trial).
+// ---------------------------------------------------------------------------
+
+// scriptEnv builds the environment for a script run: every HERDSMAN_/HERDR_
+// variable of the current process is dropped (so the test is independent of
+// the pane it runs in) and the given overrides are applied.
+func scriptEnv(overrides map[string]string) []string {
+	environment := make([]string, 0, len(os.Environ())+len(overrides))
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		if strings.HasPrefix(key, "HERDSMAN_") || strings.HasPrefix(key, "HERDR_") {
+			continue
+		}
+		environment = append(environment, entry)
+	}
+	for key, value := range overrides {
+		environment = append(environment, key+"="+value)
+	}
+	return environment
+}
+
+// runScript runs a script and returns its stdout, its stderr and its exit
+// code. A non-zero exit is a result, not a failure.
+func runScript(t *testing.T, path string, args []string, overrides map[string]string) (string, string, int) {
+	t.Helper()
+	command := exec.Command(path, args...)
+	command.Env = scriptEnv(overrides)
+	var stdout, stderr bytes.Buffer
+	command.Stdout = &stdout
+	command.Stderr = &stderr
+	err := command.Run()
+	code := 0
+	if err != nil {
+		var exitError *exec.ExitError
+		if !errors.As(err, &exitError) {
+			t.Fatalf("run %s: %v", path, err)
+		}
+		code = exitError.ExitCode()
+	}
+	return stdout.String(), stderr.String(), code
+}
+
+// writeStubScript writes an executable stub that prints one word.
+func writeStubScript(t *testing.T, directory, name, word string) string {
+	t.Helper()
+	path := filepath.Join(directory, name)
+	writeTestFile(t, path, "#!/bin/sh\necho "+word+"\n")
+	if err := os.Chmod(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+// TestWrapperAndTrialScripts covers the two scripts of the 第 6 批 preparation:
+// the CLI switch (go/scripts/herdsman) routes HERDSMAN_IMPL=ts|go to the
+// right entrypoint and rejects any other value, and the isolated trial daemon
+// (go/scripts/herdsman-go-trial) refuses to run against the production home.
+func TestWrapperAndTrialScripts(t *testing.T) {
+	workingDir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	scriptDir := filepath.Join(workingDir, "..", "..", "scripts")
+	wrapper := filepath.Join(scriptDir, "herdsman")
+	trial := filepath.Join(scriptDir, "herdsman-go-trial")
+	for _, path := range []string{wrapper, trial} {
+		info, statErr := os.Stat(path)
+		if statErr != nil {
+			t.Fatalf("stat %s: %v", path, statErr)
+		}
+		if info.Mode().Perm()&0o111 == 0 {
+			t.Fatalf("%s is not executable (mode %v)", path, info.Mode().Perm())
+		}
+	}
+
+	tempDir := t.TempDir()
+	tsStub := writeStubScript(t, tempDir, "ts-stub.sh", "ts")
+	goStub := writeStubScript(t, tempDir, "go-stub.sh", "go")
+
+	t.Run("the ts branch runs the TypeScript entrypoint", func(t *testing.T) {
+		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
+			"HERDSMAN_IMPL":     "ts",
+			"HERDSMAN_NODE":     "/bin/sh",
+			"HERDSMAN_TS_ENTRY": tsStub,
+		})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+		}
+		if strings.TrimSpace(stdout) != "ts" {
+			t.Fatalf("stdout = %q, want %q", stdout, "ts")
+		}
+	})
+
+	t.Run("the default branch is ts", func(t *testing.T) {
+		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
+			"HERDSMAN_NODE":     "/bin/sh",
+			"HERDSMAN_TS_ENTRY": tsStub,
+		})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+		}
+		if strings.TrimSpace(stdout) != "ts" {
+			t.Fatalf("stdout = %q, want %q", stdout, "ts")
+		}
+	})
+
+	t.Run("the go branch runs the Go binary", func(t *testing.T) {
+		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
+			"HERDSMAN_IMPL":   "go",
+			"HERDSMAN_GO_BIN": goStub,
+		})
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+		}
+		if strings.TrimSpace(stdout) != "go" {
+			t.Fatalf("stdout = %q, want %q", stdout, "go")
+		}
+	})
+
+	t.Run("the go branch falls back to the installed binary", func(t *testing.T) {
+		stdout, stderr, code := runScript(t, wrapper, nil, map[string]string{"HERDSMAN_IMPL": "go"})
+		installed := "/root/.local/lib/herdsman-go/herdsman"
+		_, installedErr := os.Stat(installed)
+		if installedErr == nil {
+			if code != 0 {
+				t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
+			}
+			if strings.Contains(stderr, "Go binary not found") {
+				t.Fatalf("stderr = %q, want the installed Go binary to be used", stderr)
+			}
+			return
+		}
+		if code == 0 {
+			t.Fatalf("exit code = 0, want a failure when no Go binary exists (stdout: %s)", stdout)
+		}
+		if !strings.Contains(stderr, "Go binary not found") {
+			t.Fatalf("stderr = %q, want the missing-binary message", stderr)
+		}
+	})
+
+	t.Run("an unsupported implementation is rejected", func(t *testing.T) {
+		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
+			"HERDSMAN_IMPL": "rust",
+		})
+		if code != 1 {
+			t.Fatalf("exit code = %d, want 1 (stdout: %s, stderr: %s)", code, stdout, stderr)
+		}
+		if !strings.Contains(stderr, "HERDSMAN_IMPL must be 'go' or 'ts'") {
+			t.Fatalf("stderr = %q, want the rejection message", stderr)
+		}
+	})
+
+	// The trial script must refuse the production home before it touches
+	// anything: the production database is checked before and after.
+	productionDB := "/root/.herdsman/state.db"
+	before := fileIdentity(productionDB)
+
+	for _, testCase := range []struct {
+		name    string
+		home    string
+		message string
+	}{
+		{name: "the production home is refused", home: "/root/.herdsman", message: "refusing to run"},
+		{name: "the user home is refused", home: "/root/.herdsman/", message: "refusing to run"},
+		{name: "an empty home is refused", home: "", message: "is empty"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			stdout, stderr, code := runScript(t, trial, []string{"init"}, map[string]string{
+				"HERDSMAN_TRIAL_HOME": testCase.home,
+			})
+			if code != 2 {
+				t.Fatalf("exit code = %d, want 2 (stdout: %s, stderr: %s)", code, stdout, stderr)
+			}
+			if !strings.Contains(stderr, testCase.message) {
+				t.Fatalf("stderr = %q, want %q", stderr, testCase.message)
+			}
+		})
+	}
+
+	after := fileIdentity(productionDB)
+	if before != after {
+		t.Fatalf("the production database changed during the refused runs (before %q, after %q)", before, after)
+	}
+}
+
+// fileIdentity is the size and the modification time of a file, used to prove
+// that a refused run did not write to it. A missing file has no identity.
+func fileIdentity(path string) string {
+	info, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	return fmt.Sprintf("%d:%s", info.Size(), info.ModTime().UTC().Format(time.RFC3339Nano))
+}

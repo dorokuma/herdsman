@@ -1,0 +1,400 @@
+#!/usr/bin/env bash
+# herdsman-go-trial — start/stop an *isolated* Go herdsman daemon for the
+# 第 6 批 trial, and run the smoke suite against it.
+#
+# The trial daemon never touches the production instance:
+#
+#   * its Herdsman home is $HERDSMAN_TRIAL_HOME (default /root/.herdsman-go-trial),
+#     never /root/.herdsman — a hard gate below refuses the production home;
+#   * its database is a *read-only online backup* of /root/.herdsman/state.db
+#     (SQLite backup API), so the live database is only read;
+#   * its socket, pid file, log and agy-hook state dir all live inside the
+#     trial home, so the production herdsman.sock is never contacted.
+#
+# Subcommands:
+#   init [--refresh-db]  create the isolated layout (and the db copy)
+#   start                start the isolated Go daemon and wait for it to listen
+#   stop                 stop the isolated Go daemon (SIGTERM, verified pid)
+#   status               print the isolated daemon status JSON
+#   smoke [--refresh-db] start -> status/history/agy-hook smoke -> stop
+#
+# Environment overrides:
+#   HERDSMAN_TRIAL_HOME      isolated home (default /root/.herdsman-go-trial)
+#   HERDSMAN_GO_BIN_DIR      dir of the Go binaries (default /root/.local/lib/herdsman-go)
+#   HERDSMAN_CLI             CLI used for the smoke (default /root/.local/bin/herdsman)
+#   HERDSMAN_TRIAL_START_TIMEOUT_S  seconds to wait for the daemon (default 300)
+#   HERDSMAN_TRIAL_STOP_TIMEOUT_S   seconds to wait for the shutdown (default 10)
+set -euo pipefail
+
+PRODUCTION_HOME=/root/.herdsman
+PRODUCTION_DB=/root/.herdsman/state.db
+# An explicitly empty HERDSMAN_TRIAL_HOME is *not* replaced by the default:
+# the safety gate below has to see the empty value and refuse it.
+HERDSMAN_TRIAL_HOME="${HERDSMAN_TRIAL_HOME-/root/.herdsman-go-trial}"
+GO_BIN_DIR="${HERDSMAN_GO_BIN_DIR:-/root/.local/lib/herdsman-go}"
+DAEMON_BIN="${HERDSMAN_GO_DAEMON_BIN:-$GO_BIN_DIR/herdsman-daemon}"
+CLI_BIN="${HERDSMAN_CLI:-/root/.local/bin/herdsman}"
+
+# The Herdr-ish environment used by the smoke commands. The trial uses a
+# dedicated socket path and a dedicated pane id so nothing can claim the real
+# workspace owner; the workspace id stays w3E so the copied database can be
+# queried.
+SMOKE_HERDR_SOCKET=/tmp/herdr-default.sock
+SMOKE_HERDR_PANE=wTrialSmoke:p99
+SMOKE_HERDR_WORKSPACE=w3E
+SMOKE_AGY_PANE=wTrialSmoke:p99
+SMOKE_AGY_WORKSPACE=wTrialSmoke
+
+# The startup budget is generous on purpose: the daemon replays the copied
+# database's pending terminal-event plans (with the configured status-plan
+# backoff, 5s initial up to 60s per plan) before it starts listening, and that
+# replay takes minutes on a production-sized copy.
+START_TIMEOUT_S="${HERDSMAN_TRIAL_START_TIMEOUT_S:-300}"
+STOP_TIMEOUT_S="${HERDSMAN_TRIAL_STOP_TIMEOUT_S:-10}"
+
+fail() {
+  local code="$1"
+  shift
+  echo "herdsman-go-trial: $*" >&2
+  exit "$code"
+}
+
+# resolve_trial_home is the hard safety gate: the trial home is resolved to an
+# absolute path and refused when it points at the production home (or at the
+# current user's ~/.herdsman). It runs before any filesystem write.
+resolve_trial_home() {
+  local raw="$1"
+  [ -n "$raw" ] || fail 2 "HERDSMAN_TRIAL_HOME is empty; refusing to touch any home"
+  local resolved production home_production
+  resolved=$(realpath -m -- "$raw")
+  production=$(realpath -m -- "$PRODUCTION_HOME")
+  home_production=$(realpath -m -- "${HOME:-/root}/.herdsman")
+  if [ "$resolved" = "$production" ] || [ "$resolved" = "$home_production" ]; then
+    fail 2 "HERDSMAN_TRIAL_HOME resolves to the production home '$resolved'; refusing to run"
+  fi
+  printf '%s\n' "$resolved"
+}
+
+HERDSMAN_TRIAL_HOME=$(resolve_trial_home "$HERDSMAN_TRIAL_HOME")
+
+trial_db="$HERDSMAN_TRIAL_HOME/state.db"
+trial_socket="$HERDSMAN_TRIAL_HOME/herdsman.sock"
+trial_pid="$HERDSMAN_TRIAL_HOME/herdsman.pid"
+trial_log="$HERDSMAN_TRIAL_HOME/logs/herdsman.log"
+trial_agy_state="$HERDSMAN_TRIAL_HOME/agy-hooks"
+trial_config="$HERDSMAN_TRIAL_HOME/config.yaml"
+
+# The CLI under test: the host wrapper (which honours HERDSMAN_IMPL=go) when it
+# exists, the compiled Go binary otherwise.
+if [ -x "$CLI_BIN" ]; then
+  CLI_CMD=("$CLI_BIN")
+else
+  CLI_CMD=("$GO_BIN_DIR/herdsman")
+fi
+
+# go_cli runs the Go CLI against the isolated home.
+go_cli() {
+  HERDSMAN_IMPL=go HERDSMAN_HOME="$HERDSMAN_TRIAL_HOME" "${CLI_CMD[@]}" "$@"
+}
+
+# json_field prints one top-level field of a JSON document. The document is
+# passed as an argument (the python program itself comes from stdin, so the
+# document cannot be piped in).
+json_field() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+payload, field = sys.argv[1], sys.argv[2]
+try:
+    document = json.loads(payload)
+except Exception:
+    print("")
+    raise SystemExit(0)
+if isinstance(document, dict):
+    value = document.get(field)
+    if value is None:
+        print("")
+    elif isinstance(value, bool):
+        print("true" if value else "false")
+    else:
+        print(value)
+else:
+    print("")
+PY
+}
+
+# daemon_is_running prints "true" when the isolated daemon reports a running
+# state with a reachable socket.
+daemon_is_running() {
+  local output state reachable
+  output=$(go_cli daemon status 2>/dev/null || true)
+  state=$(json_field "$output" state)
+  reachable=$(json_field "$output" socketReachable)
+  if [ "$state" = "running" ] && [ "$reachable" = "true" ]; then
+    printf 'true\n'
+  else
+    printf 'false\n'
+  fi
+}
+
+write_config() {
+  mkdir -p "$HERDSMAN_TRIAL_HOME/logs" "$HERDSMAN_TRIAL_HOME/agy-hooks"
+  cat >"$trial_config" <<EOF
+# Isolated trial config for the Go herdsman daemon. Every runtime path points
+# inside the trial home; the production home is never referenced.
+runtime:
+  db_path: $trial_db
+  socket_path: $trial_socket
+  pid_path: $trial_pid
+  log_path: $trial_log
+EOF
+}
+
+# copy_production_db takes a read-only online backup of the production
+# database into the trial home. The source is opened with mode=ro, so the live
+# database is only read; the destination is a fresh SQLite file.
+copy_production_db() {
+  [ -f "$PRODUCTION_DB" ] || fail 1 "production database $PRODUCTION_DB is missing"
+  local before after
+  before=$(stat -c '%i %s %Y' "$PRODUCTION_DB")
+  rm -f "$trial_db" "$trial_db-wal" "$trial_db-shm"
+  python3 - "$PRODUCTION_DB" "$trial_db" <<'PY'
+import sqlite3
+import sys
+
+source_path, target_path = sys.argv[1], sys.argv[2]
+source = sqlite3.connect("file:%s?mode=ro" % source_path, uri=True)
+target = sqlite3.connect(target_path)
+try:
+    source.backup(target)
+finally:
+    target.close()
+    source.close()
+PY
+  after=$(stat -c '%i %s %Y' "$PRODUCTION_DB")
+  if [ "$before" != "$after" ]; then
+    fail 1 "production database $PRODUCTION_DB changed during the read-only backup (before '$before', after '$after')"
+  fi
+  echo "herdsman-go-trial: database copy ready at $trial_db (source inode/size/mtime unchanged: $after)"
+}
+
+cmd_init() {
+  local refresh=0
+  for argument in "$@"; do
+    case "$argument" in
+      --refresh-db) refresh=1 ;;
+      *) fail 2 "init: unknown argument '$argument'" ;;
+    esac
+  done
+  mkdir -p "$HERDSMAN_TRIAL_HOME/logs" "$HERDSMAN_TRIAL_HOME/agy-hooks"
+  write_config
+  if [ ! -f "$trial_db" ] || [ "$refresh" = 1 ]; then
+    copy_production_db
+  else
+    echo "herdsman-go-trial: reusing existing database copy $trial_db"
+  fi
+  echo "herdsman-go-trial: trial home ready at $HERDSMAN_TRIAL_HOME"
+}
+
+# trial_pid_value prints the pid recorded in the trial pid file (empty when the
+# file is missing or unreadable).
+trial_pid_value() {
+  [ -f "$trial_pid" ] || return 0
+  tr -dc '0-9' <"$trial_pid"
+}
+
+cmd_start() {
+  if [ ! -f "$trial_config" ] || [ ! -f "$trial_db" ]; then
+    cmd_init
+  fi
+  [ -x "$DAEMON_BIN" ] || fail 1 "Go daemon binary not found at $DAEMON_BIN"
+
+  local pid
+  pid=$(trial_pid_value)
+  if [ -n "$pid" ] && [ -d "/proc/$pid" ]; then
+    if [ "$(daemon_is_running)" = "true" ]; then
+      echo "herdsman-go-trial: already running (pid $pid)"
+      go_cli daemon status
+      return 0
+    fi
+    fail 1 "pid file $trial_pid points at pid $pid but the isolated daemon is not running; stop it manually"
+  fi
+  rm -f "$trial_pid"
+
+  echo "herdsman-go-trial: starting the isolated Go daemon ($DAEMON_BIN)"
+  local started_at
+  started_at=$(date +%s)
+  nohup setsid env \
+    HERDSMAN_HOME="$HERDSMAN_TRIAL_HOME" \
+    HERDSMAN_AGY_STATE_DIR="$trial_agy_state" \
+    "$DAEMON_BIN" >>"$HERDSMAN_TRIAL_HOME/logs/herdsman-daemon.out" 2>&1 </dev/null &
+
+  local attempt deadline
+  deadline=$(( $(date +%s) + START_TIMEOUT_S ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ "$(daemon_is_running)" = "true" ]; then
+      echo "herdsman-go-trial: isolated daemon is up (pid $(trial_pid_value), ready after $(( $(date +%s) - started_at ))s)"
+      go_cli daemon status
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "herdsman-go-trial: the isolated daemon did not become ready within ${START_TIMEOUT_S}s" >&2
+  tail -n 40 "$HERDSMAN_TRIAL_HOME/logs/herdsman-daemon.out" >&2 || true
+  return 1
+}
+
+cmd_stop() {
+  local pid
+  pid=$(trial_pid_value)
+  if [ -z "$pid" ] || [ ! -d "/proc/$pid" ]; then
+    echo "herdsman-go-trial: no running isolated daemon (pid file: $trial_pid)"
+    go_cli daemon status
+    return 0
+  fi
+
+  local production_pid
+  production_pid=$(systemctl show -p MainPID --value herdsman.service 2>/dev/null || echo "")
+  if [ -n "$production_pid" ] && [ "$pid" = "$production_pid" ]; then
+    fail 2 "pid $pid is the production herdsman.service MainPID; refusing to stop it"
+  fi
+
+  local cmdline
+  cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || echo "")
+  case "$cmdline" in
+    *herdsman-daemon*) ;;
+    *) fail 2 "pid $pid is not a herdsman-daemon process ('$cmdline'); refusing to stop it" ;;
+  esac
+
+  local environ
+  environ=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null || true)
+  if ! printf '%s\n' "$environ" | grep -qx "HERDSMAN_HOME=$HERDSMAN_TRIAL_HOME"; then
+    fail 2 "pid $pid does not run with HERDSMAN_HOME=$HERDSMAN_TRIAL_HOME; refusing to stop it"
+  fi
+
+  echo "herdsman-go-trial: stopping the isolated daemon (pid $pid)"
+  kill -TERM "$pid"
+  local attempt deadline
+  deadline=$(( $(date +%s) + STOP_TIMEOUT_S ))
+  while [ "$(date +%s)" -lt "$deadline" ]; do
+    if [ ! -d "/proc/$pid" ] && [ "$(daemon_is_running)" = "false" ]; then
+      echo "herdsman-go-trial: isolated daemon stopped"
+      go_cli daemon status
+      return 0
+    fi
+    sleep 0.2
+  done
+  echo "herdsman-go-trial: the isolated daemon did not stop within ${STOP_TIMEOUT_S}s" >&2
+  return 1
+}
+
+cmd_status() {
+  go_cli daemon status
+}
+
+# production_main_pid prints the MainPID of the production herdsman.service (the
+# trial must never change it).
+production_main_pid() {
+  systemctl show -p MainPID --value herdsman.service 2>/dev/null || printf ''
+}
+
+# smoke_agy_hook runs one agy-hook invocation with the given stdin payload and
+# Herdr environment, and prints the raw output. CTXMODE_ROLE is dropped on
+# purpose: the trial emulates a normal agent pane, and a dispatched subagent
+# would short-circuit the hook before it ever reaches the daemon.
+smoke_agy_hook() {
+  local event="$1"
+  local payload="$2"
+  local herdr_env="$3"
+  local herdr_socket="$4"
+  local herdr_pane="$5"
+  local herdr_workspace="$6"
+  printf '%s' "$payload" | env -u CTXMODE_ROLE \
+    HERDSMAN_IMPL=go \
+    HERDSMAN_HOME="$HERDSMAN_TRIAL_HOME" \
+    HERDSMAN_AGY_STATE_DIR="$trial_agy_state" \
+    HERDR_ENV="$herdr_env" \
+    HERDR_SOCKET_PATH="$herdr_socket" \
+    HERDR_PANE_ID="$herdr_pane" \
+    HERDR_WORKSPACE_ID="$herdr_workspace" \
+    "${CLI_CMD[@]}" agy-hook "$event"
+}
+
+# has_ambient_herdr_pane reports whether the environment carries a Herdr pane
+# identity (the orchestrator status and the scope-less agent read need one).
+has_ambient_herdr_pane() {
+  [ "${HERDR_ENV:-}" = "1" ] &&
+    [ -n "${HERDR_SOCKET_PATH:-}" ] &&
+    [ -n "${HERDR_PANE_ID:-}" ] &&
+    [ -n "${HERDR_WORKSPACE_ID:-}" ]
+}
+
+cmd_smoke() {
+  local refresh=0
+  for argument in "$@"; do
+    case "$argument" in
+      --refresh-db) refresh=1 ;;
+      *) fail 2 "smoke: unknown argument '$argument'" ;;
+    esac
+  done
+
+  local production_before
+  production_before=$(production_main_pid)
+  echo "herdsman-go-trial: production herdsman.service MainPID before the smoke: ${production_before:-unknown}"
+
+  echo "== 1. start"
+  if [ "$refresh" = 1 ]; then
+    cmd_init --refresh-db
+  fi
+  cmd_start
+
+  echo "== 2. status smoke"
+  echo "-- daemon status"
+  go_cli daemon status
+  echo "-- orchestrator status (--json)"
+  if has_ambient_herdr_pane; then
+    go_cli status --json
+  else
+    echo "note: no ambient Herdr pane identity in this environment; the orchestrator status needs one" >&2
+  fi
+
+  echo "== 3. history smoke"
+  echo "-- agent list --workspace $SMOKE_HERDR_WORKSPACE --json"
+  go_cli agent list --workspace "$SMOKE_HERDR_WORKSPACE" --json
+  echo "-- agent read w3E:p1 --limit 2 --json"
+  if ! go_cli agent read w3E:p1 --limit 2 --json; then
+    echo "note: the scope-less agent read needs an ambient Herdr pane; retrying with an explicit scope" >&2
+    go_cli agent read w3E:p1 --limit 2 --workspace "$SMOKE_HERDR_WORKSPACE" --json
+  fi
+
+  echo "== 4. agy-hook smoke"
+  echo "-- PreInvocation (HERDR_ENV=0, no daemon contact)"
+  smoke_agy_hook PreInvocation '{}' 0 "$SMOKE_HERDR_SOCKET" "$SMOKE_HERDR_PANE" "$SMOKE_HERDR_WORKSPACE"
+  echo "-- Stop (HERDR_ENV=0, no daemon contact)"
+  smoke_agy_hook Stop '{}' 0 "$SMOKE_HERDR_SOCKET" "$SMOKE_HERDR_PANE" "$SMOKE_HERDR_WORKSPACE"
+  echo "-- PreInvocation (HERDR_ENV=1, against the isolated daemon)"
+  smoke_agy_hook PreInvocation '{"conversationId":"trial-smoke-session","invocationNum":1}' 1 \
+    "$SMOKE_HERDR_SOCKET" "$SMOKE_AGY_PANE" "$SMOKE_AGY_WORKSPACE"
+
+  echo "== 5. stop"
+  cmd_stop
+
+  local production_after
+  production_after=$(production_main_pid)
+  echo "herdsman-go-trial: production herdsman.service MainPID after the smoke: ${production_after:-unknown}"
+  if [ "$production_before" != "$production_after" ]; then
+    fail 1 "the production herdsman.service MainPID changed during the smoke (before '$production_before', after '$production_after')"
+  fi
+}
+
+case "${1:-}" in
+  init) shift; cmd_init "$@" ;;
+  start) shift; cmd_start "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  smoke) shift; cmd_smoke "$@" ;;
+  *)
+    fail 2 "usage: $(basename "$0") {init [--refresh-db]|start|stop|status|smoke [--refresh-db]}"
+    ;;
+esac
