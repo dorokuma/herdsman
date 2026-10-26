@@ -683,6 +683,31 @@ func TestSafeAllowedSessionPathKeepsTheRootWhitelistForHerdsmanPiRegistration(t 
 	}
 }
 
+func TestRegistrationWhitelistAcceptsPigSessionFilesUnderThePigHome(t *testing.T) {
+	home := t.TempDir()
+	pigPath := writeSessionFile(t, filepath.Join(home, ".pig", "agent", "sessions", "pig.jsonl"), discoverySessionFileBody)
+	if got := SafeAllowedSessionPath(pigPath, strp(home)); got != pigPath {
+		t.Fatalf("safeAllowedSessionPath(pig path) = %q, want %q", got, pigPath)
+	}
+	if !SessionPathAllowedByShape(pigPath, strp(home)) {
+		t.Fatal("sessionPathAllowedByShape(pig path) = false, want true")
+	}
+	// pi keeps working exactly as before: both agent homes are whitelisted.
+	piPath := writeSessionFile(t, filepath.Join(home, ".pi", "agent", "sessions", "pi.jsonl"), discoverySessionFileBody)
+	if got := SafeAllowedSessionPath(piPath, strp(home)); got != piPath {
+		t.Fatalf("safeAllowedSessionPath(pi path) = %q, want %q", got, piPath)
+	}
+	// A sibling directory whose name merely starts with the root name must not
+	// pass the containment check.
+	sibling := writeSessionFile(t, filepath.Join(home, ".pig", "agent", "sessions-backup", "sibling.jsonl"), discoverySessionFileBody)
+	if got := SafeAllowedSessionPath(sibling, strp(home)); got != "" {
+		t.Fatalf("safeAllowedSessionPath(sibling) = %q, want empty", got)
+	}
+	if SessionPathAllowedByShape(sibling, strp(home)) {
+		t.Fatal("sessionPathAllowedByShape(sibling) = true, want false")
+	}
+}
+
 func TestSafeOfficialSessionPathKeepsTheFileSafetyChecksWithoutARootWhitelist(t *testing.T) {
 	root := t.TempDir()
 	path := writeSessionFile(t, filepath.Join(root, "official-session.jsonl"), discoverySessionFileBody)

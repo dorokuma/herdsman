@@ -5,6 +5,7 @@ import {
   discoverAgentHistory,
   safeAllowedSessionPath,
   safeOfficialSessionPath,
+  sessionPathAllowedByShape,
 } from "@/agent-history/discovery.js";
 
 const HERDR_ROLE_SESSIONS_ROOT = "/tmp/herdr-role-sessions";
@@ -56,6 +57,34 @@ describe("agent history discovery (official value only)", () => {
     const directory = join(root, "a-directory.jsonl");
     await mkdir(directory, { recursive: true });
     expect(safeOfficialSessionPath(directory)).toBeNull();
+  });
+
+  test("the registration whitelist accepts pig session files under the pig home", async () => {
+    const home = await tempRoot("herdsman-pig-home-");
+    const pigPath = await sessionFile(join(home, ".pig", "agent", "sessions"), "pig-session");
+    expect(safeAllowedSessionPath(pigPath, home)).toBe(pigPath);
+    expect(sessionPathAllowedByShape(pigPath, home)).toBe(true);
+
+    // pi keeps working exactly as before: both agent homes are whitelisted.
+    const piPath = await sessionFile(join(home, ".pi", "agent", "sessions"), "pi-session");
+    expect(safeAllowedSessionPath(piPath, home)).toBe(piPath);
+    expect(sessionPathAllowedByShape(piPath, home)).toBe(true);
+  });
+
+  test("the pig home whitelist rejects paths outside the pig session root", async () => {
+    const home = await tempRoot("herdsman-pig-boundary-");
+    // A sibling directory whose name merely starts with the root name must not
+    // pass the containment check.
+    const sibling = await sessionFile(join(home, ".pig", "agent", "sessions-backup"), "sibling");
+    expect(safeAllowedSessionPath(sibling, home)).toBeNull();
+    expect(sessionPathAllowedByShape(sibling, home)).toBe(false);
+
+    // A file that lives outside every whitelisted root stays rejected, and the
+    // pig home does not become a whitelist for another home's files.
+    const outside = await sessionFile(await tempRoot("herdsman-pig-outside-"), "outside");
+    expect(safeAllowedSessionPath(outside, home)).toBeNull();
+    expect(sessionPathAllowedByShape(outside, home)).toBe(false);
+    expect(safeAllowedSessionPath(outside, await tempRoot("herdsman-pig-other-home-"))).toBeNull();
   });
 
   test("a plausible session file on disk is never picked up without an official value", async () => {

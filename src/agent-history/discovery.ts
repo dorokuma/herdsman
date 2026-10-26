@@ -24,6 +24,26 @@ import type { AgentHistoryRef, AgentSessionRef } from "@/observability/contracts
 export const ALLOWED_SESSION_ROOTS = ["/tmp/herdr-role-sessions"] as const;
 export const DEFAULT_AGY_EXTRA_HOMES = ["/root/.agy-pro-home"] as const;
 
+/**
+ * Home-relative session roots the registration whitelist accepts next to the
+ * fixed `ALLOWED_SESSION_ROOTS`:
+ *
+ * - `.pi/agent/sessions` — pi keeps its sessions under its own agent home.
+ * - `.pig/agent/sessions` — pig (PiG) keeps its sessions under its own agent
+ *   home. The same herdsman-pi extension runs inside pig, so the session path
+ *   a pig pane registers lives in pig's home, not in pi's.
+ *
+ * Both roots are derived from the same home (`homeDir` argument, else `HOME`,
+ * else `/root`) and are checked exactly like every other whitelist root: the
+ * reported path must resolve (realpath) into one of them.
+ */
+const HOME_SESSION_ROOTS = [".pi/agent/sessions", ".pig/agent/sessions"] as const;
+
+function homeSessionRoots(homeDir?: string): string[] {
+  const home = homeDir ?? process.env.HOME ?? "/root";
+  return HOME_SESSION_ROOTS.map((root) => join(home, root));
+}
+
 export type AgentHistoryLookupInput = {
   agent: string | null;
   agentSession: AgentSessionRef | null;
@@ -328,8 +348,7 @@ export function historySourceFromSessionRef(ref: AgentSessionRef): AgentHistoryR
 export function safeAllowedSessionPath(value: string, homeDir?: string): string | null {
   const real = safeRegularFile(value);
   if (!real) return null;
-  const homeSessionRoot = join(homeDir ?? process.env.HOME ?? "/root", ".pi/agent/sessions");
-  const roots = [homeSessionRoot, ...ALLOWED_SESSION_ROOTS];
+  const roots = [...homeSessionRoots(homeDir), ...ALLOWED_SESSION_ROOTS];
   return roots.some((root) => {
     const rest = relative(root, real);
     return rest === "" || (!rest.startsWith("..") && !isAbsolute(rest));
@@ -391,8 +410,7 @@ const CURRENT_EUID = process.geteuid?.() ?? -1;
 export function sessionPathAllowedByShape(value: string, homeDir?: string): boolean {
   if (!isAbsolute(value) || value.includes("..")) return false;
   const resolved = normalize(value);
-  const homeSessionRoot = join(homeDir ?? process.env.HOME ?? "/root", ".pi/agent/sessions");
-  const roots = [homeSessionRoot, ...ALLOWED_SESSION_ROOTS];
+  const roots = [...homeSessionRoots(homeDir), ...ALLOWED_SESSION_ROOTS];
   return roots.some((root) => {
     const rest = relative(root, resolved);
     return rest !== "" && !rest.startsWith("..") && !isAbsolute(rest);
