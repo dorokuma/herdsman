@@ -2465,6 +2465,11 @@ export function formatHiddenAgentUpdates(events: AgentEventWireRecord[]): string
 }
 
 function isNormalHerdsmanContext(message: PiAgentMessage): boolean {
+  // A toolResult is never one of ours, whatever it carries: tool output
+  // routinely quotes a herdsman marker (an agent reading its own board, a
+  // replayed session, a file the marker was pasted into), and dropping that
+  // entry would silently rewrite what the model actually saw.
+  if (message.role === "toolResult") return false;
   return (
     message.customType === "herdsman-agent-context" ||
     // Defensive for session replay: older versions pinned a queued wake to the
@@ -2472,19 +2477,20 @@ function isNormalHerdsmanContext(message: PiAgentMessage): boolean {
     // those entries, and they are herdsman's own, so they are dropped from the
     // incoming list like the agent-context ones (see the context hook).
     message.customType === "herdsman-wake-queued" ||
-    contentIncludesMarker(message.content, "[HERDSMAN AGENT CONTEXT]")
+    contentStartsWithMarker(message.content, "[HERDSMAN " + "AGENT CONTEXT]")
   );
 }
 
-function contentIncludesMarker(content: unknown, marker: string): boolean {
-  if (typeof content === "string") return content.includes(marker);
-  if (!Array.isArray(content)) return false;
-  return content.some((block) => {
-    const value = record(block);
-    return (
-      contentIncludesMarker(value.text, marker) || contentIncludesMarker(value.content, marker)
-    );
-  });
+/**
+ * Whether the message's first non-empty text starts with `marker`.
+ *
+ * Only the opening text counts, so a marker quoted mid-body is ordinary
+ * content rather than one of herdsman's own entries. Mirrors the Go
+ * extension's `contentStartsWithMarker`.
+ */
+function contentStartsWithMarker(content: unknown, marker: string): boolean {
+  const text = textFromContent(content);
+  return text !== null && text.trimStart().startsWith(marker);
 }
 
 function isLocalOwner(response: ConnectionStateResponse): boolean {
