@@ -1,5 +1,5 @@
 import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
-import { createServer, type Server, type Socket } from "node:net";
+import { createServer, type Server, Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, test, vi } from "vitest";
@@ -324,6 +324,181 @@ describe("ReconnectingDaemonClient", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // X3 fix ①: a session reset (or any new connection) must release what the
+  // client already holds. The pre-fix client overwrote `#socket` without
+  // closing the old one, so `new ReconnectingDaemonClient(...)` followed by a
+  // synchronous `resetForSession()` left the first socket ESTABLISHED on
+  // `herdsman.sock` with nobody holding a reference to close it.
+  test("a synchronous resetForSession after construction leaves no orphan connection", async () => {
+    const resource = createResource();
+    const live = new Set<Socket>();
+    const destroySpy = vi.spyOn(Socket.prototype, "destroy");
+    resource.server = await startServer(
+      resource.socketPath,
+      (socket, message) => {
+        socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+      },
+      (socket) => {
+        live.add(socket);
+        socket.on("close", () => live.delete(socket));
+      },
+    );
+    let connected = 0;
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [5],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+    client.onConnected = () => {
+      connected += 1;
+    };
+    // The race the extension hits: the constructor only queues its connect as a
+    // microtask, so this runs before any socket exists on the client side.
+    client.resetForSession();
+    await waitFor(() => connected === 1);
+    await waitFor(() => live.size === 1);
+    expect(connected).toBe(1);
+    expect(live.size).toBe(1);
+    expect(destroySpy.mock.calls.length).toBeGreaterThan(0);
+
+    client.close();
+    await waitFor(() => live.size === 0);
+    expect(live.size).toBe(0);
+  });
+
+  test("repeated resetForSession on a live client keeps exactly one connection", async () => {
+    const resource = createResource();
+    const live = new Set<Socket>();
+    resource.server = await startServer(
+      resource.socketPath,
+      (socket, message) => {
+        socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+      },
+      (socket) => {
+        live.add(socket);
+        socket.on("close", () => live.delete(socket));
+      },
+    );
+    let connected = 0;
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [5],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+    client.onConnected = () => {
+      connected += 1;
+    };
+    await waitFor(() => connected === 1);
+
+    // Each reset runs against a live connection: the old socket is closed and
+    // exactly one connection stays established.
+    client.resetForSession();
+    await waitFor(() => connected === 2);
+    client.resetForSession();
+    await waitFor(() => connected === 3);
+    client.resetForSession();
+    await waitFor(() => connected === 4);
+    await waitFor(() => live.size === 1);
+    expect(live.size).toBe(1);
+    await expect(client.request("agent.list", {})).resolves.toEqual({});
+
+    client.close();
+    await waitFor(() => live.size === 0);
+    expect(live.size).toBe(0);
+  });
+
+  test("a pending reconnect timer is dropped when a new connection starts", async () => {
+    const resource = createResource();
+    const live = new Set<Socket>();
+    let accepted = 0;
+    let firstServerSocket: Socket | undefined;
+    resource.server = await startServer(
+      resource.socketPath,
+      (socket, message) => {
+        socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+      },
+      (socket) => {
+        accepted += 1;
+        live.add(socket);
+        socket.on("close", () => live.delete(socket));
+        firstServerSocket ??= socket;
+      },
+    );
+    let connected = 0;
+    let disconnected = 0;
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [20],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+    client.onConnected = () => {
+      connected += 1;
+    };
+    client.onDisconnected = () => {
+      disconnected += 1;
+    };
+    await waitFor(() => connected === 1);
+
+    // Drop the live connection and wait for the client to report it: that is
+    // the exact point at which the 20ms reconnect timer is armed.
+    firstServerSocket?.destroy();
+    await waitFor(() => disconnected === 1);
+    client.resetForSession();
+    await waitFor(() => connected === 2);
+    await waitFor(() => live.size === 1);
+
+    // The stale timer must not fire against the replacement connection.
+    await new Promise((resolve) => setTimeout(resolve, 120));
+    expect(live.size).toBe(1);
+    expect(accepted).toBe(2);
+
+    client.close();
+    await waitFor(() => live.size === 0);
+  });
+
+  // X3 fix ③: the client socket and its reconnect timer must be unref'd, or a
+  // print-mode process that never calls `process.exit()` hangs on them.
+  test("the client socket and the reconnect timer are unref'd", async () => {
+    const resource = createResource();
+    const socketUnref = vi.spyOn(Socket.prototype, "unref");
+    // A reconnect delay nothing else in this run uses, so the wrapped handle is
+    // unambiguously the client's reconnect timer and not a test/scheduler one.
+    const reconnectDelayMs = 60_000;
+    const realSetTimeout = globalThis.setTimeout;
+    let reconnectTimerUnref: ReturnType<typeof vi.fn> | undefined;
+    vi.spyOn(globalThis, "setTimeout").mockImplementation(((
+      ...args: Parameters<typeof setTimeout>
+    ) => {
+      const handle = realSetTimeout(...args);
+      if (args[1] === reconnectDelayMs) {
+        const unref = vi.fn();
+        (handle as { unref?: () => void }).unref = unref;
+        reconnectTimerUnref = unref;
+      }
+      return handle;
+    }) as unknown as typeof setTimeout);
+    resource.server = await startServer(
+      resource.socketPath,
+      (socket, message) => {
+        socket.write(`${JSON.stringify({ id: message.id, result: {} })}\n`);
+      },
+      // The server drops the connection immediately, which is what arms the
+      // reconnect timer on the client side.
+      (socket) => socket.destroy(),
+    );
+    const client = new ReconnectingDaemonClient({
+      reconnectDelaysMs: [reconnectDelayMs],
+      socketPath: resource.socketPath,
+    });
+    resource.client = client;
+
+    await waitFor(() => Boolean(reconnectTimerUnref));
+    expect(socketUnref.mock.calls.length).toBeGreaterThan(0);
+    expect(reconnectTimerUnref).toHaveBeenCalled();
+
+    client.close();
   });
 });
 
