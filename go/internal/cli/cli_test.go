@@ -3,7 +3,6 @@ package cli
 import (
 	"bytes"
 	"errors"
-	"fmt"
 	"math"
 	"os"
 	"os/exec"
@@ -11,7 +10,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/dorokuma/herdsman/go/internal/agy"
 	"github.com/dorokuma/herdsman/go/internal/daemon"
@@ -1056,8 +1054,7 @@ func strPtr(value string) *string { return &value }
 func intPtr(value int) *int { return &value }
 
 // ---------------------------------------------------------------------------
-// The shell scripts: the CLI switch (go/scripts/herdsman) and the isolated
-// trial daemon (go/scripts/herdsman-go-trial).
+// The shell script: the CLI switch (go/scripts/herdsman).
 // ---------------------------------------------------------------------------
 
 // scriptEnv builds the environment for a script run: every HERDSMAN_/HERDR_
@@ -1110,29 +1107,22 @@ func writeStubScript(t *testing.T, directory, name, word string) string {
 	return path
 }
 
-// TestWrapperAndTrialScripts covers the three scripts of the 第 6 批 preparation:
-// the CLI switch (go/scripts/herdsman) routes HERDSMAN_IMPL=ts|go to the
-// right entrypoint and rejects any other value, the isolated trial daemon
-// (go/scripts/herdsman-go-trial) refuses to run against the production home,
-// and the PiG launcher (go/scripts/pig-trial) refuses the production agent
-// directory and the production herdsman home before it starts anything.
-func TestWrapperAndTrialScripts(t *testing.T) {
+// TestWrapperScript covers the CLI switch (go/scripts/herdsman): it routes
+// HERDSMAN_IMPL=ts|go to the right entrypoint and rejects any other value.
+// The isolated trial scripts (herdsman-go-trial / pig-trial) were removed.
+func TestWrapperScript(t *testing.T) {
 	workingDir, err := os.Getwd()
 	if err != nil {
 		t.Fatalf("getwd: %v", err)
 	}
 	scriptDir := filepath.Join(workingDir, "..", "..", "scripts")
 	wrapper := filepath.Join(scriptDir, "herdsman")
-	trial := filepath.Join(scriptDir, "herdsman-go-trial")
-	pigTrial := filepath.Join(scriptDir, "pig-trial")
-	for _, path := range []string{wrapper, trial, pigTrial} {
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			t.Fatalf("stat %s: %v", path, statErr)
-		}
-		if info.Mode().Perm()&0o111 == 0 {
-			t.Fatalf("%s is not executable (mode %v)", path, info.Mode().Perm())
-		}
+	info, statErr := os.Stat(wrapper)
+	if statErr != nil {
+		t.Fatalf("stat %s: %v", wrapper, statErr)
+	}
+	if info.Mode().Perm()&0o111 == 0 {
+		t.Fatalf("%s is not executable (mode %v)", wrapper, info.Mode().Perm())
 	}
 
 	tempDir := t.TempDir()
@@ -1211,207 +1201,4 @@ func TestWrapperAndTrialScripts(t *testing.T) {
 			t.Fatalf("stderr = %q, want the rejection message", stderr)
 		}
 	})
-
-	// The trial script must refuse the production home before it touches
-	// anything: the production database is checked before and after.
-	productionDB := "/root/.herdsman/state.db"
-	before := fileIdentity(productionDB)
-
-	for _, testCase := range []struct {
-		name    string
-		home    string
-		message string
-	}{
-		{name: "the production home is refused", home: "/root/.herdsman", message: "refusing to run"},
-		{name: "the user home is refused", home: "/root/.herdsman/", message: "refusing to run"},
-		{name: "an empty home is refused", home: "", message: "is empty"},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			stdout, stderr, code := runScript(t, trial, []string{"init"}, map[string]string{
-				"HERDSMAN_TRIAL_HOME": testCase.home,
-			})
-			if code != 2 {
-				t.Fatalf("exit code = %d, want 2 (stdout: %s, stderr: %s)", code, stdout, stderr)
-			}
-			if !strings.Contains(stderr, testCase.message) {
-				t.Fatalf("stderr = %q, want %q", stderr, testCase.message)
-			}
-		})
-	}
-
-	after := fileIdentity(productionDB)
-	if before != after {
-		t.Fatalf("the production database changed during the refused runs (before %q, after %q)", before, after)
-	}
-
-	// pig-trial must refuse the production agent directory and the production
-	// herdsman home before it starts the isolated daemon or PiG.
-	for _, testCase := range []struct {
-		name     string
-		home     string
-		variable string
-		message  string
-	}{
-		{name: "the production agent directory is refused", home: "/root/.pi/agent", variable: "PIG_TRIAL_HOME", message: "refusing to run"},
-		{name: "the production agent home is refused", home: "/root/.pi", variable: "PIG_TRIAL_HOME", message: "refusing to run"},
-		{name: "an empty pig home is refused", home: "", variable: "PIG_TRIAL_HOME", message: "is empty"},
-		{name: "the production herdsman home is refused", home: "/root/.herdsman", variable: "HERDSMAN_TRIAL_HOME", message: "refusing to run"},
-		{name: "an empty herdsman home is refused", home: "", variable: "HERDSMAN_TRIAL_HOME", message: "is empty"},
-	} {
-		t.Run(testCase.name, func(t *testing.T) {
-			stdout, stderr, code := runScript(t, pigTrial, []string{"-p", "--no-session"}, map[string]string{
-				testCase.variable: testCase.home,
-			})
-			if code != 2 {
-				t.Fatalf("exit code = %d, want 2 (stdout: %s, stderr: %s)", code, stdout, stderr)
-			}
-			if !strings.Contains(stderr, testCase.message) {
-				t.Fatalf("stderr = %q, want %q", stderr, testCase.message)
-			}
-		})
-	}
-
-	t.Run("pig-trial starts the isolated daemon and hands the arguments to pig", func(t *testing.T) {
-		dir := t.TempDir()
-		pigHome := filepath.Join(dir, "pig-home")
-		herdsmanHome := filepath.Join(dir, "herdsman-home")
-		for _, home := range []string{pigHome, herdsmanHome} {
-			if err := os.MkdirAll(home, 0o755); err != nil {
-				t.Fatal(err)
-			}
-		}
-		trialRecord := filepath.Join(dir, "trial-record.txt")
-		probeRecord := filepath.Join(dir, "probe-record.txt")
-		trialStub := writePigTrialDaemonStub(t, dir, trialRecord)
-		pigProbe := writePigProbe(t, dir, probeRecord)
-
-		stdout, stderr, code := runScript(t, pigTrial, []string{"-p", "--no-session"}, map[string]string{
-			"HERDSMAN_GO_TRIAL_BIN":        trialStub,
-			"PIG_BIN":                      pigProbe,
-			"PIG_TRIAL_HOME":               pigHome,
-			"HERDSMAN_TRIAL_HOME":          herdsmanHome,
-			"TRIAL_PROBE_RECORD":           trialRecord,
-			"PROBE_RECORD":                 probeRecord,
-			"PIG_CODING_AGENT_DIR":         filepath.Join(dir, "production-agent"),
-			"PIG_CODING_AGENT_SESSION_DIR": filepath.Join(dir, "production-sessions"),
-			"PIG_USE_PI_DIRS":              "1",
-		})
-		if code != 0 {
-			t.Fatalf("exit code = %d, want 0 (stdout: %s, stderr: %s)", code, stdout, stderr)
-		}
-		// The trial daemon banner must not reach pig's stdout: the caller pipes
-		// pig -p --mode json and needs a clean stream.
-		if want := "pig probe stdout\n"; stdout != want {
-			t.Fatalf("stdout = %q, want %q", stdout, want)
-		}
-		if !strings.Contains(stderr, "fake trial daemon banner") {
-			t.Fatalf("stderr = %q, want the trial daemon banner on stderr", stderr)
-		}
-
-		trial := readRecord(t, trialRecord)
-		if want := "start-arg=start"; !strings.Contains(trial, want) {
-			t.Fatalf("trial record = %q, want %q", trial, want)
-		}
-
-		probe := readRecord(t, probeRecord)
-		for _, want := range []string{
-			"args=-p --no-session",
-			"PIG_HOME=" + pigHome,
-			"HERDSMAN_IMPL=go",
-			"HERDSMAN_HOME=" + herdsmanHome,
-			"HERDSMAN_SOCKET_PATH=" + filepath.Join(herdsmanHome, "herdsman.sock"),
-			"PIG_CODING_AGENT_DIR=__UNSET__",
-			"PIG_CODING_AGENT_SESSION_DIR=__UNSET__",
-			"PIG_USE_PI_DIRS=__UNSET__",
-		} {
-			if !strings.Contains(probe, want) {
-				t.Fatalf("probe record = %q, want %q", probe, want)
-			}
-		}
-	})
-
-	t.Run("pig-trial fails when the isolated socket never appears", func(t *testing.T) {
-		dir := t.TempDir()
-		herdsmanHome := filepath.Join(dir, "herdsman-home")
-		if err := os.MkdirAll(herdsmanHome, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		trialRecord := filepath.Join(dir, "trial-record.txt")
-		trialStub := writePigTrialDaemonStub(t, dir, trialRecord)
-		// A trial daemon that starts but never creates its socket.
-		writeTestFile(t, trialStub, "#!/bin/sh\nprintf 'start-arg=%s\\n' \"$1\" >>\"${TRIAL_PROBE_RECORD:?}\"\necho \"fake trial daemon banner\"\n")
-		if err := os.Chmod(trialStub, 0o755); err != nil {
-			t.Fatal(err)
-		}
-		stdout, stderr, code := runScript(t, pigTrial, []string{"-p", "--no-session"}, map[string]string{
-			"HERDSMAN_GO_TRIAL_BIN": trialStub,
-			"PIG_BIN":               "/bin/sh",
-			"PIG_TRIAL_HOME":        filepath.Join(dir, "pig-home"),
-			"HERDSMAN_TRIAL_HOME":   herdsmanHome,
-			"TRIAL_PROBE_RECORD":    trialRecord,
-		})
-		if code != 1 {
-			t.Fatalf("exit code = %d, want 1 (stdout: %s, stderr: %s)", code, stdout, stderr)
-		}
-		if !strings.Contains(stderr, "does not exist after the daemon start") {
-			t.Fatalf("stderr = %q, want the missing-socket message", stderr)
-		}
-	})
-}
-
-// writePigTrialDaemonStub writes a fake herdsman-go-trial: it records its first
-// argument and creates the isolated socket the launcher expects to find.
-func writePigTrialDaemonStub(t *testing.T, directory, record string) string {
-	t.Helper()
-	path := filepath.Join(directory, "fake-herdsman-go-trial")
-	writeTestFile(t, path, `#!/bin/sh
-printf 'start-arg=%s\n' "$1" >>"${TRIAL_PROBE_RECORD:?}"
-mkdir -p "$HERDSMAN_TRIAL_HOME"
-: >"$HERDSMAN_TRIAL_HOME/herdsman.sock"
-echo "fake trial daemon banner"
-`)
-	if err := os.Chmod(path, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-// writePigProbe writes a fake pig that records its arguments and the
-// environment the launcher exported, then prints one line on stdout.
-func writePigProbe(t *testing.T, directory, record string) string {
-	t.Helper()
-	path := filepath.Join(directory, "fake-pig")
-	writeTestFile(t, path, `#!/bin/sh
-: >"${PROBE_RECORD:?}"
-printf 'args=%s\n' "$*" >>"${PROBE_RECORD:?}"
-for key in PIG_HOME HERDSMAN_IMPL HERDSMAN_HOME HERDSMAN_SOCKET_PATH HERDSMAN_TRIAL_HOME PIG_CODING_AGENT_DIR PIG_CODING_AGENT_SESSION_DIR PIG_USE_PI_DIRS; do
-  eval "value=\${$key-__UNSET__}"
-  printf '%s=%s\n' "$key" "$value" >>"${PROBE_RECORD:?}"
-done
-echo "pig probe stdout"
-`)
-	if err := os.Chmod(path, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	return path
-}
-
-// readRecord reads one probe record file.
-func readRecord(t *testing.T, path string) string {
-	t.Helper()
-	content, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("read %s: %v", path, err)
-	}
-	return string(content)
-}
-
-// fileIdentity is the size and the modification time of a file, used to prove
-// that a refused run did not write to it. A missing file has no identity.
-func fileIdentity(path string) string {
-	info, err := os.Stat(path)
-	if err != nil {
-		return ""
-	}
-	return fmt.Sprintf("%d:%s", info.Size(), info.ModTime().UTC().Format(time.RFC3339Nano))
 }
