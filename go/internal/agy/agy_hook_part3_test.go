@@ -959,6 +959,12 @@ func TestParseAgyComposerDraft(t *testing.T) {
 	// A rule on the draft's last line would make the naive second-to-last rule sit
 	// right above the bottom; the box must still be located.
 	assertDraft(t, strings.Join([]string{"output", rule, "> 草稿", rule, rule, "? for shortcuts"}, "\n"), strPtr("草稿\n"+rule))
+	// A draft that contains a rule followed by a `>` quote line: the innermost
+	// same-width candidate parses to an empty draft, so the walk must step outwards
+	// to the enclosing frame and keep the whole draft.
+	assertDraft(t, strings.Join([]string{"output", rule, "> 草稿", "--------", ">", rule, "? for shortcuts"}, "\n"), strPtr("草稿\n--------\n>"))
+	// Same, but the draft's own rule is byte-identical to the frame rule.
+	assertDraft(t, strings.Join([]string{"output", rule, "> 草稿", rule, ">", rule, "? for shortcuts"}, "\n"), strPtr("草稿\n"+rule+"\n>"))
 	// A composer box that cannot be located yields nil so wake keeps working.
 	assertDraft(t, "no separators here\n> orphan", nil)
 	assertDraft(t, rule+"\n"+rule, nil)
@@ -1639,6 +1645,8 @@ func TestUnconsumedEventSurvivesDaemonRedeliveryWindow(t *testing.T) {
 				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
 			PollIntervalMs: floatPtr(20),
 			ReadPaneText: func(string) (*string, error) {
+				draftClient.mu.Lock()
+				defer draftClient.mu.Unlock()
 				if composerHasDraft {
 					return &draftComposer, nil
 				}
@@ -1951,6 +1959,8 @@ func TestIgnoredContinueBatchSurvivesRepeatedWaiterPeeks(t *testing.T) {
 				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
 			PollIntervalMs: floatPtr(20),
 			ReadPaneText: func(string) (*string, error) {
+				client.mu.Lock()
+				defer client.mu.Unlock()
 				if composerHasDraft {
 					return &draftComposer, nil
 				}

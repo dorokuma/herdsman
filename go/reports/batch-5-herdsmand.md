@@ -1046,7 +1046,7 @@ agent_context_service_test.go:1188: third call forceDiscovery = false, want true
 | # | Go 测试 | 对应 TS 用例 | 覆盖的修复 |
 |---|---------|--------------|-----------|
 | 1 | `TestIntermediateAgentDoneWhilePeerStillWorkingIsDeferred`（扩展） | `84fc8b1` 追加断言段 | 同 terminal 去重：wake 后的 `PreInvocation` 只注入最新完成（1126），1118 被 `superseded by newer completion for terminal term_peer` 抑制；`presentedEventIds` / `deliveredEventIds` 均为 `[1118, 1126]`；随后的 Stop 把两者都 ack 掉 |
-| 2 | `TestParseAgyComposerDraft`（扩展 4 例） | `84fc8b1` / `adf6f09` 的 composer 用例 | 草稿内含横线（`第一段\n--------\n第三段`）、草稿末行是横线（`草稿\n<rule>`）、连续两条横线（`第一段\n第二行\n<rule>`）、无 `>` 提示行时返回 `nil` |
+| 2 | `TestParseAgyComposerDraft`（扩展 6 例：`84fc8b1` 4 例 + `adf6f09` 2 例） | `84fc8b1` / `adf6f09` 的 composer 用例 | 草稿内含横线（`第一段\n--------\n第三段`）、草稿末行是横线（`草稿\n<rule>`）、连续两条横线（`第一段\n第二行\n<rule>`）、无 `>` 提示行时返回 `nil`；另加 `adf6f09` 的 2 例——草稿内含 `--------` 或同宽 `rule` 且下一行是 `>` 引用行时（`草稿\n--------\n>` / `草稿\n<rule>\n>`），从内向外回溯保留完整草稿 |
 | 3 | `TestRetryWakePendingAloneWakesWhenOneDeferredPeerSettles` | `84fc8b1` 新增用例 | peer A 的 deferred 重试是唯一能重新检查批次的路径（peer B 恒 working、无 push，`!hasActivePeers` 永不触发） |
 | 4 | `TestLowIDWorkingDeferredEventIsNeverSwallowedByHigherIDAck` | `adf6f09` 新增用例 | ack 游标下界：deferred 的 100 在旁时，被永久抑制的 105 不得 ack；100 变成未消费 outcome 时 105 仍须等待；两者都 presented 后才 `[100, 105]` 依次 ack |
 | 5 | `TestWakeWaiterCancelsWhenTurnEpochAdvancesDuringComposerRead` | `adf6f09` 新增用例 | `readComposerDraft` I/O 期间 `turnEpoch` 前进 → 不叫醒、不清 `presentedEventIds`（`readGate` channel 冻结 pane read，主协程在其间改写状态文件） |
@@ -1071,6 +1071,7 @@ agent_context_service_test.go:1188: third call forceDiscovery = false, want true
 | post-draft epoch 复核 | 删除 `wake_waiter.go` 中 `postReadState` 及其三个比对分支 | `TestWakeWaiterCancelsWhenTurnEpochAdvancesDuringComposerRead` → `wakePrompts = [{paneID:wB:p1 promptText:[herdsman-wake]}], want none` |
 | 同 terminal 去重 | 删除 `newestCompletionID` 命中分支 | `TestIntermediateAgentDoneWhilePeerStillWorkingIsDeferred` → `injected` 同时含 `event: 1118` 与 `event: 1126`，`want the superseded 1118 removed` |
 | ack 游标下界 | `resolveMinHoldbackEventID` 提前 `return math.MaxInt64` | `TestLowIDWorkingDeferredEventIsNeverSwallowedByHigherIDAck` → `secondStop = {…Decision:<nil> Reason:<nil>}, want decision continue`；`TestUnconsumedEventSurvivesDaemonRedeliveryWindow` → `settle stop = {…}, want decision continue` |
+| composer 框顶的由内向外回溯（本次修订） | `wake_waiter.go` 中 `ParseAgyComposerDraft` 的候选回溯循环改为只试最内层候选（循环下界从 `0` 改为 `len(topCandidates)-1`） | `TestParseAgyComposerDraft` → `ParseAgyComposerDraft("output\n<rule>\n> 草稿\n<rule>\n>\n<rule>\n? for shortcuts") = "", want "草稿\n<rule>\n>"`；还原循环后同一用例 PASS |
 
 变异后均以 `/tmp` 备份还原，`git status` 确认生产文件无残留差异。
 
@@ -1115,7 +1116,16 @@ HOOK_EXIT=0
 
 （代码面为前 9 个文件，共 1950 插入 / 126 删除；第 10 个文件是本报告本节。）
 
-新增测试 7 个、扩展既有测试 3 个（#1、#2 及 `TestWakeWaiterEpochAcceptsRadixPrefixes` 的种子修正）；无新增测试文件。新增测试行数与改动行数同量级（`agy_hook_part3_test.go` +1191 对 `hook.go` +523、`wake_waiter.go` +125、`state.go` +69），比值约 1.2，低于 3 倍门槛，无需额外说明。
+本次修订（`reviewer-b5b` 的 2 项测试问题）相对 `HEAD` 的变更面（代码面；本报告文件自身行数随本节自述而变，故不计入）：
+
+```
+ go/internal/agy/agy_hook_part3_test.go | 10 ++++++++++
+1 file changed, 10 insertions(+)
+```
+
+- `agy_hook_part3_test.go` +10 行：`TestParseAgyComposerDraft` 补 2 例断言（6.11.3 表格 #2），另在 2 个测试的 `ReadPaneText` 闭包开头各加 2 行互斥锁（`mu.Lock()` / `defer mu.Unlock()`），消除 `-race` 下的潜在读写竞争。
+- 生产代码零改动：本次只补测试与报告，`wake_waiter.go` 等实现文件在本修订中逐字节未变（回溯变异的取证改动已还原，`git diff` 对该文件为空）。
+- 新增测试 7 个、扩展既有测试 3 个（#1、#2 及 `TestWakeWaiterEpochAcceptsRadixPrefixes` 的种子修正）；无新增测试文件。#2 的用例数由 4 例增至 6 例。本次修订的 10 行断言与 4 行加锁均为新增测试行，与 0 行生产代码改动相比不适用 3 倍门槛（无生产改动需要对照）。
 
 `git diff --name-only main...HEAD | grep -v '^go/'` 为空；`go-port` 相对 `main` 的改动文件总数为 **127 个，全部在 `go/` 下**。
 
@@ -1148,3 +1158,27 @@ $ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=1 go t
 ```
 
 代码改动随 `c1d79cf`（`fix(go): port agy wake race, draft parser, and retention fixes`）提交入库；本报告所在提交为紧随其后的 docs-only 提交（`docs(go): record batch 5b agy port and redaction fixture fixes`）——报告随同一提交入库，无法在提交前写下自己的 SHA，故只写明代码提交 SHA，未对代码提交 `--amend`，最终工作区干净。
+
+**本次修订（`reviewer-b5b` 的 2 项测试问题）的验证输出**（改动包 3 轮 `-race`；`-race` 需 cgo，故 `CGO_ENABLED=1`，`vet` / `build` 仍按发布面用 `CGO_ENABLED=0`）：
+
+```
+$ gofmt -l cmd internal
+（无输出）
+
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=0 go vet -buildvcs=false ./...
+（无输出，通过）
+
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=0 go build -buildvcs=false ./...
+（无输出，通过）
+
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=1 go test -race -buildvcs=false -count=3 ./internal/agy ./internal/agenthistory ./internal/config
+ok  	github.com/dorokuma/herdsman/go/internal/agy	12.423s
+ok  	github.com/dorokuma/herdsman/go/internal/agenthistory	1.288s
+ok  	github.com/dorokuma/herdsman/go/internal/config	1.024s
+```
+
+（3 个包 × 3 轮全部 ok，无 DATA RACE、无 FAIL、无超时；补在闭包里的互斥锁未引入死锁。）
+
+`ParseAgyComposerDraft` 回溯循环的先 FAIL 后 PASS 取证见 6.11.4 表格末行：变异后新增的第 2 条同宽 `rule` + `>` 断言 FAIL（实得 `""`，期望 `草稿\n<rule>\n>`），还原后 PASS。
+
+**本次修订的提交说明**：本次修订单独提交入库，提交信息为 `test(go): cover agy draft parser backtrack and lock composer reads`（Conventional Commits 白名单类型、冒号后一空格、长度 ≤ 72 字、不含 hook 噪声词、不含密钥字面量），未使用 `--no-verify`，由全局 `commit-msg` hook 正常放行。报告与测试随同一提交入库，无法在提交前写下自己的 SHA，故同上文处理：只写明提交信息，SHA 见 `git log`。
