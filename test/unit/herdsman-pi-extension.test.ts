@@ -6036,3 +6036,59 @@ describe("herdsman-pi turn completion signal", () => {
     }
   });
 });
+
+describe("herdsman-pi context hook marker filtering", () => {
+  const MARKER = "[" + "HERDSMAN AGENT CONTEXT]";
+
+  test("keeps every toolResult and drops only herdsman's own entries that open with the marker", async () => {
+    const client = createFakeClient();
+    const pi = createFakePi();
+    const ctx = fakeCtx({ idle: true });
+    const previous = withHerdrEnv();
+    try {
+      await startExtension(client, pi, ctx);
+
+      const toolResults = [
+        // A tool result whose text opens with the marker.
+        { content: `${MARKER}\nagent board`, role: "toolResult" },
+        // A tool result quoting the marker mid-body: a source snippet, a grep
+        // hit, a file the marker was pasted into.
+        { content: `index.ts:2480: ${MARKER}`, role: "toolResult" },
+        {
+          content: [{ text: `line one\n${MARKER}\nline three`, type: "text" }],
+          role: "toolResult",
+        },
+      ];
+      const ordinary = [
+        // Not herdsman's own entry: the marker is only mentioned mid-body.
+        { content: `the user asked about ${MARKER} handling`, role: "user" },
+      ];
+      const herdsmanEntries = [
+        { content: `${MARKER}\nfull preview report`, role: "user" },
+        // Leading whitespace is trimmed, so an indented marker still opens it.
+        { content: `\n  ${MARKER}\nfull preview report`, role: "user" },
+        { content: "preview", customType: "herdsman-agent-context", role: "user" },
+        { content: "queued wake", customType: "herdsman-wake-queued", role: "user" },
+      ];
+
+      const kept = [...toolResults, ...ordinary];
+      const filtered = (await pi.emitContext([...kept, ...herdsmanEntries], ctx)) as Array<
+        Record<string, unknown>
+      >;
+
+      // Every toolResult survives verbatim - the same object, not a copy - and
+      // an ordinary message that merely mentions the marker mid-body is not
+      // herdsman's own entry either.
+      expect(filtered).toEqual(kept);
+      for (const [index, message] of kept.entries()) {
+        expect(filtered[index]).toBe(message);
+      }
+      // Herdsman's own entries are the ones the hook drops.
+      for (const entry of herdsmanEntries) {
+        expect(filtered).not.toContain(entry);
+      }
+    } finally {
+      restoreEnv(previous);
+    }
+  });
+});
