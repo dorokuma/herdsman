@@ -2,7 +2,8 @@
 
 - 分支：`go-port`（worktree `/root/workspace/.wt/herdsman/go-port`）
 - 目标模块：`go/`（Go module `github.com/dorokuma/herdsman/go`，go 1.26.0）
-- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告；其后追加第 4 轮 reviewer 修复（db 闸门 / observability / herdr / daemon 共 6 项，见第 6 节）与 4.2、4.3 两节描述修正；再追加第 3D-3 精确收尾子批（`observability_rpc_slow_client_test.go` 填满 AF_UNIX `SO_SNDBUF` 并取得真实先 FAIL 后 PASS，见 6.5；`8c4bd1b` 更正为 `5fce550`，见 6.1）；最后追加第 3F 终审收口子批（`reviewer-final2` 的 5 个 Must-Fix + 1 个报告准确性 Should-Fix，见 6.10）
+- 本子批范围：修复 `internal/daemon/service.go` 启动期 SIGTERM 竞态、`gofmt`、全套 `CGO_ENABLED=0` 与 `-race` 验证、`HERDSMAN_IMPL` 包装脚本与 PiG 隔离实测、本报告；其后追加第 4 轮 reviewer 修复（db 闸门 / observability / herdr / daemon 共 6 项，见第 6 节）与 4.2、4.3 两节描述修正；再追加第 3D-3 精确收尾子批（`observability_rpc_slow_client_test.go` 填满 AF_UNIX `SO_SNDBUF` 并取得真实先 FAIL 后 PASS，见 6.5；`8c4bd1b` 更正为 `5fce550`，见 6.1）；再追加第 3F 终审收口子批（`reviewer-final2` 的 5 个 Must-Fix + 1 个报告准确性 Should-Fix，见 6.10）；最后追加第 5b 批（`b0e5c6c..main` / 0.15.1 的 4 个 agy 修复的 Go 移植与回归测试，以及 `go/` 测试假脱敏样本的运行时拼接，见 6.11）
+- 改动规模：`go-port` 相对 `main` 共 **127 个文件，全部在 `go/` 下**
 - 未触碰：`/root/.local/bin/herdsman`、`herdsman.service`、`/root/.herdsman`（生产面保持原样，见第 5 节）
 
 ---
@@ -989,3 +990,161 @@ agent_context_service_test.go:1188: third call forceDiscovery = false, want true
 
 **第 3I 变更面**：`go/internal/db/sqlite_migrations_test.go`（第 4 个子测试的 waiter 屏障改写：新增包级 `pollEnteredContext` 类型，waiter goroutine 删预检查直调 `WaitDriverConnClosed`，主协程改等 `<-waitCtx.entered`，`time.Sleep(5ms)` 删除；含改写的说明注释）、`go/reports/batch-5-herdsmand.md`（本节）。生产代码零改动；无新增测试文件、无新增测试用例，只替换既有用例的就绪屏障机制。
 
+
+### 6.11 第 5b 批：`b0e5c6c..main`（0.15.1）行为改动与回归测试移植 + 脱敏样本运行时拼接
+
+本节对应任务说明中的两项工作，全部落在 `go/` 下，未触碰 `go/` 之外的任何文件（`git diff --name-only main...HEAD | grep -v '^go/'` 为空）。
+
+#### 6.11.1 范围与来源
+
+`git log --oneline b0e5c6c..main` 共 8 个提交，其中 4 个是行为改动、1 个是发布号、3 个是文档/合并：
+
+| 提交 | 类型 | 是否移植 |
+|------|------|----------|
+| `84fc8b1` `fix(agy): deduplicate deferred completions and harden draft parser` | 行为 + 测试 | 是 |
+| `adf6f09` `fix(agy): guard ack cursor against deferred-event swallowing` | 行为 + 测试 | 是 |
+| `74df962` `fix(agy): recheck wake epoch before state writes and retain candidates` | 行为 + 测试 | 是 |
+| `3985333` `fix(agy): keep wake candidates until their ack settles` | 行为 + 测试 | 是 |
+| `322d0d9` `chore(release): 0.15.1` | 版本号 | `go/` 下无版本号常量需同步（全量检索 `0\.15\.0` / `0\.15\.1` 于 `go/**/*.go` 零命中），仅 `package.json` 的 `version` 由 `0.15.0` 改为 `0.15.1`，非 `go/` 面 |
+| `6ec2c27` `docs(skill): probe herdr via cli…`、`102a55a` `docs(skill)…`、`4b179d1` Merge | 文档/合并 | 否（无行为改动） |
+
+移植方式为逐 commit 读 `git show <sha> -- src/ test/` 的净 diff 后落到 `go/internal/agy/`，**未执行 `git merge main`**（避免把 `main` 合进 `go-port` 造成历史混乱）。
+
+#### 6.11.2 生产逻辑逐函数映射（TS `src/agy/hook.ts` → Go `go/internal/agy/`）
+
+| TS 符号 | Go 落点 | 改动内容 |
+|---------|---------|----------|
+| `projectAgyOutcomes`（同 terminal 去重） | `hook.go: projectAgyOutcomes` | 新增预扫 `newestCompletionID`：按 `terminalId` 记录「最后一条能产出有效 `completed` outcome 的完成事件 id」（要求 `isCompletionEvent`、`outcomeKind === "completed"`，且通过 `fallbackOutcome` 被同 pane 完成事件取代、`isUpstreamErrorText`、空文本三项检查，与主循环同一套判定）；主循环在 working-defer 判定之后，同 terminal 且 `event.id < newest` 的完成事件进 `suppressedEventIDs`，日志 `superseded by newer completion for terminal <id>`，随批次 ack。只对完成事件生效，`agent.failed` / `agent.discarded` 语义不变 |
+| `defaultReadPaneText` | `wake_waiter.go: defaultReadPaneText` | `herdr pane read <paneId> --lines 12` → `--lines 40`（多行草稿的框顶原先落在读取窗口外） |
+| `parseAgyComposerDraft` | `wake_waiter.go: ParseAgyComposerDraft` | 框顶不再取「倒数第二条横线」，改为「最后一条下一行以 `>` 开头（`^>(?:\s|$)`）的横线」；同宽同款候选优先（与框底逐字节相等），由内向外回溯直到解析出非空草稿；全部候选都是空 `>` 提示行时返回 `""`，一个候选都没有时返回 `nil`（= TS `undefined`）。新增包级 `composerPromptLinePattern` 与 `lineAt`（TS `lines[index] ?? ""` 守卫） |
+| `AgySessionHookState` 新增 `retainedCandidateEvents` / `deferredEventIds` / `pendingAckEventIds` | `state.go` | 三个新字段及其 getter/setter |
+| `fetchLivePeerScope`（替代 `fetchLiveWorkingTerminalIDs`） | `wake_waiter.go: fetchLivePeerScope` | 一次 `agent.list` 同时产出 `liveScopeWorkspaces` / `liveTerminalIDs` / `workingTerminalIDs`；失败返回 `nil`（TS `undefined`），调用方按「无实时信息」保守处理 |
+| `AgentListItemView` 新增 `workspaceId` | `wake_waiter.go: AgentListItemView` | 供 `liveScopeWorkspaces` 使用 |
+| `mergeKnownUnackedEvents` | `hook.go` | connState 事件 ∪ 快照事件，同 id 以 daemon 返回为准；过滤 `<= ackedEventId`、本 terminal、跨 `herdrSessionName` 的行；按 id 稳定排序。**不按 `presented` 过滤**——Stop 已把批次同时标 presented 并写进 `deliveredEventIds`，过滤掉就正好丢掉仍需存活的那批 |
+| `collectWakeCandidateEvents` | `hook.go` | 从 known-unacked 视图中剔除已 presented 的候选 |
+| `filterEligibleRetainedEvents` | `hook.go` | 只存在于快照、daemon 本轮不再重列的行，经 `agent.list` 核验 scope（`workspaceId` 不在本 owner 的 ownerless 范围内则丢）与源窗格存活（`terminalId` 不在 live 列表则丢）；daemon 刚重列过的行无条件保留；`agent.list` 失败（`liveScope == nil`）时全部保留 |
+| `retainWakeCandidates` + `RETAINED_CANDIDATE_EVENT_LIMIT` | `hook.go`（常量 `retainedCandidateEventLimit = 100`） | 输入是**未过滤**的 known-unacked 视图，保留「未 presented 或仍在 `deliveredEventIds` 中未 ack」的行；按 id 升序遍历，容量截断保留**低 ID**（ack 游标下界依赖最早未消费事件） |
+| `retainedSnapshotKey` | `hook.go` | 快照 id 拼接串，用于跳过 no-op 状态写 |
+| `resolveEligibleWakeEvents` | `hook.go` | 一次 agent.list 同时服务「资格过滤」与「live working terminals」两个消费方 |
+| `isWaiterSuperseded` | `hook.go` | 比对 `turnEpoch` / `waiterEpoch` / `waiterPid`；`waiterPid` 判定带「已落盘才比」保护（Stop 先写 epoch、spawn、最后写 pid） |
+| `resolveMinHoldbackEventId` | `hook.go` | ack 游标下界**现场重算**：`mergeKnownUnackedEvents` → `collectWakeCandidateEvents` → `resolveEligibleWakeEvents` → `projectAgyOutcomes`，取 `deferredWorkingEventIDs ∪ outcomes.eventID` 的最小值；候选集为空直接返回 `+Infinity` 并省掉 agent.list 往返。内部重算注入 no-op logger，避免与紧随的 take/peek 打重复 warn |
+| `flushDeliveredAcks` | `hook.go` | `pendingAckEventIds ∪ deliveredEventIds` 合并去重排序为 `allToAck`；逐项 `< minHoldbackEventId` 才发 RPC ack，`>=` 的移入 `pendingAckEventIds`；瞬时失败时剩余项按同规则分流（`>=` 进 pendingAck，`<` 回 `deliveredEventIds`） |
+| `peekNextWakeBatch`（`expectedWaiter` 参数） | `hook.go: peekNextWakeBatch` | 签名新增 `*waiterIdentity`；agent.list 与抑制项 ack 之后、写盘前 `r.readState()` + `isWaiterSuperseded` 复核，被取代则直接放弃写盘；`presentedEventIds` 与磁盘值取**并集**（`mergeEventIDs`）而非覆盖；空候选分支同样改写重新读取的 `freshState`；快照从未过滤的 eligible 视图重算 |
+| `takeNextWakeBatch` | `hook.go: takeNextWakeBatch` | 同步 `retainedCandidateEvents` 重算与 `deferredEventIds` 记录 |
+| `runPreInvocation` 非 owner 清理路径 | `hook.go` | 所有权移交时与 `deferredEventIds` 一并清空 `retainedCandidateEvents` |
+| `rearmDeliveredEvents` | `hook.go` | 按快照重建 `deliveredEventIds` 对应记录 |
+| `mergeEventIDs` / `minDeferredEventId` | `hook.go` | TS 数组语义的 Go 等价物（去重 + 升序；空列表 = `+Infinity`） |
+| WakeWaiter 循环：`readComposerDraft` 后 epoch 复核 | `wake_waiter.go` | `readComposerDraft` 是 I/O（最长 5s），其后的 else 分支开头重读 `sessionState`，`turnEpoch` / `waiterEpoch` / `waiterPid` 任一不符即 `stop = true; return nil`，不再 `rearmDeliveredEvents` / `triggerWakePrompt` |
+| WakeWaiter 循环：peek 传 waiter 身份 | `wake_waiter.go` | `peekNextWakeBatch` 调用点传入 `&waiterIdentity{waiterEpoch, waiterPID}` |
+
+`go/` 下无 `0.15.0` / `0.15.1` 版本号常量，`322d0d9` 无需同步（已在 6.11.1 表格说明）。
+
+#### 6.11.3 新增 / 扩展的 Go 测试
+
+全部落在 `go/internal/agy/agy_hook_part3_test.go`（+1192 行）与 `agy_hook_and_cli_test.go`（+18/−5），无新增测试文件。
+
+| # | Go 测试 | 对应 TS 用例 | 覆盖的修复 |
+|---|---------|--------------|-----------|
+| 1 | `TestIntermediateAgentDoneWhilePeerStillWorkingIsDeferred`（扩展） | `84fc8b1` 追加断言段 | 同 terminal 去重：wake 后的 `PreInvocation` 只注入最新完成（1126），1118 被 `superseded by newer completion for terminal term_peer` 抑制；`presentedEventIds` / `deliveredEventIds` 均为 `[1118, 1126]`；随后的 Stop 把两者都 ack 掉 |
+| 2 | `TestParseAgyComposerDraft`（扩展 4 例） | `84fc8b1` / `adf6f09` 的 composer 用例 | 草稿内含横线（`第一段\n--------\n第三段`）、草稿末行是横线（`草稿\n<rule>`）、连续两条横线（`第一段\n第二行\n<rule>`）、无 `>` 提示行时返回 `nil` |
+| 3 | `TestRetryWakePendingAloneWakesWhenOneDeferredPeerSettles` | `84fc8b1` 新增用例 | peer A 的 deferred 重试是唯一能重新检查批次的路径（peer B 恒 working、无 push，`!hasActivePeers` 永不触发） |
+| 4 | `TestLowIDWorkingDeferredEventIsNeverSwallowedByHigherIDAck` | `adf6f09` 新增用例 | ack 游标下界：deferred 的 100 在旁时，被永久抑制的 105 不得 ack；100 变成未消费 outcome 时 105 仍须等待；两者都 presented 后才 `[100, 105]` 依次 ack |
+| 5 | `TestWakeWaiterCancelsWhenTurnEpochAdvancesDuringComposerRead` | `adf6f09` 新增用例 | `readComposerDraft` I/O 期间 `turnEpoch` 前进 → 不叫醒、不清 `presentedEventIds`（`readGate` channel 冻结 pane read，主协程在其间改写状态文件） |
+| 6 | `TestPeekNextWakeBatchDoesNotWipePresentedEventIDsOfConcurrentTurn` | `74df962` 新增用例 | peek 的第二次 `agent.list` 被 `listGate` 冻结，期间新回合把 300 写进 presented/delivered 并 bump `turnEpoch`；陈旧 peek 不得二次投递、不得抹掉新回合记录 |
+| 7 | `TestUnconsumedEventSurvivesDaemonRedeliveryWindow` | `74df962` 新增用例（两段） | 草稿超过 300s 重投窗口后 daemon 不再重列 9001，快照使其仍能叫醒、`PreInvocation` 仍能重建注入；working-defer 的低 id 100 同理，且 105 不被提前 ack |
+| 8 | `TestIgnoredContinueBatchSurvivesRepeatedWaiterPeeks` | `3985333` 新增用例 | Stop 已 presented 且 delivered-but-unacked 的 9500 在反复 peek 后仍在快照中（`candidateEvents` 从首次 peek 起即为空，快照却不得被清），草稿消失后叫醒、`PreInvocation` 从快照重建 |
+| 9 | `TestRetainedRowsOfClosedPaneAndTakenOverSiblingAreDropped` | `3985333` 新增用例 | 快照中源窗格已关闭（`term_gone`）与被接管兄弟工作区（`wC` / `term_sibling`）的两行被资格检查丢弃，不注入也不压 ack 游标；daemon 重新列过的行（`closedPaneEvent` 进 `listedEvents`）无条件保留并注入 |
+
+配套基建改动：
+
+- `agy_hook_and_cli_test.go: makeDoneEvent` 增加可变参数 `terminalIDOverride ...string`，对齐 TS 第三参数 `terminalId`；既有两参调用点不变。
+- `agy_hook_part3_test.go` 新增包内 helper `assertRetainedIDs`（等价 TS `expect.objectContaining({ id })` 数组断言）。
+- `agy_hook_and_cli_test.go: TestWakeWaiterEpochAcceptsRadixPrefixes` 的种子状态由 `waiterEpoch: 7` 改为 `5`：该用例本意是验证 `parseJSNumber` 对 `0x5` / `0b101` / `0o5` 的解析，与 `turnEpoch` 无关；5b 批引入的 post-draft epoch 复核同样比对 `waiterEpoch`（TS `isWaiterSuperseded` 亦含该项判据），旧种子下 waiter 会在复检处被判为已被取代而提前返回。末尾「`-0x5` 是 NaN → 回退到状态 epoch 7 → 循环立即停止」的子场景保持原样（两个 epoch 都参与门闩，行为本就正确）。
+
+#### 6.11.4 新增测试的先 FAIL 后 PASS 取证（逐项实测）
+
+对每处修复做「回退该修复 → 确认对应测试 FAIL → 恢复 → 确认 PASS」的变异验证，全部实测而非声称：
+
+| 回退的修复 | 变异手法 | FAIL 的测试与实测输出 |
+|------------|----------|----------------------|
+| 快照保留（`retainWakeCandidates`） | 函数体改为 `return nil` | `TestUnconsumedEventSurvivesDaemonRedeliveryWindow` → `wakePrompts = [], want [{paneID:wB:p1 promptText:[herdsman-wake]}]`；`TestIgnoredContinueBatchSurvivesRepeatedWaiterPeeks` → `retainedCandidateEvents has 0 entries ([]), want [9500]`；`TestRetainedRowsOfClosedPaneAndTakenOverSiblingAreDropped` → `retainedCandidateEvents has 0 entries ([]), want [400]` |
+| post-draft epoch 复核 | 删除 `wake_waiter.go` 中 `postReadState` 及其三个比对分支 | `TestWakeWaiterCancelsWhenTurnEpochAdvancesDuringComposerRead` → `wakePrompts = [{paneID:wB:p1 promptText:[herdsman-wake]}], want none` |
+| 同 terminal 去重 | 删除 `newestCompletionID` 命中分支 | `TestIntermediateAgentDoneWhilePeerStillWorkingIsDeferred` → `injected` 同时含 `event: 1118` 与 `event: 1126`，`want the superseded 1118 removed` |
+| ack 游标下界 | `resolveMinHoldbackEventID` 提前 `return math.MaxInt64` | `TestLowIDWorkingDeferredEventIsNeverSwallowedByHigherIDAck` → `secondStop = {…Decision:<nil> Reason:<nil>}, want decision continue`；`TestUnconsumedEventSurvivesDaemonRedeliveryWindow` → `settle stop = {…}, want decision continue` |
+
+变异后均以 `/tmp` 备份还原，`git status` 确认生产文件无残留差异。
+
+#### 6.11.5 任务一：假脱敏样本的运行时拼接
+
+全局 `commit-msg` hook 在 `git merge --no-ff go-port` 时会对 `git diff --cached`（即 `main...go-port` 全部新增行）跑 `added_lines_only` + `check_secret_patterns`（`sk-[a-zA-Z0-9._-]{8,}` 等）+ `check_credential_assignments`（`(password|api_key|secret)[A-Za-z0-9_]*[[:space:]]*[:=]+>?[[:space:]]*`，右值首 token 去引号后 `>= 6` 字符）。`go/` 下有 4 个文件的测试夹具字面量会命中，改为运行时拼接：
+
+| 文件 | 原写法 | 改后 |
+|------|--------|------|
+| `go/internal/agenthistory/text.go` | 三条正则字面量 `(?i)\b(password=)[^\s&]+` 等 | 拆为 `(?i)\b(pass` + `word=)[^\s&]+`、`(?i)\b(sec` + `ret=)[^\s&]+`、`(?i)\b(api_` + `key=)[^\s&]+`——Go 常量表达式在编译期求值，**运行期正则逐字节不变** |
+| `go/internal/agenthistory/text_test.go` | `"password=hunter2"` / `"openai sk-abcdefghijklmnopqrstuvwxyz"` 等 | `joinParts("password", "=hunter2")` / `joinParts("openai ", "sk-", "abcdefghijklmnopqrstuvwxyz")`；新增同包 helper `joinParts(parts ...string) string { return strings.Join(parts, "") }` |
+| `go/internal/agenthistory/readers_test.go` | JSONL 行内 `password=hunter2 … sk-abcdefghijklmnopqrstuvwxyz` | 同一行拆成 5 段 `joinParts(...)`，左值 `"pass`+`word=hunter2 …`，右值 `"sk-"` + `"abcdefghijklmnopqrstuvwxyz"` 分列两行 |
+| `go/internal/config/runtime_test.go` | `OPENAI_API_KEY="file-key"` | `OPENAI_API_` + `KEY="file-key"`（Go 相邻字符串常量拼接，运行期字节一致） |
+
+**字节一致性**：所有改动都是 Go 编译期常量折叠或 `strings.Join`，运行期字符串与原版逐字节相同；测试断言逻辑一字未改（仍是 `strings.Contains` / 逐项相等），因此测试全绿本身就是字节一致性的证明。
+
+**验证**：直接跑权威 hook（不是自拟扫描脚本）——
+
+```
+$ printf 'test(go): port agy wake race and draft fixes\n' > /tmp/cm.txt
+$ /root/.git-hooks/commit-msg /tmp/cm.txt
+HOOK_EXIT=0
+```
+
+未修改 `/root/.git-hooks/commit-msg` 或 `.husky/commit-msg`，未使用 `--no-verify`。手工预扫（`git diff --cached $(git merge-base main HEAD)` 的新增行跑同一组 grep）在 `check_secret_patterns` 上 0 命中、在 `check_credential_assignments` 的关键字正则上有 5 行命中，但逐行按 hook 的取值规则（右值**首 token** 去引号后计长）计算分别为 2 / 5 / 4 / 5 / 2 字符，均低于 6 字符门槛，与权威 hook 的 exit 0 一致。
+
+#### 6.11.6 变更面（`git diff --stat HEAD`）
+
+```
+ go/internal/agenthistory/readers_test.go |   10 +-
+ go/internal/agenthistory/text.go         |    6 +-
+ go/internal/agenthistory/text_test.go    |   23 +-
+ go/internal/agy/agy_hook_and_cli_test.go |   18 +-
+ go/internal/agy/agy_hook_part3_test.go   | 1192 +++++++++++++++++++++++++++++-
+ go/internal/agy/hook.go                  |  599 +++++++++++++--
+ go/internal/agy/state.go                 |   72 +-
+ go/internal/agy/wake_waiter.go           |  154 ++++-
+ go/internal/config/runtime_test.go       |    2 +-
+ go/reports/batch-5-herdsmand.md          |  158 +++-
+10 files changed, 2107 insertions(+), 127 deletions(-)
+```
+
+（代码面为前 9 个文件，共 1950 插入 / 126 删除；第 10 个文件是本报告本节。）
+
+新增测试 7 个、扩展既有测试 3 个（#1、#2 及 `TestWakeWaiterEpochAcceptsRadixPrefixes` 的种子修正）；无新增测试文件。新增测试行数与改动行数同量级（`agy_hook_part3_test.go` +1191 对 `hook.go` +523、`wake_waiter.go` +125、`state.go` +69），比值约 1.2，低于 3 倍门槛，无需额外说明。
+
+`git diff --name-only main...HEAD | grep -v '^go/'` 为空；`go-port` 相对 `main` 的改动文件总数为 **127 个，全部在 `go/` 下**。
+
+#### 6.11.7 验证输出原文
+
+```
+$ gofmt -l cmd internal
+（无输出）
+
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=0 go vet -buildvcs=false ./...
+（无输出，通过）
+
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=0 go build -buildvcs=false ./...
+（无输出，通过）
+
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=0 go test -buildvcs=false -count=1 ./...
+ok  	github.com/dorokuma/herdsman/go/internal/agenthistory	1.129s
+ok  	github.com/dorokuma/herdsman/go/internal/agy	4.800s
+ok  	github.com/dorokuma/herdsman/go/internal/cli	1.021s
+ok  	github.com/dorokuma/herdsman/go/internal/config	1.022s
+ok  	github.com/dorokuma/herdsman/go/internal/daemon	30.565s
+ok  	github.com/dorokuma/herdsman/go/internal/db	12.239s
+ok  	github.com/dorokuma/herdsman/go/internal/db/dedup	1.019s
+ok  	github.com/dorokuma/herdsman/go/internal/herdr	2.185s
+ok  	github.com/dorokuma/herdsman/go/internal/observability	85.548s
+ok  	github.com/dorokuma/herdsman/go/internal/shared	1.123s
+
+$ PATH=/root/.local/share/mise/installs/node/26.7.0/bin:$PATH CGO_ENABLED=1 go test -race -buildvcs=false -count=1 ./...
+（同上 10 个包全部 ok，无 DATA RACE、无 FAIL）
+```
+
+代码改动随 `c1d79cf`（`fix(go): port agy wake race, draft parser, and retention fixes`）提交入库；本报告所在提交为紧随其后的 docs-only 提交（`docs(go): record batch 5b agy port and redaction fixture fixes`）——报告随同一提交入库，无法在提交前写下自己的 SHA，故只写明代码提交 SHA，未对代码提交 `--amend`，最终工作区干净。
