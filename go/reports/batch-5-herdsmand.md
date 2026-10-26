@@ -965,3 +965,27 @@ agent_context_service_test.go:1188: third call forceDiscovery = false, want true
 
 **第 3H 变更面**（`git diff --stat`）：`go/internal/db/sqlite_migrations_test.go` +57−31（第 4 个子测试的重排：两个观测点提前到放行之前并加就绪屏障，原「连接已知关闭后才调 WaitDriverConnClosed」的写法删除；含改写的说明注释）、`go/reports/batch-5-herdsmand.md`（本节及 6.8 表第 2 行对齐）。生产代码零改动；无新增测试文件、无新增测试用例，只重排既有用例的 goroutine 时序。
 
+#### 第 3I 子批追加（`reviewer-final7`：1 个 Must-Fix，用 `Done()` 首调取代 3H 屏障里的 `time.Sleep`）
+
+本轮基线为 `b700669`（3H 收口后的 HEAD）；本轮改动随本报告所在的提交入库（短 SHA 以仓库 `git log -1` 为准——报告随同一提交入库，无法在提交前写下自己的 SHA；本提交后不再 `--amend`）。只改 `go/` 下的文件，红线同 3F/3G/3H；测试全部使用 `t.TempDir()`。
+
+| # | 级别 | 问题 | 修复落点 |
+|---|------|------|----------|
+| 1 | Must-Fix | 3H 的 waiter 屏障是「goroutine 内预检查 `!DriverConnClosed(db)` 后 `close(waiterReady)` + 主协程 `time.Sleep(5ms)`」：预检查与进入 `WaitDriverConnClosed` 内部轮询之间仍有调度缝隙，5ms 只是在猜 waiter 何时到达其 1ms `select`，慢调度下 `close(release)` 放行时 waiter 可能尚未在轮询中 | `internal/db/sqlite_migrations_test.go`：新增包级 `pollEnteredContext`（嵌入 `context.Context` + `sync.Once` + `entered chan struct{}`，其 `Done()` 首次被调用时 `close(entered)` 再返回内层 `Done()`）；waiter goroutine 直接 `waiterResult <- WaitDriverConnClosed(waitCtx, db)`，删除外部预检查与 `close(waiterReady)`；主协程等 `<-pollerReady` 与 `<-waitCtx.entered` 后断言 `waiterResult` 尚未返回，随即 `close(release)`。确定性来自 `WaitDriverConnClosed` 自身结构：循环体先 `if DriverConnClosed(db) { return true }`，观测到连接未关才求值 `select { case <-ctx.Done(): … case <-time.After(time.Millisecond): }`，此时必然调用 `ctx.Done()`——首调 `Done()` 即「waiter 已完成首次 `DriverConnClosed(db) == false` 判定、正停在其内部轮询 `select` 中」的 100% 确定性信号，零 sleep、零猜测 |
+
+**先 FAIL 后 PASS 取证**（同 3H 方法，针对新屏障）：临时去掉 `client.go` 中 `Close()` 的 `c.mu` 保护块（`c.mu.Lock(); c.closed = true; err = c.conn.Close(); c.mu.Unlock()` → 去锁直行）与 `DriverConnClosed()` 的 `connector.mu.Lock()/defer Unlock()`，`go test -race -buildvcs=false -count=1 -run TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate ./internal/db` → **首轮即 DATA RACE，FAIL**，且两个交叠观测点都报了竞争对（证明屏障后 waiter 确实停在 `WaitDriverConnClosed` 内部轮询中并跨越了 teardown）：
+
+- 写侧 `modernc.org/sqlite.(*conn).Close()`（`conn.go:1083/1088`）← `client.go:178`（`serializedConnector.Close`）← `db.Close()`（`sqlite_migrations_test.go:739`）；读侧 `(*conn).usable()`（`conn.go:1133`）← `IsValid()` ← `DriverConnClosed`（`client.go:212`）← **紧轮询 goroutine**（`sqlite_migrations_test.go:760`）。
+- 第二组竞争对读侧经 `WaitDriverConnClosed`（`client.go:223`）← **waiter goroutine**（`sqlite_migrations_test.go:768`，即 `waiterResult <- WaitDriverConnClosed(waitCtx, db)` 那一行）——`Done()` 首调屏障下这一条在首轮 `-count=1` 就出现，证明 waiter 在放行前确已进入内部轮询。
+
+恢复 `c.mu` / `connector.mu` 保护（备份还原，`git status` 确认 `client.go` 无差异）后：`go test -race -buildvcs=false -count=3 -run TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate ./internal/db` → `ok 2.849s`，无 `DATA RACE`、无 `FAIL`。
+
+**第 3I 子批验证**：
+
+- `gofmt -l cmd internal` 为空。
+- `go vet -buildvcs=false ./...` 通过；`go build -buildvcs=false ./...` 通过。
+- `go test -buildvcs=false -count=1 ./...`：12 个包全绿（2 个 `no test files` + 10 个 `ok`），其中 `internal/daemon 12.764s`、`internal/observability 4.482s`、`internal/agy 2.811s`、`internal/herdr 1.162s`、`internal/db 1.017s`。
+- 3 轮 `-race`：`go test -race -buildvcs=false -count=3 -run TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate ./internal/db` → `ok 2.849s`，无 `DATA RACE`、无 `FAIL`。
+
+**第 3I 变更面**：`go/internal/db/sqlite_migrations_test.go`（第 4 个子测试的 waiter 屏障改写：新增包级 `pollEnteredContext` 类型，waiter goroutine 删预检查直调 `WaitDriverConnClosed`，主协程改等 `<-waitCtx.entered`，`time.Sleep(5ms)` 删除；含改写的说明注释）、`go/reports/batch-5-herdsmand.md`（本节）。生产代码零改动；无新增测试文件、无新增测试用例，只替换既有用例的就绪屏障机制。
+

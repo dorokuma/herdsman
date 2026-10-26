@@ -520,6 +520,23 @@ func insertTestWorkspace(db *sql.DB, workspace string) error {
 // The last subtest is the concurrency regression: DriverConnClosed polled while
 // (*sql.DB).Close tears the driver connection down must be synchronised
 // against that teardown, not just the closed flag.
+// pollEnteredContext closes entered the first time Done() is called.
+// WaitDriverConnClosed's loop only reaches its select — and with it Done() —
+// after a DriverConnClosed(db) pass has observed the connection still open, so
+// the first Done() call is a 100% deterministic "the waiter is inside its own
+// 1ms poll cycle" barrier: no pre-check in the waiter goroutine, no sleep to
+// guess when the waiter reached the select.
+type pollEnteredContext struct {
+	context.Context
+	once    sync.Once
+	entered chan struct{}
+}
+
+func (c *pollEnteredContext) Done() <-chan struct{} {
+	c.once.Do(func() { close(c.entered) })
+	return c.Context.Done()
+}
+
 func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
 	t.Run("the handle closes the driver connection and drops the gate", func(t *testing.T) {
 		db, err := OpenSqlite(filepath.Join(t.TempDir(), "close.sqlite"))
@@ -691,10 +708,11 @@ func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
 	// flags. The poller and the WaitDriverConnClosed waiter below are both
 	// parked against a held gate and held at a readiness barrier before the
 	// gate is released: both are already observing a live connection (the
-	// waiter already inside WaitDriverConnClosed's own 1ms poll cycle) when
+	// waiter parked inside WaitDriverConnClosed's own 1ms poll select) when
 	// the driver Close actually starts, so the overlap window is the lifetime
 	// of the driver's own Close — which an observer starting only after
 	// (*sql.DB).Close returned could never observe.
+
 	t.Run("DriverConnClosed does not race the driver Close", func(t *testing.T) {
 		db := openMigratedTestDB(t)
 		gate := shared.SqliteGateOf(db)
@@ -725,8 +743,9 @@ func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
 		// scheduled after db.Close() has already run can never overlap the
 		// driver Close, so the overlap window below would be empty on a slow
 		// scheduler. pollerReady proves the tight poller read the still-open
-		// connection; waiterReady proves the WaitDriverConnClosed goroutine
-		// checked !DriverConnClosed and entered its 1ms poll cycle.
+		// connection; pollEnteredContext.Done() proves the WaitDriverConnClosed
+		// goroutine checked !DriverConnClosed and is parked inside its own 1ms
+		// poll select.
 		pollerDone := make(chan struct{})
 		pollerReady := make(chan struct{})
 		go func() {
@@ -742,26 +761,19 @@ func TestOpenSqliteCloseReleasesDriverConnAndUnregistersGate(t *testing.T) {
 			}
 		}()
 
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		waitCtx := &pollEnteredContext{Context: ctx, entered: make(chan struct{})}
 		waiterResult := make(chan bool, 1)
-		waiterReady := make(chan struct{})
-		go func() {
-			if DriverConnClosed(db) {
-				close(waiterResult)
-				close(waiterReady)
-				return
-			}
-			close(waiterReady)
-			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer cancel()
-			waiterResult <- WaitDriverConnClosed(ctx, db)
-		}()
+		go func() { waiterResult <- WaitDriverConnClosed(waitCtx, db) }()
 
 		<-pollerReady
-		<-waiterReady
-		// Give the waiter the chance to enter WaitDriverConnClosed's own 1ms
-		// poll cycle, then assert it has not returned yet: the connection is
-		// still open behind the held gate.
-		time.Sleep(5 * time.Millisecond)
+		<-waitCtx.entered
+		// entered is closed only once WaitDriverConnClosed's own loop has
+		// evaluated Done() — which happens right after DriverConnClosed(db) saw
+		// the connection still open — so the waiter is parked inside its 1ms
+		// select while the gate still holds the close back. Assert it has not
+		// returned yet, then release the gate.
 		select {
 		case result := <-waiterResult:
 			t.Fatalf("WaitDriverConnClosed = %v while the gate still held the close back, want it still polling", result)
