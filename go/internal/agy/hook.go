@@ -421,6 +421,22 @@ func (r *runner) runPreInvocation() HookOutput {
 	if !isLocalOwner(connState) {
 		if len(sessionState.Delivered()) > 0 {
 			sessionState.SetDelivered(nil)
+		}
+		// Ownership moved elsewhere: held-back acknowledgements belong to the new
+		// owner now, and this session may not ack them out of scope anyway.
+		if len(sessionState.PendingAck()) > 0 {
+			sessionState.SetPendingAck(nil)
+		}
+		// Same for the unacked batch and its candidate snapshot: the new owner
+		// decides when those events are delivered.
+		if len(sessionState.Deferred()) > 0 {
+			sessionState.SetDeferred(nil)
+		}
+		if len(sessionState.RetainedCandidates()) > 0 {
+			sessionState.SetRetained(nil)
+		}
+		if sessionState.DeliveredEventIDs != nil || sessionState.PendingAckEventIDs != nil ||
+			sessionState.DeferredEventIDs != nil || sessionState.RetainedCandidateEvents != nil {
 			r.writeState(sessionState)
 		}
 		return HookOutput{}
@@ -623,15 +639,32 @@ func (r *runner) flushDeliveredAcks(
 	connState ConnectionState,
 	sessionState *SessionHookState,
 ) (ConnectionState, error) {
-	delivered := uniqueSortedIDs(sessionState.Delivered())
-	if len(delivered) == 0 {
+	allToAck := mergeEventIDs(sessionState.PendingAck(), sessionState.Delivered())
+	// Nothing to settle, but a recorded deferral may have been resolved by the
+	// latest poll: drop it so it cannot hold back future acknowledgements forever.
+	if len(allToAck) == 0 {
+		if len(sessionState.Deferred()) > 0 {
+			sessionState.SetDeferred(nil)
+			r.writeState(*sessionState)
+		}
 		return connState, nil
 	}
+	// resolveMinHoldbackEventID tolerates its own agent.list failure, so it
+	// cannot fail the flush.
+	minHoldbackEventID := r.resolveMinHoldbackEventID(client, connState, sessionState)
 	presented := idSet(sessionState.Presented())
 	remaining := []int64{}
+	stillPendingAck := []int64{}
 	ackedAny := false
-	for index := 0; index < len(delivered); index++ {
-		eventID := delivered[index]
+	for index := 0; index < len(allToAck); index++ {
+		eventID := allToAck[index]
+		if eventID >= minHoldbackEventID {
+			// Already presented, so it will never be injected again; only the RPC
+			// ack is postponed until the lower-id event stops blocking the cursor.
+			presented[eventID] = struct{}{}
+			stillPendingAck = append(stillPendingAck, eventID)
+			continue
+		}
 		_, err := client.Call("agent.notifications.ack", map[string]any{"eventId": eventID})
 		if err == nil {
 			presented[eventID] = struct{}{}
@@ -642,11 +675,21 @@ func (r *runner) flushDeliveredAcks(
 			presented[eventID] = struct{}{}
 			continue
 		}
-		remaining = append(remaining, delivered[index:]...)
+		// Transient failure: keep this id and every later one for the next
+		// attempt. Ids above the hold-back bound stay in pendingAckEventIds so
+		// rearmDeliveredEvents can never re-inject them.
+		for _, restID := range allToAck[index:] {
+			if restID >= minHoldbackEventID {
+				stillPendingAck = append(stillPendingAck, restID)
+			} else {
+				remaining = append(remaining, restID)
+			}
+		}
 		break
 	}
 	sessionState.SetPresented(lastN(idsOf(presented), 500))
-	sessionState.SetDelivered(derefIDs(&remaining))
+	sessionState.SetDelivered(remaining)
+	sessionState.SetPendingAck(stillPendingAck)
 	r.writeState(*sessionState)
 	if !ackedAny {
 		return connState, nil
@@ -656,6 +699,13 @@ func (r *runner) flushDeliveredAcks(
 		return connState, nil
 	}
 	return decodeConnectionState(result), nil
+}
+
+// waiterIdentity mirrors the `{ waiterEpoch, waiterPid }` object the TS
+// WakeWaiter hands to peekNextWakeBatch.
+type waiterIdentity struct {
+	waiterEpoch float64
+	waiterPID   int
 }
 
 // peekResult mirrors the `{ hasDeferredWorking, hasOutcomes }` return of
@@ -671,35 +721,123 @@ type peekResult struct {
 // peekNextWakeBatch mirrors peekNextWakeBatch: it only evaluates whether a
 // batch exists, acking the events the projection permanently suppressed.
 // Working-deferred events stay unacked and unpresented so a later poll can
-// project them once agent.list catches up.
+// project them once agent.list catches up. expectedWaiter carries the identity
+// of the WakeWaiter that is peeking (nil in direct callers): both the
+// agent.list wait and the suppression acks below are asynchronous, so the
+// batch this call decided on can already belong to a superseded turn by the
+// time it writes.
 func (r *runner) peekNextWakeBatch(
 	client rpcClient,
 	connState ConnectionState,
 	sessionState *SessionHookState,
+	expectedWaiter *waiterIdentity,
 ) (peekResult, error) {
-	candidates, presented := r.wakeCandidates(connState, sessionState)
-	sessionState.SetPresented(idsOf(presented))
-	if len(candidates) == 0 {
-		return peekResult{}, nil
+	ackedEventID := int64(0)
+	if connState.State != nil {
+		ackedEventID = connState.State.AckedEventID
 	}
-	projection := r.projectCandidates(client, connState.Presence, candidates)
-	deferredWorking := len(projection.DeferredWorkingEventIDs) > 0
-	if len(projection.Outcomes) == 0 {
-		if len(projection.SuppressedEventIDs) > 0 {
-			if err := r.ackSuppressed(client, connState, sessionState, presented, projection.SuppressedEventIDs); err != nil {
-				return peekResult{}, err
-			}
-			// The suppressed ack path re-reads the state before persisting, so a
-			// concurrent writer's changes are not lost.
-			freshState := r.readState()
-			presentedIDs := lastN(idsOf(presented), 500)
-			freshState.SetPresented(presentedIDs)
-			sessionState.SetPresented(presentedIDs)
+	presented := idSet([]int64{})
+	for _, id := range sessionState.Presented() {
+		if id > ackedEventID {
+			presented[id] = struct{}{}
+		}
+	}
+	sessionState.SetPresented(idsOf(presented))
+
+	eligibleKnownEvents, liveWorkingTerminalIDs := r.resolveEligibleWakeEvents(client, connState, sessionState)
+	candidateEvents := collectWakeCandidateEvents(eligibleKnownEvents, presented)
+
+	if len(candidateEvents) == 0 {
+		// Re-read before writing: sessionState may predate a turn that started
+		// while this poll was in flight, and the on-disk copy is the newer one.
+		freshState := r.readState()
+		if isWaiterSuperseded(freshState, expectedWaiter) {
+			return peekResult{}, nil
+		}
+		// No candidate does *not* mean nothing left to retain: a batch the Stop
+		// hook handed to the host is presented (so it is no longer a candidate)
+		// while it waits in deliveredEventIds for its ack or for
+		// rearmDeliveredEvents. Wiping the snapshot here would drop exactly that
+		// batch when the host ignores `decision: continue` and the draft outlives
+		// the redelivery window.
+		retainedEvents := retainWakeCandidates(eligibleKnownEvents, presented, freshState.Delivered())
+		if len(freshState.Deferred()) > 0 ||
+			retainedSnapshotKey(freshState.RetainedCandidates()) != retainedSnapshotKey(retainedEvents) {
+			freshState.SetDeferred(nil)
+			freshState.SetRetained(retainedEvents)
+			sessionState.SetDeferred(nil)
+			sessionState.SetRetained(retainedEvents)
 			r.writeState(freshState)
 		}
-		return peekResult{HasDeferredWorking: deferredWorking, HasOutcomes: false}, nil
+		return peekResult{}, nil
 	}
-	return peekResult{HasDeferredWorking: deferredWorking, HasOutcomes: true}, nil
+
+	projection := projectAgyOutcomes(candidateEvents, liveWorkingTerminalIDs, r.warn)
+	// An ack settles `id <= eventId`, so acknowledging a suppressed id above a
+	// still-deferred id would advance the cursor past the deferred event and
+	// permanently swallow it.
+	minDeferredID := minDeferredEventID(projection.DeferredWorkingEventIDs)
+	// Working-deferred completions must stay unacked and unpresented so a later
+	// poll can project them once agent.list catches up to idle/done.
+	heldAckEventIDs := []int64{}
+	if len(projection.Outcomes) == 0 {
+		for _, suppressedID := range projection.SuppressedEventIDs {
+			if suppressedID > minDeferredID {
+				// Held back: mark it presented (so the suppression is not logged or
+				// re-projected every poll) but leave the RPC ack for a later pass.
+				presented[suppressedID] = struct{}{}
+				heldAckEventIDs = append(heldAckEventIDs, suppressedID)
+				continue
+			}
+			_, err := client.Call("agent.notifications.ack", map[string]any{"eventId": suppressedID})
+			if err == nil {
+				presented[suppressedID] = struct{}{}
+				continue
+			}
+			if isPermanentAckFailure(err) {
+				presented[suppressedID] = struct{}{}
+				continue
+			}
+			break
+		}
+	}
+	freshState := r.readState()
+	// A PreInvocation may have run while agent.list and the acks above were in
+	// flight: it bumps turnEpoch and takeNextWakeBatch can already have marked
+	// this very batch presented on disk. Writing the sets collected before the
+	// await would drop those ids and let the next turn inject the batch twice,
+	// so a superseded waiter just backs off.
+	if isWaiterSuperseded(freshState, expectedWaiter) {
+		return peekResult{}, nil
+	}
+	// Union, never an overwrite: ids that only the on-disk state knows about
+	// were written by a newer turn and must survive.
+	freshPresented := append([]int64{}, freshState.Presented()...)
+	aboveAcked := make([]int64, 0, len(freshPresented))
+	for _, id := range freshPresented {
+		if id > ackedEventID {
+			aboveAcked = append(aboveAcked, id)
+		}
+	}
+	freshState.SetPresented(lastN(mergeEventIDs(aboveAcked, idsOf(presented)), 500))
+	freshState.SetDeferred(projection.DeferredWorkingEventIDs)
+	freshState.SetPendingAck(mergeEventIDs(freshState.PendingAck(), heldAckEventIDs))
+	// peek never marks outcomes presented, so the batch it just reported stays
+	// in the snapshot: the composer draft may outlive the daemon's redelivery
+	// window before takeNextWakeBatch consumes it. The input is the *unfiltered*
+	// eligible view, so a batch that is already presented but still unacked is
+	// retained for the whole polling round instead of being dropped here.
+	freshState.SetRetained(retainWakeCandidates(eligibleKnownEvents, presented, freshState.Delivered()))
+	sessionState.SetPresented(freshState.Presented())
+	sessionState.SetDeferred(freshState.Deferred())
+	sessionState.SetPendingAck(freshState.PendingAck())
+	sessionState.SetRetained(freshState.RetainedCandidates())
+	r.writeState(freshState)
+
+	return peekResult{
+		HasDeferredWorking: len(projection.DeferredWorkingEventIDs) > 0,
+		HasOutcomes:        len(projection.Outcomes) > 0,
+	}, nil
 }
 
 // takeNextWakeBatch mirrors takeNextWakeBatch: it persists the presented and
@@ -709,20 +847,68 @@ func (r *runner) takeNextWakeBatch(
 	connState ConnectionState,
 	sessionState *SessionHookState,
 ) (*string, error) {
-	candidates, presented := r.wakeCandidates(connState, sessionState)
-	sessionState.SetPresented(idsOf(presented))
-	if len(candidates) == 0 {
-		return nil, nil
+	ackedEventID := int64(0)
+	if connState.State != nil {
+		ackedEventID = connState.State.AckedEventID
 	}
-	projection := r.projectCandidates(client, connState.Presence, candidates)
-	if len(projection.Outcomes) == 0 {
-		if len(projection.SuppressedEventIDs) > 0 {
-			if err := r.ackSuppressed(client, connState, sessionState, presented, projection.SuppressedEventIDs); err != nil {
-				return nil, err
-			}
-			sessionState.SetPresented(lastN(idsOf(presented), 500))
+	presented := idSet([]int64{})
+	for _, id := range sessionState.Presented() {
+		if id > ackedEventID {
+			presented[id] = struct{}{}
+		}
+	}
+	sessionState.SetPresented(idsOf(presented))
+
+	eligibleKnownEvents, liveWorkingTerminalIDs := r.resolveEligibleWakeEvents(client, connState, sessionState)
+	candidateEvents := collectWakeCandidateEvents(eligibleKnownEvents, presented)
+
+	if len(candidateEvents) == 0 {
+		// Same reasoning as peekNextWakeBatch: a presented-but-unacked batch is
+		// not a candidate, yet its records must stay in the snapshot until
+		// flushDeliveredAcks settles the ack (or rearmDeliveredEvents makes it
+		// injectable again), otherwise a later turn cannot rebuild it.
+		retainedEvents := retainWakeCandidates(eligibleKnownEvents, presented, sessionState.Delivered())
+		if len(sessionState.Deferred()) > 0 ||
+			retainedSnapshotKey(sessionState.RetainedCandidates()) != retainedSnapshotKey(retainedEvents) {
+			sessionState.SetDeferred(nil)
+			sessionState.SetRetained(retainedEvents)
 			r.writeState(*sessionState)
 		}
+		return nil, nil
+	}
+
+	projection := projectAgyOutcomes(candidateEvents, liveWorkingTerminalIDs, r.warn)
+	// An ack settles `id <= eventId`: acknowledging a suppressed id above a
+	// still-deferred id would advance the cursor past the deferred event and
+	// permanently swallow it.
+	minDeferredID := minDeferredEventID(projection.DeferredWorkingEventIDs)
+	if len(projection.Outcomes) == 0 {
+		heldAckEventIDs := []int64{}
+		for _, suppressedID := range projection.SuppressedEventIDs {
+			if suppressedID > minDeferredID {
+				// Presented so it is neither re-logged nor re-projected, but the
+				// RPC ack waits for flushDeliveredAcks until the deferral clears.
+				presented[suppressedID] = struct{}{}
+				heldAckEventIDs = append(heldAckEventIDs, suppressedID)
+				continue
+			}
+			_, err := client.Call("agent.notifications.ack", map[string]any{"eventId": suppressedID})
+			if err == nil {
+				presented[suppressedID] = struct{}{}
+				continue
+			}
+			if isPermanentAckFailure(err) {
+				presented[suppressedID] = struct{}{}
+				continue
+			}
+			break
+		}
+		sessionState.SetPresented(lastN(idsOf(presented), 500))
+		sessionState.SetDeferred(projection.DeferredWorkingEventIDs)
+		sessionState.SetPendingAck(mergeEventIDs(sessionState.PendingAck(), heldAckEventIDs))
+		sessionState.SetRetained(retainWakeCandidates(eligibleKnownEvents, presented, sessionState.Delivered()))
+		r.writeState(*sessionState)
+		// Working-deferred completions stay unacked/unpresented for the next poll.
 		return nil, nil
 	}
 
@@ -730,28 +916,277 @@ func (r *runner) takeNextWakeBatch(
 	for _, outcome := range projection.Outcomes {
 		outcomeIDs = append(outcomeIDs, outcome.EventID)
 	}
-	// Only permanent suppressions and real outcomes are marked presented;
-	// working-deferred ids stay eligible for the next projection pass.
-	deliveredIDs := uniqueSortedIDs(append(append([]int64{}, projection.SuppressedEventIDs...), outcomeIDs...))
+	// Only permanent suppressions and real outcomes are marked presented.
+	// Working-deferred ids must remain eligible for the next projection pass.
+	deliveredIDs := mergeEventIDs(projection.SuppressedEventIDs, outcomeIDs)
 	for _, id := range deliveredIDs {
 		presented[id] = struct{}{}
 	}
 	sessionState.SetPresented(lastN(idsOf(presented), 500))
-	sessionState.SetDelivered(uniqueSortedIDs(append(append([]int64{}, sessionState.Delivered()...), deliveredIDs...)))
+	sessionState.SetDelivered(mergeEventIDs(sessionState.Delivered(), deliveredIDs))
+	// Recorded for the acknowledgement hold-back bound; flushDeliveredAcks
+	// moves any id above it from deliveredEventIds into pendingAckEventIds.
+	sessionState.SetDeferred(projection.DeferredWorkingEventIDs)
+	// The batch is presented *and* delivered-but-unacked here:
+	// rearmDeliveredEvents can hand it back to a later PreInvocation, possibly
+	// after a draft outlived the daemon's redelivery window, so its records
+	// have to survive in the state. The unfiltered eligible view is what keeps
+	// them in even though the ids are already presented by now.
+	sessionState.SetRetained(retainWakeCandidates(eligibleKnownEvents, presented, sessionState.Delivered()))
 	r.writeState(*sessionState)
 
 	text := FormatAgyOutcomeUpdates(projection.Outcomes)
 	return &text, nil
 }
 
-// wakeCandidates mirrors the shared head of peekNextWakeBatch and
-// takeNextWakeBatch: the presented set is narrowed to ids above the acked
-// watermark and the deliverable events are the ones not presented yet and not
-// published by this terminal.
-func (r *runner) wakeCandidates(
+// retainedCandidateEventLimit mirrors RETAINED_CANDIDATE_EVENT_LIMIT, the upper
+// bound of the persisted candidate snapshot. A wake batch is a handful of peer
+// completions, so 100 records cover even a long working-defer streak while
+// keeping the session state file bounded. When the bound is hit the *lowest*
+// ids are kept (see retainWakeCandidates), because those are the ones the
+// acknowledgement cursor must not pass.
+const retainedCandidateEventLimit = 100
+
+// mergeEventIDs mirrors `[...new Set(lists.flatMap((list) => list ?? []))].sort((a, b) => a - b)`.
+func mergeEventIDs(lists ...[]int64) []int64 {
+	ids := []int64{}
+	seen := map[int64]struct{}{}
+	for _, list := range lists {
+		for _, id := range list {
+			if _, ok := seen[id]; ok {
+				continue
+			}
+			seen[id] = struct{}{}
+			ids = append(ids, id)
+		}
+	}
+	sort.Slice(ids, func(left, right int) bool { return ids[left] < ids[right] })
+	return ids
+}
+
+// minDeferredEventID mirrors minDeferredEventId: an empty list is
+// Number.POSITIVE_INFINITY.
+func minDeferredEventID(deferredEventIDs []int64) int64 {
+	if len(deferredEventIDs) == 0 {
+		return math.MaxInt64
+	}
+	minimum := deferredEventIDs[0]
+	for _, id := range deferredEventIDs[1:] {
+		if id < minimum {
+			minimum = id
+		}
+	}
+	return minimum
+}
+
+// mergeKnownUnackedEvents mirrors mergeKnownUnackedEvents: every event of this
+// session that still owes a projection *or* an ack.
+//
+// `agent.orchestrator.get` only returns rows with `id > ackedEventId`, so an id
+// that survives this merge is by definition not acknowledged yet. For an id the
+// daemon still reports, the daemon's current copy wins.
+//
+// Deliberately **not** filtered by presentedEventIds: the Stop hook marks the
+// batch presented *and* records it in deliveredEventIds before handing it to
+// the host, so a presented-filtered view would report "nothing to do" for
+// exactly the batch that still has to survive. Callers apply the presented
+// filter themselves via collectWakeCandidateEvents, and retainWakeCandidates
+// uses the unfiltered view to keep the delivered-but-unacked records alive.
+func mergeKnownUnackedEvents(
+	connState ConnectionState,
+	retained []observability.AgentEventRecord,
+) []observability.AgentEventRecord {
+	ackedEventID := int64(0)
+	if connState.State != nil {
+		ackedEventID = connState.State.AckedEventID
+	}
+	byID := map[int64]observability.AgentEventRecord{}
+	for _, event := range retained {
+		byID[event.ID] = event
+	}
+	for _, event := range connState.Events {
+		byID[event.ID] = event
+	}
+	merged := make([]observability.AgentEventRecord, 0, len(byID))
+	for _, event := range byID {
+		if event.ID <= ackedEventID {
+			continue
+		}
+		if terminalIDEquals(event.TerminalID, connState.Presence.TerminalID) {
+			continue
+		}
+		// A state file can outlive the workspace it was written for; never
+		// project an event that belongs to a different Herdr session.
+		if event.HerdrSessionName != "" && event.HerdrSessionName != connState.Presence.HerdrSessionName {
+			continue
+		}
+		merged = append(merged, event)
+	}
+	sort.SliceStable(merged, func(left, right int) bool { return merged[left].ID < merged[right].ID })
+	return merged
+}
+
+// collectWakeCandidateEvents mirrors collectWakeCandidateEvents: the subset of
+// knownUnackedEvents that may still be handed to the host, i.e. everything that
+// has not been presented (suppressed or delivered) yet.
+func collectWakeCandidateEvents(
+	knownUnackedEvents []observability.AgentEventRecord,
+	presented map[int64]struct{},
+) []observability.AgentEventRecord {
+	candidates := make([]observability.AgentEventRecord, 0, len(knownUnackedEvents))
+	for _, event := range knownUnackedEvents {
+		if _, isPresented := presented[event.ID]; isPresented {
+			continue
+		}
+		candidates = append(candidates, event)
+	}
+	return candidates
+}
+
+// filterEligibleRetainedEvents mirrors filterEligibleRetainedEvents: retained-only
+// rows that are no longer deliverable in this scope are dropped. A row the
+// daemon re-listed was just validated by the daemon itself and is kept
+// unconditionally; when agent.list failed (liveScope nil) nothing is known, so
+// every row is kept: losing a real completion is worse than one more useless
+// wake.
+func filterEligibleRetainedEvents(
+	events []observability.AgentEventRecord,
+	liveConnEventIDs map[int64]struct{},
+	presenceWorkspaceID string,
+	liveScope *livePeerScope,
+) []observability.AgentEventRecord {
+	if liveScope == nil {
+		return append([]observability.AgentEventRecord{}, events...)
+	}
+	eligible := make([]observability.AgentEventRecord, 0, len(events))
+	for _, event := range events {
+		if _, live := liveConnEventIDs[event.ID]; live {
+			eligible = append(eligible, event)
+			continue
+		}
+		if event.WorkspaceID != nil && *event.WorkspaceID != "" &&
+			*event.WorkspaceID != presenceWorkspaceID {
+			if _, inScope := liveScope.LiveScopeWorkspaces[*event.WorkspaceID]; !inScope {
+				continue
+			}
+		}
+		if event.TerminalID != nil {
+			if _, live := liveScope.LiveTerminalIDs[*event.TerminalID]; !live {
+				continue
+			}
+		}
+		eligible = append(eligible, event)
+	}
+	return eligible
+}
+
+// retainWakeCandidates mirrors retainWakeCandidates: the candidates that still
+// have to be handed over, for the persisted snapshot. knownUnackedEvents is
+// sorted by id, so the capacity bound trims from the top: the oldest ids — the
+// ones the acknowledgement cursor must not pass — are the ones that stay.
+func retainWakeCandidates(
+	knownUnackedEvents []observability.AgentEventRecord,
+	presented map[int64]struct{},
+	deliveredEventIDs []int64,
+) []observability.AgentEventRecord {
+	unackedDelivered := idSet(deliveredEventIDs)
+	retained := make([]observability.AgentEventRecord, 0, len(knownUnackedEvents))
+	for _, event := range knownUnackedEvents {
+		_, isPresented := presented[event.ID]
+		_, isUnackedDelivered := unackedDelivered[event.ID]
+		if isPresented && !isUnackedDelivered {
+			continue
+		}
+		retained = append(retained, event)
+		if len(retained) >= retainedCandidateEventLimit {
+			break
+		}
+	}
+	return retained
+}
+
+// retainedSnapshotKey mirrors retainedSnapshotKey: identity of a persisted
+// snapshot, used to skip no-op state writes.
+func retainedSnapshotKey(events []observability.AgentEventRecord) string {
+	parts := make([]string, 0, len(events))
+	for _, event := range events {
+		parts = append(parts, strconv.FormatInt(event.ID, 10))
+	}
+	return strings.Join(parts, ",")
+}
+
+// livePeerScope mirrors the live peer view of this orchestrator scope, straight
+// from agent.list.
+type livePeerScope struct {
+	LiveScopeWorkspaces map[string]struct{}
+	LiveTerminalIDs     map[string]struct{}
+	WorkingTerminalIDs  map[string]struct{}
+}
+
+// resolveEligibleWakeEvents mirrors resolveEligibleWakeEvents: known-unacked
+// events that are still eligible for projection, together with the peers whose
+// live Herdr status is `working`. One agent.list round trip serves both
+// consumers.
+func (r *runner) resolveEligibleWakeEvents(
+	client rpcClient,
 	connState ConnectionState,
 	sessionState *SessionHookState,
-) ([]observability.AgentEventRecord, map[int64]struct{}) {
+) ([]observability.AgentEventRecord, map[string]struct{}) {
+	knownUnackedEvents := mergeKnownUnackedEvents(connState, sessionState.RetainedCandidates())
+	if len(knownUnackedEvents) == 0 {
+		return []observability.AgentEventRecord{}, map[string]struct{}{}
+	}
+	liveScope := r.fetchLivePeerScope(client, connState.Presence)
+	liveConnEventIDs := map[int64]struct{}{}
+	for _, event := range connState.Events {
+		liveConnEventIDs[event.ID] = struct{}{}
+	}
+	// agent.list failed: no live status is known, so completions are projected
+	// (the tolerated pre-fix behaviour) and retained rows are kept.
+	working := map[string]struct{}{}
+	if liveScope != nil {
+		working = liveScope.WorkingTerminalIDs
+	}
+	return filterEligibleRetainedEvents(
+		knownUnackedEvents,
+		liveConnEventIDs,
+		connState.Presence.WorkspaceID,
+		liveScope,
+	), working
+}
+
+// isWaiterSuperseded mirrors isWaiterSuperseded: whether the caller's turn/
+// waiter generation has already been superseded.
+func isWaiterSuperseded(state SessionHookState, expectedWaiter *waiterIdentity) bool {
+	if expectedWaiter == nil {
+		return false
+	}
+	// waiterPid / waiterEpoch may not be on disk yet: Stop writes the epochs,
+	// spawns, and only then records the pid.
+	if turnEpoch, ok := state.TurnEpochValue(); ok && turnEpoch != expectedWaiter.waiterEpoch {
+		return true
+	}
+	if waiterEpoch, ok := state.WaiterEpochValue(); ok && waiterEpoch != expectedWaiter.waiterEpoch {
+		return true
+	}
+	if waiterPID, ok := state.WaiterPIDValue(); ok && waiterPID != expectedWaiter.waiterPID {
+		return true
+	}
+	return false
+}
+
+// resolveMinHoldbackEventID mirrors resolveMinHoldbackEventId: the lowest event
+// id that must not be acknowledged yet.
+//
+// agent.notifications.ack settles *every* row with `id <= eventId` and advances
+// the workspace cursor to it, so acknowledging a high id silently swallows
+// every lower id that is still waiting to be projected. The bound is recomputed
+// from the *current* candidate set instead of trusting the recorded deferral.
+func (r *runner) resolveMinHoldbackEventID(
+	client rpcClient,
+	connState ConnectionState,
+	sessionState *SessionHookState,
+) int64 {
 	ackedEventID := int64(0)
 	if connState.State != nil {
 		ackedEventID = connState.State.AckedEventID
@@ -762,55 +1197,31 @@ func (r *runner) wakeCandidates(
 			presented[id] = struct{}{}
 		}
 	}
-	candidates := make([]observability.AgentEventRecord, 0, len(connState.Events))
-	for _, event := range connState.Events {
-		if event.ID <= ackedEventID {
-			continue
-		}
-		if _, isPresented := presented[event.ID]; isPresented {
-			continue
-		}
-		if terminalIDEquals(event.TerminalID, connState.Presence.TerminalID) {
-			continue
-		}
-		candidates = append(candidates, event)
+	// Nothing to project can hold the cursor back, and eligibility can only
+	// remove candidates — so with no candidate at all the bound is unbounded and
+	// the agent.list round trip below is not needed.
+	if len(collectWakeCandidateEvents(
+		mergeKnownUnackedEvents(connState, sessionState.RetainedCandidates()),
+		presented,
+	)) == 0 {
+		return math.MaxInt64
 	}
-	sort.SliceStable(candidates, func(left, right int) bool { return candidates[left].ID < candidates[right].ID })
-	return candidates, presented
-}
-
-// projectCandidates mirrors the projection step shared by peek/take: it fetches
-// the live working terminals and projects the candidate events. The live-status
-// lookup tolerates its own failure (see fetchLiveWorkingTerminalIDs), so it
-// cannot fail the batch.
-func (r *runner) projectCandidates(
-	client rpcClient,
-	presence Presence,
-	candidates []observability.AgentEventRecord,
-) projection {
-	return projectAgyOutcomes(candidates, r.fetchLiveWorkingTerminalIDs(client, presence), r.warn)
-}
-
-// ackSuppressed mirrors the suppressed-ack loop: permanent failures still mark
-// the id presented, a transient failure stops the loop.
-func (r *runner) ackSuppressed(
-	client rpcClient,
-	connState ConnectionState,
-	sessionState *SessionHookState,
-	presented map[int64]struct{},
-	suppressed []int64,
-) error {
-	for _, suppressedID := range suppressed {
-		if _, err := client.Call("agent.notifications.ack", map[string]any{"eventId": suppressedID}); err != nil {
-			if isPermanentAckFailure(err) {
-				presented[suppressedID] = struct{}{}
-				continue
-			}
-			return nil
-		}
-		presented[suppressedID] = struct{}{}
+	eligibleKnownEvents, liveWorkingTerminalIDs := r.resolveEligibleWakeEvents(client, connState, sessionState)
+	// Recomputed through the eligibility filter: a retained row that is no longer
+	// deliverable must not hold the cursor back forever.
+	candidateEvents := collectWakeCandidateEvents(eligibleKnownEvents, presented)
+	if len(candidateEvents) == 0 {
+		return math.MaxInt64
 	}
-	return nil
+	projection := projectAgyOutcomes(candidateEvents, liveWorkingTerminalIDs, func(string) {
+		// The following takeNextWakeBatch / peekNextWakeBatch pass logs these very
+		// suppressions; logging them here too would only duplicate the warn lines.
+	})
+	holdback := append([]int64{}, projection.DeferredWorkingEventIDs...)
+	for _, outcome := range projection.Outcomes {
+		holdback = append(holdback, outcome.EventID)
+	}
+	return minDeferredEventID(holdback)
 }
 
 // clearOwnWaiterPid mirrors clearOwnWaiterPid.
@@ -874,6 +1285,37 @@ func projectAgyOutcomes(
 	if liveWorkingTerminalIDs == nil {
 		liveWorkingTerminalIDs = map[string]struct{}{}
 	}
+
+	// One terminal may legally emit several completion events inside a single
+	// Stop-to-Stop window (an intermediate tool round deferred above, then the
+	// real final round). Once the peer stops reporting `working` they all become
+	// projectable at once, which would inject the same peer twice with two
+	// different round texts. Keep only the newest completion that actually yields
+	// a usable `completed` outcome and suppress everything older for that
+	// terminal.
+	newestCompletionID := map[string]int64{}
+	for _, event := range events {
+		if !isCompletionEvent(event) || event.TerminalID == nil {
+			continue
+		}
+		if kind, ok := outcomeKind(event); !ok || kind != OutcomeCompleted {
+			continue
+		}
+		payload := asRecord(event.Payload)
+		if fallbackOutcome(payload) && truthyString(event.PaneID) && truthyString(event.PaneGeneration) {
+			if _, isCompleted := completedPanes[*event.PaneID+"\x00"+*event.PaneGeneration]; isCompleted {
+				continue
+			}
+		}
+		text := normalizeExcerpt(compactHistoryText(event))
+		if len(text) == 0 || isUpstreamErrorText(text) {
+			continue
+		}
+		if current, ok := newestCompletionID[*event.TerminalID]; !ok || event.ID > current {
+			newestCompletionID[*event.TerminalID] = event.ID
+		}
+	}
+
 	for _, event := range events {
 		if isCompletionEvent(event) && event.TerminalID != nil {
 			if _, isWorking := liveWorkingTerminalIDs[*event.TerminalID]; isWorking {
@@ -883,6 +1325,11 @@ func projectAgyOutcomes(
 				// can decide.
 				deferredWorkingEventIDs = append(deferredWorkingEventIDs, event.ID)
 				logAgyEventSuppressed(warn, event.ID, "deferred: peer terminal "+*event.TerminalID+" still working in agent.list")
+				continue
+			}
+			if newest, ok := newestCompletionID[*event.TerminalID]; ok && event.ID < newest {
+				suppressedEventIDs = append(suppressedEventIDs, event.ID)
+				logAgyEventSuppressed(warn, event.ID, "superseded by newer completion for terminal "+*event.TerminalID)
 				continue
 			}
 		}

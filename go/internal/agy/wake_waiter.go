@@ -59,6 +59,7 @@ type AgentListItemView struct {
 	History     PeerHistory                `json:"history"`
 	PaneID      string                     `json:"paneId"`
 	TerminalID  *string                    `json:"terminalId"`
+	WorkspaceID *string                    `json:"workspaceId"`
 }
 
 // PeerHistory mirrors the `history` projection on AgentListItem.
@@ -276,7 +277,10 @@ func (w *waiter) loop() error {
 					return nil
 				}
 
-				peekedBatch, peekErr := w.runner.peekNextWakeBatch(w.client, latestState, &sessionState)
+				peekedBatch, peekErr := w.runner.peekNextWakeBatch(w.client, latestState, &sessionState, &waiterIdentity{
+					waiterEpoch: w.waiterEpoch,
+					waiterPID:   w.runnerPID(),
+				})
 				if peekErr != nil {
 					return peekErr
 				}
@@ -311,6 +315,27 @@ func (w *waiter) loop() error {
 						w.runner.warn("Herdsman agy wake deferred: 输入框有草稿，推迟叫醒 (pane " + w.runner.launch.PaneID + ")")
 						w.retryWakePending = true
 					} else {
+						// readComposerDraft is I/O (up to 5s). While it was in flight the
+						// user may have submitted a new turn (bumping turnEpoch) or a fresh
+						// Stop may have started a new waiter, so the state this loop decided
+						// on can already be superseded. Re-check before touching shared
+						// state: rearming the batch or prompting on behalf of a stale turn
+						// would duplicate an injection the host already received.
+						postReadState := readSessionState(w.stateDir, w.sessionID)
+						stale := false
+						if turnEpoch, ok := postReadState.TurnEpochValue(); ok && turnEpoch != w.waiterEpoch {
+							stale = true
+						}
+						if waiterEpoch, ok := postReadState.WaiterEpochValue(); ok && waiterEpoch != w.waiterEpoch {
+							stale = true
+						}
+						if waiterPID, ok := postReadState.WaiterPIDValue(); ok && waiterPID != w.runnerPID() {
+							stale = true
+						}
+						if stale {
+							stop = true
+							return nil
+						}
 						// The stop hook marked the batch presented before returning it
 						// to the host; the turn started by this prompt has to receive
 						// it in PreInvocation, so re-arm the unacked batch first.
@@ -504,29 +529,42 @@ func (r *runner) settleGraceMs() float64 {
 	return defaultSettleGraceMs
 }
 
-// fetchLiveWorkingTerminalIDs mirrors fetchLiveWorkingTerminalIDs: terminal ids
-// of peers whose live Herdr status is `working`. Failure is tolerated and reads
-// as "no live working peer".
-func (r *runner) fetchLiveWorkingTerminalIDs(client rpcClient, presence Presence) map[string]struct{} {
+// fetchLivePeerScope mirrors fetchLivePeerScope: the live peer view of this
+// orchestrator scope, straight from `agent.list`.
+//
+// A nil result is the TS `undefined`: `agent.list` failed, so nothing is known.
+// Completions are then projected as real outcomes (the pre-fix behaviour)
+// instead of dropping the whole batch, and unvalidated snapshot rows are kept.
+func (r *runner) fetchLivePeerScope(client rpcClient, presence Presence) *livePeerScope {
 	result, err := client.Call("agent.list", map[string]any{
 		"herdrSessionName":           presence.HerdrSessionName,
 		"includeOwnerlessWorkspaces": true,
 		"workspaceId":                presence.WorkspaceID,
 	})
 	if err != nil {
-		return map[string]struct{}{}
+		return nil
 	}
-	live := map[string]struct{}{}
-	for _, agent := range decodeAgentList(result) {
-		if agent.AgentStatus == nil || *agent.AgentStatus != observability.AgentStatusWorking {
-			continue
+	agents := decodeAgentList(result)
+	liveScopeWorkspaces := map[string]struct{}{presence.WorkspaceID: {}}
+	liveTerminalIDs := map[string]struct{}{}
+	workingTerminalIDs := map[string]struct{}{}
+	for _, agent := range agents {
+		if workspaceID, ok := nonEmptyStringPtr(agent.WorkspaceID); ok {
+			liveScopeWorkspaces[workspaceID] = struct{}{}
 		}
 		if !truthyString(agent.TerminalID) || terminalIDEquals(agent.TerminalID, presence.TerminalID) {
 			continue
 		}
-		live[*agent.TerminalID] = struct{}{}
+		liveTerminalIDs[*agent.TerminalID] = struct{}{}
+		if agent.AgentStatus != nil && *agent.AgentStatus == observability.AgentStatusWorking {
+			workingTerminalIDs[*agent.TerminalID] = struct{}{}
+		}
 	}
-	return live
+	return &livePeerScope{
+		LiveScopeWorkspaces: liveScopeWorkspaces,
+		LiveTerminalIDs:     liveTerminalIDs,
+		WorkingTerminalIDs:  workingTerminalIDs,
+	}
 }
 
 // decodeAgentList mirrors the `as { agents?: AgentListItem[] }` cast plus the
@@ -593,12 +631,13 @@ func defaultTriggerWakePrompt(paneID, promptText string) error {
 }
 
 // defaultReadPaneText mirrors defaultReadPaneText: `herdr pane read <paneId>
-// --lines 12` with a 5s timeout. Any failure reads as "no text" (a nil result)
+// --lines 40` with a 5s timeout (40 lines so a multi-line draft plus the box
+// frame stays inside the dump). Any failure reads as "no text" (a nil result)
 // so the caller falls back to the pre-fix wake behaviour.
 func defaultReadPaneText(paneID string) (*string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	stdout, err := exec.CommandContext(ctx, "herdr", "pane", "read", paneID, "--lines", "12").Output()
+	stdout, err := exec.CommandContext(ctx, "herdr", "pane", "read", paneID, "--lines", "40").Output()
 	if err != nil {
 		return nil, nil
 	}
@@ -638,27 +677,84 @@ func ParseAgyComposerDraft(paneText string) *string {
 		return nil
 	}
 	bottom := separatorIndexes[len(separatorIndexes)-1]
-	top := separatorIndexes[len(separatorIndexes)-2]
-	if bottom <= top+1 {
-		return nil
-	}
-	region := lines[top+1 : bottom]
-	if len(region) == 0 {
-		return nil
-	}
-	draftLines := make([]string, 0, len(region))
-	for index, line := range region {
-		if index == 0 {
-			if match := composerPromptPattern.FindStringSubmatch(line); match != nil {
-				draftLines = append(draftLines, match[1])
-				continue
-			}
+	// The rule right above the status bar is the bottom of the composer box.
+	bottomLine := strings.TrimSpace(lines[bottom])
+	// The top rule is *not* simply the previous rule: a multi-line draft may itself
+	// contain a `--------` / `────────` line followed by a `>` quote line, which then
+	// looks exactly like a composer top rule and would collapse the box (and, for an
+	// empty `>`, return an empty draft). The composer frame is drawn by one TUI
+	// component, so its top and bottom rules share the same characters and width:
+	// prefer candidates that match the bottom rule byte for byte, and among those
+	// walk outwards until one yields a non-empty draft.
+	followedByPrompt := make([]int, 0, len(separatorIndexes))
+	for _, separatorIndex := range separatorIndexes[:len(separatorIndexes)-1] {
+		if composerPromptLinePattern.MatchString(lineAt(lines, separatorIndex+1)) {
+			followedByPrompt = append(followedByPrompt, separatorIndex)
 		}
-		draftLines = append(draftLines, line)
 	}
-	draft := composerTrailingWhitespacePattern.ReplaceAllString(strings.Join(draftLines, "\n"), "")
-	draft = strings.TrimRightFunc(draft, unicode.IsSpace)
-	return &draft
+	if len(followedByPrompt) == 0 {
+		return nil
+	}
+	matchingFrame := make([]int, 0, len(followedByPrompt))
+	for _, separatorIndex := range followedByPrompt {
+		if strings.TrimSpace(lineAt(lines, separatorIndex)) == bottomLine {
+			matchingFrame = append(matchingFrame, separatorIndex)
+		}
+	}
+	topCandidates := matchingFrame
+	if len(topCandidates) == 0 {
+		topCandidates = followedByPrompt
+	}
+
+	sawCandidate := false
+	for index := len(topCandidates) - 1; index >= 0; index-- {
+		separatorIndex := topCandidates[index]
+		if separatorIndex >= bottom-1 {
+			continue
+		}
+		region := lines[separatorIndex+1 : bottom]
+		if len(region) == 0 {
+			continue
+		}
+		sawCandidate = true
+		draftLines := make([]string, 0, len(region))
+		for regionIndex, line := range region {
+			if regionIndex == 0 {
+				if match := composerPromptPattern.FindStringSubmatch(line); match != nil {
+					draftLines = append(draftLines, match[1])
+					continue
+				}
+			}
+			draftLines = append(draftLines, line)
+		}
+		draft := strings.TrimRightFunc(
+			composerTrailingWhitespacePattern.ReplaceAllString(strings.Join(draftLines, "\n"), ""),
+			unicode.IsSpace,
+		)
+		// An innermost candidate that parses to an empty draft is the rule the user
+		// typed inside the composer; the real frame is the enclosing one.
+		if strings.TrimSpace(draft) != "" {
+			return &draft
+		}
+	}
+	// Every same-frame candidate is an empty `>` prompt line: the composer is empty.
+	if !sawCandidate {
+		return nil
+	}
+	empty := ""
+	return &empty
+}
+
+// composerPromptLinePattern mirrors `/^>(?:\s|$)/`: the `>` prompt line that must
+// follow a composer top rule.
+var composerPromptLinePattern = regexp.MustCompile(`^>(?:\s|$)`)
+
+// lineAt mirrors the TS `lines[index] ?? ""` guard.
+func lineAt(lines []string, index int) string {
+	if index < 0 || index >= len(lines) {
+		return ""
+	}
+	return lines[index]
 }
 
 // composerTrailingNewlinePattern mirrors `replace(/\r\n?/g, "\n")`.

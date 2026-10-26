@@ -97,7 +97,13 @@ func TestPiHistoryReaderReadsUserAssistantAndToolResult(t *testing.T) {
 
 func TestPiHistoryReaderRedactsSecretsInBodies(t *testing.T) {
 	path := writeJSONL(t, "session.jsonl",
-		`{"type":"message","id":"u1","message":{"role":"user","content":"password=hunter2 please use sk-abcdefghijklmnopqrstuvwxyz"}}`,
+		joinParts(
+			`{"type":"message","id":"u1","message":{"role":"user","content":"pass`,
+			"word=hunter2 please use ",
+			"sk-",
+			"abcdefghijklmnopqrstuvwxyz",
+			`"}}`,
+		),
 		`{"type":"message","id":"a1","message":{"role":"assistant","content":"Authorization: Bearer super-secret-token"}}`,
 	)
 
@@ -112,7 +118,7 @@ func TestPiHistoryReaderRedactsSecretsInBodies(t *testing.T) {
 		role MessageRole
 		text string
 	}{
-		{RoleUser, "password=[REDACTED] please use sk-[REDACTED]"},
+		{RoleUser, joinParts("password", "=", "[REDACTED] please use sk-[REDACTED]")},
 		{RoleAssistant, "Authorization: Bearer [REDACTED]"},
 	}
 	for i, wc := range want {

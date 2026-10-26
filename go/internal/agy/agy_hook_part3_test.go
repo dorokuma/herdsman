@@ -20,6 +20,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -537,6 +538,82 @@ func TestIntermediateAgentDoneWhilePeerStillWorkingIsDeferred(t *testing.T) {
 	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(prompts, want) {
 		t.Fatalf("wakePrompts = %+v, want %+v", prompts, want)
 	}
+
+	// The wake prompt starts a new turn, so PreInvocation now takes the batch.
+	// Both deferred completions of the same terminal are candidates at once; the
+	// batch must carry only the newest one.
+	wakeTurn := agy.RunAgyHook(agy.HookPreInvocation, `{"invocationNum":2,"sessionId":"`+sessionID+`"}`, agy.RunAgyHookOptions{
+		Connect: client.connectCapturing,
+		Environment: mergeEnv(herdrEnv,
+			"HERDSMAN_AGY_SESSION_ID", sessionID,
+			"HERDSMAN_AGY_STATE_DIR", dir),
+		ReadPaneText: func(string) (*string, error) { return nil, nil },
+		SocketPath:   "/tmp/herdsman.sock",
+		StateDir:     strPtr(dir),
+		Warn:         collectWarn,
+	})
+	injected := ""
+	if len(wakeTurn.InjectSteps) > 0 {
+		injected = wakeTurn.InjectSteps[0].EphemeralMessage
+	}
+	if !strings.Contains(injected, "全部测试通过。") || !strings.Contains(injected, "event: 1126") {
+		t.Fatalf("injected = %q, want the newest completion 1126", injected)
+	}
+	if strings.Contains(injected, "已改完代码，继续跑测试。") || strings.Contains(injected, "event: 1118") {
+		t.Fatalf("injected = %q, want the superseded 1118 removed", injected)
+	}
+	if got := strings.Count(injected, "- completed "); got != 1 {
+		t.Fatalf("injected has %d `- completed` blocks, want 1", got)
+	}
+	client.mu.Lock()
+	injectWarns := append([]string{}, warns...)
+	client.mu.Unlock()
+	if !anyWarnContains(injectWarns, "eventId=1118") ||
+		!anyWarnContains(injectWarns, "superseded by newer completion for terminal term_peer") {
+		t.Fatalf("warns = %v, want the 1118 supersession warning", injectWarns)
+	}
+	assertStateMatches(t, readStateObject(t, sessionStatePath(dir, sessionID)), map[string]any{
+		"presentedEventIds": []any{float64(1118), float64(1126)},
+		"deliveredEventIds": []any{float64(1118), float64(1126)},
+	})
+
+	// The woken turn's Stop settles the batch, so the superseded mid-turn
+	// completion is acked and can never be injected again later.
+	client.mu.Lock()
+	ackedBeforeStop := append([]int64{}, ackedIDs...)
+	client.mu.Unlock()
+	stopSettle := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`"}`, agy.RunAgyHookOptions{
+		Connect:     client.connectCapturing,
+		Environment: herdrEnv,
+		ReadPaneText: func(string) (*string, error) {
+			return nil, nil
+		},
+		SocketPath: "/tmp/herdsman.sock",
+		SpawnWakeWaiter: func(agy.SpawnWakeWaiterInput) *agy.SpawnWakeWaiterResult {
+			return &agy.SpawnWakeWaiterResult{PID: intPtr(os.Getpid())}
+		},
+		StateDir: strPtr(dir),
+		Warn:     collectWarn,
+	})
+	if !isEmptyHookOutput(stopSettle) {
+		t.Fatalf("stop result = %+v, want {}", stopSettle)
+	}
+	client.mu.Lock()
+	ackedAfterStop := append([]int64{}, ackedIDs...)
+	finalPrompts := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	ackedSet := map[int64]bool{}
+	for _, id := range ackedAfterStop {
+		ackedSet[id] = true
+	}
+	for _, want := range []int64{1118, 1126} {
+		if !ackedSet[want] {
+			t.Fatalf("ackedIDs = %v (before stop %v), want both 1118 and 1126", ackedAfterStop, ackedBeforeStop)
+		}
+	}
+	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(finalPrompts, want) {
+		t.Fatalf("wakePrompts = %+v, want %+v", finalPrompts, want)
+	}
 }
 
 // --- WakeWaiter working-race / composer-draft deferral (lines 1733-2079) ----
@@ -873,11 +950,20 @@ func TestParseAgyComposerDraft(t *testing.T) {
 	assertDraft(t, strings.Join([]string{"output", rule, ">", rule, "? for shortcuts             Gemini 4 Argon · medium"}, "\n"), strPtr(""))
 	assertDraft(t, strings.Join([]string{"output", rule, "> hello draft", rule, "? for shortcuts"}, "\n"), strPtr("hello draft"))
 	assertDraft(t, strings.Join([]string{"output", rule, "> line one", "line two", "line three", rule, "? for shortcuts"}, "\n"), strPtr("line one\nline two\nline three"))
-	// A sole `>` with only whitespace is still empty (no placeholder observed).
+	// A sole `>` with only whitespace is still empty (no placeholder observed on real panes).
 	assertDraft(t, strings.Join([]string{"output", rule, ">   ", rule, "footer"}, "\n"), strPtr(""))
+	// A draft that itself contains a rule must not collapse the box: the real top
+	// rule is the last one followed by the `>` prompt line, not the previous rule.
+	assertDraft(t, strings.Join([]string{"output", rule, "> 第一段", "--------", "第三段", rule, "? for shortcuts"}, "\n"), strPtr("第一段\n--------\n第三段"))
+	assertDraft(t, strings.Join([]string{"output", rule, "> 第一段", "第二行", rule, rule, "? for shortcuts"}, "\n"), strPtr("第一段\n第二行\n"+rule))
+	// A rule on the draft's last line would make the naive second-to-last rule sit
+	// right above the bottom; the box must still be located.
+	assertDraft(t, strings.Join([]string{"output", rule, "> 草稿", rule, rule, "? for shortcuts"}, "\n"), strPtr("草稿\n"+rule))
 	// A composer box that cannot be located yields nil so wake keeps working.
 	assertDraft(t, "no separators here\n> orphan", nil)
 	assertDraft(t, rule+"\n"+rule, nil)
+	// No rule above the box bottom is followed by a `>` prompt line.
+	assertDraft(t, strings.Join([]string{"output", rule, "plain", rule, "footer"}, "\n"), nil)
 }
 
 // --- Stop decision:continue + unacked delivered fallback (lines 1724-1881) ---
@@ -1024,4 +1110,1108 @@ func TestStopSpawnsWaiterAlongsideDecisionContinue(t *testing.T) {
 	if promptsAfter != 1 {
 		t.Fatalf("wakePrompts = %d, want the single fallback prompt", promptsAfter)
 	}
+}
+
+// --- retryWakePending-only wake (84fc8b1) -----------------------------------
+
+// TestRetryWakePendingAloneWakesWhenOneDeferredPeerSettles mirrors the TS
+// "WakeWaiter wakes through retryWakePending alone when one deferred peer settles
+// while another keeps working": peer A's deferred completion retries the poll on
+// its own, and peer B keeps reporting working so the no-active-peers path can
+// never fire. Without the retryWakePending flag the wake is lost.
+func TestRetryWakePendingAloneWakesWhenOneDeferredPeerSettles(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "f1111111-2222-3333-4444-555555555555"
+	pendingEvents := []any{makeDoneEvent(9500, "工人 A 的最终结论。", "term_peer_a")}
+	ackedEventID := int64(0)
+	peerAStatus := "working"
+	wakePrompts := []wakePrompt{}
+	warns := []string{}
+
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		switch method {
+		case "agent.notifications.ack":
+			eventID := asEventID(params.(map[string]any)["eventId"])
+			if eventID > ackedEventID {
+				ackedEventID = eventID
+			}
+			return map[string]any{"acknowledged": true}, nil
+		case "agent.list":
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-25T05:06:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("agy", peerAStatus, "2026-10-25T05:06:00.000Z", "wB:p2", "term_peer_a"),
+				// Peer B never leaves working and no push notification ever arrives,
+				// so `!hasActivePeers` can never trigger the check.
+				agentListEntry("agy", "working", "2026-10-25T05:06:00.000Z", "wB:p3", "term_peer_b"),
+			}}, nil
+		}
+		return orchestratorStateResponse(sessionID, pendingEvents, ackedEventID), nil
+	}
+	writeStateFile(t, sessionStatePath(dir, sessionID), map[string]any{
+		"turnEpoch": float64(1), "waiterEpoch": float64(1), "waiterPid": float64(os.Getpid()),
+	})
+	collectWarn := func(message string) {
+		client.mu.Lock()
+		warns = append(warns, message)
+		client.mu.Unlock()
+	}
+
+	// An empty composer: `herdr pane read` shows the lone `>` prompt line.
+	emptyComposer := strings.Join([]string{
+		"assistant output",
+		"───────────────────────────────────────────────────",
+		">",
+		"───────────────────────────────────────────────────",
+		"? for shortcuts",
+	}, "\n")
+
+	done := make(chan agy.HookOutput, 1)
+	go func() {
+		done <- agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: client.connectCapturing,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", sessionID,
+				"HERDSMAN_AGY_STATE_DIR", dir,
+				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+			PollIntervalMs: floatPtr(20),
+			ReadPaneText: func(string) (*string, error) {
+				return &emptyComposer, nil
+			},
+			SocketPath: "/tmp/herdsman.sock",
+			StateDir:   strPtr(dir),
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				client.mu.Lock()
+				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+				client.mu.Unlock()
+				return nil
+			},
+			WaitTimeoutMs: floatPtr(5000),
+			Warn:          collectWarn,
+		})
+	}()
+
+	// Peer A is still working: the completion is deferred, nothing is acked and
+	// peer B keeps the wake check from firing through the no-active-peers path.
+	time.Sleep(60 * time.Millisecond)
+	client.mu.Lock()
+	earlyPrompts := len(wakePrompts)
+	earlyAcked := ackedEventID
+	earlyWarns := append([]string{}, warns...)
+	client.mu.Unlock()
+	if earlyPrompts != 0 {
+		t.Fatalf("wakePrompts = %d while peer A works, want 0", earlyPrompts)
+	}
+	if earlyAcked != 0 {
+		t.Fatalf("ackedEventID = %d while peer A works, want 0", earlyAcked)
+	}
+	if !anyWarnContains(earlyWarns, "eventId=9500") || !anyWarnContains(earlyWarns, "still working") {
+		t.Fatalf("warns = %v, want the 9500 still-working warning", earlyWarns)
+	}
+
+	// No push notification is delivered: the deferred retry timer is the only
+	// thing that can re-check the batch and wake the orchestrator.
+	client.mu.Lock()
+	peerAStatus = "done"
+	client.mu.Unlock()
+	if result := awaitHookOutput(t, done); !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	client.mu.Lock()
+	prompts := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(prompts, want) {
+		t.Fatalf("wakePrompts = %+v, want %+v", prompts, want)
+	}
+}
+
+// --- ack-cursor holdback against deferred-event swallowing (adf6f09) -------
+
+// TestLowIDWorkingDeferredEventIsNeverSwallowedByHigherIDAck mirrors the TS
+// "a low-id working-deferred event is never swallowed by the ack of a higher-id
+// suppressed event": `agent.notifications.ack` settles *every* row with
+// `id <= eventId`, so the ack of the suppressed 105 must wait while the deferred
+// 100 still owes its projection.
+func TestLowIDWorkingDeferredEventIsNeverSwallowedByHigherIDAck(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "d1111111-2222-3333-4444-555555555555"
+	ackedIDs := []int64{}
+	ackedEventID := int64(0)
+	peerAStatus := "working"
+
+	peerAEvent := makeDoneEvent(100, "工人 A 的最终结论。", "term_peer_a")
+	peerAEvent.AgentID = strPtr("ag_peer_a")
+	peerAEvent.PaneID = strPtr("wB:p2")
+	// Peer B finished with an empty assistant text: permanently suppressed noise.
+	peerBEvent := makeDoneEvent(105, "", "term_peer_b")
+	peerBEvent.AgentID = strPtr("ag_peer_b")
+	peerBEvent.PaneID = strPtr("wB:p3")
+	pendingEvents := []any{peerAEvent, peerBEvent}
+
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		switch method {
+		case "agent.notifications.ack":
+			eventID := asEventID(params.(map[string]any)["eventId"])
+			ackedIDs = append(ackedIDs, eventID)
+			if eventID > ackedEventID {
+				ackedEventID = eventID
+			}
+			return map[string]any{"acknowledged": true}, nil
+		case "agent.list":
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-25T05:06:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("pi", peerAStatus, "2026-10-25T05:06:00.000Z", "wB:p2", "term_peer_a"),
+				agentListEntry("pi", "idle", "2026-10-25T05:06:00.000Z", "wB:p3", "term_peer_b"),
+			}}, nil
+		}
+		// Real markAcked only re-lists rows above the cursor.
+		live := []any{}
+		for _, event := range pendingEvents {
+			if event.(observability.AgentEventRecord).ID > ackedEventID {
+				live = append(live, event)
+			}
+		}
+		return orchestratorStateResponse(sessionID, live, ackedEventID), nil
+	}
+	stopOptions := func() agy.RunAgyHookOptions {
+		return agy.RunAgyHookOptions{
+			Connect:     client.connect,
+			Environment: herdrEnv,
+			SocketPath:  "/tmp/herdsman.sock",
+			SpawnWakeWaiter: func(agy.SpawnWakeWaiterInput) *agy.SpawnWakeWaiterResult {
+				return &agy.SpawnWakeWaiterResult{PID: intPtr(os.Getpid())}
+			},
+			StateDir: strPtr(dir),
+		}
+	}
+	readState := func() map[string]any {
+		return readStateObject(t, sessionStatePath(dir, sessionID))
+	}
+	// 1. Peer A is still `working`, so event 100 is deferred; event 105 is
+	//    permanently suppressed noise sitting above it.
+	firstStop := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, stopOptions())
+	if !isEmptyHookOutput(firstStop) {
+		t.Fatalf("firstStop = %+v, want {}", firstStop)
+	}
+	client.mu.Lock()
+	firstAcked := append([]int64{}, ackedIDs...)
+	client.mu.Unlock()
+	// The ack of 105 must not fire: it would settle `id <= 105` and swallow the
+	// deferred event 100 forever.
+	if len(firstAcked) != 0 {
+		t.Fatalf("ackedIDs = %v after the deferred stop, want none", firstAcked)
+	}
+	assertStateMatches(t, readState(), map[string]any{
+		"deferredEventIds":   []any{float64(100)},
+		"pendingAckEventIds": []any{float64(105)},
+		"presentedEventIds":  []any{float64(105)},
+	})
+
+	// 2. Peer A stops reporting working: event 100 becomes a real outcome. The
+	//    held-back ack of 105 must still wait, because acking it would advance
+	//    the cursor past the not-yet-delivered event 100.
+	client.mu.Lock()
+	peerAStatus = "done"
+	client.mu.Unlock()
+	secondStop := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, stopOptions())
+	if secondStop.Decision == nil || *secondStop.Decision != "continue" {
+		t.Fatalf("secondStop = %+v, want decision continue", secondStop)
+	}
+	if secondStop.Reason == nil || !strings.Contains(*secondStop.Reason, "工人 A 的最终结论。") {
+		t.Fatalf("secondStop.Reason = %v, want the peer A completion", secondStop.Reason)
+	}
+	client.mu.Lock()
+	secondAcked := append([]int64{}, ackedIDs...)
+	client.mu.Unlock()
+	if len(secondAcked) != 0 {
+		t.Fatalf("ackedIDs = %v while 100 is undelivered, want none", secondAcked)
+	}
+	assertStateMatches(t, readState(), map[string]any{
+		"deliveredEventIds":  []any{float64(100)},
+		"pendingAckEventIds": []any{float64(105)},
+	})
+
+	// 3. Once both events are presented (consumed by the host) nothing blocks
+	//    the cursor any more and both are acknowledged.
+	thirdStop := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, stopOptions())
+	if !isEmptyHookOutput(thirdStop) {
+		t.Fatalf("thirdStop = %+v, want {}", thirdStop)
+	}
+	client.mu.Lock()
+	thirdAcked := append([]int64{}, ackedIDs...)
+	client.mu.Unlock()
+	if !reflect.DeepEqual(thirdAcked, []int64{100, 105}) {
+		t.Fatalf("ackedIDs = %v, want [100 105]", thirdAcked)
+	}
+	assertStateMatches(t, readState(), map[string]any{
+		"deliveredEventIds":  []any{},
+		"pendingAckEventIds": []any{},
+	})
+}
+
+// --- wake-epoch race while readComposerDraft is in flight (adf6f09) --------
+
+// TestWakeWaiterCancelsWhenTurnEpochAdvancesDuringComposerRead mirrors the TS
+// "WakeWaiter cancels the wake when turnEpoch advances while readComposerDraft
+// is in flight": the pane read is up to 5s of I/O, and a new turn started in the
+// meantime makes every shared-state write by this waiter stale.
+func TestWakeWaiterCancelsWhenTurnEpochAdvancesDuringComposerRead(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "e1111111-2222-3333-4444-555555555555"
+	pendingEvents := []any{makeDoneEvent(300, "工人完成，测试绿。")}
+	wakePrompts := []wakePrompt{}
+
+	emptyComposer := strings.Join([]string{
+		"assistant output",
+		"───────────────────────────────────────────────────",
+		">",
+		"───────────────────────────────────────────────────",
+		"? for shortcuts",
+	}, "\n")
+
+	readGate := make(chan string, 1)
+	readCalls := int64(0)
+
+	client := workingRaceClient(t, sessionID, pendingEvents, strPtr("idle"), new(int64), nil)
+	client.respond = func(method string, params any) (any, error) {
+		if method == "agent.list" {
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-25T05:06:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("pi", "idle", "2026-10-25T05:06:00.000Z", "wB:p2", "term_peer"),
+			}}, nil
+		}
+		return orchestratorStateResponse(sessionID, pendingEvents, 0), nil
+	}
+
+	stopResult := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, agy.RunAgyHookOptions{
+		Connect:     client.connect,
+		Environment: herdrEnv,
+		SocketPath:  "/tmp/herdsman.sock",
+		SpawnWakeWaiter: func(agy.SpawnWakeWaiterInput) *agy.SpawnWakeWaiterResult {
+			return &agy.SpawnWakeWaiterResult{PID: intPtr(os.Getpid())}
+		},
+		StateDir: strPtr(dir),
+	})
+	if stopResult.Decision == nil || *stopResult.Decision != "continue" {
+		t.Fatalf("stop result = %+v, want decision continue", stopResult)
+	}
+	assertStateMatches(t, readStateObject(t, sessionStatePath(dir, sessionID)), map[string]any{
+		"deliveredEventIds": []any{float64(300)},
+		"presentedEventIds": []any{float64(300)},
+		"turnEpoch":         float64(1),
+		"waiterEpoch":       float64(1),
+		"waiterPid":         float64(os.Getpid()),
+	})
+
+	done := make(chan agy.HookOutput, 1)
+	go func() {
+		done <- agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: client.connectCapturing,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", sessionID,
+				"HERDSMAN_AGY_STATE_DIR", dir,
+				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+			PollIntervalMs: floatPtr(20),
+			ReadPaneText: func(string) (*string, error) {
+				atomic.AddInt64(&readCalls, 1)
+				// Mirrors the TS readGate: the pane read blocks until the test
+				// releases it, so the epoch bump below lands while it is in flight.
+				text := <-readGate
+				return &text, nil
+			},
+			SocketPath: "/tmp/herdsman.sock",
+			StateDir:   strPtr(dir),
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				client.mu.Lock()
+				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+				client.mu.Unlock()
+				return nil
+			},
+			WaitTimeoutMs: floatPtr(5000),
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt64(&readCalls) == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt64(&readCalls) == 0 {
+		t.Fatal("readPaneText was never called, want exactly one composer read")
+	}
+
+	// The user submits a new turn while the pane read is still in flight: the
+	// epoch this waiter was started for is gone.
+	inFlightState := readStateObject(t, sessionStatePath(dir, sessionID))
+	inFlightState["turnEpoch"] = float64(2)
+	writeStateFile(t, sessionStatePath(dir, sessionID), inFlightState)
+	readGate <- emptyComposer
+
+	if result := awaitHookOutput(t, done); !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	if len(wakePrompts) != 0 {
+		t.Fatalf("wakePrompts = %+v, want none", wakePrompts)
+	}
+	// `rearmDeliveredEvents` must not have dropped the delivered batch from
+	// `presentedEventIds`, otherwise the next PreInvocation injects it twice.
+	assertStateMatches(t, readStateObject(t, sessionStatePath(dir, sessionID)), map[string]any{
+		"deliveredEventIds": []any{float64(300)},
+		"presentedEventIds": []any{float64(300)},
+		"turnEpoch":         float64(2),
+	})
+}
+
+// --- peek must not wipe a turn's presentedEventIds (74df962) ---------------
+
+// TestPeekNextWakeBatchDoesNotWipePresentedEventIDsOfConcurrentTurn mirrors the
+// TS "peekNextWakeBatch does not wipe presentedEventIds written by a turn that
+// started during agent.list": the agent.list round trip inside the peek is
+// asynchronous, so the turn this waiter was started for can already be gone by
+// the time it writes back.
+func TestPeekNextWakeBatchDoesNotWipePresentedEventIDsOfConcurrentTurn(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "f1111111-2222-3333-4444-555555555555"
+	statePath := sessionStatePath(dir, sessionID)
+	pendingEvents := []any{makeDoneEvent(300, "工人完成，测试绿。")}
+	wakePrompts := []wakePrompt{}
+	agentListCalls := int64(0)
+	listGate := make(chan struct{})
+
+	// A waiter owns the session; the batch is not delivered/presented yet.
+	writeStateFile(t, statePath, map[string]any{
+		"turnEpoch": float64(1), "waiterEpoch": float64(1), "waiterPid": float64(os.Getpid()),
+	})
+
+	emptyComposer := strings.Join([]string{
+		"assistant output",
+		"──────────────────────────────────────────────────",
+		">",
+		"──────────────────────────────────────────────────",
+		"? for shortcuts",
+	}, "\n")
+
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		if method == "agent.list" {
+			calls := atomic.AddInt64(&agentListCalls, 1)
+			// One waiter iteration calls `agent.list` twice: inspectWorkspaceAgents
+			// and then fetchLivePeerScope inside peekNextWakeBatch. Gate the second
+			// one, i.e. freeze the peek right at its await.
+			if calls == 2 {
+				<-listGate
+			}
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-25T05:06:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("pi", "idle", "2026-10-25T05:06:00.000Z", "wB:p2", "term_peer"),
+			}}, nil
+		}
+		return orchestratorStateResponse(sessionID, pendingEvents, 0), nil
+	}
+
+	done := make(chan agy.HookOutput, 1)
+	go func() {
+		done <- agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: client.connectCapturing,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", sessionID,
+				"HERDSMAN_AGY_STATE_DIR", dir,
+				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+			PollIntervalMs: floatPtr(20),
+			ReadPaneText: func(string) (*string, error) {
+				return &emptyComposer, nil
+			},
+			SocketPath: "/tmp/herdsman.sock",
+			StateDir:   strPtr(dir),
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				client.mu.Lock()
+				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+				client.mu.Unlock()
+				return nil
+			},
+			WaitTimeoutMs: floatPtr(5000),
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadInt64(&agentListCalls) < 2 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if atomic.LoadInt64(&agentListCalls) < 2 {
+		t.Fatalf("agent.list calls = %d, want at least 2 (the peek froze)", atomic.LoadInt64(&agentListCalls))
+	}
+
+	// The user submits a turn while the peek is awaiting `agent.list`: the new
+	// PreInvocation consumes the batch and marks 300 presented on disk.
+	writeStateFile(t, statePath, map[string]any{
+		"deliveredEventIds": []any{float64(300)},
+		"presentedEventIds": []any{float64(300)},
+		"turnEpoch":         float64(2),
+	})
+	close(listGate)
+
+	if result := awaitHookOutput(t, done); !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	// The stale peek must not hand the batch to the host a second time.
+	if len(wakePrompts) != 0 {
+		t.Fatalf("wakePrompts = %+v, want none", wakePrompts)
+	}
+	// ...and its write-back must not erase the batch the new turn recorded.
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds": []any{float64(300)},
+		"presentedEventIds": []any{float64(300)},
+		"turnEpoch":         float64(2),
+	})
+}
+
+// --- unconsumed events outlive the daemon 300s redelivery window (74df962) --
+
+// TestUnconsumedEventSurvivesDaemonRedeliveryWindow mirrors the TS "an unconsumed
+// event survives the daemon 300s redelivery window: long composer draft and long
+// working-defer". `listAfter` only re-lists delivered rows whose last_attempt_at
+// is inside REDELIVERY_FRESHNESS_MS, so an event the hook has not consumed yet
+// disappears from connState.events: without the retained snapshot it can neither
+// be injected nor hold the ack cursor back.
+func TestUnconsumedEventSurvivesDaemonRedeliveryWindow(t *testing.T) {
+	selfAgent := agentListEntry("agy", "idle", "2026-10-21T11:50:00.000Z", "wB:p1", "term_self")
+	// The pane that produced the completion is still open — only its `agent.done`
+	// row left the daemon's redelivery window — so `agent.list` keeps reporting it.
+	// That is what filterEligibleRetainedEvents uses to tell "too old to be
+	// re-listed" apart from "source pane closed".
+	peerAgent := agentListEntry("pi", "done", "2026-10-21T11:50:00.000Z", "wB:p2", "term_peer")
+	emptyComposer := strings.Join([]string{
+		"assistant output",
+		"──────────────────────────────────────────────────",
+		">",
+		"──────────────────────────────────────────────────",
+		"? for shortcuts",
+	}, "\n")
+	draftComposer := strings.Join([]string{
+		"assistant output",
+		"──────────────────────────────────────────────────",
+		"> 用户正在打的草稿",
+		"──────────────────────────────────────────────────",
+		"? for shortcuts",
+	}, "\n")
+
+	// --- 1. the composer draft outlives REDELIVERY_FRESHNESS_MS --------------
+	draftDir := t.TempDir()
+	draftSessionID := "f2222222-2222-3333-4444-555555555555"
+	draftStatePath := sessionStatePath(draftDir, draftSessionID)
+	draftEvent := makeDoneEvent(9001, "工人完成。")
+	draftWakePrompts := []wakePrompt{}
+	draftWarns := []string{}
+	// `agent.orchestrator.get` hands out event 9001 once (reservePending marks it
+	// `delivered`); after 300s listAfter stops re-listing that row while the hook
+	// still has not consumed it.
+	daemonListsDraftEvent := true
+	composerHasDraft := true
+
+	writeStateFile(t, draftStatePath, map[string]any{
+		"turnEpoch": float64(1), "waiterEpoch": float64(1), "waiterPid": float64(os.Getpid()),
+	})
+
+	draftClient := &concClient{}
+	draftClient.respond = func(method string, params any) (any, error) {
+		if method == "agent.list" {
+			return map[string]any{"agents": []any{selfAgent, peerAgent}}, nil
+		}
+		events := []any{}
+		if daemonListsDraftEvent {
+			events = append(events, draftEvent)
+		}
+		return orchestratorStateResponse(draftSessionID, events, 0), nil
+	}
+	draftWarn := func(message string) {
+		draftClient.mu.Lock()
+		draftWarns = append(draftWarns, message)
+		draftClient.mu.Unlock()
+	}
+
+	draftDone := make(chan agy.HookOutput, 1)
+	go func() {
+		draftDone <- agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: draftClient.connectCapturing,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", draftSessionID,
+				"HERDSMAN_AGY_STATE_DIR", draftDir,
+				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+			PollIntervalMs: floatPtr(20),
+			ReadPaneText: func(string) (*string, error) {
+				if composerHasDraft {
+					return &draftComposer, nil
+				}
+				return &emptyComposer, nil
+			},
+			SocketPath: "/tmp/herdsman.sock",
+			StateDir:   strPtr(draftDir),
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				draftClient.mu.Lock()
+				draftWakePrompts = append(draftWakePrompts, wakePrompt{paneID, promptText})
+				draftClient.mu.Unlock()
+				return nil
+			},
+			WaitTimeoutMs: floatPtr(2000),
+			Warn:          draftWarn,
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		draftClient.mu.Lock()
+		deferred := anyWarnContains(draftWarns, "输入框有草稿，推迟叫醒")
+		draftClient.mu.Unlock()
+		if deferred || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	draftClient.mu.Lock()
+	sawDraftDefer := anyWarnContains(draftWarns, "输入框有草稿，推迟叫醒")
+	draftClient.mu.Unlock()
+	if !sawDraftDefer {
+		t.Fatalf("warns = %v, want the composer-draft deferral", draftWarns)
+	}
+
+	// The user keeps typing past the redelivery window: the daemon no longer
+	// lists the event, but the batch must stay alive in the session state.
+	draftClient.mu.Lock()
+	daemonListsDraftEvent = false
+	draftClient.mu.Unlock()
+	time.Sleep(80 * time.Millisecond)
+	draftClient.mu.Lock()
+	earlyDraftPrompts := append([]wakePrompt{}, draftWakePrompts...)
+	draftClient.mu.Unlock()
+	if len(earlyDraftPrompts) != 0 {
+		t.Fatalf("wakePrompts = %+v while the draft persists, want none", earlyDraftPrompts)
+	}
+
+	// The draft is gone: the retained batch must still wake the orchestrator.
+	draftClient.mu.Lock()
+	composerHasDraft = false
+	draftClient.mu.Unlock()
+
+	if result := awaitHookOutput(t, draftDone); !isEmptyHookOutput(result) {
+		t.Fatalf("draft waiter result = %+v, want {}", result)
+	}
+	draftClient.mu.Lock()
+	draftPrompts := append([]wakePrompt{}, draftWakePrompts...)
+	draftClient.mu.Unlock()
+	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(draftPrompts, want) {
+		t.Fatalf("wakePrompts = %+v, want %+v", draftPrompts, want)
+	}
+	// A peek never presents: the event is still unacked, unpresented and retained.
+	draftState := readStateObject(t, draftStatePath)
+	assertStateMatches(t, draftState, map[string]any{
+		"presentedEventIds": []any{},
+	})
+	retained, ok := draftState["retainedCandidateEvents"].([]any)
+	if !ok || len(retained) != 1 {
+		t.Fatalf("retainedCandidateEvents = %v, want one entry", draftState["retainedCandidateEvents"])
+	}
+	if retainedID := retained[0].(map[string]any)["id"].(float64); retainedID != 9001 {
+		t.Fatalf("retainedCandidateEvents[0].id = %v, want 9001", retainedID)
+	}
+
+	// The wake prompt starts the turn, whose PreInvocation must still inject it
+	// even though `agent.orchestrator.get` returns no events any more.
+	draftPre := agy.RunAgyHook(agy.HookPreInvocation, `{"invocationNum":2,"sessionId":"`+draftSessionID+`"}`, agy.RunAgyHookOptions{
+		Connect:      draftClient.connect,
+		Environment:  herdrEnv,
+		ReadPaneText: func(string) (*string, error) { return nil, nil },
+		SocketPath:   "/tmp/herdsman.sock",
+		StateDir:     strPtr(draftDir),
+	})
+	if len(draftPre.InjectSteps) == 0 || !strings.Contains(draftPre.InjectSteps[0].EphemeralMessage, "工人完成。") {
+		t.Fatalf("draftPre.InjectSteps = %+v, want the retained completion", draftPre.InjectSteps)
+	}
+	assertStateMatches(t, readStateObject(t, draftStatePath), map[string]any{
+		"deliveredEventIds": []any{float64(9001)},
+		"presentedEventIds": []any{float64(9001)},
+	})
+
+	// --- 2. a working-deferred low id outlives the window ---------------------
+	deferDir := t.TempDir()
+	deferSessionID := "f3333333-2222-3333-4444-555555555555"
+	deferStatePath := sessionStatePath(deferDir, deferSessionID)
+	ackedIDs := []int64{}
+	ackedEventID := int64(0)
+	peerAStatus := "working"
+
+	peerAEvent := makeDoneEvent(100, "工人 A 的最终结论。", "term_peer_a")
+	peerAEvent.AgentID = strPtr("ag_peer_a")
+	peerAEvent.PaneID = strPtr("wB:p2")
+	// Peer B finished with an empty assistant text: permanently suppressed noise.
+	peerBEvent := makeDoneEvent(105, "", "term_peer_b")
+	peerBEvent.AgentID = strPtr("ag_peer_b")
+	peerBEvent.PaneID = strPtr("wB:p3")
+	// What the daemon still re-lists: after 300s only the freshly pending row 105
+	// is there, the delivered-but-unconsumed row 100 is gone.
+	listedEvents := []any{peerAEvent}
+
+	deferClient := &concClient{}
+	deferClient.respond = func(method string, params any) (any, error) {
+		switch method {
+		case "agent.notifications.ack":
+			eventID := asEventID(params.(map[string]any)["eventId"])
+			ackedIDs = append(ackedIDs, eventID)
+			if eventID > ackedEventID {
+				ackedEventID = eventID
+			}
+			return map[string]any{"acknowledged": true}, nil
+		case "agent.list":
+			return map[string]any{"agents": []any{
+				selfAgent,
+				agentListEntry("pi", peerAStatus, "2026-10-25T05:06:00.000Z", "wB:p2", "term_peer_a"),
+				agentListEntry("pi", "idle", "2026-10-25T05:06:00.000Z", "wB:p3", "term_peer_b"),
+			}}, nil
+		}
+		live := []any{}
+		for _, event := range listedEvents {
+			if event.(observability.AgentEventRecord).ID > ackedEventID {
+				live = append(live, event)
+			}
+		}
+		return orchestratorStateResponse(deferSessionID, live, ackedEventID), nil
+	}
+	deferOptions := func() agy.RunAgyHookOptions {
+		return agy.RunAgyHookOptions{
+			Connect:     deferClient.connect,
+			Environment: herdrEnv,
+			SocketPath:  "/tmp/herdsman.sock",
+			SpawnWakeWaiter: func(agy.SpawnWakeWaiterInput) *agy.SpawnWakeWaiterResult {
+				return &agy.SpawnWakeWaiterResult{PID: intPtr(os.Getpid())}
+			},
+			StateDir: strPtr(deferDir),
+		}
+	}
+	runStop := func() agy.HookOutput {
+		return agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+deferSessionID+`","terminationReason":"NO_TOOL_CALL"}`, deferOptions())
+	}
+
+	// 1. Peer A is `working`: event 100 is deferred and gets handed to the daemon
+	//    as a delivered row by this very poll.
+	if first := runStop(); !isEmptyHookOutput(first) {
+		t.Fatalf("first stop = %+v, want {}", first)
+	}
+	assertStateMatches(t, readStateObject(t, deferStatePath), map[string]any{
+		"deferredEventIds": []any{float64(100)},
+	})
+
+	// 2. More than 300s later: the daemon dropped the delivered row 100 and now
+	//    only reports the freshly pending noise event 105.
+	deferClient.mu.Lock()
+	listedEvents = []any{peerBEvent}
+	deferClient.mu.Unlock()
+	if second := runStop(); !isEmptyHookOutput(second) {
+		t.Fatalf("second stop = %+v, want {}", second)
+	}
+	// Without the retained snapshot, 105 would be acked right here (nothing holds
+	// the cursor any more) and settle `id <= 105` over the deferred 100.
+	deferClient.mu.Lock()
+	ackedSoFar := append([]int64{}, ackedIDs...)
+	deferClient.mu.Unlock()
+	if len(ackedSoFar) != 0 {
+		t.Fatalf("ackedIDs = %v, want none", ackedSoFar)
+	}
+	assertStateMatches(t, readStateObject(t, deferStatePath), map[string]any{
+		"deferredEventIds":   []any{float64(100)},
+		"pendingAckEventIds": []any{float64(105)},
+		"presentedEventIds":  []any{float64(105)},
+	})
+
+	// 3. Peer A stops reporting working: the stale-looking event is still there
+	//    and gets injected, and 105 still may not ack past it.
+	deferClient.mu.Lock()
+	peerAStatus = "done"
+	deferClient.mu.Unlock()
+	settleStop := runStop()
+	if settleStop.Decision == nil || *settleStop.Decision != "continue" {
+		t.Fatalf("settle stop = %+v, want decision continue", settleStop)
+	}
+	if settleStop.Reason == nil || !strings.Contains(*settleStop.Reason, "工人 A 的最终结论。") {
+		t.Fatalf("settle stop reason = %v, want the peer A completion", settleStop.Reason)
+	}
+	deferClient.mu.Lock()
+	ackedSoFar = append([]int64{}, ackedIDs...)
+	deferClient.mu.Unlock()
+	if len(ackedSoFar) != 0 {
+		t.Fatalf("ackedIDs = %v, want none", ackedSoFar)
+	}
+	assertStateMatches(t, readStateObject(t, deferStatePath), map[string]any{
+		"deliveredEventIds":  []any{float64(100)},
+		"pendingAckEventIds": []any{float64(105)},
+	})
+
+	// 4. Both are consumed, so nothing blocks the cursor any more.
+	if fourth := runStop(); !isEmptyHookOutput(fourth) {
+		t.Fatalf("fourth stop = %+v, want {}", fourth)
+	}
+	deferClient.mu.Lock()
+	ackedSoFar = append([]int64{}, ackedIDs...)
+	deferClient.mu.Unlock()
+	if !reflect.DeepEqual(ackedSoFar, []int64{100, 105}) {
+		t.Fatalf("ackedIDs = %v, want [100 105]", ackedSoFar)
+	}
+	assertStateMatches(t, readStateObject(t, deferStatePath), map[string]any{
+		"deliveredEventIds":  []any{},
+		"pendingAckEventIds": []any{},
+		// Acked and presented: the snapshot entry is gone for good.
+		"retainedCandidateEvents": []any{},
+	})
+}
+
+// --- an ignored decision:continue batch survives repeated peeks (3985333) --
+
+// TestIgnoredContinueBatchSurvivesRepeatedWaiterPeeks mirrors the TS "a batch the
+// host ignored survives repeated waiter peeks past the redelivery window and is
+// still injected after the wake prompt": the Stop hook marks the batch presented
+// *and* records it in deliveredEventIds, so the snapshot has to keep it even
+// though it is no longer a candidate.
+func TestIgnoredContinueBatchSurvivesRepeatedWaiterPeeks(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "f4444444-2222-3333-4444-555555555555"
+	statePath := sessionStatePath(dir, sessionID)
+	// `Stop` hands event 9500 to the host through `decision: continue`; the host
+	// ignores it, so the WakeWaiter is the only one left to surface the batch.
+	// After 300s the daemon stops re-listing the delivered row, leaving the
+	// persisted snapshot as the only source of the record.
+	peerEvent := makeDoneEvent(9500, "被忽略的批次结论。")
+	daemonListsEvent := true
+	composerHasDraft := true
+	wakePrompts := []wakePrompt{}
+	warns := []string{}
+
+	emptyComposer := strings.Join([]string{
+		"assistant output",
+		"───────────────────────────────────────────",
+		">",
+		"───────────────────────────────────────────",
+		"? for shortcuts",
+	}, "\n")
+	draftComposer := strings.Join([]string{
+		"assistant output",
+		"───────────────────────────────────────────",
+		"> 用户正在打的草稿",
+		"───────────────────────────────────────────",
+		"? for shortcuts",
+	}, "\n")
+
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		if method == "agent.list" {
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-21T11:50:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("pi", "done", "2026-10-21T11:50:00.000Z", "wB:p2", "term_peer"),
+			}}, nil
+		}
+		events := []any{}
+		if daemonListsEvent {
+			events = append(events, peerEvent)
+		}
+		return orchestratorStateResponse(sessionID, events, 0), nil
+	}
+	collectWarn := func(message string) {
+		client.mu.Lock()
+		warns = append(warns, message)
+		client.mu.Unlock()
+	}
+
+	stopResult := agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, agy.RunAgyHookOptions{
+		Connect:     client.connect,
+		Environment: herdrEnv,
+		SocketPath:  "/tmp/herdsman.sock",
+		SpawnWakeWaiter: func(agy.SpawnWakeWaiterInput) *agy.SpawnWakeWaiterResult {
+			return &agy.SpawnWakeWaiterResult{PID: intPtr(os.Getpid())}
+		},
+		StateDir: strPtr(dir),
+	})
+	if stopResult.Decision == nil || *stopResult.Decision != "continue" {
+		t.Fatalf("stop result = %+v, want decision continue", stopResult)
+	}
+	if stopResult.Reason == nil || !strings.Contains(*stopResult.Reason, "被忽略的批次结论。") {
+		t.Fatalf("stop reason = %v, want the ignored batch text", stopResult.Reason)
+	}
+	// The batch is presented (handed to the host) *and* delivered-but-unacked,
+	// so its record is retained even though it is no longer a candidate.
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds": []any{float64(9500)},
+		"presentedEventIds": []any{float64(9500)},
+	})
+	assertRetainedIDs(t, readStateObject(t, statePath), []int64{9500})
+
+	done := make(chan agy.HookOutput, 1)
+	go func() {
+		done <- agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+			Connect: client.connectCapturing,
+			Environment: mergeEnv(herdrEnv,
+				"HERDSMAN_AGY_SESSION_ID", sessionID,
+				"HERDSMAN_AGY_STATE_DIR", dir,
+				"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+			PollIntervalMs: floatPtr(20),
+			ReadPaneText: func(string) (*string, error) {
+				if composerHasDraft {
+					return &draftComposer, nil
+				}
+				return &emptyComposer, nil
+			},
+			SocketPath: "/tmp/herdsman.sock",
+			StateDir:   strPtr(dir),
+			TriggerWakePrompt: func(paneID, promptText string) error {
+				client.mu.Lock()
+				wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+				client.mu.Unlock()
+				return nil
+			},
+			WaitTimeoutMs: floatPtr(5000),
+			Warn:          collectWarn,
+		})
+	}()
+
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		client.mu.Lock()
+		deferred := anyWarnContains(warns, "输入框有草稿，推迟叫醒")
+		client.mu.Unlock()
+		if deferred || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	client.mu.Lock()
+	sawDraftDefer := anyWarnContains(warns, "输入框有草稿，推迟叫醒")
+	client.mu.Unlock()
+	if !sawDraftDefer {
+		t.Fatalf("warns = %v, want the composer-draft deferral", warns)
+	}
+
+	// The user keeps typing past the redelivery window while the waiter peeks
+	// over the batch again and again. `candidateEvents` is empty from the first
+	// peek on (the id is presented), and that must not clear the snapshot: the
+	// pre-fix behaviour wiped it here and lost the batch for good.
+	client.mu.Lock()
+	daemonListsEvent = false
+	client.mu.Unlock()
+	time.Sleep(120 * time.Millisecond)
+	client.mu.Lock()
+	earlyPrompts := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if len(earlyPrompts) != 0 {
+		t.Fatalf("wakePrompts = %+v while the draft persists, want none", earlyPrompts)
+	}
+	assertRetainedIDs(t, readStateObject(t, statePath), []int64{9500})
+
+	// Draft gone: the waiter re-arms the delivered batch and prompts.
+	client.mu.Lock()
+	composerHasDraft = false
+	client.mu.Unlock()
+	if result := awaitHookOutput(t, done); !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	client.mu.Lock()
+	prompts := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(prompts, want) {
+		t.Fatalf("wakePrompts = %+v, want %+v", prompts, want)
+	}
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds": []any{float64(9500)},
+		"presentedEventIds": []any{},
+	})
+	assertRetainedIDs(t, readStateObject(t, statePath), []int64{9500})
+
+	// The prompt starts the turn: `PreInvocation` has to rebuild the batch from
+	// the snapshot, because `agent.orchestrator.get` no longer returns it.
+	preOut := agy.RunAgyHook(agy.HookPreInvocation, `{"invocationNum":2,"sessionId":"`+sessionID+`"}`, agy.RunAgyHookOptions{
+		Connect:      client.connect,
+		Environment:  herdrEnv,
+		ReadPaneText: func(string) (*string, error) { return nil, nil },
+		SocketPath:   "/tmp/herdsman.sock",
+		StateDir:     strPtr(dir),
+	})
+	if len(preOut.InjectSteps) == 0 || !strings.Contains(preOut.InjectSteps[0].EphemeralMessage, "被忽略的批次结论。") {
+		t.Fatalf("preOut.InjectSteps = %+v, want the retained batch", preOut.InjectSteps)
+	}
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds": []any{float64(9500)},
+		"presentedEventIds": []any{float64(9500)},
+	})
+}
+
+// assertRetainedIDs mirrors the TS
+// `expect(state.retainedCandidateEvents).toEqual(ids.map((id) => expect.objectContaining({ id })))`.
+func assertRetainedIDs(t *testing.T, state map[string]any, want []int64) {
+	t.Helper()
+	raw, ok := state["retainedCandidateEvents"]
+	if !ok {
+		if len(want) == 0 {
+			return
+		}
+		t.Fatalf("retainedCandidateEvents is missing, want %v", want)
+	}
+	entries, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("retainedCandidateEvents = %v, want a list", raw)
+	}
+	if len(entries) != len(want) {
+		t.Fatalf("retainedCandidateEvents has %d entries (%v), want %v", len(entries), raw, want)
+	}
+	for index, id := range want {
+		entry, ok := entries[index].(map[string]any)
+		if !ok {
+			t.Fatalf("retainedCandidateEvents[%d] = %v, want an object", index, entries[index])
+		}
+		if got, ok := entry["id"].(float64); !ok || int64(got) != id {
+			t.Fatalf("retainedCandidateEvents[%d].id = %v, want %d", index, entry["id"], id)
+		}
+	}
+}
+
+// --- retained-row eligibility: closed pane / taken-over sibling (3985333) --
+
+// TestRetainedRowsOfClosedPaneAndTakenOverSiblingAreDropped mirrors the TS
+// "retained rows whose source pane closed or whose sibling workspace was taken
+// over are dropped, not injected and not holding the ack cursor": a row that only
+// the snapshot knows is validated against the live agent.list before it is
+// injected or allowed to hold the acknowledgement cursor back.
+func TestRetainedRowsOfClosedPaneAndTakenOverSiblingAreDropped(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "f6666666-2222-3333-4444-555555555555"
+	statePath := sessionStatePath(dir, sessionID)
+
+	// Only in the snapshot: its pane has been closed, so the row was reclaimed
+	// and the terminal left `agent.list` for good.
+	closedPaneEvent := makeDoneEvent(400, "已关闭窗格的旧结论。", "term_gone")
+	// Only in the snapshot: the sibling workspace now has an orchestrator owner
+	// of its own, so it is no longer part of this owner's ownerless scope.
+	takenOverSiblingEvent := makeDoneEvent(410, "被接管兄弟工作区的旧结论。", "term_sibling")
+	takenOverSiblingEvent.PaneID = strPtr("wC:p9")
+	takenOverSiblingEvent.WorkspaceID = strPtr("wC")
+	// Still open, still this workspace: the peer of the delivered row 420 lives on.
+	livePeerEvent := makeDoneEvent(420, "在线工人的结论。", "term_live")
+
+	// All three rows left the daemon's redelivery window: none of them comes back
+	// through `agent.orchestrator.get`, so only the eligibility check below can
+	// tell the two dead rows apart from the live one.
+	listedEvents := []any{}
+	ackedEventID := int64(0)
+	ackedIDs := []int64{}
+	rejectAcks := false
+
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		switch method {
+		case "agent.notifications.ack":
+			eventID := asEventID(params.(map[string]any)["eventId"])
+			if rejectAcks {
+				return nil, errors.New(`{"code":"ORCHESTRATOR_EVENT_INVALIDATED","message":"event invalidated"}`)
+			}
+			ackedIDs = append(ackedIDs, eventID)
+			if eventID > ackedEventID {
+				ackedEventID = eventID
+			}
+			return map[string]any{"acknowledged": true}, nil
+		case "agent.list":
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-21T11:50:00.000Z", "wB:p1", "term_self"),
+				agentListEntry("pi", "done", "2026-10-21T11:50:00.000Z", "wB:p7", "term_live"),
+			}}, nil
+		}
+		live := []any{}
+		for _, event := range listedEvents {
+			if event.(observability.AgentEventRecord).ID > ackedEventID {
+				live = append(live, event)
+			}
+		}
+		return orchestratorStateResponse(sessionID, live, ackedEventID), nil
+	}
+	seed := func() {
+		writeStateFile(t, statePath, map[string]any{
+			"deliveredEventIds":       []any{float64(420)},
+			"pendingAckEventIds":      []any{},
+			"presentedEventIds":       []any{float64(420)},
+			"retainedCandidateEvents": []any{closedPaneEvent, takenOverSiblingEvent, livePeerEvent},
+			"turnEpoch":               float64(0),
+		})
+	}
+	runStop := func() agy.HookOutput {
+		return agy.RunAgyHook(agy.HookStop, `{"sessionId":"`+sessionID+`","terminationReason":"NO_TOOL_CALL"}`, agy.RunAgyHookOptions{
+			Connect:     client.connect,
+			Environment: herdrEnv,
+			SocketPath:  "/tmp/herdsman.sock",
+			SpawnWakeWaiter: func(agy.SpawnWakeWaiterInput) *agy.SpawnWakeWaiterResult {
+				return &agy.SpawnWakeWaiterResult{PID: intPtr(os.Getpid())}
+			},
+			StateDir: strPtr(dir),
+		})
+	}
+
+	// 1. The daemon rejects the ack (the row was invalidated), so the cursor stays
+	//    at 0 and the two dead rows keep showing up. They must be dropped by the
+	//    eligibility check instead of being injected as outcomes — the pre-fix
+	//    behaviour woke the orchestrator with a closed pane's text.
+	client.mu.Lock()
+	rejectAcks = true
+	client.mu.Unlock()
+	seed()
+	if first := runStop(); !isEmptyHookOutput(first) {
+		t.Fatalf("first stop = %+v, want {}", first)
+	}
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds":  []any{},
+		"pendingAckEventIds": []any{},
+	})
+	// Both stale records are gone; only the still-open peer's row was a candidate
+	// and it was already handed over.
+	assertRetainedIDs(t, readStateObject(t, statePath), nil)
+
+	// 2. Same snapshot, but the ack of the delivered row succeeds: a dead low id
+	//    must not hold the cursor back, so 420 is acknowledged right away (pre-fix
+	//    it stayed in pendingAckEventIds forever) and nothing stale is injected on
+	//    top of it.
+	client.mu.Lock()
+	rejectAcks = false
+	ackedIDs = []int64{}
+	ackedEventID = 0
+	client.mu.Unlock()
+	seed()
+	if second := runStop(); !isEmptyHookOutput(second) {
+		t.Fatalf("second stop = %+v, want {}", second)
+	}
+	client.mu.Lock()
+	ackedSoFar := append([]int64{}, ackedIDs...)
+	cursor := ackedEventID
+	client.mu.Unlock()
+	if !reflect.DeepEqual(ackedSoFar, []int64{420}) {
+		t.Fatalf("ackedIDs = %v, want [420]", ackedSoFar)
+	}
+	if cursor != 420 {
+		t.Fatalf("ackedEventID = %d, want 420", cursor)
+	}
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds":  []any{},
+		"pendingAckEventIds": []any{},
+	})
+	assertRetainedIDs(t, readStateObject(t, statePath), nil)
+
+	// 3. A row the daemon re-listed is kept unconditionally, even for a peer this
+	//    `agent.list` response does not report: the daemon just validated its
+	//    scope and deliverability (a `retained invalidated` row inside the grace
+	//    window is exactly this case).
+	client.mu.Lock()
+	listedEvents = []any{closedPaneEvent}
+	ackedEventID = 0
+	ackedIDs = []int64{}
+	client.mu.Unlock()
+	writeStateFile(t, statePath, map[string]any{"turnEpoch": float64(0)})
+	listedStop := runStop()
+	if listedStop.Reason == nil || !strings.Contains(*listedStop.Reason, "已关闭窗格的旧结论。") {
+		t.Fatalf("listed stop reason = %v, want the closed-pane row", listedStop.Reason)
+	}
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds": []any{float64(400)},
+		"presentedEventIds": []any{float64(400)},
+	})
+	assertRetainedIDs(t, readStateObject(t, statePath), []int64{400})
 }

@@ -14,6 +14,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+
+	"github.com/dorokuma/herdsman/go/internal/observability"
 )
 
 // SessionHookState mirrors AgySessionHookState: the per-agy-session hook state
@@ -24,10 +26,32 @@ import (
 // absent key stays absent, which is what `delete sessionState.turnEpoch` and
 // the `?? fallback` reads depend on.
 type SessionHookState struct {
-	AutoClaimAttempted *bool    `json:"autoClaimAttempted,omitempty"`
-	AwaitingNextTurn   *bool    `json:"awaitingNextTurn,omitempty"`
-	DeliveredEventIDs  *[]int64 `json:"deliveredEventIds,omitempty"`
+	AutoClaimAttempted *bool `json:"autoClaimAttempted,omitempty"`
+	AwaitingNextTurn   *bool `json:"awaitingNextTurn,omitempty"`
+	// DeferredEventIDs are completions `projectAgyOutcomes` deferred because
+	// `agent.list` still reports the peer as `working`. They stay unacked and
+	// unpresented so a later poll can project them once the live status catches
+	// up; the ids are recorded so the acknowledgement cursor can be held below
+	// them.
+	DeferredEventIDs  *[]int64 `json:"deferredEventIds,omitempty"`
+	DeliveredEventIDs *[]int64 `json:"deliveredEventIds,omitempty"`
+	// PendingAckEventIDs are events that are already presented (permanently
+	// suppressed or handed to the host) whose `agent.notifications.ack` RPC is
+	// held back because a lower-id event is still waiting to be projected.
+	// Deliberately separate from DeliveredEventIDs: rearmDeliveredEvents re-arms
+	// the latter, and an event that was already delivered must never be injected
+	// twice.
+	PendingAckEventIDs *[]int64 `json:"pendingAckEventIds,omitempty"`
 	PresentedEventIDs  *[]int64 `json:"presentedEventIds,omitempty"`
+	// RetainedCandidateEvents snapshot candidate events that are still waiting
+	// to be projected. `agent.orchestrator.get` only re-lists `delivered` rows
+	// whose `last_attempt_at` is within the redelivery freshness window (300s)
+	// and `reservePending` never refreshes it for an already delivered row, so
+	// an unacked event vanishes from ConnectionState.Events after that window
+	// while it is still unacked. The snapshot keeps it injectable and keeps it
+	// visible to the acknowledgement hold-back bound. See
+	// mergeKnownUnackedEvents and filterEligibleRetainedEvents.
+	RetainedCandidateEvents *[]observability.AgentEventRecord `json:"retainedCandidateEvents,omitempty"`
 	// The epochs are JS numbers (max 2^53, so float64 keeps every value the TS
 	// implementation can write, including a fractional one).
 	TurnEpoch   *float64 `json:"turnEpoch,omitempty"`
@@ -40,6 +64,45 @@ func (s SessionHookState) Delivered() []int64 { return derefIDs(s.DeliveredEvent
 
 // Presented mirrors `sessionState.presentedEventIds ?? []`.
 func (s SessionHookState) Presented() []int64 { return derefIDs(s.PresentedEventIDs) }
+
+// Deferred mirrors `sessionState.deferredEventIds ?? []`.
+func (s SessionHookState) Deferred() []int64 { return derefIDs(s.DeferredEventIDs) }
+
+// PendingAck mirrors `sessionState.pendingAckEventIds ?? []`.
+func (s SessionHookState) PendingAck() []int64 { return derefIDs(s.PendingAckEventIDs) }
+
+// RetainedCandidates mirrors `sessionState.retainedCandidateEvents ?? []`.
+func (s SessionHookState) RetainedCandidates() []observability.AgentEventRecord {
+	if s.RetainedCandidateEvents == nil {
+		return nil
+	}
+	return *s.RetainedCandidateEvents
+}
+
+// SetDeferred mirrors `sessionState.deferredEventIds = value`: an empty slice
+// is still written (`[]`), which is why the field is not plain `omitempty`.
+func (s *SessionHookState) SetDeferred(ids []int64) {
+	if ids == nil {
+		ids = []int64{}
+	}
+	s.DeferredEventIDs = &ids
+}
+
+// SetPendingAck mirrors `sessionState.pendingAckEventIds = value`.
+func (s *SessionHookState) SetPendingAck(ids []int64) {
+	if ids == nil {
+		ids = []int64{}
+	}
+	s.PendingAckEventIDs = &ids
+}
+
+// SetRetained mirrors `sessionState.retainedCandidateEvents = value`.
+func (s *SessionHookState) SetRetained(events []observability.AgentEventRecord) {
+	if events == nil {
+		events = []observability.AgentEventRecord{}
+	}
+	s.RetainedCandidateEvents = &events
+}
 
 // SetDelivered mirrors `sessionState.deliveredEventIds = value`: an empty slice
 // is still written (`[]`), which is why the field is not plain `omitempty`.
@@ -130,8 +193,11 @@ func readSessionState(stateDir, sessionID string) SessionHookState {
 var knownStateJSONKeys = []string{
 	"autoClaimAttempted",
 	"awaitingNextTurn",
+	"deferredEventIds",
 	"deliveredEventIds",
+	"pendingAckEventIds",
 	"presentedEventIds",
+	"retainedCandidateEvents",
 	"turnEpoch",
 	"waiterEpoch",
 	"waiterPid",

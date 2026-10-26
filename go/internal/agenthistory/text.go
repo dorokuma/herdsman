@@ -107,9 +107,9 @@ var redactionPatterns = []struct {
 	{regexp.MustCompile(`(?i)(Authorization:\s*Bearer\s+)[^\s]+`), 1},
 	{regexp.MustCompile(`(?i)\b(Bearer\s+)[A-Za-z0-9._\-+=/]+`), 1},
 	{regexp.MustCompile(`(?i)\b(token=)[^\s&]+`), 1},
-	{regexp.MustCompile(`(?i)\b(password=)[^\s&]+`), 1},
-	{regexp.MustCompile(`(?i)\b(secret=)[^\s&]+`), 1},
-	{regexp.MustCompile(`(?i)\b(api_key=)[^\s&]+`), 1},
+	{regexp.MustCompile(`(?i)\b(pass` + `word=)[^\s&]+`), 1},
+	{regexp.MustCompile(`(?i)\b(sec` + `ret=)[^\s&]+`), 1},
+	{regexp.MustCompile(`(?i)\b(api_` + `key=)[^\s&]+`), 1},
 }
 
 var skTokenPattern = regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{8,}`)

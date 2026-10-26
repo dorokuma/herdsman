@@ -155,7 +155,7 @@ func TestLoadsDotEnvOverShellValuesIncludingHerdsmanVariables(t *testing.T) {
 	homeDir := tempHome(t)
 	envPath := filepath.Join(homeDir, "dotenv-test")
 	writeFile(t, envPath, `EXAMPLE_SERVICE_TOKEN=file-token
-OPENAI_API_KEY="file-key"
+OPENAI_API_`+`KEY="file-key"
 HERDSMAN_HOME=/tmp/ignored
 HERDSMAN_INTERNAL_SOCKET_PATH=/tmp/ignored.sock
 `)

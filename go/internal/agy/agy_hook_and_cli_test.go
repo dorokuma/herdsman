@@ -86,7 +86,10 @@ func mergeEnv(base map[string]string, keyValues ...string) map[string]string {
 
 // makeDoneEvent mirrors the TS makeDoneEvent helper: an `agent.done` record for
 // a peer terminal whose last assistant message is `text`.
-func makeDoneEvent(id int64, text string) observability.AgentEventRecord {
+// makeDoneEvent builds a done event of the default peer terminal. The
+// variadic terminalID override mirrors the TS third parameter and keeps the
+// existing two-argument calls unchanged.
+func makeDoneEvent(id int64, text string, terminalIDOverride ...string) observability.AgentEventRecord {
 	terminalID := "term_peer"
 	paneID := "wB:p2"
 	paneGeneration := "gen-1"
@@ -95,6 +98,11 @@ func makeDoneEvent(id int64, text string) observability.AgentEventRecord {
 	attempts := 0
 	status := observability.AgentEventStatusPending
 	path := "/tmp/pi-session.jsonl"
+	if len(terminalIDOverride) > 0 {
+		terminalID = terminalIDOverride[0]
+		paneID = "wB:p3"
+		agentID = "ag_" + terminalID
+	}
 	return observability.AgentEventRecord{
 		AgentID: &agentID,
 		CompactHistory: &observability.CompactAgentHistory{
@@ -784,14 +792,16 @@ func TestRunAgyHookReadsTheProcessEnvironmentWhenEnvironmentIsOmitted(t *testing
 // only runs while it equals the state's turnEpoch, so a dropped value silently
 // stopped the standby loop instead of letting it deliver the wake batch.
 //
-// The state carries turnEpoch 5 with a stale waiterEpoch 7: only a parsed
-// environment epoch of 5 keeps the loop alive long enough to prompt.
+// The state carries turnEpoch 5 with waiterEpoch 5: only a parsed
+// environment epoch of 5 keeps the loop alive long enough to prompt. Both
+// epochs agree, because the post-draft re-check of the 5b batch compares
+// waiterEpoch against the resolved waiter epoch too.
 func TestWakeWaiterEpochAcceptsRadixPrefixes(t *testing.T) {
 	for _, raw := range []string{"0x5", "0X5", "0b101", "0o5"} {
 		dir := t.TempDir()
 		sessionID := "66666666-2222-3333-4444-555555555555"
 		writeStateFile(t, sessionStatePath(dir, sessionID), map[string]any{
-			"turnEpoch": float64(5), "waiterEpoch": float64(7), "waiterPid": float64(os.Getpid()),
+			"turnEpoch": float64(5), "waiterEpoch": float64(5), "waiterPid": float64(os.Getpid()),
 		})
 
 		peerStatus := "done"
