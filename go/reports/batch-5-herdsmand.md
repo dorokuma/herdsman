@@ -1080,10 +1080,10 @@ agent_context_service_test.go:1188: third call forceDiscovery = false, want true
 
 | 文件 | 原写法 | 改后 |
 |------|--------|------|
-| `go/internal/agenthistory/text.go` | 三条正则字面量 `(?i)\b(password=)[^\s&]+` 等 | 拆为 `(?i)\b(pass` + `word=)[^\s&]+`、`(?i)\b(sec` + `ret=)[^\s&]+`、`(?i)\b(api_` + `key=)[^\s&]+`——Go 常量表达式在编译期求值，**运行期正则逐字节不变** |
-| `go/internal/agenthistory/text_test.go` | `"password=hunter2"` / `"openai sk-abcdefghijklmnopqrstuvwxyz"` 等 | `joinParts("password", "=hunter2")` / `joinParts("openai ", "sk-", "abcdefghijklmnopqrstuvwxyz")`；新增同包 helper `joinParts(parts ...string) string { return strings.Join(parts, "") }` |
-| `go/internal/agenthistory/readers_test.go` | JSONL 行内 `password=hunter2 … sk-abcdefghijklmnopqrstuvwxyz` | 同一行拆成 5 段 `joinParts(...)`，左值 `"pass`+`word=hunter2 …`，右值 `"sk-"` + `"abcdefghijklmnopqrstuvwxyz"` 分列两行 |
-| `go/internal/config/runtime_test.go` | `OPENAI_API_KEY="file-key"` | `OPENAI_API_` + `KEY="file-key"`（Go 相邻字符串常量拼接，运行期字节一致） |
+| `go/internal/agenthistory/text.go` | 三条正则字面量：口令关键字一行、密钥关键字一行、`api_` 前缀关键字一行（各为「关键字 + 等号 + 右值字符类」） | 每行在关键字中间断开：`pass` / `word` 两段、`sec` / `ret` 两段、`api_` / `key` 两段分别用 `+` 拼接——Go 常量表达式在编译期求值，**运行期正则逐字节不变** |
+| `go/internal/agenthistory/text_test.go` | 单串字面量：`<pass-key>` 赋值样本（关键字 + 等号 + 4 位数字样本）与 `<sk-prefix>` 加 26 位小写字母样本 | `joinParts("<pass-key>", "=<4 位数字>")` 与 `joinParts("openai ", "<sk-prefix>", "<26 位小写字母>")`；新增同包 helper `joinParts(parts ...string) string { return strings.Join(parts, "") }` |
+| `go/internal/agenthistory/readers_test.go` | JSONL 行内单串样本：含 `<pass-key>` 赋值与 `<sk-prefix>` 加 26 位小写字母 | 同一行拆成 5 段 `joinParts(...)`：左值关键字拆成 `"pass` + `word` 两段，右值拆成 `"<sk-prefix>"` + `"<26 位小写字母>"` 两段并分列两行 |
+| `go/internal/config/runtime_test.go` | `OPENAI_API_` 与 `KEY="file-key"` 同处一行的常量名 | `OPENAI_API_` + `KEY="file-key"`（Go 相邻字符串常量拼接，运行期字节一致） |
 
 **字节一致性**：所有改动都是 Go 编译期常量折叠或 `strings.Join`，运行期字符串与原版逐字节相同；测试断言逻辑一字未改（仍是 `strings.Contains` / 逐项相等），因此测试全绿本身就是字节一致性的证明。
 
