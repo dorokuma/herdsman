@@ -1544,3 +1544,52 @@ $ HERDSMAN_IMPL=go HERDSMAN_HOME=/root/.herdsman-go-trial /root/.local/bin/herds
 6. **agy-hook 第三个用例的 register 会被隔离守护进程拒绝**：任务书给的 `HERDR_SOCKET_PATH=/tmp/herdr-default.sock` 在库里不是「running 的已注册会话」，隔离守护进程的 `agent.orchestrator.register` 因此返回 `Herdr socket is not registered as a running session`，hook 把错误吞掉后输出 `{}`、退出码 0（可观测结果与任务书一致）。**真正跑通完整 register** 的是 status 冒烟里的 orchestrator `status --json`（用当前窗格身份，返回了完整 presence）。三种 agy-hook 调用的可观测输出都是 `{}` + 退出码 0，与任务书一致。
 7. **`go/scripts/herdsman-go-trial` 装到 `/root/.local/lib/herdsman-go/`**：这是任务书要求的「同时安装一份」，该文件是仓库脚本的副本（sha256 相同），不属于仓库产物。
 
+#### 6.12.9 提交与门禁
+
+代码与脚本改动随提交 `7e1a6cc`（`feat(go): add impl switch and isolated trial daemon scripts`）入库；本节 6.12.9 的说明随紧随其后的 docs-only 提交入库。
+
+**`main...HEAD` 全量的 commit-msg 规则扫描**（对全部 1005 行新增行，含本报告文件）：
+
+```
+$ git diff main...HEAD --stat
+ go/internal/cli/cli_test.go     | 202 ++++++++++++++++++++++
+ go/reports/batch-5-herdsmand.md | 391 +++++++++++++++++++++++++++++++++++++++
+ go/scripts/herdsman             |  16 +-
+ go/scripts/herdsman-go-trial    | 400 ++++++++++++++++++++++++++++++++++++++++
+ 4 files changed, 1005 insertions(+), 4 deletions(-)
+
+$ git diff main...HEAD --name-only | grep -v '^go/' | wc -l
+0
+（全部改动位于 go/ 下）
+
+$ <hook 的 added_lines_only> > /tmp/added-lines.txt ; wc -l /tmp/added-lines.txt
+1005 /tmp/added-lines.txt
+
+$ <hook 的 secret 模式检查> /tmp/added-lines.txt
+退出码 0；命中文件为空
+
+$ <hook 的 credential 赋值检查> /tmp/added-lines.txt
+退出码 0；命中文件为空
+
+$ printf 'feat(go): add impl switch and isolated trial daemon scripts\n' > /tmp/cm.txt
+$ /root/.git-hooks/commit-msg /tmp/cm.txt
+（退出码 0）
+```
+
+扫描脚本为从 `/root/.git-hooks/commit-msg` 抽取函数到 `/tmp` 的副本，hook 原件未被修改。
+
+**关于 husky 钩子**：本 worktree 的 `core.hooksPath` 指向 `.husky/_`，而该目录只在主仓（`pnpm install` 带脚本装 husky 时）生成，worktree 内不存在，故 git 在本 worktree 找不到可执行的钩子（与第 5 批子批的同一状况）。因此提交规范由**全局 commit-msg hook** 校验：上面对提交信息与全部新增行各跑了一次，均退出码 0。提交**没有**使用 `--no-verify`（`git commit` 未带任何绕过参数）。
+
+**提交后按最新 commit 重编译二进制**（`go/` 的编译输入未变：本次提交只动了脚本、测试与报告）：
+
+```
+$ cd /root/workspace/.wt/herdsman/chore-go-trial-switch/go
+$ CGO_ENABLED=0 go build -buildvcs=false -o /root/.local/lib/herdsman-go/herdsman ./cmd/herdsman
+$ CGO_ENABLED=0 go build -buildvcs=false -o /root/.local/lib/herdsman-go/herdsman-daemon ./cmd/herdsman-daemon
+$ sha256sum /root/.local/lib/herdsman-go/herdsman /root/.local/lib/herdsman-go/herdsman-daemon
+c1e23a992d8aaa37928478c03df51d6e56d6940ebbc2e3a82c447852c221e726  /root/.local/lib/herdsman-go/herdsman
+903a8ce0783ef2f275efc830ac39e0ce6f32706cb3dc2f9dea15159dfe17bca2  /root/.local/lib/herdsman-go/herdsman-daemon
+```
+
+与 6.12.2 记录的值逐字节一致，故 6.12.2 的 sha256 对提交 `7e1a6cc` 同样成立。
+
