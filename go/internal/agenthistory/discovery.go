@@ -539,6 +539,20 @@ func HistorySourceFromSessionRef(ref observability.AgentSessionRef) HistorySourc
 	return SourceUnknown
 }
 
+// homeSessionRoots mirrors homeSessionRoots: the home-relative session roots
+// the registration whitelist accepts next to the fixed AllowedSessionRoots.
+//
+//   - .pi/agent/sessions — pi keeps its sessions under its own agent home.
+//   - .pig/agent/sessions — pig (PiG) keeps its sessions under its own agent
+//     home; the same herdsman-pi extension runs inside pig, so the session
+//     path a pig pane registers lives in pig's home, not in pi's.
+func homeSessionRoots(home string) []string {
+	return []string{
+		filepath.Join(home, ".pi/agent/sessions"),
+		filepath.Join(home, ".pig/agent/sessions"),
+	}
+}
+
 // SafeAllowedSessionPath mirrors safeAllowedSessionPath: the root whitelist used
 // by the herdsman-pi registration protocol, on top of the file-safety gate.
 func SafeAllowedSessionPath(value string, homeDir *string) string {
@@ -554,7 +568,7 @@ func SafeAllowedSessionPath(value string, homeDir *string) string {
 	} else {
 		home = "/root"
 	}
-	roots := append([]string{filepath.Join(home, ".pi/agent/sessions")}, AllowedSessionRoots...)
+	roots := append(homeSessionRoots(home), AllowedSessionRoots...)
 	for _, root := range roots {
 		rest := relativePath(root, real)
 		if rest == "" || rest == "." || (!strings.HasPrefix(rest, "..") && !filepath.IsAbs(rest)) {
@@ -650,7 +664,7 @@ func SessionPathAllowedByShape(value string, homeDir *string) bool {
 	} else {
 		home = "/root"
 	}
-	roots := append([]string{filepath.Join(home, ".pi/agent/sessions")}, AllowedSessionRoots...)
+	roots := append(homeSessionRoots(home), AllowedSessionRoots...)
 	for _, root := range roots {
 		rest := relativePath(root, resolved)
 		if rest != "" && rest != "." && !strings.HasPrefix(rest, "..") && !filepath.IsAbs(rest) {
