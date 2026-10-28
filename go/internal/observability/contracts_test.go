@@ -66,6 +66,14 @@ func TestAgentOrchestratorRegisterInputSchemaValidatesConnectionBoundRPC(t *test
 		want bool
 	}{
 		{"valid pi registration", valid, true},
+		{"valid pig registration", `{
+			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
+			"sessionRef":{"agent":"pig","kind":"path","source":"herdr:pig","value":"/root/.pig/agent/sessions/ses-1.jsonl"},
+			"subscriberId":"pig-session","subscriberKind":"pig","workspaceId":"wB"}`, true},
+		{"pig sessionRef with kind=id", `{
+			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
+			"sessionRef":{"agent":"pig","kind":"id","source":"herdr:pig","value":"ses-1"},
+			"subscriberId":"pig-session","subscriberKind":"pig","workspaceId":"wB"}`, false},
 		{"pi sessionRef with kind=id", `{
 			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
 			"sessionRef":{"agent":"pi","kind":"id","source":"herdr:pi","value":"/tmp/pi-session.jsonl"},

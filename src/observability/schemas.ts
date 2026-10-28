@@ -55,7 +55,10 @@ export const agentEventsInputSchema = Type.Object(
 const piPresenceSessionRefSchema = Type.Union([
   Type.Object(
     {
-      agent: Type.Literal("pi"),
+      // pi and pig emit the same pi-jsonl session format and herdsman
+      // protocol and register the same `kind: "path"` sessionRef; pig reports
+      // `agent: "pig"` / `herdr:pig`.
+      agent: Type.Union([Type.Literal("pi"), Type.Literal("pig")]),
       kind: Type.Literal("path"),
       source: Type.String({ minLength: 1 }),
       value: Type.String({ minLength: 1 }),
@@ -77,9 +80,15 @@ export const agentOrchestratorRegisterInputSchema = Type.Object(
   {
     herdrSocketPath: Type.String({ minLength: 1 }),
     paneId: Type.String({ minLength: 1 }),
+    // `sessionRef.agent` (the session's own identity, "pi" | "pig") and
+    // `subscriberKind` (the terminal's subscription kind, "pi" | "pig" |
+    // "agy") are validated independently on purpose: there is no cross-field
+    // equality constraint, so a mixed deployment (e.g. a Go extension that
+    // reports `agent: "pig"` while subscribing as `subscriberKind: "pi"`)
+    // still registers.
     sessionRef: piPresenceSessionRefSchema,
     subscriberId: Type.String({ minLength: 1 }),
-    subscriberKind: Type.Union([Type.Literal("pi"), Type.Literal("agy")]),
+    subscriberKind: Type.Union([Type.Literal("pi"), Type.Literal("pig"), Type.Literal("agy")]),
     workspaceId: Type.String({ minLength: 1 }),
   },
   { additionalProperties: false },

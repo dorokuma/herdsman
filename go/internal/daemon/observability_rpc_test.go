@@ -1176,6 +1176,121 @@ func assertObsNoNotificationsOfMethod(t *testing.T, who string, client *obsRPCCl
 	}
 }
 
+// TestObservabilityRpcTreatsPigTerminalLikePi mirrors the TS case "treats a
+// pig terminal like a pi terminal": a pig presence registers, owns its
+// workspace, and receives its events exactly like a pi terminal.
+func TestObservabilityRpcTreatsPigTerminalLikePi(t *testing.T) {
+	registry := observability.NewTurnCompletionRegistry(observability.WithTurnSettimeout(1_000))
+	fixture := obsOpenRPCServerWithoutClient(t, obsRPCServerOptions{turnCompletions: registry})
+	fixture.harness.upsertRunningSession(t)
+	fixture.harness.replaceAgents(t, []db.HerdrAgentLike{
+		{"agent": "pig", "pane_id": "wB:p-pig", "terminal_id": "term_pig", "workspace_id": obsWorkspaceB},
+		// The event that lands on the pig owner has to come from a different
+		// terminal: a terminal never receives its own events.
+		{"agent": "pi", "pane_id": "wB:p-b", "terminal_id": "term_b", "workspace_id": obsWorkspaceB},
+		// A second pig terminal indexes a dispatched pig worker so the event
+		// below is appended under a live `agent: "pig"` row: `publishAgentEvent`
+		// resolves the kind through the agents table, not the session hint, so
+		// the index record must carry the pig kind itself.
+		{"agent": "pig", "pane_id": "wB:p-pig-worker", "terminal_id": "term_pig_worker", "workspace_id": obsWorkspaceB},
+	})
+	pig := obsDial(t, fixture.socketPath)
+	registered := obsRequest(t, pig, "agent.orchestrator.register", map[string]any{
+		"herdrSocketPath": obsHerdrSocketPath,
+		"paneId":          "wB:p-pig",
+		"sessionRef": map[string]any{
+			"agent":  "pig",
+			"kind":   "path",
+			"source": "herdr:pig",
+			"value":  "/root/.pig/agent/sessions/ses-1.jsonl",
+		},
+		"subscriberId":   "pig-session",
+		"subscriberKind": "pig",
+		"workspaceId":    obsWorkspaceB,
+	})
+	assertObsSubset(t, obsAt(t, registered, "presence"), map[string]any{"terminalId": "term_pig"})
+	claimed := obsRequest(t, pig, "agent.orchestrator.set", map[string]any{"enabled": true})
+	assertObsSubset(t, claimed, map[string]any{"changed": true})
+	assertObsSubset(t, obsAt(t, claimed, "state", "owner"), map[string]any{"terminalId": "term_pig"})
+
+	event := obsAppendRoutedEvent(t, fixture.harness, "term_b", obsWorkspaceB)
+	fixture.server.PublishAgentEvent(event)
+	notification := obsWaitNotification(t, pig, "agent.event")
+	assertObsSubset(t, obsAt(t, notification, "params", "event"), map[string]any{"id": float64(event.ID)})
+
+	// The reverse direction: a dispatched pig pane acting as the event
+	// producer / completion signaller. Its agent.done passes the
+	// isDeliverableAgentEvent gate and is delivered to the workspace owner,
+	// and its agent.turn.completed is recorded like a pi signal.
+	producer := obsDial(t, fixture.socketPath)
+	registeredProducer := obsRequest(t, producer, "agent.orchestrator.register", map[string]any{
+		"herdrSocketPath": obsHerdrSocketPath,
+		"paneId":          "wB:p-b",
+		"sessionRef": map[string]any{
+			"agent":  "pig",
+			"kind":   "path",
+			"source": "herdr:pig",
+			"value":  "/root/.pig/agent/sessions/ses-producer.jsonl",
+		},
+		"subscriberId":   "pig-producer",
+		"subscriberKind": "pig",
+		"workspaceId":    obsWorkspaceB,
+	})
+	assertObsSubset(t, obsAt(t, registeredProducer, "presence"), map[string]any{"terminalId": "term_b"})
+	pigEvent := obsAppendRoutedEvent(t, fixture.harness, "term_b", obsWorkspaceB)
+	fixture.server.PublishAgentEvent(pigEvent)
+	pigNotification := obsWaitNotification(t, pig, "agent.event")
+	assertObsSubset(t, obsAt(t, pigNotification, "params", "event"), map[string]any{"id": float64(pigEvent.ID)})
+	assertObsExact(t, "agent.turn.completed", obsRequest(t, producer, "agent.turn.completed", map[string]any{
+		"confirmed":        true,
+		"herdrSessionName": obsSessionName,
+		"paneId":           "wB:p-b",
+		"terminalId":       "term_b",
+		"workspaceId":      obsWorkspaceB,
+	}), map[string]any{"accepted": true})
+	recorded := registry.WaitForSignal(observability.WaitForSignalInput{
+		HerdrSessionName: obsSessionName,
+		RecordedAfterMs:  0,
+		TerminalID:       "term_b",
+	})
+	if !recorded.Received || !recorded.Confirmed {
+		t.Fatalf("term_b waiter: expected {confirmed:true, received:true}, got %+v", recorded)
+	}
+
+	// A dispatched pig worker's agent.done passes the same delivery gate and
+	// reaches the workspace owner carrying its own `agent: "pig"` kind, not a
+	// borrowed pi identity.
+	pigWorker, err := fixture.harness.agents.FindByTerminal(db.FindAgentByTerminalInput{
+		HerdrSessionName: obsSessionName,
+		TerminalID:       "term_pig_worker",
+	})
+	if err != nil || pigWorker == nil {
+		t.Fatalf("findByTerminal(term_pig_worker): agent=%+v err=%v", pigWorker, err)
+	}
+	pigWorkerEvent, err := fixture.harness.agentEvents.Append(db.AppendAgentEventInput{
+		AgentID:          &pigWorker.ID,
+		HerdrSessionName: obsSessionName,
+		PaneID:           &pigWorker.PaneID,
+		Payload:          map[string]any{"agent": "pig"},
+		TerminalID:       obsString("term_pig_worker"),
+		Type:             observability.AgentEventDone,
+		WorkspaceID:      obsString(obsWorkspaceB),
+	})
+	if err != nil {
+		t.Fatalf("append pig worker event: %v", err)
+	}
+	fixture.server.PublishAgentEvent(pigWorkerEvent)
+	pigWorkerNotification := obsWaitNotification(t, pig, "agent.event")
+	assertObsSubset(t, obsAt(t, pigWorkerNotification, "params", "event", "payload"), map[string]any{
+		"agent": "pig",
+	})
+	assertObsSubset(t, obsAt(t, pigWorkerNotification, "params", "event"), map[string]any{
+		"id": float64(pigWorkerEvent.ID),
+	})
+	producer.close()
+	pig.close()
+}
+
 // TestObservabilityRpcRoutesEventsToNewestOwner is the TS case "routes events to
 // the newest owner socket and role changes to the exact scope".
 func TestObservabilityRpcRoutesEventsToNewestOwner(t *testing.T) {

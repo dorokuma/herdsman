@@ -93,6 +93,7 @@ export function isDeliverableAgentEvent(
     const agentKind = typeof payload.agent === "string" ? payload.agent : "pi";
     if (
       agentKind !== "pi" &&
+      agentKind !== "pig" &&
       (event.type === "agent.idle" || event.type === "agent.done") &&
       !hasNonEmptyAssistantMessage(event.compactHistory)
     ) {
@@ -107,6 +108,7 @@ export function isDeliverableAgentEvent(
     !(isInteractivePiAgent(agent) && event.type === "agent.idle") &&
     !(
       agent.agent !== "pi" &&
+      agent.agent !== "pig" &&
       (event.type === "agent.idle" || event.type === "agent.done") &&
       !hasNonEmptyAssistantMessage(event.compactHistory)
     ) &&

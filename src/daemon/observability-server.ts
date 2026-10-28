@@ -64,7 +64,7 @@ export type PiPresence = AgentScope & {
   connectedAt: number;
   paneId: string;
   subscriberId: string;
-  subscriberKind?: "pi" | "agy";
+  subscriberKind?: "pi" | "pig" | "agy";
   terminalId: string;
 };
 
@@ -901,11 +901,14 @@ export class ObservabilityRpcServer {
         herdrSessionName: presence.herdrSessionName,
         paneId: presence.paneId,
       });
-    if (indexed?.agent === "pi") return true;
+    // Exact lowercase comparison, matching the Go mirror
+    // (go/internal/daemon/observability_server.go) and the schema literals.
+    if (indexed?.agent === "pi" || indexed?.agent === "pig") return true;
     const sockets = this.#socketsByTerminal.get(terminalPresenceKey(presence));
     if (!sockets) return false;
     for (const socket of sockets) {
-      if (this.#piPresenceBySocket.get(socket)?.subscriberKind === "pi") return true;
+      const subscriberKind = this.#piPresenceBySocket.get(socket)?.subscriberKind;
+      if (subscriberKind === "pi" || subscriberKind === "pig") return true;
     }
     return false;
   }

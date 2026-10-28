@@ -2663,7 +2663,7 @@ export class AgentIndexService {
         this.#turnCompletions !== undefined &&
         (input.to === "done" || input.to === "blocked") &&
         input.agent.terminalId !== null &&
-        input.agent.agent === "pi"
+        isPiFamily(input.agent.agent)
       ) {
         const isRetry = (input.attempts ?? 0) > 0;
         const latestTerminal = this.#stores.agentEvents.latestTerminalEvent(
@@ -3103,7 +3103,7 @@ export class AgentIndexService {
             },
           );
         }
-      } else if (input.agent.agent !== "pi" && (input.to === "idle" || input.to === "done")) {
+      } else if (!isPiFamily(input.agent.agent) && (input.to === "idle" || input.to === "done")) {
         // Note: blocked is an interactive intermediate state, exempt from ready gate and empty delivery gate.
         const isAgyHistory = (compact: CompactAgentHistory | undefined): boolean =>
           compact?.source === "antigravity-sqlite" || input.agent.agent === "agy";
@@ -3759,6 +3759,14 @@ function matchingPrior(
   return (
     (generationMatches ? terminalMatch : undefined) ?? (canUsePaneFallback ? paneMatch : undefined)
   );
+}
+
+// pi and pig emit the same pi-jsonl session format and herdsman protocol,
+// and report the same turn-completion signal, so every pi-specific
+// status-event rule treats them as one family.
+function isPiFamily(agent: string | null | undefined): boolean {
+  const normalized = agent?.trim();
+  return normalized === "pi" || normalized === "pig";
 }
 
 function sameIdentity(left: AgentIndexRecord, right: AgentIndexRecord): boolean {

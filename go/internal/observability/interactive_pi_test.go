@@ -20,6 +20,20 @@ func piAgent(sessionValue *string) *AgentIndexRecord {
 	return record
 }
 
+func pigAgent(sessionValue *string) *AgentIndexRecord {
+	agent := "pig"
+	record := &AgentIndexRecord{Agent: &agent}
+	if sessionValue != nil {
+		record.AgentSession = &AgentSessionRef{
+			Agent:  "pig",
+			Kind:   SessionRefPath,
+			Source: "herdr:pig",
+			Value:  *sessionValue,
+		}
+	}
+	return record
+}
+
 func strPtr(s string) *string { return &s }
 
 func TestRejectsSessionPathContainingParentRef(t *testing.T) {
@@ -66,5 +80,29 @@ func TestDoesNotIsolatePiAgentsWithoutSessionPath(t *testing.T) {
 	other := "claude"
 	if IsInteractivePiAgent(&AgentIndexRecord{Agent: &other, AgentSession: &AgentSessionRef{Value: "/tmp/x.jsonl"}}) {
 		t.Fatal("a non-pi agent must be non-interactive")
+	}
+}
+
+func TestClassifiesPigAgentLikePi(t *testing.T) {
+	dir := t.TempDir()
+	file := filepath.Join(dir, "x.jsonl")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatalf("write session file: %v", err)
+	}
+	if !IsInteractivePiAgent(pigAgent(strPtr(file))) {
+		t.Fatalf("a real pig session %q must be interactive", file)
+	}
+	dispatched := "/tmp/herdr-role-sessions/role-x/session.jsonl"
+	if IsInteractivePiAgent(pigAgent(strPtr(dispatched))) {
+		t.Fatalf("%q must be classified as a dispatched role session", dispatched)
+	}
+	if IsInteractivePiAgent(pigAgent(nil)) {
+		t.Fatal("a pig agent without agentSession must be non-interactive")
+	}
+	// Agent kinds are exact lowercase literals: a differently-cased label is
+	// not the pi family.
+	upper := "PIG"
+	if IsInteractivePiAgent(&AgentIndexRecord{Agent: &upper, AgentSession: &AgentSessionRef{Value: file}}) {
+		t.Fatal("a differently-cased agent kind must be non-interactive")
 	}
 }

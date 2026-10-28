@@ -506,10 +506,12 @@ var nonSegmentSeparator = func(r rune) bool {
 }
 
 // HistorySourceFromSessionRef mirrors historySourceFromSessionRef: maps an
-// official `agent_session` to the reader that can read it. Only the two
-// supported agents have a reader; everything else is `unknown`, which every
-// reader rejects. `source` looks like `herdr:<agent>`, so segments are matched
-// whole — `herdr:copilot` contains "pi" and must never be read as a pi session.
+// official `agent_session` to the reader that can read it. `pi` and `pig`
+// (PiG, which emits the same pi-jsonl session format and herdsman protocol)
+// share the `pi-jsonl` reader; `agy` is the other supported agent. Everything else is
+// `unknown`, which every reader rejects. `source` looks like `herdr:<agent>`,
+// so segments are matched whole — `herdr:copilot` contains "pi" and must
+// never be read as a pi session.
 func HistorySourceFromSessionRef(ref observability.AgentSessionRef) HistorySource {
 	segments := []string{}
 	if agent := strings.ToLower(ref.Agent); agent != "" {
@@ -533,7 +535,7 @@ func HistorySourceFromSessionRef(ref observability.AgentSessionRef) HistorySourc
 	if has("agy", "antigravity", "antigravity_cli", "antigravity-cli") {
 		return SourceAntigravitySQLite
 	}
-	if has("pi") {
+	if has("pi", "pig") {
 		return SourcePiJSONL
 	}
 	return SourceUnknown
@@ -544,8 +546,8 @@ func HistorySourceFromSessionRef(ref observability.AgentSessionRef) HistorySourc
 //
 //   - .pi/agent/sessions — pi keeps its sessions under its own agent home.
 //   - .pig/agent/sessions — pig (PiG) keeps its sessions under its own agent
-//     home; the same herdsman-pi extension runs inside pig, so the session
-//     path a pig pane registers lives in pig's home, not in pi's.
+//     home; pig emits the same pi-jsonl session format and herdsman protocol,
+//     so the session path a pig pane registers lives in pig's home, not pi's.
 func homeSessionRoots(home string) []string {
 	return []string{
 		filepath.Join(home, ".pi/agent/sessions"),

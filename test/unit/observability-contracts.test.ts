@@ -50,6 +50,32 @@ describe("agent observability contracts", () => {
       workspaceId: "wB",
     };
     expect(Value.Check(agentOrchestratorRegisterInputSchema, validPiRegistration)).toBe(true);
+    // pig (PiG) emits the same pi-jsonl session format and herdsman protocol and registers the same `kind: "path"`
+    // sessionRef under its own agent kind.
+    expect(
+      Value.Check(agentOrchestratorRegisterInputSchema, {
+        ...validPiRegistration,
+        sessionRef: {
+          agent: "pig",
+          kind: "path",
+          source: "herdr:pig",
+          value: "/root/.pig/agent/sessions/ses-1.jsonl",
+        },
+        subscriberKind: "pig",
+      }),
+    ).toBe(true);
+    // A pig registration still has to carry a path ref, never an id.
+    expect(
+      Value.Check(agentOrchestratorRegisterInputSchema, {
+        ...validPiRegistration,
+        sessionRef: {
+          agent: "pig",
+          kind: "id",
+          source: "herdr:pig",
+          value: "ses-1",
+        },
+      }),
+    ).toBe(false);
     expect(
       Value.Check(agentOrchestratorRegisterInputSchema, {
         ...validPiRegistration,

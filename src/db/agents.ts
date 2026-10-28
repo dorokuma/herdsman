@@ -119,7 +119,11 @@ export class AgentStore {
         const terminalTitle = stringValue(snapshot.agent.terminal_title);
         if (terminalTitle) this.#terminalTitleById.set(id, terminalTitle);
         else this.#terminalTitleById.delete(id);
-        const sessionHint = current?.agent === agent ? current.agent_session_hint_json : null;
+        const sessionHint =
+          current &&
+          (current.agent === agent || (isPiFamilyAgent(current.agent) && isPiFamilyAgent(agent)))
+            ? current.agent_session_hint_json
+            : null;
         // `grok_home` is a legacy column kept so the schema does not need a
         // migration; no reader and no discovery path reads it any more (grok is
         // not a supported history agent), so it is written as a constant null.
@@ -358,7 +362,12 @@ export class AgentStore {
   }): AgentIndexRecord | undefined {
     const current = this.findByTerminal(input);
     if (!current) return undefined;
-    const compatible = current.agent?.toLowerCase() === input.agentSession.agent.toLowerCase();
+    const compatible =
+      current.agent?.toLowerCase() === input.agentSession.agent.toLowerCase() ||
+      // pi and pig emit the same pi-jsonl session format and herdsman
+      // protocol, so a hint registered by one stays valid when the terminal
+      // is later indexed as the other.
+      (isPiFamilyAgent(current.agent) && isPiFamilyAgent(input.agentSession.agent));
     this.#sqlite
       .prepare(
         `update agents
@@ -499,11 +508,22 @@ export class AgentStore {
   }
 }
 
+// pi and pig emit the same pi-jsonl session format and herdsman protocol,
+// so a session hint written by one stays compatible when the same terminal is
+// later indexed as the other.
+function isPiFamilyAgent(agent: string | null | undefined): boolean {
+  const kind = agent?.toLowerCase();
+  return kind === "pi" || kind === "pig";
+}
+
 function mapAgent(row: AgentRow): AgentIndexRecord {
   const reportedSession = parseAgentSession(row.agent_session_json);
   const hintedSession = parseAgentSession(row.agent_session_hint_json);
   const compatibleHint =
-    row.agent?.toLowerCase() === hintedSession?.agent.toLowerCase() ? hintedSession : null;
+    row.agent?.toLowerCase() === hintedSession?.agent.toLowerCase() ||
+    (isPiFamilyAgent(row.agent) && isPiFamilyAgent(hintedSession?.agent))
+      ? hintedSession
+      : null;
   return {
     agent: row.agent,
     agentSession: reportedSession ?? compatibleHint,

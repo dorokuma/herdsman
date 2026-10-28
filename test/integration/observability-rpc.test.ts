@@ -446,6 +446,121 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
+  test("treats a pig terminal like a pi terminal", async () => {
+    const registry = new TurnCompletionRegistry({ timeoutMs: 1_000 });
+    const { harness, server, socketPath } = await openServerWithoutClient({
+      turnCompletions: registry,
+    });
+    harness.herdrSessions.upsertRunning({
+      name: "default",
+      sessionDir: "/tmp/herdr",
+      socketPath: "/tmp/herdr/herdr.sock",
+    });
+    harness.agents.replaceForSession({
+      agents: [
+        { agent: "pig", pane_id: "wB:p-pig", terminal_id: "term_pig", workspace_id: "wB" },
+        // The event that lands on the pig owner has to come from a different
+        // terminal: a terminal never receives its own events.
+        { agent: "pi", pane_id: "wB:p-b", terminal_id: "term_b", workspace_id: "wB" },
+        // A second pig terminal indexes a dispatched pig worker so the event
+        // below is appended under a live `agent: "pig"` row: `publishAgentEvent`
+        // resolves the kind through the agents table, not the session hint, so
+        // the index record must carry the pig kind itself.
+        {
+          agent: "pig",
+          pane_id: "wB:p-pig-worker",
+          terminal_id: "term_pig_worker",
+          workspace_id: "wB",
+        },
+      ],
+      herdrSessionName: "default",
+    });
+    const pig = await RpcTestClient.connect(socketPath);
+    await expect(
+      pig.request("agent.orchestrator.register", {
+        herdrSocketPath: "/tmp/herdr/herdr.sock",
+        paneId: "wB:p-pig",
+        sessionRef: {
+          agent: "pig",
+          kind: "path",
+          source: "herdr:pig",
+          value: "/root/.pig/agent/sessions/ses-1.jsonl",
+        },
+        subscriberId: "pig-session",
+        subscriberKind: "pig",
+        workspaceId: "wB",
+      }),
+    ).resolves.toMatchObject({ presence: { terminalId: "term_pig" } });
+    // A pig terminal owns its workspace like a pi terminal does.
+    await expect(pig.request("agent.orchestrator.set", { enabled: true })).resolves.toMatchObject({
+      changed: true,
+      state: { owner: { terminalId: "term_pig" } },
+    });
+
+    const event = appendRoutedEvent(harness, "term_b", "wB");
+    server.publishAgentEvent(event);
+    await expect(pig.waitForNotification("agent.event")).resolves.toMatchObject({
+      params: { event: { id: event.id } },
+    });
+
+    // The reverse direction: a dispatched pig pane acting as the event
+    // producer / completion signaller. Its agent.done passes the
+    // isDeliverableAgentEvent gate and is delivered to the workspace owner,
+    // and its agent.turn.completed is recorded like a pi signal.
+    const producer = await RpcTestClient.connect(socketPath);
+    await expect(
+      producer.request("agent.orchestrator.register", {
+        herdrSocketPath: "/tmp/herdr/herdr.sock",
+        paneId: "wB:p-b",
+        sessionRef: {
+          agent: "pig",
+          kind: "path",
+          source: "herdr:pig",
+          value: "/root/.pig/agent/sessions/ses-producer.jsonl",
+        },
+        subscriberId: "pig-producer",
+        subscriberKind: "pig",
+        workspaceId: "wB",
+      }),
+    ).resolves.toMatchObject({ presence: { terminalId: "term_b" } });
+    const pigEvent = appendRoutedEvent(harness, "term_b", "wB");
+    server.publishAgentEvent(pigEvent);
+    await expect(pig.waitForNotification("agent.event")).resolves.toMatchObject({
+      params: { event: { id: pigEvent.id } },
+    });
+    await expect(
+      producer.request("agent.turn.completed", {
+        confirmed: true,
+        herdrSessionName: "default",
+        paneId: "wB:p-b",
+        terminalId: "term_b",
+        workspaceId: "wB",
+      }),
+    ).resolves.toEqual({ accepted: true });
+    await expect(
+      registry.waitForSignal({
+        herdrSessionName: "default",
+        recordedAfterMs: 0,
+        terminalId: "term_b",
+      }),
+    ).resolves.toEqual({ confirmed: true, received: true });
+
+    // A dispatched pig worker's agent.done passes the same delivery gate and
+    // reaches the workspace owner carrying its own `agent: "pig"` kind, not a
+    // borrowed pi identity.
+    const pigWorkerEvent = appendRoutedEvent(harness, "term_pig_worker", "wB", {
+      agent: "pig",
+    });
+    await server.publishAgentEvent(pigWorkerEvent);
+    const receivedAfterPigEvent = await pig.waitForNotification("agent.event");
+    expect(receivedAfterPigEvent).toMatchObject({
+      params: { event: { id: pigWorkerEvent.id, payload: { agent: "pig" } } },
+    });
+    producer.close();
+    pig.close();
+    harness.sqlite.close();
+  });
+
   test("routes events to the newest owner socket and role changes to the exact scope", async () => {
     const { harness, server, socketPath } = await openServerWithoutClient();
     seedRoutingAgents(harness);
@@ -1133,13 +1248,14 @@ function appendRoutedEvent(
   harness: ReturnType<typeof openObservabilityDbHarness>,
   terminalId: string,
   workspaceId: string,
+  payload: Record<string, unknown> = {},
 ) {
   const agent = harness.agents.findByTerminal({ herdrSessionName: "default", terminalId });
   return harness.agentEvents.append({
     agentId: agent?.id ?? null,
     paneId: agent?.paneId ?? null,
     herdrSessionName: "default",
-    payload: {},
+    payload,
     terminalId,
     type: "agent.done",
     workspaceId,

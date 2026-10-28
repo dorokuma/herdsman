@@ -272,6 +272,17 @@ describe("agent history discovery", () => {
         value: "/tmp/x.jsonl",
       });
     expect(source("pi")).toBe("pi-jsonl");
+    // pig (PiG) emits the same pi-jsonl session format and herdsman protocol, so it reads
+    // through the same reader.
+    expect(source("pig")).toBe("pi-jsonl");
+    expect(
+      historySourceFromSessionRef({
+        agent: "pig",
+        kind: "path",
+        source: "herdr:pig",
+        value: "/root/.pig/agent/sessions/ses-1.jsonl",
+      }),
+    ).toBe("pi-jsonl");
     expect(
       historySourceFromSessionRef({
         agent: "antigravity_cli",
