@@ -6,8 +6,11 @@ export const DISPATCHED_PI_SESSION_ROOT = "/tmp/herdr-role-sessions/";
 
 /** Returns true only for pi-family (pi/pig) agents used as interactive observers, not dispatched roles. */
 export function isInteractivePiAgent(agent: AgentIndexRecord | undefined): boolean {
-  const kind = agent?.agent?.toLowerCase();
-  if ((kind !== "pi" && kind !== "pig") || !agent?.agentSession?.value) return false;
+  // Exact lowercase comparison, matching the Go mirror
+  // (go/internal/observability/interactive_pi.go) and the schema literals.
+  if ((agent?.agent !== "pi" && agent?.agent !== "pig") || !agent?.agentSession?.value) {
+    return false;
+  }
   const raw = agent.agentSession.value;
   if (raw.includes("..")) return false;
   let resolved = normalize(raw);

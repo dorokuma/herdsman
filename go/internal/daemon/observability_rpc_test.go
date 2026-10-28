@@ -1180,7 +1180,8 @@ func assertObsNoNotificationsOfMethod(t *testing.T, who string, client *obsRPCCl
 // pig terminal like a pi terminal": a pig presence registers, owns its
 // workspace, and receives its events exactly like a pi terminal.
 func TestObservabilityRpcTreatsPigTerminalLikePi(t *testing.T) {
-	fixture := obsOpenRPCServerWithoutClient(t, obsRPCServerOptions{})
+	registry := observability.NewTurnCompletionRegistry(observability.WithTurnSettimeout(1_000))
+	fixture := obsOpenRPCServerWithoutClient(t, obsRPCServerOptions{turnCompletions: registry})
 	fixture.harness.upsertRunningSession(t)
 	fixture.harness.replaceAgents(t, []db.HerdrAgentLike{
 		{"agent": "pig", "pane_id": "wB:p-pig", "terminal_id": "term_pig", "workspace_id": obsWorkspaceB},
@@ -1211,6 +1212,46 @@ func TestObservabilityRpcTreatsPigTerminalLikePi(t *testing.T) {
 	fixture.server.PublishAgentEvent(event)
 	notification := obsWaitNotification(t, pig, "agent.event")
 	assertObsSubset(t, obsAt(t, notification, "params", "event"), map[string]any{"id": float64(event.ID)})
+
+	// The reverse direction: a dispatched pig pane acting as the event
+	// producer / completion signaller. Its agent.done passes the
+	// isDeliverableAgentEvent gate and is delivered to the workspace owner,
+	// and its agent.turn.completed is recorded like a pi signal.
+	producer := obsDial(t, fixture.socketPath)
+	registeredProducer := obsRequest(t, producer, "agent.orchestrator.register", map[string]any{
+		"herdrSocketPath": obsHerdrSocketPath,
+		"paneId":          "wB:p-b",
+		"sessionRef": map[string]any{
+			"agent":  "pig",
+			"kind":   "path",
+			"source": "herdr:pig",
+			"value":  "/root/.pig/agent/sessions/ses-producer.jsonl",
+		},
+		"subscriberId":   "pig-producer",
+		"subscriberKind": "pig",
+		"workspaceId":    obsWorkspaceB,
+	})
+	assertObsSubset(t, obsAt(t, registeredProducer, "presence"), map[string]any{"terminalId": "term_b"})
+	pigEvent := obsAppendRoutedEvent(t, fixture.harness, "term_b", obsWorkspaceB)
+	fixture.server.PublishAgentEvent(pigEvent)
+	pigNotification := obsWaitNotification(t, pig, "agent.event")
+	assertObsSubset(t, obsAt(t, pigNotification, "params", "event"), map[string]any{"id": float64(pigEvent.ID)})
+	assertObsExact(t, "agent.turn.completed", obsRequest(t, producer, "agent.turn.completed", map[string]any{
+		"confirmed":        true,
+		"herdrSessionName": obsSessionName,
+		"paneId":           "wB:p-b",
+		"terminalId":       "term_b",
+		"workspaceId":      obsWorkspaceB,
+	}), map[string]any{"accepted": true})
+	recorded := registry.WaitForSignal(observability.WaitForSignalInput{
+		HerdrSessionName: obsSessionName,
+		RecordedAfterMs:  0,
+		TerminalID:       "term_b",
+	})
+	if !recorded.Received || !recorded.Confirmed {
+		t.Fatalf("term_b waiter: expected {confirmed:true, received:true}, got %+v", recorded)
+	}
+	producer.close()
 	pig.close()
 }
 

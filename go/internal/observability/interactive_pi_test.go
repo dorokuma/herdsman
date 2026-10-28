@@ -99,4 +99,10 @@ func TestClassifiesPigAgentLikePi(t *testing.T) {
 	if IsInteractivePiAgent(pigAgent(nil)) {
 		t.Fatal("a pig agent without agentSession must be non-interactive")
 	}
+	// Agent kinds are exact lowercase literals: a differently-cased label is
+	// not the pi family.
+	upper := "PIG"
+	if IsInteractivePiAgent(&AgentIndexRecord{Agent: &upper, AgentSession: &AgentSessionRef{Value: file}}) {
+		t.Fatal("a differently-cased agent kind must be non-interactive")
+	}
 }

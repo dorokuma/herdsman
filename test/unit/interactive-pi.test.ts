@@ -57,5 +57,13 @@ describe("interactive Pi session classification", () => {
       false,
     );
     expect(isInteractivePiAgent(pigAgent(undefined))).toBe(false);
+    // Agent kinds are exact lowercase literals, like the Go mirror and the
+    // schema: a differently-cased label is not the pi family.
+    expect(
+      isInteractivePiAgent({
+        agent: "PIG",
+        agentSession: { value: file },
+      } as unknown as Parameters<typeof isInteractivePiAgent>[0]),
+    ).toBe(false);
   });
 });

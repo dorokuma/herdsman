@@ -242,6 +242,13 @@ var piPresenceSessionRefAgySchema = &ObjectSchema{
 // AgentOrchestratorRegisterInputSchema mirrors agentOrchestratorRegisterInputSchema,
 // including the pi/agy sessionRef union. The union is modelled as a nested
 // anyOf check so `sessionRef` keeps the discriminator semantics exactly.
+//
+// `sessionRef.agent` (the session's own identity, "pi" | "pig") and
+// `subscriberKind` (the terminal's subscription kind, "pi" | "pig" | "agy")
+// are validated independently on purpose: there is no cross-field equality
+// constraint, so a mixed deployment (e.g. a Go extension that reports
+// `agent: "pig"` while subscribing as `subscriberKind: "pi"`) still
+// registers.
 var AgentOrchestratorRegisterInputSchema = &ObjectSchema{
 	Name: "agentOrchestratorRegisterInputSchema",
 	Properties: map[string]*fieldSpec{

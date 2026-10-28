@@ -79,6 +79,12 @@ export const agentOrchestratorRegisterInputSchema = Type.Object(
   {
     herdrSocketPath: Type.String({ minLength: 1 }),
     paneId: Type.String({ minLength: 1 }),
+    // `sessionRef.agent` (the session's own identity, "pi" | "pig") and
+    // `subscriberKind` (the terminal's subscription kind, "pi" | "pig" |
+    // "agy") are validated independently on purpose: there is no cross-field
+    // equality constraint, so a mixed deployment (e.g. a Go extension that
+    // reports `agent: "pig"` while subscribing as `subscriberKind: "pi"`)
+    // still registers.
     sessionRef: piPresenceSessionRefSchema,
     subscriberId: Type.String({ minLength: 1 }),
     subscriberKind: Type.Union([Type.Literal("pi"), Type.Literal("pig"), Type.Literal("agy")]),

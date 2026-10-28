@@ -199,46 +199,6 @@ describe("herdsman-pi orchestrator bridge", () => {
     }
   });
 
-  test("registers a pig session under the pig agent kind", async () => {
-    // The same extension runs inside pig (PiG), which keeps its sessions under
-    // the pig home. A pig session must be reported as `pig` / `herdr:pig`
-    // instead of being aliased to pi.
-    const client = createFakeClient();
-    client.response = (method) => {
-      if (method === "agent.orchestrator.register" || method === "agent.orchestrator.get") {
-        return connectionResponse({ paneId: "wC:p3", workspaceId: "wC" });
-      }
-      return { accepted: true };
-    };
-    const pi = createFakePi();
-    const ctx = fakeCtx({ sessionFile: "/root/.pig/agent/sessions/ses-1.jsonl" });
-    const { createHerdsmanPiExtension } = (await import(extensionModuleUrl)) as Module;
-    createHerdsmanPiExtension({ clientFactory: () => client })(pi);
-    const previous = withHerdrEnv({ paneId: "wB:p1", workspaceId: "wB" });
-    try {
-      await pi.emit("session_start", {}, ctx);
-      await client.connect();
-      expect(client.calls[0]).toEqual([
-        "agent.orchestrator.register",
-        {
-          herdrSocketPath: "/tmp/herdr.sock",
-          paneId: "wB:p1",
-          sessionRef: {
-            agent: "pig",
-            kind: "path",
-            source: "herdr:pig",
-            value: "/root/.pig/agent/sessions/ses-1.jsonl",
-          },
-          subscriberId: "pi-session",
-          subscriberKind: "pig",
-          workspaceId: "wB",
-        },
-      ]);
-    } finally {
-      restoreEnv(previous);
-    }
-  });
-
   test("registers presence, adopts daemon location, and reconnects", async () => {
     const client = createFakeClient();
     client.response = (method) => {

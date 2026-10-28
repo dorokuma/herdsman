@@ -447,7 +447,10 @@ describe("ObservabilityRpcServer", () => {
   });
 
   test("treats a pig terminal like a pi terminal", async () => {
-    const { harness, server, socketPath } = await openServerWithoutClient();
+    const registry = new TurnCompletionRegistry({ timeoutMs: 1_000 });
+    const { harness, server, socketPath } = await openServerWithoutClient({
+      turnCompletions: registry,
+    });
     harness.herdrSessions.upsertRunning({
       name: "default",
       sessionDir: "/tmp/herdr",
@@ -489,6 +492,49 @@ describe("ObservabilityRpcServer", () => {
     await expect(pig.waitForNotification("agent.event")).resolves.toMatchObject({
       params: { event: { id: event.id } },
     });
+
+    // The reverse direction: a dispatched pig pane acting as the event
+    // producer / completion signaller. Its agent.done passes the
+    // isDeliverableAgentEvent gate and is delivered to the workspace owner,
+    // and its agent.turn.completed is recorded like a pi signal.
+    const producer = await RpcTestClient.connect(socketPath);
+    await expect(
+      producer.request("agent.orchestrator.register", {
+        herdrSocketPath: "/tmp/herdr/herdr.sock",
+        paneId: "wB:p-b",
+        sessionRef: {
+          agent: "pig",
+          kind: "path",
+          source: "herdr:pig",
+          value: "/root/.pig/agent/sessions/ses-producer.jsonl",
+        },
+        subscriberId: "pig-producer",
+        subscriberKind: "pig",
+        workspaceId: "wB",
+      }),
+    ).resolves.toMatchObject({ presence: { terminalId: "term_b" } });
+    const pigEvent = appendRoutedEvent(harness, "term_b", "wB");
+    server.publishAgentEvent(pigEvent);
+    await expect(pig.waitForNotification("agent.event")).resolves.toMatchObject({
+      params: { event: { id: pigEvent.id } },
+    });
+    await expect(
+      producer.request("agent.turn.completed", {
+        confirmed: true,
+        herdrSessionName: "default",
+        paneId: "wB:p-b",
+        terminalId: "term_b",
+        workspaceId: "wB",
+      }),
+    ).resolves.toEqual({ accepted: true });
+    await expect(
+      registry.waitForSignal({
+        herdrSessionName: "default",
+        recordedAfterMs: 0,
+        terminalId: "term_b",
+      }),
+    ).resolves.toEqual({ confirmed: true, received: true });
+    producer.close();
     pig.close();
     harness.sqlite.close();
   });
