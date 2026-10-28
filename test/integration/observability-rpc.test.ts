@@ -462,6 +462,16 @@ describe("ObservabilityRpcServer", () => {
         // The event that lands on the pig owner has to come from a different
         // terminal: a terminal never receives its own events.
         { agent: "pi", pane_id: "wB:p-b", terminal_id: "term_b", workspace_id: "wB" },
+        // A second pig terminal indexes a dispatched pig worker so the event
+        // below is appended under a live `agent: "pig"` row: `publishAgentEvent`
+        // resolves the kind through the agents table, not the session hint, so
+        // the index record must carry the pig kind itself.
+        {
+          agent: "pig",
+          pane_id: "wB:p-pig-worker",
+          terminal_id: "term_pig_worker",
+          workspace_id: "wB",
+        },
       ],
       herdrSessionName: "default",
     });
@@ -534,6 +544,18 @@ describe("ObservabilityRpcServer", () => {
         terminalId: "term_b",
       }),
     ).resolves.toEqual({ confirmed: true, received: true });
+
+    // A dispatched pig worker's agent.done passes the same delivery gate and
+    // reaches the workspace owner carrying its own `agent: "pig"` kind, not a
+    // borrowed pi identity.
+    const pigWorkerEvent = appendRoutedEvent(harness, "term_pig_worker", "wB", {
+      agent: "pig",
+    });
+    await server.publishAgentEvent(pigWorkerEvent);
+    const receivedAfterPigEvent = await pig.waitForNotification("agent.event");
+    expect(receivedAfterPigEvent).toMatchObject({
+      params: { event: { id: pigWorkerEvent.id, payload: { agent: "pig" } } },
+    });
     producer.close();
     pig.close();
     harness.sqlite.close();
@@ -1226,13 +1248,14 @@ function appendRoutedEvent(
   harness: ReturnType<typeof openObservabilityDbHarness>,
   terminalId: string,
   workspaceId: string,
+  payload: Record<string, unknown> = {},
 ) {
   const agent = harness.agents.findByTerminal({ herdrSessionName: "default", terminalId });
   return harness.agentEvents.append({
     agentId: agent?.id ?? null,
     paneId: agent?.paneId ?? null,
     herdrSessionName: "default",
-    payload: {},
+    payload,
     terminalId,
     type: "agent.done",
     workspaceId,

@@ -270,8 +270,9 @@ func TestAgentStoreTerminalIdentity(t *testing.T) {
 	})
 
 	t.Run("accepts a pi-family hint across the pi and pig boundary", func(t *testing.T) {
-		// pig runs the same herdsman-pi extension, so a pi-family hint stays
-		// valid when the terminal is indexed under the other family member.
+		// pig emits the same pi-jsonl session format and herdsman protocol, so a
+		// pi-family hint stays valid when the terminal is indexed under the other
+		// family member.
 		agents, _, _, _ := openAgentHarness(t)
 		pig := replacePiAgent(t, agents, piAgentInput{Agent: stringPtr("pig")})
 		if pig == nil {

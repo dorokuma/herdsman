@@ -134,8 +134,9 @@ describe("AgentStore terminal identity", () => {
   });
 
   test("accepts a pi session hint for a terminal indexed as pig and the reverse", () => {
-    // pig runs the same herdsman-pi extension, so a pi-family hint stays
-    // valid when the terminal is indexed under the other family member.
+    // pig emits the same pi-jsonl session format and herdsman protocol, so a
+    // pi-family hint stays valid when the terminal is indexed under the other
+    // family member.
     const { agents } = openHarness();
     const pig = replacePiAgent(agents, { agent: "pig" });
     if (!pig) throw new Error("Expected pig agent");

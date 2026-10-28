@@ -1188,6 +1188,11 @@ func TestObservabilityRpcTreatsPigTerminalLikePi(t *testing.T) {
 		// The event that lands on the pig owner has to come from a different
 		// terminal: a terminal never receives its own events.
 		{"agent": "pi", "pane_id": "wB:p-b", "terminal_id": "term_b", "workspace_id": obsWorkspaceB},
+		// A second pig terminal indexes a dispatched pig worker so the event
+		// below is appended under a live `agent: "pig"` row: `publishAgentEvent`
+		// resolves the kind through the agents table, not the session hint, so
+		// the index record must carry the pig kind itself.
+		{"agent": "pig", "pane_id": "wB:p-pig-worker", "terminal_id": "term_pig_worker", "workspace_id": obsWorkspaceB},
 	})
 	pig := obsDial(t, fixture.socketPath)
 	registered := obsRequest(t, pig, "agent.orchestrator.register", map[string]any{
@@ -1251,6 +1256,37 @@ func TestObservabilityRpcTreatsPigTerminalLikePi(t *testing.T) {
 	if !recorded.Received || !recorded.Confirmed {
 		t.Fatalf("term_b waiter: expected {confirmed:true, received:true}, got %+v", recorded)
 	}
+
+	// A dispatched pig worker's agent.done passes the same delivery gate and
+	// reaches the workspace owner carrying its own `agent: "pig"` kind, not a
+	// borrowed pi identity.
+	pigWorker, err := fixture.harness.agents.FindByTerminal(db.FindAgentByTerminalInput{
+		HerdrSessionName: obsSessionName,
+		TerminalID:       "term_pig_worker",
+	})
+	if err != nil || pigWorker == nil {
+		t.Fatalf("findByTerminal(term_pig_worker): agent=%+v err=%v", pigWorker, err)
+	}
+	pigWorkerEvent, err := fixture.harness.agentEvents.Append(db.AppendAgentEventInput{
+		AgentID:          &pigWorker.ID,
+		HerdrSessionName: obsSessionName,
+		PaneID:           &pigWorker.PaneID,
+		Payload:          map[string]any{"agent": "pig"},
+		TerminalID:       obsString("term_pig_worker"),
+		Type:             observability.AgentEventDone,
+		WorkspaceID:      obsString(obsWorkspaceB),
+	})
+	if err != nil {
+		t.Fatalf("append pig worker event: %v", err)
+	}
+	fixture.server.PublishAgentEvent(pigWorkerEvent)
+	pigWorkerNotification := obsWaitNotification(t, pig, "agent.event")
+	assertObsSubset(t, obsAt(t, pigWorkerNotification, "params", "event", "payload"), map[string]any{
+		"agent": "pig",
+	})
+	assertObsSubset(t, obsAt(t, pigWorkerNotification, "params", "event"), map[string]any{
+		"id": float64(pigWorkerEvent.ID),
+	})
 	producer.close()
 	pig.close()
 }

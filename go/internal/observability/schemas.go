@@ -216,8 +216,8 @@ var AgentEventsInputSchema = &ObjectSchema{
 }
 
 // piPresenceSessionRefPiSchema is the pi-family (`agent: "pi"` | `"pig"`)
-// branch: `kind` is `path` only. pi and pig run the same herdsman-pi
-// extension and register the same `kind: "path"` sessionRef.
+// branch: `kind` is `path` only. pi and pig emit the same pi-jsonl session
+// format and herdsman protocol and register the same `kind: "path"` sessionRef.
 var piPresenceSessionRefPiSchema = &ObjectSchema{
 	Name: "piPresenceSessionRefSchema[pi]",
 	Properties: map[string]*fieldSpec{

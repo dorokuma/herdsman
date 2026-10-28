@@ -10,7 +10,7 @@ supersedes: ""
 
 ## 一句话结论
 
-pig（PiG）与 pi 共用同一套 herdsman-pi 扩展与 session 格式，因此在「历史读取器路由、交互式主控判定、会话 hint 兼容、状态事件等待/放行、孤儿/失败事件投递白名单、`#isPiTerminal` 终端归属、presence 注册 schema」全部点位上把 `pig`（及 `herdr:pig` / `subscriberKind: "pig"`）与 `pi` 视为同一 **pi 家族**，而非把 pig 当作「非 pi 的其它 agent」。
+TS 版 `pi` 运行本仓 `packages/herdsman-pi`，Go 版 `pig`（PiG）运行独立仓 `pi-extensions/go/herdsman-pi` 与 `pi-extensions/go/herdr-agent-state`；二者各自独立，但产出兼容的 `pi-jsonl` 会话格式与 herdsman 协议、上报同一 turn-completion 信号。因此在「历史读取器路由、交互式主控判定、会话 hint 兼容、状态事件等待/放行、孤儿/失败事件投递白名单、`#isPiTerminal` 终端归属、presence 注册 schema」全部点位上把 `pig`（及 `herdr:pig` / `subscriberKind: "pig"`）与 `pi` 视为同一 **pi 家族**，而非把 pig 当作「非 pi 的其它 agent」。
 
 ## 返修记录（C 档门禁第 1 轮）
 
@@ -28,7 +28,7 @@ pig（PiG）与 pi 共用同一套 herdsman-pi 扩展与 session 格式，因此
 
 ## 背景
 
-- pig 是 pi 家族 coding agent，其会话写在 `~/.pig/agent/sessions`（白名单已在 `20261026-pig-session-root-whitelist` 接受），运行同一 herdsman-pi 扩展、产出同一 `pi-jsonl` 格式、上报同一 turn-completion 信号。
+- pig 是 pi 家族 coding agent，其会话写在 `~/.pig/agent/sessions`（白名单已在 `20261026-pig-session-root-whitelist` 接受）；TS `pi` 用本仓 `packages/herdsman-pi`、Go `pig` 用独立仓 `pi-extensions/go/herdsman-pi` 与 `pi-extensions/go/herdr-agent-state`，二者各自独立、产出兼容的 `pi-jsonl` 会话格式与 herdsman 协议、上报同一 turn-completion 信号。
 - 此前所有 agent-kind 判定都是 `=== "pi"` / `=== "agy"` 的二元硬编码，pig pane 会被归入「非 pi」分支：历史读不出来（`pi-jsonl` 不命中）、交互式/派发角色不区分、turn 完成信号不等待、孤儿 `agent.done`/`agent.idle` 被空 body 门槛误杀、终端不被认作 pi 家族终端。
 - 扩展此前在 `session_start` 写死 `sessionRef.agent = "pi"` / `source = "herdr:pi"` / `subscriberKind = "pi"`，pig 会话也会被当成 pi 上报。
 
@@ -52,3 +52,9 @@ pig（PiG）与 pi 共用同一套 herdsman-pi 扩展与 session 格式，因此
 - 代码：`src/agent-history/discovery.ts`、`src/observability/interactive-pi.ts`、`src/observability/agent-index-service.ts`、`src/observability/schemas.ts`、`src/observability/contracts.ts`、`src/db/agents.ts`、`src/db/agent-events.ts`、`src/daemon/observability-server.ts`、`packages/herdsman-pi/src/index.ts`，及其 Go 镜像 `go/internal/agenthistory/discovery.go`、`go/internal/observability/interactive_pi.go`、`go/internal/observability/agent_index_events.go`、`go/internal/observability/schemas.go`、`go/internal/observability/contracts.go`、`go/internal/db/agents.go`、`go/internal/db/agent_events.go`、`go/internal/daemon/observability_server.go`。
 - 前置决策：`.agents/notes/20261026-pig-session-root-whitelist.md`（pig 自有会话根白名单）。
 - 测试：`test/unit/agent-history-discovery.test.ts`、`test/unit/interactive-pi.test.ts`、`test/unit/observability-contracts.test.ts`、`test/unit/herdsman-pi-extension.test.ts`、`test/integration/agent-store-terminal-identity.test.ts`、`test/integration/observability-rpc.test.ts`，及 Go 镜像 `go/internal/agenthistory/discovery_test.go`、`go/internal/observability/interactive_pi_test.go`、`go/internal/observability/contracts_test.go`、`go/internal/db/agent_store_terminal_identity_test.go`、`go/internal/daemon/observability_rpc_test.go`。
+
+## 返修记录（C 档门禁第 2 轮 / Rework Round 2）
+
+- **RPC 集成测试真覆盖 pig 产生方（TS + Go 镜像）**：`test/integration/observability-rpc.test.ts` 的 `treats a pig terminal like a pi terminal` 与 `go/internal/daemon/observability_rpc_test.go` 的 `TestObservabilityRpcTreatsPigTerminalLikePi` 原本让 `term_b` 以 `agent: "pi"` 入库，只在 `session.register` 里用 `agent: "pig"` 上报，`publishAgentEvent` 投递门走的是 `agents` 行 kind 而非 session hint—— `isDeliverableAgentEvent` 的 `agent.agent !== "pig"`（`src/db/agent-events.ts`）/ `agentKind != "pig"`（`go/internal/db/agent_events.go`）分支从未被 pig 产生方真覆盖。已在 `replaceForSession`/`ReplaceForSession` 新增一条 `agent: "pig"` 的派发 worker 索引记录（`term_pig_worker`），对它 `appendRoutedEvent` 并 `publishAgentEvent`，断言 owner 收到的 `agent.done` 事件携带 `payload.agent === "pig"`，真覆盖 pig 作为事件产生方的投递门。
+- **大小写比较与基线 `eb8e83d` 严格对齐（TS + Go 镜像）**：`src/observability/agent-index-service.ts` 的 `isPiFamily` 去掉 `.toLowerCase()` 改为 `agent?.trim()` 后精确小写比较；`go/internal/observability/agent_index_events.go` 的 `isPiFamilyAgentKind` 去掉 `strings.ToLower` 改为 `strings.TrimSpace` 后精确小写比较。`src/db/agents.ts` 与 `go/internal/db/agents.go` 的大小写不敏感比较保持与基线一致、未改动。
+- **统一扩展措辞并修正残留**：全仓代码注释中残留的「pi 和 pig 运行/共用同一套 herdsman-pi 扩展」表述统一改写为「emit the same pi-jsonl session format and herdsman protocol」（各自独立、产出兼容格式与协议），覆盖 `src/agent-history/discovery.ts`、`src/observability/schemas.ts`、`src/db/agents.ts`、`src/observability/agent-index-service.ts`、`test/integration/agent-store-terminal-identity.test.ts` 及其 Go 镜像 `go/internal/agenthistory/discovery.go`、`go/internal/observability/schemas.go`、`go/internal/db/agents.go`、`go/internal/db/agent_store_terminal_identity_test.go`；旧短语 `git grep` 已 0 命中。本文件的「一句话结论」与「背景」也同步改为 TS `pi` 用本仓 `packages/herdsman-pi`、Go `pig` 用独立仓 `pi-extensions/go/herdsman-pi` 与 `pi-extensions/go/herdr-agent-state` 的准确表述。

@@ -12,12 +12,12 @@ import (
 // turn-completion signal wait with its degrade/release judgement, and the
 // non-Pi readiness gate.
 
-// isPiFamilyAgentKind mirrors isPiFamily: pi and pig run the same herdsman-pi
-// extension, emit the same session format, and report the same turn-completion
+// isPiFamilyAgentKind mirrors isPiFamily: pi and pig emit the same pi-jsonl
+// session format and herdsman protocol, and report the same turn-completion
 // signal, so every pi-specific status-event rule treats them as one family.
 func isPiFamilyAgentKind(agentKind string) bool {
-	kind := strings.ToLower(agentKind)
-	return kind == "pi" || kind == "pig"
+	normalized := strings.TrimSpace(agentKind)
+	return normalized == "pi" || normalized == "pig"
 }
 
 // appendStatusEvents mirrors #appendStatusEvents. The returned cancelled flag

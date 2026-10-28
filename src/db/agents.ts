@@ -364,9 +364,9 @@ export class AgentStore {
     if (!current) return undefined;
     const compatible =
       current.agent?.toLowerCase() === input.agentSession.agent.toLowerCase() ||
-      // pi and pig run the same herdsman-pi extension and session format, so a
-      // hint registered by one stays valid when the terminal is later indexed
-      // as the other.
+      // pi and pig emit the same pi-jsonl session format and herdsman
+      // protocol, so a hint registered by one stays valid when the terminal
+      // is later indexed as the other.
       (isPiFamilyAgent(current.agent) && isPiFamilyAgent(input.agentSession.agent));
     this.#sqlite
       .prepare(
@@ -508,9 +508,9 @@ export class AgentStore {
   }
 }
 
-// pi and pig share the same herdsman-pi extension and session format, so a
-// session hint written by one stays compatible when the same terminal is later
-// indexed as the other.
+// pi and pig emit the same pi-jsonl session format and herdsman protocol,
+// so a session hint written by one stays compatible when the same terminal is
+// later indexed as the other.
 function isPiFamilyAgent(agent: string | null | undefined): boolean {
   const kind = agent?.toLowerCase();
   return kind === "pi" || kind === "pig";

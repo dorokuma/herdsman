@@ -55,8 +55,9 @@ export const agentEventsInputSchema = Type.Object(
 const piPresenceSessionRefSchema = Type.Union([
   Type.Object(
     {
-      // pi and pig run the same herdsman-pi extension and register the same
-      // `kind: "path"` sessionRef; pig reports `agent: "pig"` / `herdr:pig`.
+      // pi and pig emit the same pi-jsonl session format and herdsman
+      // protocol and register the same `kind: "path"` sessionRef; pig reports
+      // `agent: "pig"` / `herdr:pig`.
       agent: Type.Union([Type.Literal("pi"), Type.Literal("pig")]),
       kind: Type.Literal("path"),
       source: Type.String({ minLength: 1 }),

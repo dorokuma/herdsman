@@ -197,8 +197,9 @@ func (s *AgentStore) ReplaceForSession(
 			var sessionHint sql.NullString
 			if entry.current != nil &&
 				(sameNullableString(nullableString(entry.current.agent), agent) ||
-					// pi and pig run the same herdsman-pi extension, so a hint
-					// written by one stays valid across a pi<->pig relabel.
+					// pi and pig emit the same pi-jsonl session format and herdsman
+					// protocol, so a hint written by one stays valid across a
+					// pi<->pig relabel.
 					(isPiFamilyAgent(nullableString(entry.current.agent)) &&
 						isPiFamilyAgent(agent))) {
 				sessionHint = entry.current.agentSessionHintJSON
@@ -508,8 +509,9 @@ func (s *AgentStore) SetSessionRefByTerminal(
 	}
 	compatible := (current.Agent != nil &&
 		strings.EqualFold(*current.Agent, input.AgentSession.Agent)) ||
-		// pi and pig run the same herdsman-pi extension, so a hint registered
-		// by one stays valid when the terminal is later indexed as the other.
+		// pi and pig emit the same pi-jsonl session format and herdsman
+		// protocol, so a hint registered by one stays valid when the terminal
+		// is later indexed as the other.
 		(isPiFamilyAgent(current.Agent) && isPiFamilyAgent(&input.AgentSession.Agent))
 	var hintJSON any
 	if compatible {
@@ -1036,9 +1038,9 @@ func agentGenerationClause(paneGeneration *string) (string, []any) {
 	return " and pane_generation = ?", []any{paneGeneration}
 }
 
-// isPiFamilyAgent mirrors isPiFamilyAgent: pi and pig share the same
-// herdsman-pi extension and session format, so a session hint written by one
-// stays compatible when the same terminal is later indexed as the other.
+// isPiFamilyAgent mirrors isPiFamilyAgent: pi and pig emit the same
+// pi-jsonl session format and herdsman protocol, so a session hint written by
+// one stays compatible when the same terminal is later indexed as the other.
 func isPiFamilyAgent(agent *string) bool {
 	if agent == nil {
 		return false

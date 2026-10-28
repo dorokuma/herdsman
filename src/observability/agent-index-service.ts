@@ -3761,12 +3761,12 @@ function matchingPrior(
   );
 }
 
-// pi and pig run the same herdsman-pi extension, emit the same session
-// format, and report the same turn-completion signal, so every pi-specific
+// pi and pig emit the same pi-jsonl session format and herdsman protocol,
+// and report the same turn-completion signal, so every pi-specific
 // status-event rule treats them as one family.
 function isPiFamily(agent: string | null | undefined): boolean {
-  const kind = agent?.toLowerCase();
-  return kind === "pi" || kind === "pig";
+  const normalized = agent?.trim();
+  return normalized === "pi" || normalized === "pig";
 }
 
 function sameIdentity(left: AgentIndexRecord, right: AgentIndexRecord): boolean {
