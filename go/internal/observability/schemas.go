@@ -215,11 +215,13 @@ var AgentEventsInputSchema = &ObjectSchema{
 	},
 }
 
-// piPresenceSessionRefPiSchema is the `agent: "pi"` branch: `kind` is `path` only.
+// piPresenceSessionRefPiSchema is the pi-family (`agent: "pi"` | `"pig"`)
+// branch: `kind` is `path` only. pi and pig run the same herdsman-pi
+// extension and register the same `kind: "path"` sessionRef.
 var piPresenceSessionRefPiSchema = &ObjectSchema{
 	Name: "piPresenceSessionRefSchema[pi]",
 	Properties: map[string]*fieldSpec{
-		"agent":  literals(string(SubscriberPi)),
+		"agent":  literals(string(SubscriberPi), string(SubscriberPig)),
 		"kind":   literals(string(SessionRefPath)),
 		"source": str(1),
 		"value":  str(1),
@@ -250,7 +252,8 @@ var AgentOrchestratorRegisterInputSchema = &ObjectSchema{
 			union: sessionRefUnionSchema,
 		},
 		"subscriberId":   str(1),
-		"subscriberKind": literals(string(SubscriberPi), string(SubscriberAgy)),
+		"subscriberKind": literals(
+			string(SubscriberPi), string(SubscriberPig), string(SubscriberAgy)),
 		"workspaceId":    str(1),
 	},
 }

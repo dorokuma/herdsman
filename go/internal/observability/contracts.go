@@ -96,6 +96,7 @@ type SubscriberKind string
 
 const (
 	SubscriberPi  SubscriberKind = "pi"
+	SubscriberPig SubscriberKind = "pig"
 	SubscriberAgy SubscriberKind = "agy"
 )
 

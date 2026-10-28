@@ -14,6 +14,12 @@ function agent(value: string | null | undefined) {
     agentSession: value === undefined ? undefined : value === null ? null : { value },
   } as unknown as Parameters<typeof isInteractivePiAgent>[0];
 }
+function pigAgent(value: string | null | undefined) {
+  return {
+    agent: "pig",
+    agentSession: value === undefined ? undefined : value === null ? null : { value },
+  } as unknown as Parameters<typeof isInteractivePiAgent>[0];
+}
 describe("interactive Pi session classification", () => {
   test("rejects a session path containing .. as non-interactive", () => {
     expect(isInteractivePiAgent(agent("/root/.pi/agent/sessions/../x.jsonl"))).toBe(false);
@@ -39,5 +45,17 @@ describe("interactive Pi session classification", () => {
     expect(isInteractivePiAgent(agent(undefined))).toBe(false);
     expect(isInteractivePiAgent(agent(null))).toBe(false);
     expect(isInteractivePiAgent(agent(""))).toBe(false);
+  });
+  test("classifies a pig agent like a pi agent", () => {
+    const dir = mkdtempSync(join(tmpdir(), "interactive-pig-test-"));
+    tempDirs.push(dir);
+    const file = join(dir, "x.jsonl");
+    writeFileSync(file, "");
+    expect(isInteractivePiAgent(pigAgent(file))).toBe(true);
+    // A dispatched role session stays non-interactive for pig too.
+    expect(isInteractivePiAgent(pigAgent("/tmp/herdr-role-sessions/role-x/session.jsonl"))).toBe(
+      false,
+    );
+    expect(isInteractivePiAgent(pigAgent(undefined))).toBe(false);
   });
 });

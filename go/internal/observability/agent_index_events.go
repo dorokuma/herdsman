@@ -12,6 +12,14 @@ import (
 // turn-completion signal wait with its degrade/release judgement, and the
 // non-Pi readiness gate.
 
+// isPiFamilyAgentKind mirrors isPiFamily: pi and pig run the same herdsman-pi
+// extension, emit the same session format, and report the same turn-completion
+// signal, so every pi-specific status-event rule treats them as one family.
+func isPiFamilyAgentKind(agentKind string) bool {
+	kind := strings.ToLower(agentKind)
+	return kind == "pi" || kind == "pig"
+}
+
 // appendStatusEvents mirrors #appendStatusEvents. The returned cancelled flag
 // stands in for the TS PLAN_CANCELLED sentinel: the agent row is gone, so
 // appending would create an undeliverable dangling event and the plan must be
@@ -120,7 +128,7 @@ func (s *AgentIndexService) appendStatusEvents(
 
 	if s.turnCompletions != nil &&
 		(input.To == AgentStatusDone || input.To == AgentStatusBlocked) &&
-		terminalID != "" && agentKind == "pi" {
+		terminalID != "" && isPiFamilyAgentKind(agentKind) {
 		isRetry := attempts > 0
 		latestTerminal, err := s.stores.AgentEvents.LatestTerminalEvent(
 			input.Agent.ID, input.Agent.HerdrSessionName)
@@ -459,7 +467,8 @@ func (s *AgentIndexService) appendStatusEvents(
 					"terminalId":       input.Agent.TerminalID,
 				})
 		}
-	} else if agentKind != "pi" && (input.To == AgentStatusIdle || input.To == AgentStatusDone) {
+	} else if !isPiFamilyAgentKind(agentKind) &&
+		(input.To == AgentStatusIdle || input.To == AgentStatusDone) {
 		// Note: blocked is an interactive intermediate state, exempt from the ready
 		// gate and the empty delivery gate.
 		isAgyHistory := func(compact *CompactAgentHistory) bool {

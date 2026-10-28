@@ -8,8 +8,8 @@ import (
 // DispatchedPiSessionRoot mirrors DISPATCHED_PI_SESSION_ROOT.
 const DispatchedPiSessionRoot = "/tmp/herdr-role-sessions/"
 
-// IsInteractivePiAgent mirrors isInteractivePiAgent: true only for Pi agents
-// used as interactive observers, not dispatched roles.
+// IsInteractivePiAgent mirrors isInteractivePiAgent: true only for pi-family
+// (pi/pig) agents used as interactive observers, not dispatched roles.
 //
 // The TS implementation rejects any raw value containing "..", normalises the
 // path, prefers realpathSync when it resolves, and finally tests the
@@ -17,7 +17,8 @@ const DispatchedPiSessionRoot = "/tmp/herdr-role-sessions/"
 // path.normalize for absolute POSIX paths; EvalSymlinks stands in for
 // realpathSync and its failure is tolerated exactly like the TS catch block.
 func IsInteractivePiAgent(agent *AgentIndexRecord) bool {
-	if agent == nil || agent.Agent == nil || *agent.Agent != "pi" {
+	if agent == nil || agent.Agent == nil ||
+		(*agent.Agent != "pi" && *agent.Agent != "pig") {
 		return false
 	}
 	if agent.AgentSession == nil || agent.AgentSession.Value == "" {

@@ -1180,13 +1180,15 @@ func (s *ObservabilityRpcServer) isPiTerminal(
 	if err != nil {
 		return false, err
 	}
-	if indexed != nil && indexed.Agent != nil && *indexed.Agent == "pi" {
+	if indexed != nil && indexed.Agent != nil &&
+		(*indexed.Agent == "pi" || *indexed.Agent == "pig") {
 		return true, nil
 	}
 	for connection := range s.socketsByTerminal[terminalPresenceKey(herdrSessionName, terminalID)] {
 		if presence, ok := s.piPresenceBySocket[connection]; ok &&
 			presence.SubscriberKind != nil &&
-			*presence.SubscriberKind == observability.SubscriberPi {
+			(*presence.SubscriberKind == observability.SubscriberPi ||
+				*presence.SubscriberKind == observability.SubscriberPig) {
 			return true, nil
 		}
 	}

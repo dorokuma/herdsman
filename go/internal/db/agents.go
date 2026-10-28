@@ -195,9 +195,12 @@ func (s *AgentStore) ReplaceForSession(
 			terminalTitle := stringValue(entry.snapshot.agent["terminal_title"])
 			s.setTerminalTitle(id, terminalTitle)
 			var sessionHint sql.NullString
-			if entry.current != nil && sameNullableString(
-				nullableString(entry.current.agent), agent,
-			) {
+			if entry.current != nil &&
+				(sameNullableString(nullableString(entry.current.agent), agent) ||
+					// pi and pig run the same herdsman-pi extension, so a hint
+					// written by one stays valid across a pi<->pig relabel.
+					(isPiFamilyAgent(nullableString(entry.current.agent)) &&
+						isPiFamilyAgent(agent))) {
 				sessionHint = entry.current.agentSessionHintJSON
 			}
 			// `grok_home` is a legacy column kept so the schema does not need a
@@ -503,8 +506,11 @@ func (s *AgentStore) SetSessionRefByTerminal(
 	if current == nil {
 		return nil, nil
 	}
-	compatible := current.Agent != nil &&
-		strings.EqualFold(*current.Agent, input.AgentSession.Agent)
+	compatible := (current.Agent != nil &&
+		strings.EqualFold(*current.Agent, input.AgentSession.Agent)) ||
+		// pi and pig run the same herdsman-pi extension, so a hint registered
+		// by one stays valid when the terminal is later indexed as the other.
+		(isPiFamilyAgent(current.Agent) && isPiFamilyAgent(&input.AgentSession.Agent))
 	var hintJSON any
 	if compatible {
 		encoded, err := json.Marshal(input.AgentSession)
@@ -866,8 +872,10 @@ func mapAgent(row agentRow) observability.AgentIndexRecord {
 	reportedSession := parseAgentSession(row.agentSessionJSON)
 	hintedSession := parseAgentSession(row.agentSessionHintJSON)
 	var compatibleHint *observability.AgentSessionRef
-	if row.agent.Valid && hintedSession != nil &&
-		strings.EqualFold(row.agent.String, hintedSession.Agent) {
+	if hintedSession != nil &&
+		(row.agent.Valid && strings.EqualFold(row.agent.String, hintedSession.Agent) ||
+			isPiFamilyAgent(nullableString(row.agent)) &&
+				isPiFamilyAgent(&hintedSession.Agent)) {
 		compatibleHint = hintedSession
 	}
 	agentSession := reportedSession
@@ -1026,6 +1034,16 @@ func agentGenerationClause(paneGeneration *string) (string, []any) {
 		return "", []any{}
 	}
 	return " and pane_generation = ?", []any{paneGeneration}
+}
+
+// isPiFamilyAgent mirrors isPiFamilyAgent: pi and pig share the same
+// herdsman-pi extension and session format, so a session hint written by one
+// stays compatible when the same terminal is later indexed as the other.
+func isPiFamilyAgent(agent *string) bool {
+	if agent == nil {
+		return false
+	}
+	return strings.EqualFold(*agent, "pi") || strings.EqualFold(*agent, "pig")
 }
 
 // sameNullableString compares two nullable fields the way `===` does in TS.

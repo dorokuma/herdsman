@@ -331,17 +331,19 @@ function reportMissingOfficialSession(input: AgentHistoryLookupInput, detail: st
 }
 
 /**
- * Maps an official `agent_session` to the reader that can read it. Only the two
- * supported agents have a reader; everything else is `unknown`, which every
- * reader rejects. `source` looks like `herdr:<agent>`, so segments are matched
- * whole — `herdr:copilot` contains "pi" and must never be read as a pi session.
+ * Maps an official `agent_session` to the reader that can read it. `pi` and
+ * `pig` (PiG, which runs the same herdsman-pi extension and session format)
+ * share the `pi-jsonl` reader; `agy` is the other supported agent. Everything
+ * else is `unknown`, which every reader rejects. `source` looks like
+ * `herdr:<agent>`, so segments are matched whole — `herdr:copilot` contains
+ * "pi" and must never be read as a pi session.
  */
 export function historySourceFromSessionRef(ref: AgentSessionRef): AgentHistoryRef["source"] {
   const agent = ref.agent.toLowerCase();
   const segments = [agent, ...ref.source.toLowerCase().split(/[^a-z0-9_]+/)].filter(Boolean);
   const is = (...names: string[]) => names.some((name) => segments.includes(name));
   if (is("agy", "antigravity", "antigravity_cli", "antigravity-cli")) return "antigravity-sqlite";
-  if (is("pi")) return "pi-jsonl";
+  if (is("pi", "pig")) return "pi-jsonl";
   return "unknown";
 }
 

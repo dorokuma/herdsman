@@ -1176,6 +1176,44 @@ func assertObsNoNotificationsOfMethod(t *testing.T, who string, client *obsRPCCl
 	}
 }
 
+// TestObservabilityRpcTreatsPigTerminalLikePi mirrors the TS case "treats a
+// pig terminal like a pi terminal": a pig presence registers, owns its
+// workspace, and receives its events exactly like a pi terminal.
+func TestObservabilityRpcTreatsPigTerminalLikePi(t *testing.T) {
+	fixture := obsOpenRPCServerWithoutClient(t, obsRPCServerOptions{})
+	fixture.harness.upsertRunningSession(t)
+	fixture.harness.replaceAgents(t, []db.HerdrAgentLike{
+		{"agent": "pig", "pane_id": "wB:p-pig", "terminal_id": "term_pig", "workspace_id": obsWorkspaceB},
+		// The event that lands on the pig owner has to come from a different
+		// terminal: a terminal never receives its own events.
+		{"agent": "pi", "pane_id": "wB:p-b", "terminal_id": "term_b", "workspace_id": obsWorkspaceB},
+	})
+	pig := obsDial(t, fixture.socketPath)
+	registered := obsRequest(t, pig, "agent.orchestrator.register", map[string]any{
+		"herdrSocketPath": obsHerdrSocketPath,
+		"paneId":          "wB:p-pig",
+		"sessionRef": map[string]any{
+			"agent":  "pig",
+			"kind":   "path",
+			"source": "herdr:pig",
+			"value":  "/root/.pig/agent/sessions/ses-1.jsonl",
+		},
+		"subscriberId":   "pig-session",
+		"subscriberKind": "pig",
+		"workspaceId":    obsWorkspaceB,
+	})
+	assertObsSubset(t, obsAt(t, registered, "presence"), map[string]any{"terminalId": "term_pig"})
+	claimed := obsRequest(t, pig, "agent.orchestrator.set", map[string]any{"enabled": true})
+	assertObsSubset(t, claimed, map[string]any{"changed": true})
+	assertObsSubset(t, obsAt(t, claimed, "state", "owner"), map[string]any{"terminalId": "term_pig"})
+
+	event := obsAppendRoutedEvent(t, fixture.harness, "term_b", obsWorkspaceB)
+	fixture.server.PublishAgentEvent(event)
+	notification := obsWaitNotification(t, pig, "agent.event")
+	assertObsSubset(t, obsAt(t, notification, "params", "event"), map[string]any{"id": float64(event.ID)})
+	pig.close()
+}
+
 // TestObservabilityRpcRoutesEventsToNewestOwner is the TS case "routes events to
 // the newest owner socket and role changes to the exact scope".
 func TestObservabilityRpcRoutesEventsToNewestOwner(t *testing.T) {

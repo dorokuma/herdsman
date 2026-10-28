@@ -374,6 +374,17 @@ func TestHistorySourceFromSessionRefMapsTheSupportedAgentsAndNothingElse(t *test
 	if got := source("pi", observability.SessionRefPath); got != SourcePiJSONL {
 		t.Fatalf("pi source = %q, want %q", got, SourcePiJSONL)
 	}
+	// pig (PiG) runs the same extension and session format, so it reads
+	// through the same reader.
+	if got := source("pig", observability.SessionRefPath); got != SourcePiJSONL {
+		t.Fatalf("pig source = %q, want %q", got, SourcePiJSONL)
+	}
+	if got := HistorySourceFromSessionRef(observability.AgentSessionRef{
+		Agent: "pig", Kind: observability.SessionRefPath,
+		Source: "herdr:pig", Value: "/root/.pig/agent/sessions/ses-1.jsonl",
+	}); got != SourcePiJSONL {
+		t.Fatalf("herdr:pig source = %q, want %q", got, SourcePiJSONL)
+	}
 	if got := HistorySourceFromSessionRef(observability.AgentSessionRef{
 		Agent: "antigravity_cli", Kind: observability.SessionRefID,
 		Source: "herdr:antigravity_cli", Value: agyTestID,

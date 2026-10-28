@@ -4,9 +4,10 @@ import type { AgentIndexRecord } from "./contracts.js";
 
 export const DISPATCHED_PI_SESSION_ROOT = "/tmp/herdr-role-sessions/";
 
-/** Returns true only for Pi agents used as interactive observers, not dispatched roles. */
+/** Returns true only for pi-family (pi/pig) agents used as interactive observers, not dispatched roles. */
 export function isInteractivePiAgent(agent: AgentIndexRecord | undefined): boolean {
-  if (agent?.agent !== "pi" || !agent.agentSession?.value) return false;
+  const kind = agent?.agent?.toLowerCase();
+  if ((kind !== "pi" && kind !== "pig") || !agent?.agentSession?.value) return false;
   const raw = agent.agentSession.value;
   if (raw.includes("..")) return false;
   let resolved = normalize(raw);

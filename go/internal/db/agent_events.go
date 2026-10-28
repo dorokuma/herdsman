@@ -126,7 +126,7 @@ func IsDeliverableAgentEvent(
 		if kind, ok := payload["agent"].(string); ok {
 			agentKind = kind
 		}
-		if agentKind != "pi" &&
+		if agentKind != "pi" && agentKind != "pig" &&
 			(event.Type == observability.AgentEventIdle || event.Type == observability.AgentEventDone) &&
 			!HasNonEmptyAssistantMessage(event.CompactHistory) {
 			return false
@@ -143,7 +143,7 @@ func IsDeliverableAgentEvent(
 		agentKind = *agent.Agent
 	}
 	return !(observability.IsInteractivePiAgent(agent) && event.Type == observability.AgentEventIdle) &&
-		!(agentKind != "pi" &&
+		!(agentKind != "pi" && agentKind != "pig" &&
 			(event.Type == observability.AgentEventIdle || event.Type == observability.AgentEventDone) &&
 			!HasNonEmptyAssistantMessage(event.CompactHistory)) &&
 		agent.PaneID == *event.PaneID &&

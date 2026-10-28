@@ -446,6 +446,53 @@ describe("ObservabilityRpcServer", () => {
     harness.sqlite.close();
   });
 
+  test("treats a pig terminal like a pi terminal", async () => {
+    const { harness, server, socketPath } = await openServerWithoutClient();
+    harness.herdrSessions.upsertRunning({
+      name: "default",
+      sessionDir: "/tmp/herdr",
+      socketPath: "/tmp/herdr/herdr.sock",
+    });
+    harness.agents.replaceForSession({
+      agents: [
+        { agent: "pig", pane_id: "wB:p-pig", terminal_id: "term_pig", workspace_id: "wB" },
+        // The event that lands on the pig owner has to come from a different
+        // terminal: a terminal never receives its own events.
+        { agent: "pi", pane_id: "wB:p-b", terminal_id: "term_b", workspace_id: "wB" },
+      ],
+      herdrSessionName: "default",
+    });
+    const pig = await RpcTestClient.connect(socketPath);
+    await expect(
+      pig.request("agent.orchestrator.register", {
+        herdrSocketPath: "/tmp/herdr/herdr.sock",
+        paneId: "wB:p-pig",
+        sessionRef: {
+          agent: "pig",
+          kind: "path",
+          source: "herdr:pig",
+          value: "/root/.pig/agent/sessions/ses-1.jsonl",
+        },
+        subscriberId: "pig-session",
+        subscriberKind: "pig",
+        workspaceId: "wB",
+      }),
+    ).resolves.toMatchObject({ presence: { terminalId: "term_pig" } });
+    // A pig terminal owns its workspace like a pi terminal does.
+    await expect(pig.request("agent.orchestrator.set", { enabled: true })).resolves.toMatchObject({
+      changed: true,
+      state: { owner: { terminalId: "term_pig" } },
+    });
+
+    const event = appendRoutedEvent(harness, "term_b", "wB");
+    server.publishAgentEvent(event);
+    await expect(pig.waitForNotification("agent.event")).resolves.toMatchObject({
+      params: { event: { id: event.id } },
+    });
+    pig.close();
+    harness.sqlite.close();
+  });
+
   test("routes events to the newest owner socket and role changes to the exact scope", async () => {
     const { harness, server, socketPath } = await openServerWithoutClient();
     seedRoutingAgents(harness);

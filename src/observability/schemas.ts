@@ -55,7 +55,9 @@ export const agentEventsInputSchema = Type.Object(
 const piPresenceSessionRefSchema = Type.Union([
   Type.Object(
     {
-      agent: Type.Literal("pi"),
+      // pi and pig run the same herdsman-pi extension and register the same
+      // `kind: "path"` sessionRef; pig reports `agent: "pig"` / `herdr:pig`.
+      agent: Type.Union([Type.Literal("pi"), Type.Literal("pig")]),
       kind: Type.Literal("path"),
       source: Type.String({ minLength: 1 }),
       value: Type.String({ minLength: 1 }),
@@ -79,7 +81,7 @@ export const agentOrchestratorRegisterInputSchema = Type.Object(
     paneId: Type.String({ minLength: 1 }),
     sessionRef: piPresenceSessionRefSchema,
     subscriberId: Type.String({ minLength: 1 }),
-    subscriberKind: Type.Union([Type.Literal("pi"), Type.Literal("agy")]),
+    subscriberKind: Type.Union([Type.Literal("pi"), Type.Literal("pig"), Type.Literal("agy")]),
     workspaceId: Type.String({ minLength: 1 }),
   },
   { additionalProperties: false },

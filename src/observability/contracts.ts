@@ -212,7 +212,7 @@ export type PiPresenceRegistration = {
   paneId: string;
   sessionRef: AgentSessionRef;
   subscriberId: string;
-  subscriberKind: "pi" | "agy";
+  subscriberKind: "pi" | "pig" | "agy";
   workspaceId: string;
 };
 

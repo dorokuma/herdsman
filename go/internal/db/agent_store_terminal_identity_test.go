@@ -47,6 +47,12 @@ var (
 		Source: "herdr:claude",
 		Value:  "session-1",
 	}
+	pigSessionRef = observability.AgentSessionRef{
+		Agent:  "pig",
+		Kind:   observability.SessionRefPath,
+		Source: "herdr:pig",
+		Value:  "/root/.pig/agent/sessions/ses-1.jsonl",
+	}
 )
 
 // piAgentInput mirrors the TS replacePiAgent input. HasName distinguishes an
@@ -260,6 +266,45 @@ func TestAgentStoreTerminalIdentity(t *testing.T) {
 		if got := replacePiAgent(t, agents, piAgentInput{Revision: intPtr(44)}); got == nil ||
 			!reflect.DeepEqual(got.AgentSession, &piSessionRef) {
 			t.Fatalf("agentSession = %#v, want the preserved Pi hint", got)
+		}
+	})
+
+	t.Run("accepts a pi-family hint across the pi and pig boundary", func(t *testing.T) {
+		// pig runs the same herdsman-pi extension, so a pi-family hint stays
+		// valid when the terminal is indexed under the other family member.
+		agents, _, _, _ := openAgentHarness(t)
+		pig := replacePiAgent(t, agents, piAgentInput{Agent: stringPtr("pig")})
+		if pig == nil {
+			t.Fatalf("the pig agent is missing")
+		}
+		got, err := agents.SetSessionRefByTerminal(SetSessionRefByTerminalInput{
+			AgentSession:     piSessionRef,
+			HerdrSessionName: "default",
+			TerminalID:       "term_1",
+		})
+		if err != nil {
+			t.Fatalf("setSessionRefByTerminal: %v", err)
+		}
+		if got == nil || got.Agent == nil || *got.Agent != "pig" ||
+			!reflect.DeepEqual(got.AgentSession, &piSessionRef) {
+			t.Fatalf("agentSession = %#v, want the pi hint on the pig terminal", got)
+		}
+
+		pi := replacePiAgent(t, agents, piAgentInput{Agent: stringPtr("pi")})
+		if pi == nil {
+			t.Fatalf("the pi agent is missing")
+		}
+		got, err = agents.SetSessionRefByTerminal(SetSessionRefByTerminalInput{
+			AgentSession:     pigSessionRef,
+			HerdrSessionName: "default",
+			TerminalID:       "term_1",
+		})
+		if err != nil {
+			t.Fatalf("setSessionRefByTerminal: %v", err)
+		}
+		if got == nil || got.Agent == nil || *got.Agent != "pi" ||
+			!reflect.DeepEqual(got.AgentSession, &pigSessionRef) {
+			t.Fatalf("agentSession = %#v, want the pig hint on the pi terminal", got)
 		}
 	})
 

@@ -27,6 +27,13 @@ const claudeSessionRef = {
   value: "session-1",
 };
 
+const pigSessionRef = {
+  agent: "pig",
+  kind: "path" as const,
+  source: "herdr:pig",
+  value: "/root/.pig/agent/sessions/ses-1.jsonl",
+};
+
 function replacePiAgent(
   agents: ReturnType<typeof openHarness>["agents"],
   input: {
@@ -124,6 +131,32 @@ describe("AgentStore terminal identity", () => {
       sqlite.prepare("select agent_session_hint_json from agents where id = ?").get(initial.id),
     ).toEqual({ agent_session_hint_json: JSON.stringify(piSessionRef) });
     expect(replacePiAgent(agents, { revision: 44 })?.agentSession).toEqual(piSessionRef);
+  });
+
+  test("accepts a pi session hint for a terminal indexed as pig and the reverse", () => {
+    // pig runs the same herdsman-pi extension, so a pi-family hint stays
+    // valid when the terminal is indexed under the other family member.
+    const { agents } = openHarness();
+    const pig = replacePiAgent(agents, { agent: "pig" });
+    if (!pig) throw new Error("Expected pig agent");
+
+    expect(
+      agents.setSessionRefByTerminal({
+        agentSession: piSessionRef,
+        herdrSessionName: "default",
+        terminalId: "term_1",
+      }),
+    ).toMatchObject({ agent: "pig", agentSession: piSessionRef });
+
+    const pi = replacePiAgent(agents, { agent: "pi" });
+    if (!pi) throw new Error("Expected pi agent");
+    expect(
+      agents.setSessionRefByTerminal({
+        agentSession: pigSessionRef,
+        herdrSessionName: "default",
+        terminalId: "term_1",
+      }),
+    ).toMatchObject({ agent: "pi", agentSession: pigSessionRef });
   });
 
   test("rejects a Pi session hint for a terminal indexed as another agent", () => {

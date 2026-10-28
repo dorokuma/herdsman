@@ -2059,7 +2059,9 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
           paneId: state.currentScope?.paneId ?? launchIdentity.paneId,
           sessionRef,
           subscriberId,
-          subscriberKind: "pi",
+          // pig runs this same extension; it subscribes under the pig kind so
+          // the daemon counts the terminal as pi-family without aliasing to pi.
+          subscriberKind: sessionRef.agent === "pig" ? "pig" : "pi",
           workspaceId: state.currentScope?.workspaceId ?? launchIdentity.workspaceId,
         })
         .then(async (rawResponse) => {
@@ -2160,11 +2162,16 @@ export function createHerdsmanPiExtension(options: ExtensionOptions = {}) {
       activeContext = ctx;
       state.autoClaimAttempted = false;
       state.subscriberId = ctx.sessionManager.getSessionId();
+      const sessionFile = ctx.sessionManager.getSessionFile();
+      // The same extension runs inside pi and pig (PiG). A session living under
+      // the pig home identifies this run as pig so the daemon indexes the pane
+      // under its own agent kind instead of aliasing it to pi.
+      const isPig = typeof sessionFile === "string" && sessionFile.includes("/.pig/");
       state.sessionRef = {
-        agent: "pi",
+        agent: isPig ? "pig" : "pi",
         kind: "path",
-        source: "herdr:pi",
-        value: ctx.sessionManager.getSessionFile(),
+        source: isPig ? "herdr:pig" : "herdr:pi",
+        value: sessionFile,
       };
       state.launchIdentity = herdrLaunchIdentity(process.env);
       if (!state.launchIdentity) {
