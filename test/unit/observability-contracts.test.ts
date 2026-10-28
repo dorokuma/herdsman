@@ -50,7 +50,7 @@ describe("agent observability contracts", () => {
       workspaceId: "wB",
     };
     expect(Value.Check(agentOrchestratorRegisterInputSchema, validPiRegistration)).toBe(true);
-    // pig (PiG) runs the same extension and registers the same `kind: "path"`
+    // pig (PiG) emits the same pi-jsonl session format and herdsman protocol and registers the same `kind: "path"`
     // sessionRef under its own agent kind.
     expect(
       Value.Check(agentOrchestratorRegisterInputSchema, {

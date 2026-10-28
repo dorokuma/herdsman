@@ -374,7 +374,7 @@ func TestHistorySourceFromSessionRefMapsTheSupportedAgentsAndNothingElse(t *test
 	if got := source("pi", observability.SessionRefPath); got != SourcePiJSONL {
 		t.Fatalf("pi source = %q, want %q", got, SourcePiJSONL)
 	}
-	// pig (PiG) runs the same extension and session format, so it reads
+	// pig (PiG) emits the same pi-jsonl session format and herdsman protocol, so it reads
 	// through the same reader.
 	if got := source("pig", observability.SessionRefPath); got != SourcePiJSONL {
 		t.Fatalf("pig source = %q, want %q", got, SourcePiJSONL)

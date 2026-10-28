@@ -272,7 +272,7 @@ describe("agent history discovery", () => {
         value: "/tmp/x.jsonl",
       });
     expect(source("pi")).toBe("pi-jsonl");
-    // pig (PiG) runs the same extension and session format, so it reads
+    // pig (PiG) emits the same pi-jsonl session format and herdsman protocol, so it reads
     // through the same reader.
     expect(source("pig")).toBe("pi-jsonl");
     expect(
