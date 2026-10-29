@@ -4,3 +4,5 @@ dist/
 *.sqlite-*
 .DS_Store
 .agents/notes/INDEX.md
+*.db
+*.db-*
