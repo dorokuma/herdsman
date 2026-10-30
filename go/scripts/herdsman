@@ -2,11 +2,12 @@
 # herdsman — in-repo wrapper that switches the CLI between the TypeScript
 # entrypoint and the Go port.
 #
-# Why this file exists: the host runs the published CLI from
-# /root/.local/bin/herdsman (the npm global install). Switching that symlink to
-# the Go binary would make a half-ported daemon the production CLI, so the
-# switch lives here, inside the repository, and the host install is never
-# touched.
+# Why this file exists: the host runs the CLI through
+# /root/.local/bin/herdsman, a wrapper that execs the Go binary directly
+# (the npm global install it replaced was removed with Node on 2026-10-30).
+# Switching that symlink to this repo's binary would make a half-ported
+# daemon the production CLI, so the switch lives here, inside the
+# repository, and the host install is never touched.
 #
 #   HERDSMAN_IMPL=go  (default) exec the compiled Go binary
 #   HERDSMAN_IMPL=ts            exec the TS entrypoint — requires a Node
