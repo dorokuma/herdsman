@@ -2,15 +2,15 @@ import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { describe, expect, test } from "vitest";
 
-type FakeClient = {
-  calls: unknown[];
-  close: () => void;
-  request: (method: string, params: unknown) => Promise<unknown>;
-};
+const GO_COMMAND = "/root/.local/lib/herdsman-go/herdsman";
+
+function readManifest() {
+  return readFileSync("packages/herdsman-herdr-plugin/herdr-plugin.toml", "utf8");
+}
 
 describe("herdsman Herdr plugin package", () => {
   test("declares agent actions", () => {
-    const manifest = readFileSync("packages/herdsman-herdr-plugin/herdr-plugin.toml", "utf8");
+    const manifest = readManifest();
     expect(manifest).toContain('id = "agent-list"');
     expect(manifest).toContain('title = "Show Herdsman agents"');
     expect(manifest).toContain('title = "Herdsman Agents"');
@@ -18,46 +18,34 @@ describe("herdsman Herdr plugin package", () => {
     expect(manifest).not.toContain('id = "legacy"');
   });
 
-  test("renders agent rows from daemon RPC", async () => {
-    const { runPluginCommand } = await importPlugin();
-    const client = createFakeClient();
-    const output: string[] = [];
-    await expect(
-      runPluginCommand(["agent-list"], {
-        clientFactory: () => client,
-        env: { HERDR_ENV: "1", HERDR_WORKSPACE_ID: "wB" },
-        output: (line: string) => output.push(line),
-      }),
-    ).resolves.toBe(0);
+  test("manifest action and pane exec the Go herdsman binary", () => {
+    const manifest = readManifest();
+    const commands = [
+      ...manifest.matchAll(/^command = \["([^"]+)", "([^"]+)", "([^"]+)"\]$/gm),
+    ].map((match) => [match[1], match[2], match[3]]);
 
-    expect(client.calls).toEqual([["agent.list", { workspaceId: "wB" }], ["close"]]);
-    expect(output[0]).toContain("status\tname\tagent\tpane\tlast user\tlast assistant");
-    expect(output[0]).toContain(
-      "done\treviewer\tcodex\twB:p2\tReview the diff\tNo blocking issues",
-    );
-    expect(output[0]).toContain("idle\t\tcodex\twB:p3");
+    // Both the [[actions]] entry and the [[panes]] entry must point at the Go
+    // CLI — Node was removed from this host, so a node/index.mjs command would
+    // be dead on arrival.
+    expect(commands).toEqual([
+      [GO_COMMAND, "agent", "list"],
+      [GO_COMMAND, "agent", "list"],
+    ]);
+    expect(manifest).not.toContain("index.mjs");
+    expect(manifest).not.toContain('"node"');
   });
 
-  test("rejects missing Herdr context", async () => {
-    const { runPluginCommand } = await importPlugin();
-    const client = createFakeClient();
-    const output: string[] = [];
-    await expect(
-      runPluginCommand(["agent-list"], {
-        clientFactory: () => client,
-        env: {},
-        output: (line: string) => output.push(line),
-      }),
-    ).resolves.toBe(2);
-    expect(output[0]).toContain("HERDR_ENV=1");
-  });
+  test("Go binary answers agent list", () => {
+    // The vitest setup redirects HERDSMAN_HOME to an empty tmp dir; the live
+    // daemon socket lives in the default home.
+    const output = execFileSync(GO_COMMAND, ["agent", "list"], {
+      encoding: "utf8",
+      env: { ...process.env, HERDSMAN_HOME: undefined },
+    });
+    expect(output).toMatch(/^status\tname\tagent\tpane/m);
+  }, 15_000);
 
-  test("renders empty agents", async () => {
-    const { renderAgents } = await importPlugin();
-    expect(renderAgents({ agents: [] })).toBe("No Herdsman agents indexed.");
-  });
-
-  test("packages the runtime entrypoint without build output", () => {
+  test("packages the manifest without build output", () => {
     const output = execFileSync("bun", ["pm", "pack", "--dry-run"], {
       cwd: "packages/herdsman-herdr-plugin",
       encoding: "utf8",
@@ -72,47 +60,3 @@ describe("herdsman Herdr plugin package", () => {
     expect(files.some((file) => file.startsWith("dist/"))).toBe(false);
   }, 30_000);
 });
-
-async function importPlugin() {
-  const pluginModuleUrl = new URL("../../packages/herdsman-herdr-plugin/index.mjs", import.meta.url)
-    .href;
-  return import(pluginModuleUrl) as Promise<{
-    renderAgents(input: unknown): string;
-    runPluginCommand(args: string[], deps: unknown): Promise<number>;
-  }>;
-}
-
-function createFakeClient(): FakeClient {
-  const calls: unknown[] = [];
-  return {
-    calls,
-    close: () => calls.push(["close"]),
-    async request(method, params) {
-      calls.push([method, params]);
-      if (method === "agent.list") {
-        return {
-          agents: [
-            {
-              agent: "codex",
-              agentStatus: "done",
-              history: {
-                lastAssistantMessage: { text: "No blocking issues" },
-                lastUserMessage: { text: "Review the diff" },
-              },
-              name: "reviewer",
-              paneId: "wB:p2",
-            },
-            {
-              agent: "codex",
-              agentStatus: "idle",
-              history: {},
-              name: null,
-              paneId: "wB:p3",
-            },
-          ],
-        };
-      }
-      return {};
-    },
-  };
-}

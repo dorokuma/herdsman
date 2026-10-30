@@ -8,25 +8,28 @@
 # switch lives here, inside the repository, and the host install is never
 # touched.
 #
-#   HERDSMAN_IMPL=ts  (default) exec node on the built TS entrypoint
-#   HERDSMAN_IMPL=go            exec the compiled Go binary
+#   HERDSMAN_IMPL=go  (default) exec the compiled Go binary
+#   HERDSMAN_IMPL=ts            exec the TS entrypoint — requires a Node
+#                               runtime (retired on this host: Node was
+#                               removed system-wide on 2026-10-30)
 #
 # Overrides (mainly for tests and out-of-tree builds):
 #   HERDSMAN_GO_BIN   path of the Go binary      (default: <repo>/go/bin/herdsman,
 #                    falling back to /root/.local/lib/herdsman-go/herdsman)
 #   HERDSMAN_TS_ENTRY path of the TS entrypoint  (default: <repo>/dist/src/cli/herdsman.js)
-#   HERDSMAN_NODE     node binary for the TS entrypoint (default: node)
+#   HERDSMAN_NODE     node binary for the TS entrypoint (default: node — absent
+#                    on this host; ts only works where Node is still installed)
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
-impl=${HERDSMAN_IMPL:-ts}
+impl=${HERDSMAN_IMPL:-go}
 
 case "$impl" in
   ts)
     entry=${HERDSMAN_TS_ENTRY:-$repo_root/dist/src/cli/herdsman.js}
     if [ ! -f "$entry" ]; then
-      echo "herdsman wrapper: TS entrypoint not found at $entry (run: pnpm build)" >&2
+      echo "herdsman wrapper: TS entrypoint not found at $entry (build it with: bun run build)" >&2
       exit 1
     fi
     exec "${HERDSMAN_NODE:-node}" "$entry" "$@"

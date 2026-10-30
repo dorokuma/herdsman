@@ -18,9 +18,16 @@ Detailed development and contribution guidelines are maintained across:
 
 ## Requirements
 
+Published npm package (running the TypeScript CLI):
+
 - Node.js >= 22.12.0
 - Herdr >= 0.7.0
 - Pi >= 0.80.6 when using `herdsman-pi`
+
+This host (zero-node since 2026-10-30):
+
+- The production CLI and daemon are the Go binaries under `/root/.local/lib/herdsman-go/` — no Node required.
+- Source builds and tests need Bun >= 1.4.0 (`packageManager: bun@1.4.4`; the TypeScript toolchain now runs on Bun).
 
 ## Install
 
@@ -31,29 +38,33 @@ herdsman help
 
 ### Install from source
 
-This path is for local development only; it is not a production install channel.
+This path is for local development only; it is not a production install channel. The production host runs the Go binaries under `/root/.local/lib/herdsman-go/` — see AGENTS.md「本机运维」.
 
-Source builds also require pnpm >= 11.9.0.
+Source builds require Bun >= 1.4.0 (this repo's `packageManager` is `bun@1.4.4`).
 
 ```bash
 git clone https://github.com/dorokuma/herdsman.git
 cd herdsman
-pnpm install
-pnpm build
+bun install
+bun run build
 npm install --global . --ignore-scripts
 herdsman help
 ```
+
+Note: `npm install --global` is the registry/distribution step and needs Node + npm on a machine that has them; this host has neither. On this host, `bun install` + `bun run build` produce `dist/`, and the entrypoint can also run under Bun (`bun ./dist/src/cli/herdsman.js help`).
 
 ## Start the daemon
 
 Herdsman agent commands and Pi notifications require the daemon. The daemon watches all running Herdr sessions reported by `herdr session list --json`, rescans them every 60 seconds, and does not index stopped Herdr sessions. Runtime files live in `~/.herdsman` by default. Set `HERDSMAN_HOME` to use another directory.
 
-On the production host the package is installed from the npm registry (`npm install --global @dorokuma/herdsman@<version>`), and the daemon is managed by the systemd unit `herdsman.service`, which keeps it running: use `systemctl restart herdsman.service` to restart it. Install it with the same Node.js toolchain the unit uses, and prefix the command with that toolchain's `bin` on `PATH`, e.g. `PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" npm install --global @dorokuma/herdsman@<version>`, so the global prefix matches the unit's (the production unit pins nvm v22.23.1). On a host that mixes `nvm` and `mise`, omitting the prefix can install into a different global prefix. There are no CLI start/stop/restart commands. `herdsman daemon status` reports the daemon state in either case.
+On this host the production daemon is the Go binary `/root/.local/lib/herdsman-go/herdsman-daemon`, started directly by the systemd unit `herdsman.service`, which keeps it running: use `systemctl restart herdsman.service` to restart it. The npm-installed TypeScript daemon described in [docs/releasing.md](./docs/releasing.md) is the published-artifact channel for downstream hosts that have Node.js; this host no longer runs it.
 
-For development or verification, run the entrypoint in the foreground with an explicit temporary data directory, so the production data directory is not used as scratch space:
+For development or verification, run the entrypoint in the foreground with an explicit temporary data directory, so the production data directory is not used as scratch space. Either the Go binary or the Bun-built TypeScript entrypoint works:
 
 ```bash
-HERDSMAN_HOME=/tmp/herdsman-dev node ./dist/src/cli/herdsman-daemon.js
+HERDSMAN_HOME=/tmp/herdsman-dev /root/.local/lib/herdsman-go/herdsman-daemon
+# or, after `bun run build`:
+HERDSMAN_HOME=/tmp/herdsman-dev bun ./dist/src/cli/herdsman-daemon.js
 ```
 
 ## Main commands
@@ -148,18 +159,18 @@ The plugin connects to the Herdsman daemon and shows compact agent rows for the 
 ## Development
 
 ```bash
-pnpm install
-pnpm check
-pnpm build
+bun install
+bun run check
+bun run build
 ```
 
-See [Releasing Herdsman](./docs/releasing.md) for package validation, npm publication, and GitHub Release steps. Because the release commit on `main` must update the Herdr plugin `--ref <tag>` install command in `README.md` and `packages/herdsman-herdr-plugin/README.md` before the annotated git tag is created — so the tag snapshot itself seals the matching `--ref <tag>`, manifest versions, and `CHANGELOG.md` section — and the remote tag is pushed only after `main` is pushed and both npm packages are published and verified, `--ref <tag>` on `main` has a short structural window where the new tag is not yet resolvable on GitHub. Follow the release order in [docs/releasing.md](./docs/releasing.md) strictly: synchronize the four manifests, both README `--ref` lines, and `CHANGELOG.md` (recording only facts already true when the release commit is written), run `pnpm check` / `pnpm build` and isolated tarball checks, commit and push `main`, create and verify the local annotated tag snapshot, publish and verify both `@dorokuma/herdsman` and `@dorokuma/herdsman-pi` on npm, push the remote tag and create the GitHub Release (closing the `--ref` window; run `herdr plugin install` with the new `--ref <tag>` only after the remote tag and Release are live), and finally record the release under `.agents/notes/` as a separate commit on `main`. Published git tags, GitHub Releases, and already-released `CHANGELOG.md` sections are immutable and must never be rewritten, moved, or backfilled retroactively; record any post-release observations or wording corrections in `.agents/notes/` instead.
+See [Releasing Herdsman](./docs/releasing.md) for package validation, npm publication, and GitHub Release steps. Because the release commit on `main` must update the Herdr plugin `--ref <tag>` install command in `README.md` and `packages/herdsman-herdr-plugin/README.md` before the annotated git tag is created — so the tag snapshot itself seals the matching `--ref <tag>`, manifest versions, and `CHANGELOG.md` section — and the remote tag is pushed only after `main` is pushed and both npm packages are published and verified, `--ref <tag>` on `main` has a short structural window where the new tag is not yet resolvable on GitHub. Follow the release order in [docs/releasing.md](./docs/releasing.md) strictly: synchronize the four manifests, both README `--ref` lines, and `CHANGELOG.md` (recording only facts already true when the release commit is written), run `bun run check` / `bun run build` and isolated tarball checks, commit and push `main`, create and verify the local annotated tag snapshot, publish and verify both `@dorokuma/herdsman` and `@dorokuma/herdsman-pi` on npm, push the remote tag and create the GitHub Release (closing the `--ref` window; run `herdr plugin install` with the new `--ref <tag>` only after the remote tag and Release are live), and finally record the release under `.agents/notes/` as a separate commit on `main`. Published git tags, GitHub Releases, and already-released `CHANGELOG.md` sections are immutable and must never be rewritten, moved, or backfilled retroactively; record any post-release observations or wording corrections in `.agents/notes/` instead.
 
 DB schema changes require:
 
 ```bash
-pnpm db:generate
-pnpm db:check
+bun run db:generate
+bun run db:check
 ```
 
 ## License
