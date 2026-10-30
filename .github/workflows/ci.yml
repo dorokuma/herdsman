@@ -9,13 +9,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: pnpm/setup@v2
+      - uses: oven-sh/setup-bun@v2
         with:
-          version: 11.9.0
-          runtime: node@22
-          cache: true
-          # pnpm/setup's install input is a plain boolean with no extra-arg
-          # passthrough, so keep the explicit step to preserve --ignore-scripts
-          install: false
-      - run: pnpm install --ignore-scripts
-      - run: pnpm check
+          bun-version: 1.4.4
+      - run: bun install --ignore-scripts
+      - run: bun run check

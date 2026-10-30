@@ -19,7 +19,7 @@ describe("deployment guidance", () => {
       .split(/^## /m)
       .find((section) => section.startsWith("Validate source and package contents"));
     expect(validateSection).toBeDefined();
-    expect(validateSection).toContain("pnpm check");
+    expect(validateSection).toContain("bun run check");
     expect(deployBullet).toContain("Validate source and package contents");
 
     // Deployment itself never runs the gate — release rounds already ran it — so

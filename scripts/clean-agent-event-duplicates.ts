@@ -1,8 +1,8 @@
-#!/usr/bin/env tsx
+#!/usr/bin/env bun
 /**
  * Remove historical semantic duplicates from the daemon's agent_events table.
  *
- * Usage: pnpm exec tsx scripts/clean-agent-event-duplicates.ts [--dry-run]
+ * Usage: bun scripts/clean-agent-event-duplicates.ts [--dry-run]
  *        ... [--db /absolute/path/to/state.db]
  */
 import { existsSync } from "node:fs";

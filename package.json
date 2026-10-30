@@ -28,27 +28,26 @@
     "url": "https://github.com/dorokuma/herdsman/issues"
   },
   "homepage": "https://github.com/dorokuma/herdsman#readme",
-  "packageManager": "pnpm@11.9.0",
+  "packageManager": "bun@1.4.4",
   "engines": {
-    "node": ">=22.12.0",
-    "pnpm": ">=11.9.0"
+    "bun": ">=1.4.0"
   },
   "scripts": {
-    "build": "pnpm clean:dist && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
-    "check": "pnpm typecheck && pnpm test && pnpm lint && pnpm format:check && pnpm db:check && pnpm package:check && pnpm pi-package:check && pnpm herdr-plugin:check",
-    "clean:dist": "node scripts/clean-dist.mjs",
+    "build": "bun run clean:dist && tsc -p tsconfig.build.json && tsc-alias -p tsconfig.build.json",
+    "check": "bun run typecheck && bun run test && bun run lint && bun run format:check && bun run db:check && bun run package:check && bun run pi-package:check && bun run herdr-plugin:check",
+    "clean:dist": "bun scripts/clean-dist.mjs",
     "db:check": "drizzle-kit check --config drizzle.config.ts",
     "db:generate": "drizzle-kit generate --config drizzle.config.ts",
-    "db:migrate": "tsx src/db/migrate.ts",
+    "db:migrate": "bun src/db/migrate.ts",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "herdr-plugin:check": "pnpm --dir packages/herdsman-herdr-plugin typecheck && pnpm --dir packages/herdsman-herdr-plugin package:check",
+    "herdr-plugin:check": "cd packages/herdsman-herdr-plugin && bun run typecheck && bun run package:check",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "package:check": "node scripts/check-root-package.mjs",
-    "pi-package:check": "pnpm --dir packages/herdsman-pi typecheck && (cd packages/herdsman-pi && npm pack --dry-run --json > /dev/null)",
-    "pnpm:devPreinstall": "husky",
-    "prepack": "pnpm build",
+    "package:check": "bun scripts/check-root-package.mjs",
+    "pi-package:check": "cd packages/herdsman-pi && bun run typecheck && bun pm pack --dry-run > /dev/null",
+    "prepack": "bun run build",
+    "postinstall": "husky",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc --noEmit -p tsconfig.json"

@@ -58,13 +58,14 @@ describe("herdsman Herdr plugin package", () => {
   });
 
   test("packages the runtime entrypoint without build output", () => {
-    const pack = JSON.parse(
-      execFileSync("npm", ["pack", "--dry-run", "--json"], {
-        cwd: "packages/herdsman-herdr-plugin",
-        encoding: "utf8",
-      }),
-    ) as Array<{ files: Array<{ path: string }> }>;
-    const files = pack[0]?.files.map((file) => file.path) ?? [];
+    const output = execFileSync("bun", ["pm", "pack", "--dry-run"], {
+      cwd: "packages/herdsman-herdr-plugin",
+      encoding: "utf8",
+    });
+    const files = output
+      .split("\n")
+      .map((line) => /^packed\s+\S+\s+(.+?)\s*$/.exec(line)?.[1])
+      .filter((path): path is string => Boolean(path));
 
     expect(files).toContain("index.mjs");
     expect(files).toContain("herdr-plugin.toml");

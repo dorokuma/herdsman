@@ -36,14 +36,14 @@ describe("npm publication metadata", () => {
     expect(root.files).toEqual(["dist", "drizzle"]);
     expect(root.publishConfig?.access).toBe("public");
     expect(root.scripts).toMatchObject({
-      "clean:dist": "node scripts/clean-dist.mjs",
-      "package:check": "node scripts/check-root-package.mjs",
-      "pnpm:devPreinstall": "husky",
-      prepack: "pnpm build",
+      "clean:dist": "bun scripts/clean-dist.mjs",
+      "package:check": "bun scripts/check-root-package.mjs",
+      postinstall: "husky",
+      prepack: "bun run build",
     });
     expect(root.scripts).not.toHaveProperty("prepare");
-    expect(root.scripts?.build).toContain("pnpm clean:dist");
-    expect(root.scripts?.check).toContain("pnpm package:check");
+    expect(root.scripts?.build).toContain("bun run clean:dist");
+    expect(root.scripts?.check).toContain("bun run package:check");
 
     expect(pi.name).toBe("@dorokuma/herdsman-pi");
     expect(pi.files).toEqual(["src", "LICENSE"]);
@@ -63,17 +63,14 @@ describe("npm publication metadata", () => {
 
   test("includes LICENSE in the Pi package tarball", () => {
     const cwd = fileURLToPath(new URL("../../packages/herdsman-pi", import.meta.url));
-    const output = execFileSync("npm", ["pack", "--dry-run", "--json"], {
+    const output = execFileSync("bun", ["pm", "pack", "--dry-run"], {
       cwd,
       encoding: "utf8",
     });
-    const packed = JSON.parse(output) as
-      | Array<{ files?: Array<{ path: string }> }>
-      | {
-          files?: Array<{ path: string }>;
-        };
-    const entries = Array.isArray(packed) ? packed : [packed];
-    const files = entries.flatMap((entry) => entry.files ?? []).map((file) => file.path);
+    const files = output
+      .split("\n")
+      .map((line) => /^packed\s+\S+\s+(.+?)\s*$/.exec(line)?.[1])
+      .filter((path): path is string => Boolean(path));
     expect(files).toContain("LICENSE");
   }, 30_000);
 });

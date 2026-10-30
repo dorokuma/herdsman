@@ -1,11 +1,13 @@
-#!/usr/bin/env node
+#!/usr/bin/env bun
 // @ts-check
 import { execFileSync } from "node:child_process";
 
-const [pack] = /** @type {Array<{ files: Array<{ path: string }> }>} */ (
-  JSON.parse(execFileSync("npm", ["pack", "--dry-run", "--json"], { encoding: "utf8" }))
-);
-const files = pack?.files.map((file) => file.path) ?? [];
+const bun = process.platform === "win32" ? "bun.exe" : "bun";
+const output = execFileSync(bun, ["pm", "pack", "--dry-run"], { encoding: "utf8" });
+const files = output
+  .split("\n")
+  .map((line) => line.match(/^packed\s+\S+\s+(.+?)\s*$/)?.[1])
+  .filter(/** @returns {p is string} */ (p) => Boolean(p));
 
 for (const required of ["index.mjs", "herdr-plugin.toml"]) {
   if (!files.includes(required)) {
