@@ -200,6 +200,19 @@ func applyMigration(db *sql.DB, file migrationFile) error {
 	if _, err := db.Exec("begin"); err != nil {
 		return err
 	}
+	// Same panic contract as RunSqliteTransaction: a panic unwinding past this
+	// point would leave the open transaction attached to the one connection
+	// every goroutine shares, so it is rolled back inside the unwind before
+	// the panic continues. The statements above are db.Exec calls — the gate
+	// levels they take are released per call — but the leftover-transaction
+	// window is identical, so the repair is identical: a rollback failure must
+	// not mask the panic, hence the ignored error.
+	defer func() {
+		if p := recover(); p != nil {
+			_, _ = db.Exec("rollback")
+			panic(p)
+		}
+	}()
 	for _, statement := range file.statements {
 		if _, err := db.Exec(statement); err != nil {
 			_, _ = db.Exec("rollback")

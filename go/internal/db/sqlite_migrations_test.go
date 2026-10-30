@@ -967,3 +967,208 @@ func TestRunSqliteTransactionRollsBackAfterFailedCommit(t *testing.T) {
 		t.Fatalf("orphan workspace count = %d, want 0 (the failed commit was rolled back)", orphans)
 	}
 }
+
+// TestRunSqliteTransactionRollsBackAfterFnPanic is the regression for the
+// panic path of RunSqliteTransaction: a panicking callback must still roll its
+// transaction back before the panic propagates.
+//
+// Without the recover inside the function the defer chain still releases the
+// gate, but the open transaction stays attached to the one connection every
+// goroutine shares — the next caller's `begin immediate` then fails with
+// "cannot start a transaction within a transaction", which is the same stuck
+// window a failed commit leaves.
+func TestRunSqliteTransactionRollsBackAfterFnPanic(t *testing.T) {
+	db := openMigratedTestDB(t)
+	insertTestSession(t, db)
+
+	func() {
+		defer func() {
+			if p := recover(); p == nil {
+				t.Fatal("RunSqliteTransaction returned without panicking")
+			} else if p != "fn panicked on purpose" {
+				t.Fatalf("panic = %v, want the callback's own panic to propagate", p)
+			}
+		}()
+		_ = RunSqliteTransaction(db, func() error {
+			if err := insertTestWorkspace(db, "panic-rolled-back"); err != nil {
+				return err
+			}
+			panic("fn panicked on purpose")
+		})
+	}()
+
+	// The rollback ran before the panic propagated, so the shared connection is
+	// clean again: a new transaction must be able to BEGIN IMMEDIATE and commit
+	// instead of hitting the leftover open transaction.
+	if err := RunSqliteTransaction(db, func() error {
+		return insertTestWorkspace(db, "after-fn-panic")
+	}); err != nil {
+		t.Fatalf("transaction after a panicking fn: %v", err)
+	}
+
+	var rolledBack, committed int
+	if err := db.QueryRow(
+		"select count(*) from herdr_workspaces where workspace_id = 'panic-rolled-back'",
+	).Scan(&rolledBack); err != nil {
+		t.Fatalf("count rolled-back: %v", err)
+	}
+	if err := db.QueryRow(
+		"select count(*) from herdr_workspaces where workspace_id = 'after-fn-panic'",
+	).Scan(&committed); err != nil {
+		t.Fatalf("count committed: %v", err)
+	}
+	if rolledBack != 0 {
+		t.Fatalf("panic-rolled-back workspace count = %d, want 0 (the panic discarded it)", rolledBack)
+	}
+	if committed != 1 {
+		t.Fatalf("after-fn-panic workspace count = %d, want 1", committed)
+	}
+}
+
+// TestRunSqliteTransactionPanicSettlesOrphanedGateLevels is the regression for
+// the owner-never-release shape the rollback alone cannot fix: when fn panics
+// while a *sql.Rows (or a prepared statement) it opened is still unclosed,
+// that wrapper's gate level is orphaned — the panic unwinds past its Close.
+// Before the fix the deferred Release popped only the transaction's own
+// level, so depth never reached zero, the owner stayed pinned, and every
+// later statement queued forever — the exact deadlock the watchdog reports.
+func TestRunSqliteTransactionPanicSettlesOrphanedGateLevels(t *testing.T) {
+	db := openMigratedTestDB(t)
+	insertTestSession(t, db)
+
+	gid := make(chan int64, 1)
+	func() {
+		defer func() {
+			if p := recover(); p == nil {
+				t.Fatal("RunSqliteTransaction returned without panicking")
+			}
+		}()
+		_ = RunSqliteTransaction(db, func() error {
+			// Query keeps its gate level until rows.Close, which the panic
+			// below unwinds past — the orphaned level of the production shape.
+			rows, err := db.Query("select workspace_id from herdr_workspaces")
+			if err != nil {
+				return err
+			}
+			_ = rows // deliberately unclosed
+			gid <- shared.CurrentGoroutineID()
+			panic("fn panicked with open rows")
+		})
+	}()
+
+	// The unwind settled every level this goroutine owned, so its leftover
+	// gate hold is gone entirely.
+	if shared.SqliteGateOf(db).HeldBy(<-gid) {
+		t.Fatal("gate still held by the panicking goroutine: orphaned rows level kept depth above zero")
+	}
+
+	// The gate is free again: a new transaction from another goroutine
+	// acquires, begins, and commits instead of queueing forever.
+	done := make(chan error, 1)
+	go func() {
+		done <- RunSqliteTransaction(db, func() error {
+			return insertTestWorkspace(db, "after-orphaned-rows-panic")
+		})
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("transaction after the panic: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("deadlock: the orphaned rows level kept the gate owned forever")
+	}
+
+	var committed int
+	if err := db.QueryRow(
+		"select count(*) from herdr_workspaces where workspace_id = 'after-orphaned-rows-panic'",
+	).Scan(&committed); err != nil {
+		t.Fatalf("count committed: %v", err)
+	}
+	if committed != 1 {
+		t.Fatalf("after-orphaned-rows-panic workspace count = %d, want 1", committed)
+	}
+}
+
+// TestRunSqliteTransactionPanicRollsBackBeforeReleasingGate is the regression
+// for the lock order of the panic path: the rollback must run while the
+// panicking goroutine still owns the gate, and the orphaned gate levels
+// settle only after it. Settling them first would broadcast the queue awake
+// while the shared connection is still inside the open transaction — a
+// waiter that wins the free gate then either fails its `begin immediate`
+// with "cannot start a transaction within a transaction" or writes into a
+// transaction the rollback is about to discard, losing a write it believes
+// committed.
+//
+// A wrong order opens only a single race — the woken waiter must reach the
+// gate before the rollback re-acquires it — so the assertion runs parked
+// waiters against the panic over many attempts. Under the fixed order no
+// waiter can observe the gate free while the transaction is open, so every
+// attempt must commit every waiter row; under the old order one steal is
+// enough to lose the waiter's write to the rollback.
+func TestRunSqliteTransactionPanicRollsBackBeforeReleasingGate(t *testing.T) {
+	db := openMigratedTestDB(t)
+	insertTestSession(t, db)
+
+	const attempts = 64
+	const waiters = 8
+	for attempt := 0; attempt < attempts; attempt++ {
+		var wait sync.WaitGroup
+		errs := make([]error, waiters)
+		wait.Add(waiters)
+
+		func() {
+			defer func() {
+				if p := recover(); p == nil {
+					t.Fatal("RunSqliteTransaction returned without panicking")
+				}
+			}()
+			_ = RunSqliteTransaction(db, func() error {
+				rolledBack := fmt.Sprintf("window-rolled-back-%d", attempt)
+				if err := insertTestWorkspace(db, rolledBack); err != nil {
+					return err
+				}
+				// The waiters park on the gate while fn still holds it, so a
+				// ReleaseAll ahead of the rollback wakes them into the still-open
+				// transaction — their plain inserts would silently join it and be
+				// discarded by the rollback that follows.
+				for index := 0; index < waiters; index++ {
+					go func(index int) {
+						defer wait.Done()
+						errs[index] = insertTestWorkspace(db, fmt.Sprintf("window-waiter-%d-%d", attempt, index))
+					}(index)
+				}
+				time.Sleep(5 * time.Millisecond)
+				panic("fn panicked with waiters queued on the gate")
+			})
+		}()
+
+		wait.Wait()
+		for index, err := range errs {
+			if err != nil {
+				t.Fatalf("attempt %d waiter %d failed: %v", attempt, index, err)
+			}
+		}
+
+		var survived, rolledBack int
+		if err := db.QueryRow(
+			"select count(*) from herdr_workspaces where workspace_id like ?",
+			fmt.Sprintf("window-waiter-%d-%%", attempt),
+		).Scan(&survived); err != nil {
+			t.Fatalf("count waiter rows: %v", err)
+		}
+		if survived != waiters {
+			t.Fatalf("attempt %d: committed waiter rows = %d, want %d — a waiter wrote into the not-yet-rolled-back transaction and the rollback discarded it",
+				attempt, survived, waiters)
+		}
+		if err := db.QueryRow(
+			"select count(*) from herdr_workspaces where workspace_id = ?",
+			fmt.Sprintf("window-rolled-back-%d", attempt),
+		).Scan(&rolledBack); err != nil {
+			t.Fatalf("count rolled-back row: %v", err)
+		}
+		if rolledBack != 0 {
+			t.Fatalf("attempt %d: rolled-back row count = %d, want 0", attempt, rolledBack)
+		}
+	}
+}
