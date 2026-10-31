@@ -294,6 +294,11 @@ func TestStopSpawnsWaiterAndWakeWaiterWakesIdleMainPane(t *testing.T) {
 }
 
 // --- WakeWaiter silently acks suppressed events (lines 659-732) -------------
+//
+// As of the error-passthrough change the only remaining permanently
+// suppressed class is an empty assistant text (an upstream-error result is now
+// delivered verbatim with a warning instead). The behaviour under test is
+// unchanged: suppressed candidates settle in place without a wake prompt.
 
 func TestWakeWaiterSilentlyAcksSuppressedEvents(t *testing.T) {
 	dir := t.TempDir()
@@ -302,16 +307,12 @@ func TestWakeWaiterSilentlyAcksSuppressedEvents(t *testing.T) {
 	var ackedEventID int64
 	wakePrompts := []wakePrompt{}
 
-	// Event 30 is an upstream 429 failure; event 31 is a completed event with a
-	// whitespace-only excerpt. Both are suppressed by the projection and must be
-	// acked without a wake prompt.
+	// Event 30 is an upstream 429 failure — as of the error-passthrough change
+	// it is *delivered* (with a warning banner) instead of suppressed, so this
+	// suppression case uses an event that can no longer be mistaken for one:
+	// a completion with an empty assistant text, plus a whitespace-only one.
 	suppressed := []any{
-		func() any {
-			event := makeDoneEvent(30, "")
-			event.Type = "agent.failed"
-			event.Payload = map[string]any{"agent": "pi", "name": "role-worker-1", "reason": "429 rate limit exceeded"}
-			return event
-		}(),
+		makeDoneEvent(30, ""),
 		makeDoneEvent(31, "   "),
 	}
 

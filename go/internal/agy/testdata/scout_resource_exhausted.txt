@@ -1,0 +1,103 @@
+### 摸到什么
+
+**账号套餐与调用路由**
+
+- 账号与凭据文件：本机 Google Antigravity 主账号凭据位于 [antigravity-oauth-token](file:///home/dev/.gemini/antigravity-cli/antigravity-oauth-token)，认证账号为 primary@example.com（证据见 [cli-20261031_213326.log:156](file:///home/dev/.gemini/antigravity-cli/log/cli-20261031_213326.log#L156)），套餐档位为 Google AI Ultra。备用账号凭据位于 [/home/dev/.agy-pro-home/.gemini/antigravity-cli/antigravity-oauth-token](file:///home/dev/.agy-pro-home/.gemini/antigravity-cli/antigravity-oauth-token)，对应 Google AI Pro（backup@example.com）。
+- 官方调用端点：Google Antigravity CLI 调用 Anthropic（Claude 系列）模型走 Google 官方内部网关 `https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent`，由 Google Vertex AI 后端提供托管服务，响应标识前缀为 `req_vrtx_`。
+- 本地 Magpie 网关与 pig 路由：本地运行 Magpie 代理服务于 `127.0.0.1:3425`（配置见 [models.json](file:///home/dev/.pig/agent/models.json#L5) 与 [providers.json](file:///home/dev/.config/magpie/providers.json#L1083-L1160)）。pig 的各角色默认路由至 `group/*` 分组（worker、reviewer、verifier、oracle），底层主要分发到 deepseek、swe-2 或本地 qwen 等模型，默认不走 Ultra 套餐官方 Claude 配额池。
+
+**本地配额查询方法与当前配额状态**
+
+- 安全只读配额查询方式：向 `https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels` 发送 POST 空 JSON 请求（请求头携带 `antigravity-oauth-token` 内的 Bearer token 与 `User-Agent: antigravity/2.0.0 linux/amd64`），可即时获取云端下发的各模型 `quotaInfo`（含 `remainingFraction` 剩余比例与 `resetTime` 重置时间戳）。
+- Ultra 账号各模型实时配额取证（查询时间戳 2026-10-31T21:47:16+08:00 / 2026-10-31T13:47:16Z）：
+  - `claude-opus-5-5-high`：`remainingFraction` 为 `None`（用量已耗尽），`resetTime` 为 `2026-11-05T03:27:44Z`（换算本地时间 **2026-11-05T11:27:44+08:00**）。
+  - `claude-opus-5-5-medium`：`remainingFraction` 为 `None`，`resetTime` 为 `2026-11-05T03:27:44Z`（**2026-11-05T11:27:44+08:00**）。
+  - `claude-opus-5-5-low`：`remainingFraction` 为 `None`，`resetTime` 为 `2026-11-05T03:27:44Z`（**2026-11-05T11:27:44+08:00**）。
+  - `claude-sonnet-5-5-high`：`remainingFraction` 为 `None`，`resetTime` 为 `2026-11-05T03:27:44Z`（**2026-11-05T11:27:44+08:00**）。
+  - `claude-sonnet-5-5-medium`：`remainingFraction` 为 `None`，`resetTime` 为 `2026-11-05T03:27:44Z`（**2026-11-05T11:27:44+08:00**）。
+  - `claude-sonnet-5-5-low`：`remainingFraction` 为 `None`，`resetTime` 为 `2026-11-05T03:27:44Z`（**2026-11-05T11:27:44+08:00**）。
+  - `gpt-oss-120b-medium`：共享同一周配额池，`remainingFraction` 为 `None`，`resetTime` 为 `2026-11-05T03:27:44Z`（**2026-11-05T11:27:44+08:00**）。
+  - 对照 Gemini 配额池：`gemini-2.5-pro`、`gemini-3-flash` 属独立短周期配额，当前剩余 93.08%（`remainingFraction: 0.93087816`），重置时间为 `2026-10-31T16:23:24Z`（**2026-11-01T00:23:24+08:00**）。
+
+**打满与切模精确时间点**
+
+- 末次成功响应时间戳：
+  - 日志位置：[cli-20261029_172928.log:291](file:///home/dev/.gemini/antigravity-cli/log/cli-20261029_172928.log#L291)
+  - 时间戳：`2026-10-29T18:00:14.891515+08:00`（原始日志：`I1029 18:00:14.891515` / UTC `2026-10-29T10:00:14.891515Z`）
+  - 响应凭证：`ResponseID: req_vrtx_000000000000000000000000`，URL: `https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse`
+- 首次出现周配额耗尽（打满）时间戳：
+  - 日志位置：[cli-20261029_172928.log:292-293](file:///home/dev/.gemini/antigravity-cli/log/cli-20261029_172928.log#L292-L293)
+  - 时间戳：`2026-10-29T18:00:36.270396+08:00`（原始日志：`E1029 18:00:36.270396` / UTC `2026-10-29T10:00:36.270396Z`）
+  - 原始报错文本：`agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 161h25m49s.`
+  - 重置时间换算：打满时报错标注在 161 小时 25 分 49 秒后重置（即约 6.72 天后，对应 **2026-11-05T11:26:25+08:00**），与当前云端接口返回的 `2026-11-05T03:27:44Z` 精确对应。
+- 被迫切模时间戳：
+  - 日志位置：[cli-20261029_181606.log:120-122](file:///home/dev/.gemini/antigravity-cli/log/cli-20261029_181606.log#L120-L122)
+  - 时间戳：`2026-10-29T18:16:54.953685+08:00`（原始日志：`I1029 18:16:54.953685` / UTC `2026-10-29T10:16:54.953685Z`）
+  - 动作：官方配额 429 报错后 CLI 重启，主会话被迫切模为 Magpie 第三方代理提供商 `magpie/devin/claude-opus-5-5`。
+
+**用量消耗归因**
+
+- 角色配置排查：检查 [/home/dev/.pig/agent/agents/](file:///home/dev/.pig/agent/agents) 下全部 7 个角色（[worker.md](file:///home/dev/.pig/agent/agents/worker.md)、[reviewer.md](file:///home/dev/.pig/agent/agents/reviewer.md)、[verifier.md](file:///home/dev/.pig/agent/agents/verifier.md)、[oracle.md](file:///home/dev/.pig/agent/agents/oracle.md)、[planner.md](file:///home/dev/.pig/agent/agents/planner.md)、[scout.md](file:///home/dev/.pig/agent/agents/scout.md)、[researcher.md](file:///home/dev/.pig/agent/agents/researcher.md)）及 [/tmp/dispatch-*.md](file:///tmp) 共 79 份任务派发单，所有角色与派发任务均未配置 Claude 模型。
+- 头号且唯一消耗会话：
+  - 会话目录与转录：[transcript.jsonl](file:///home/dev/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000000/.system_generated/logs/transcript.jsonl)（会话 ID：`00000000-0000-4000-8000-000000000000`）
+  - 任务主题：“扫描所有 herdr 工作区推进状态并给出统筹建议”（PiG 界面空行 bug 与 AssistantMessageComponent 崩溃修复统筹主会话）。
+  - 模型切模点：用户在 2026-10-29T11:26:18+08:00 于该会话手动切模为 `Claude Opus 5.5 (Medium)`（见 [cli-20261028_181152.log:10633](file:///home/dev/.gemini/antigravity-cli/log/cli-20261028_181152.log#L10633)）。
+  - 消耗量级：全会话累计 2,302 步，累计消耗 input token **9,660,525**（966 万）、output token **678,574**（67.8 万）、cache read token **116,542,585**（1.165 亿）。
+  - 官方调用集中度：10月24日至今，全机日志中所有 **130 次** 成功返回的官方 Claude 请求（`req_vrtx_`）**100% 发生在该单一会话**（2026-10-29T11:26:29 至 18:00:14 之间）。
+  - 打满根因：该会话不仅步骤极长，而且由于频繁接收 `[herdsman-wake]` 触发主代理思考推进，并在 18:00 前后单步 input token 膨胀至 **363,278 tokens**（见 [transcript.jsonl:2208](file:///home/dev/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000000/.system_generated/logs/transcript.jsonl#L2208)），每次请求均在高位上下文基线上消耗，最终在 18:00:36 彻底打穿 Google AI Ultra 套餐提供的 7 天 Claude 周额度。
+
+---
+
+### 关系
+
+```mermaid
+flowchart TD
+    User["用户会话 00000000 (工作区统筹)"] -->|10-29 11:26 切模| Opus["Claude Opus 5.5 (Medium)"]
+    Opus -->|130次高频交互 / 单步36万tokens| VertexGateway["Google Vertex 官方内部网关 daily-cloudcode-pa"]
+    VertexGateway -->|扣减配额| UltraQuota["Google AI Ultra 周配额池 (7天)"]
+    UltraQuota -->|10-29 18:00:36 耗尽| Err429["RESOURCE_EXHAUSTED (code 429) Resets in 161h25m49s"]
+    Err429 -->|10-29 18:16 重启| ForcedSwitch["被迫切模: magpie/devin/claude-opus-5-5"]
+```
+
+- 影响面局限性：本次额度耗尽只影响绑定 Google AI Ultra 账号（primary@example.com）官方配额池下的 Anthropic（Claude 系列）和 GPT-OSS 120B 模型；Gemini 系列因属独立配额池（短周期小时级重置），依然剩余 93.08% 配额且运转正常。
+
+---
+
+### 关键片段
+
+```go
+// /home/dev/.gemini/antigravity-cli/log/cli-20261029_172928.log:291-293
+I1029 18:00:14.891515   13840 http_helpers.go:359] URL: https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse Trace: 0x3a2b6c86bf469b6c ResponseID: req_vrtx_000000000000000000000000
+E1029 18:00:36.270396   13507 errorreport.go:224] agent executor error: generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 161h25m49s.
+E1029 18:00:36.315119   13507 errorreport.go:224] generating and executing: RESOURCE_EXHAUSTED (code 429): Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 161h25m49s.
+```
+
+```json
+// /home/dev/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000000/.system_generated/logs/transcript.jsonl:2208
+{"step_index":2214,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-29T09:59:54Z","input_tokens":363278,"cache_read_tokens":0,"output_tokens":1705}
+```
+
+```go
+// /home/dev/.gemini/antigravity-cli/log/cli-20261029_181606.log:120-122
+I1029 18:16:54.953685     887 model_resolver.go:107] Resolving model magpie/devin/claude-opus-5-5
+I1029 18:16:54.953732     887 server.go:2292] Custom model config override: model_id:MODEL_GOOGLE_GEMINI_INTERNAL_BYOM  model_features:{zero
+I1029 18:16:54.953780     887 model_config_manager.go:363] Propagating selected model override to backend: label="magpie/devin/claude-opus-5"
+```
+
+---
+
+### 风险线索
+
+- 配额耗尽时间长：Anthropic 模型的配额窗口为 7 天自然周，当前配额锁定期将持续至 **2026-11-05T11:27:44+08:00**（UTC `2026-11-05T03:27:44Z`），在此之前原生官方 `claude-opus-5-5-*` 与 `claude-sonnet-5-5-*` 调用均会持续 429 报错。
+- 单会话超大上下文膨胀风险：长会话在未及时 compact 的情况下，步数达 2000+ 时单步上下文可高达 36 万 tokens；在此类会话中挂载 Claude Opus 5.5 会极快耗尽周额度。
+- 备用账号状态：备用 Pro 账号（backup@example.com）的 token 访问官方端点时出现 SSL/EOF 连接异常，目前未处于热备状态。
+
+---
+
+### 起点
+
+下游继续处理或规划时，建议优先查阅以下位置：
+
+- 核查官方实时配额状态：运行安全的只读脚本请求 `https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels`（Token 读取自 [antigravity-oauth-token](file:///home/dev/.gemini/antigravity-cli/antigravity-oauth-token)），观察 `claude-*` 的 `quotaInfo` 是否在 2026-11-05T11:27:44+08:00 解锁。
+- 核对切模配置与代理可用性：查看 [providers.json](file:///home/dev/.config/magpie/providers.json#L1018-L1053) 中 Magpie 的第三方渠道配置，确保在官方配额恢复前有稳定的替代模型路由。
+- 检查会话压缩与管理规范：定位 [00000000-0000-4000-8000-000000000000](file:///home/dev/.gemini/antigravity-cli/brain/00000000-0000-4000-8000-000000000000) 的生命周期管理，避免在单个会话中无压缩累积超过 30 万 tokens 时持续使用高消耗的 Opus 模型。
