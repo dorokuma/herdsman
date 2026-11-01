@@ -4,20 +4,22 @@ Herdsman 是一个 TypeScript daemon / CLI，从 Herdr 管理的 coding agent �
 
 ## 铁律 / Iron Rules
 
-1. **构建・测试・静态检查**: 修改实现后必须通过 `pnpm check`（typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 验证）；改动 CLI/package 时还必须通过 `pnpm build` 和 `pnpm package:check`。
+1. **构建・测试・静态检查**: 修改实现后必须通过 `bun run check`（typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 验证）；改动 CLI/package 时还必须通过 `bun run build` 和 `bun run package:check`。
 2. **提交规范**——commit message 须过全局 commit-msg hook：Conventional Commits 类型白名单、≤72 字、冒号后一空格、禁噪声词与密钥。
 3. **决策/踩坑须记 .agents/notes/**：重大决策、架构调整、方案否决、临时降级/workaround/特判必须记入 `.agents/notes/`（满足六触发之一即写，详见 [.agents/notes/README.md](.agents/notes/README.md)）。
 4. **未提交变更保护**: 不得回退用户或其他进程的未提交变更。`node_modules/`、`dist/`、`*.sqlite` 不要 commit。
 
 ## 本机运维 / Local Operations
 
-- 正式服务是 systemd 单元 `herdsman.service`（`/etc/systemd/system/herdsman.service`，`enabled`；`ExecStart` 直连全局安装的 `herdsman-daemon.js`）。
+> **zero-node（2026-10-30 起）**：本机已删除系统/通用 Node 运行时；TypeScript 开发链全部走 Bun 1.4.4（`/root/.local/bin/bun`，见 `mise.toml` / `package.json`）。生产 CLI 与 daemon 是 Go 二进制 `/root/.local/lib/herdsman-go/{herdsman,herdsman-daemon}`。npm registry 发布契约（下游 Node 消费者的 `npm publish` / `npm install` 流程）见 `docs/releasing.md`，需在有 Node + npm 的环境执行，不属本机开发命令。
+
+- 正式服务是 systemd 单元 `herdsman.service`（`/etc/systemd/system/herdsman.service`，`enabled`；`ExecStart=/root/.local/lib/herdsman-go/herdsman-daemon` 直连 Go 二进制）。
 - 启停用 `systemctl restart|stop|start herdsman.service`。判断进程归属看 `systemctl status herdsman.service` 与 `/proc/<MainPID>/cgroup`（`pgrep -af herdsman-daemon` 会误报）。
 - daemon 常驻、不在前台交互；进程异常退出（非零退出码，或被信号杀死且不属 SIGHUP/SIGINT/SIGTERM/SIGPIPE）时由 systemd 拉回（本机单元当前为 `Restart=on-failure`，`RestartSec=5` 约 5 秒后重试，连续失败受 `StartLimit*` 限制）；`systemctl stop` 是显式停止，不会被拉回。
-- 部署（registry 单一渠道）：`PATH=/root/.nvm/versions/node/v22.23.1/bin:$PATH npm install --global @dorokuma/herdsman@<version>`（**必须钉版本号**；显式带 nvm PATH 前缀，使 `npm prefix -g` 落在 nvm 前缀；`npm install` 只替换文件，**restart 之后才生效**）→ `systemctl restart herdsman.service` → 按下方「部署后核对」核对：版本 / MainPID / socket（daemon status）/ `agent list` / 优雅关停 journal。部署的版本必须是**完整发布**——`@dorokuma/herdsman` 与 `@dorokuma/herdsman-pi` 两包都已发布、且 `v<version>` tag 已推到远端；半发布（root 已发、pi 缺席、tag 未推）的版本不部署，例外须用户决策。校验：`npm view @dorokuma/herdsman@<version> version`、`npm view @dorokuma/herdsman-pi@<version> version`、`git ls-remote --tags --exit-code origin "refs/tags/v<version>"`（`--exit-code` 不可省：缺 tag 时 `git ls-remote` 默认 exit 0 + 空输出，会静默通过；加上后缺失为 exit 非 0）。全量门禁 `pnpm check` 属**发布面**：在 `main` 上按 `docs/releasing.md`「Validate source and package contents」执行（发布轮惯例再以生产面 nvm v22.23.1 工具链复跑一次，生产面是 node 22）；**部署步骤不复跑** `pnpm check`——部署只做装包 → `systemctl restart herdsman.service` → 部署后核对。
+- 部署（registry 单一渠道）：本机生产面为 Go 二进制——替换 `/root/.local/lib/herdsman-go/herdsman-daemon`（升级前的二进制先备份成同目录 `*.bak-<时间戳>`）→ `systemctl restart herdsman.service` → 按下方「部署后核对」核对：MainPID / socket（daemon status）/ `agent list` / 优雅关停 journal。全量门禁 `bun run check` 属**发布面**：在 `main` 上按 `docs/releasing.md`「Validate source and package contents」执行，**部署步骤不复跑**——部署只换二进制 → 重启 → 部署后核对。npm registry 部署渠道（`npm install --global @dorokuma/herdsman@<version>` 钉版本、完整发布校验等）是面向下游 Node 消费者的发布契约，见 `docs/releasing.md`；本机 zero-node 后不再走该渠道。
 - 生产日志看 `journalctl -u herdsman.service`。`logs/herdsman.log` 是旧的，不用它判断生产状态。
-- 部署后核对：**版本**用 `PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" npm ls -g @dorokuma/herdsman`，或直接读 `"$HOME/.nvm/versions/node/v22.23.1/lib/node_modules/@dorokuma/herdsman/package.json"`（部署是装进 nvm 前缀的，而默认 shell 的 npm 可能走 mise 前缀、查不到该包，所以要带前缀或读绝对路径）；**MainPID** 看 `systemctl show -p MainPID herdsman.service`；**socket / daemon status** 看 `herdsman daemon status`；**`agent list` 端到端**跑 `herdsman agent list`；**优雅关停**看 `journalctl -u herdsman.service`，确认 `shutdown finished`、`exitCode: 0`、无 SIGKILL 与超时。**registry 不允许同版本重发，所以版本号即部署身份**：核对就是 `npm ls -g` 出的版本，需要时再与**安装目录**逐文件 sha256 比对（**排除嵌套 `node_modules`**；先用 `npm pack @dorokuma/herdsman@<version>` 取发布物解包，再与 `lib/node_modules/@dorokuma/herdsman` 比对）。历史教训：曾用本地 tarball 部署，出现「同版本号、不同字节」，故已统一为 registry 渠道。
-- 回滚 = 用**同一渠道**钉版本装回**上一个完整发布的版本** → 重启 → 按「部署后核对」核对；仅当该版本在 registry 取不到时，才用备份 tgz 应急（路径与还原步骤见 `.agents/notes/20261001-production-install-channel-npm-registry.md`）。用备份 tgz 应急还原属**临时破例**：还原后版本号在 registry 无对应物（0.13.1 从未发布），或字节与 registry 不一致（0.13.2 备份还原后 `npm ls -g` 仍显示 0.13.2，实为切换前本地构建）；恢复后须用同一渠道钉版本装回 registry 版本才算收尾。
+- 部署后核对：**版本**以源码事实为准——读 `go/` 目录对应代码或 `package.json` 的 `version` 字段比对部署意图（Go 二进制无 `--version`）；**MainPID** 看 `systemctl show -p MainPID herdsman.service`；**socket / daemon status** 看 `herdsman daemon status`（`/root/.local/bin/herdsman` wrapper 直接 exec Go 二进制）；**`agent list` 端到端**跑 `herdsman agent list`；**优雅关停**看 `journalctl -u herdsman.service`，确认 `shutdown finished`、`exitCode: 0`、无 SIGKILL 与超时。
+- 回滚 = 用同目录 `*.bak-<时间戳>` 备份二进制换回原文件 → 重启 → 按「部署后核对」核对。
 - 默认数据目录 `~/.herdsman` 即生产；开发/验证请显式指定临时目录（`HERDSMAN_HOME=/tmp/<名字>`），不要拿生产目录做实验。
 
 ## 文档・索引 / Documentation Index
@@ -33,40 +35,30 @@ Herdsman 是一个 TypeScript daemon / CLI，从 Herdr 管理的 coding agent �
 
 ## 常用命令
 
-- `mise install`: 安装 `mise.toml` 中的 Node.js / pnpm。
-- `pnpm install`: 安装依赖。
-- `pnpm check`: 一次性执行 typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 的验证。
-- `pnpm test`: 运行一次 Vitest。
-- `pnpm test:watch`: Vitest 的 watch。
-- `pnpm build`: 删除旧的 `dist` 后输出 TypeScript，并用 `tsc-alias` 解析 import alias。
-- `pnpm package:check`: 构建 root npm package，并验证 tarball 的 file allowlist。
-- `pnpm lint:fix`: 应用 Biome 的 lint/import/format fix。
-- `pnpm db:generate`: 从 `src/db/schema.ts` 生成 SQL migration。
-- `HERDSMAN_HOME=/tmp/herdsman pnpm db:migrate`: 对指定的 Herdsman home 的 SQLite DB 应用 migration。
+- `mise install`: 安装 `mise.toml` 中的 Bun（当前 `bun = "1.4.4"`）。
+- `bun install`: 安装依赖。
+- `bun run check`: 一次性执行 typecheck、test、Biome、Drizzle、Pi package、Herdr plugin 的验证。
+- `bun run test`: 运行一次 Vitest。
+- `bun run test:watch`: Vitest 的 watch。
+- `bun run build`: 删除旧的 `dist` 后输出 TypeScript，并用 `tsc-alias` 解析 import alias。
+- `bun run package:check`: 构建 root npm package，并验证 tarball 的 file allowlist。
+- `bun run lint:fix`: 应用 Biome 的 lint/import/format fix。
+- `bun run db:generate`: 从 `src/db/schema.ts` 生成 SQL migration。
+- `HERDSMAN_HOME=/tmp/herdsman bun run db:migrate`: 对指定的 Herdsman home 的 SQLite DB 应用 migration。
 
 ## 验证步骤
 
-- 修改实现后必须通过 `pnpm check`。
-- 涉及 CLI entrypoint、`dist` 的 import 解析、package 内容的改动，还要通过 `pnpm build` 和 `pnpm package:check`。
-- 改了 DB schema 就先执行 `pnpm db:generate`，确认生成的 SQL 之后再看 migrate。
-- Node / pnpm 的 PATH 较旧的环境，在执行验证命令前加上下面这行。
-
-```bash
-PATH="$HOME/.local/share/mise/installs/node/26.7.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0:$PATH"
-```
+- 修改实现后必须通过 `bun run check`。
+- 涉及 CLI entrypoint、`dist` 的 import 解析、package 内容的改动，还要通过 `bun run build` 和 `bun run package:check`。
+- 改了 DB schema 就先执行 `bun run db:generate`，确认生成的 SQL 之后再看 migrate。
+- 本机 PATH 上无 node/pnpm/npm；工具链只有 Bun（`/root/.local/bin/bun`，与 `mise.toml` 钉版一致），无需再为运行时前置 PATH；PATH 较旧或缺 bun 的环境先 `export PATH="$HOME/.local/bin:$PATH"`。
 
 本机（生产机）运行时事实，照它选运行时，不要对着版本号猜：
 
-- 生产 daemon：由 systemd 单元 `herdsman.service` 的 `ExecStart` 固定用 nvm v22.23.1 的 node 启动。
-- 提交门禁：`.husky/pre-commit` 显式把 mise 钉版前置进 PATH，实际跑 mise 的 node 26.7.0 + pnpm 11.9.0（与 `mise.toml` 一致）。
-- 普通 shell 里跑哪个版本以现场 `node -v` 为准：登录交互 bash 会先激活 mise（`/root/.bashrc` 在 nvm 之后激活 mise，mise 优先），而 daemon 派生的 shell 继承单元里的 PATH：**node 走 nvm 优先**（单元 PATH 含 `/root/.nvm/versions/node/v22.23.1/bin`）；**pnpm 走 nvm 前缀下的 corepack shim** `/root/.nvm/versions/node/v22.23.1/bin/pnpm`（单元 PATH 首位的 `/root/.local/bin/pnpm` 原本是一条指向 `/root/.hermes/node/lib/node_modules/pnpm/bin/pnpm.cjs` 的失效软链，目标一直不存在，故从未生效；该软链已删除）。
-- 支持面与生产面是 node 22（`package.json` 的 `engines.node >=22.12.0`，CI 也用 node 22），所以 mise 的 26.7.0 上绿不能替代生产面验证；全量门禁 `pnpm check` 属**发布面**，在 `main` 上按 `docs/releasing.md`「Validate source and package contents」执行（发布轮惯例再以生产面 nvm v22.23.1 工具链复跑一次，生产面是 node 22）；部署步骤不复跑（见「本机运维」的部署 bullet）：
-
-```bash
-PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" pnpm check
-```
-
-- 上一条的 mise PATH 只在需要钉版（`mise.toml` 的 node 26.7.0 / pnpm 11.9.0）时前置使用。mise 的 pnpm 安装目录没有 `bin/`，PATH 里要写安装目录本身。
+- 生产 CLI / daemon：Go 二进制 `/root/.local/lib/herdsman-go/{herdsman,herdsman-daemon}`，daemon 由 `herdsman.service` 的 `ExecStart` 直连；无 Node 参与。
+- 提交门禁：`.husky/pre-commit` 定位 `bun`（PATH 优先、`mise where bun` 兜底）后跑 `bun x lint-staged` + `bun run typecheck/test/lint/format:check/db:check`。
+- TypeScript 测试/构建链全程在 Bun 下跑（`vitest`、`tsc --noEmit` 由 Bun 拉起，实测 955 用例全过）。
+- npm 发布面属对外契约：`bun run check` 的门禁在 `main` 上按 `docs/releasing.md`「Validate source and package contents」执行；`npm publish` / `npm install --global` 等步骤需在有 Node + npm 的环境完成，不在本机跑；部署步骤不复跑该门禁（见「本机运维」的部署 bullet）。
 
 ## 重要路径
 
@@ -105,5 +97,4 @@ PATH="$HOME/.nvm/versions/node/v22.23.1/bin:$PATH" pnpm check
 ## 注意
 
 - `node_modules/`, `dist/`, `*.sqlite` 不要 commit。
-- `pnpm-workspace.yaml` 是给 pnpm 11 的 `allowBuilds` 用的。不要以 workspace 化为目的去编辑它。
 - 不得回退用户或其他进程的未提交变更。

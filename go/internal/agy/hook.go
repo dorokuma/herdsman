@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"os"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strconv"
@@ -146,6 +148,12 @@ type Outcome struct {
 	Reason     *string
 	TerminalID string
 	Text       string
+
+	// SuspectedUpstreamError marks results whose text or reason matched an
+	// upstream model error pattern. The event is delivered verbatim instead
+	// of being suppressed; FormatAgyOutcomeUpdates prepends a warning banner
+	// telling the main agent to defer to the user rather than acting on it.
+	SuspectedUpstreamError bool
 }
 
 // launchIdentity mirrors the resolved Herdr launch environment.
@@ -179,6 +187,17 @@ If no update is actionable, summarize the result briefly and stop.`
 
 // wakePolicyHeader mirrors the `[HERDSMAN AGENT UPDATES]` section header.
 const wakePolicyHeader = "[HERDSMAN AGENT UPDATES]"
+
+// suspectedUpstreamErrorWarning is the banner prepended to a delivered result
+// whose text matched an upstream model error pattern. Delivering the result
+// verbatim with this warning replaces the old behaviour of silently acking
+// the event without ever waking the main agent.
+const suspectedUpstreamErrorWarning = "⚠️ 该子代理的结果疑似包含模型/上游报错。不要据此自主做任何决定或后续动作，立即把情况告知用户并请求指示。"
+
+// upstreamErrorLogFile is the file each agy-state dir gets for the durable
+// suppression/warning audit trail: the WakeWaiter's stderr is /dev/null, so
+// warn lines alone leave no trace. One JSON object per line.
+const upstreamErrorLogFile = "agy-wake-audit.jsonl"
 
 // upstreamErrorPatterns mirrors UPSTREAM_ERROR_PATTERNS (JS regexes with the
 // `i` flag; Go spells that as `(?i)`).
@@ -773,6 +792,14 @@ func (r *runner) peekNextWakeBatch(
 	}
 
 	projection := projectAgyOutcomes(candidateEvents, liveWorkingTerminalIDs, r.warn)
+	// Every suspected upstream-error hit leaves a durable record: the warn
+	// line above is lost with the waiter's /dev/null stdio, so each flagged
+	// outcome also lands in the state-dir audit log and on daemon stdout.
+	for _, outcome := range projection.Outcomes {
+		if outcome.SuspectedUpstreamError {
+			r.logUpstreamErrorHit(outcome.EventID, "lastAssistantMessage")
+		}
+	}
 	// An ack settles `id <= eventId`, so acknowledging a suppressed id above a
 	// still-deferred id would advance the cursor past the deferred event and
 	// permanently swallow it.
@@ -878,6 +905,15 @@ func (r *runner) takeNextWakeBatch(
 	}
 
 	projection := projectAgyOutcomes(candidateEvents, liveWorkingTerminalIDs, r.warn)
+	// Same durable record as peekNextWakeBatch: a flagged outcome that reaches
+	// this path (e.g. PreInvocation took the batch without a waiter peek) is
+	// still written to the audit log once, before the events turn into the
+	// presented+delivered batch the next projection no longer sees.
+	for _, outcome := range projection.Outcomes {
+		if outcome.SuspectedUpstreamError {
+			r.logUpstreamErrorHit(outcome.EventID, "lastAssistantMessage")
+		}
+	}
 	// An ack settles `id <= eventId`: acknowledging a suppressed id above a
 	// still-deferred id would advance the cursor past the deferred event and
 	// permanently swallow it.
@@ -1308,7 +1344,10 @@ func projectAgyOutcomes(
 			}
 		}
 		text := normalizeExcerpt(compactHistoryText(event))
-		if len(text) == 0 || isUpstreamErrorText(text) {
+		// Only the empty-text check applies here: upstream-error text now still
+		// yields a (warning-flagged) outcome, so the newest such completion is
+		// the one older events for this terminal must defer to.
+		if len(text) == 0 {
 			continue
 		}
 		if current, ok := newestCompletionID[*event.TerminalID]; !ok || event.ID > current {
@@ -1357,25 +1396,30 @@ func projectAgyOutcomes(
 			value := normalizeExcerpt(payload["reason"])
 			reason = &value
 		}
-		if isUpstreamErrorText(text) || (reason != nil && isUpstreamErrorText(*reason)) {
-			suppressedEventIDs = append(suppressedEventIDs, event.ID)
-			logAgyEventSuppressed(warn, event.ID, "upstream model error text")
-			continue
-		}
+		suspectedUpstreamError := isUpstreamErrorText(text) ||
+			(reason != nil && isUpstreamErrorText(*reason))
 		if kind == OutcomeCompleted && len(text) == 0 {
 			suppressedEventIDs = append(suppressedEventIDs, event.ID)
 			logAgyEventSuppressed(warn, event.ID, "empty completed assistant text")
 			continue
 		}
+		if suspectedUpstreamError {
+			// The result is delivered verbatim with a warning banner instead of
+			// being swallowed: an upstream error inside a sub-agent report used
+			// to suppress the whole event, so the main agent was never woken.
+			logAgyEventSuppressed(warn, event.ID,
+				"suspected upstream model error text; delivering verbatim with warning")
+		}
 		outcomes = append(outcomes, Outcome{
-			Agent:      outcomeAgent(payload, event),
-			EventID:    event.ID,
-			Kind:       kind,
-			Name:       optionalNonEmptyString(payload["name"]),
-			PaneID:     event.PaneID,
-			Reason:     reason,
-			TerminalID: *event.TerminalID,
-			Text:       text,
+			Agent:                  outcomeAgent(payload, event),
+			EventID:                event.ID,
+			Kind:                   kind,
+			Name:                   optionalNonEmptyString(payload["name"]),
+			PaneID:                 event.PaneID,
+			Reason:                 reason,
+			TerminalID:             *event.TerminalID,
+			Text:                   text,
+			SuspectedUpstreamError: suspectedUpstreamError,
 		})
 	}
 
@@ -1395,6 +1439,40 @@ func logAgyEventSuppressed(warn func(message string), eventID int64, reason stri
 		return
 	}
 	os.Stderr.WriteString(message + "\n")
+}
+
+// logUpstreamErrorHit appends one JSON line to `<stateDir>/agy-wake-audit.jsonl`
+// and prints a matching line to stdout. The WakeWaiter runs with stdio set to
+// /dev/null, so the stderr warn emitted by logAgyEventSuppressed leaves no
+// trace; this file/daemon-side line is the durable record that an
+// upstream-error keyword hit happened. Write failures fall back to stderr.
+func (r *runner) logUpstreamErrorHit(eventID int64, field string) {
+	entry := map[string]any{
+		"kind":      "suspected_upstream_error",
+		"eventId":   eventID,
+		"field":     field,
+		"sessionId": r.sessionID,
+		"ts":        time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	encoded, err := json.Marshal(entry)
+	if err != nil {
+		return
+	}
+	line := "Herdsman agy wake upstream-error hit: " + string(encoded)
+	if r.stateDir != "" {
+		logPath := filepath.Join(r.stateDir, upstreamErrorLogFile)
+		file, openErr := os.OpenFile(logPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+		if openErr == nil {
+			if _, writeErr := file.Write(append(encoded, '\n')); writeErr == nil {
+				file.Close()
+				fmt.Fprintln(os.Stdout, line)
+				return
+			}
+			file.Close()
+		}
+	}
+	fmt.Fprintln(os.Stdout, line)
+	os.Stderr.WriteString(line + " (audit file write failed or stateDir empty)\n")
 }
 
 // outcomeAgent mirrors the agent fallback chain of the projection:
@@ -1502,6 +1580,9 @@ func outcomeKind(event observability.AgentEventRecord) (OutcomeKind, bool) {
 func FormatAgyOutcomeUpdates(outcomes []Outcome) string {
 	lines := make([]string, 0, len(outcomes))
 	for _, outcome := range outcomes {
+		if outcome.SuspectedUpstreamError {
+			lines = append(lines, suspectedUpstreamErrorWarning)
+		}
 		identity := outcome.Agent
 		if identity == "" {
 			identity = "unknown"

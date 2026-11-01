@@ -9,10 +9,10 @@ platforms = ["linux"]
 id = "agent-list"
 title = "Show Herdsman agents"
 contexts = ["workspace"]
-command = ["node", "index.mjs", "agent-list"]
+command = ["/root/.local/lib/herdsman-go/herdsman", "agent", "list"]
 
 [[panes]]
 id = "agents"
 title = "Herdsman Agents"
 placement = "split"
-command = ["node", "index.mjs", "agents"]
+command = ["/root/.local/lib/herdsman-go/herdsman", "agent", "list"]

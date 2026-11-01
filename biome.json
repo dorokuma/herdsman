@@ -17,7 +17,8 @@
       "*.config.ts",
       "*.json",
       "*.jsonc",
-      "!pnpm-lock.yaml"
+      "!pnpm-lock.yaml",
+      "!bun.lock"
     ]
   },
   "formatter": {

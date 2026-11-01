@@ -9,7 +9,7 @@
     "herdr-plugin.toml"
   ],
   "scripts": {
-    "package:check": "node check-package.mjs",
+    "package:check": "bun check-package.mjs",
     "typecheck": "tsc -p tsconfig.json"
   },
   "bin": {

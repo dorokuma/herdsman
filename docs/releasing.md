@@ -17,7 +17,7 @@ Run releases from the repository root on `main`. Replace the version below with 
 ```bash
 export VERSION=0.13.2
 export TAG="v$VERSION"
-export PATH="$HOME/.local/share/mise/installs/node/26.7.0/bin:$HOME/.local/share/mise/installs/pnpm/11.9.0:$PATH"
+export PATH="$HOME/.local/bin:$PATH"   # bun (magpie-bun) deve resolver para Bun 1.4.4
 
 git fetch origin main
 test "$(git branch --show-current)" = "main"
@@ -63,7 +63,7 @@ Keep these files synchronized:
 The following command updates all four:
 
 ```bash
-node --input-type=module <<'NODE'
+bun --input-type=module <<'NODE'
 import { readFile, writeFile } from "node:fs/promises";
 
 const version = process.env.VERSION;
@@ -120,12 +120,12 @@ Once the four manifests, both READMEs, and the CHANGELOG release section are all
 ## Validate source and package contents
 
 ```bash
-pnpm check
-pnpm build
+bun run check
+bun run build
 git diff --check
 ```
 
-`pnpm check` includes root, Pi, and Herdr package checks. The root package checker rebuilds from a clean `dist` directory and rejects source, tests, plans, nested packages, assets, and stale `worker` paths.
+`bun run check` includes root, Pi, and Herdr package checks. The root package checker rebuilds from a clean `dist` directory and rejects source, tests, plans, nested packages, assets, and stale `worker` paths.
 
 Create the two public tarballs outside the repository:
 
