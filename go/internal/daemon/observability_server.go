@@ -547,6 +547,7 @@ func (s *ObservabilityRpcServer) publishAgentEventLocked(
 		}
 		connection := s.newestSocketForSessionTerminal(event.HerdrSessionName, *sessionOwner)
 		if connection == nil {
+			s.warn(fmt.Sprintf("Herdsman has no live connection for an agent event; skipping delivery (eventId=%d herdrSession=%q sessionOwner=%q)", event.ID, event.HerdrSessionName, *sessionOwner), nil)
 			return nil
 		}
 		return []pendingFrame{{target: connection, message: frame}}
@@ -556,6 +557,7 @@ func (s *ObservabilityRpcServer) publishAgentEventLocked(
 	}
 	connection := s.newestSocketForTerminal(scope, owner.TerminalID)
 	if connection == nil {
+		s.warn(fmt.Sprintf("Herdsman has no live connection for an agent event; skipping delivery (eventId=%d terminal=%q)", event.ID, owner.TerminalID), nil)
 		return nil
 	}
 	return []pendingFrame{{target: connection, message: frame}}

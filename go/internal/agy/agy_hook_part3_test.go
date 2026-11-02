@@ -572,9 +572,13 @@ func TestIntermediateAgentDoneWhilePeerStillWorkingIsDeferred(t *testing.T) {
 		!anyWarnContains(injectWarns, "superseded by newer completion for terminal term_peer") {
 		t.Fatalf("warns = %v, want the 1118 supersession warning", injectWarns)
 	}
+	// 1126 is a real outcome and sits in deliveredEventIds; 1118 is a permanent
+	// suppression — never part of the injected batch — so it waits for its ack
+	// in pendingAckEventIds instead of pinning the transcript-confirmation gate.
 	assertStateMatches(t, readStateObject(t, sessionStatePath(dir, sessionID)), map[string]any{
-		"presentedEventIds": []any{float64(1118), float64(1126)},
-		"deliveredEventIds": []any{float64(1118), float64(1126)},
+		"presentedEventIds":  []any{float64(1118), float64(1126)},
+		"deliveredEventIds":  []any{float64(1126)},
+		"pendingAckEventIds": []any{float64(1118)},
 	})
 
 	// The woken turn's Stop settles the batch, so the superseded mid-turn
@@ -2224,4 +2228,196 @@ func TestRetainedRowsOfClosedPaneAndTakenOverSiblingAreDropped(t *testing.T) {
 		"presentedEventIds": []any{float64(400)},
 	})
 	assertRetainedIDs(t, readStateObject(t, statePath), []int64{400})
+}
+
+// --- Bug 1B regression: stale delivered ids never drive an empty wake -------
+
+// TestWakeWaiterDropsStaleDeliveredIDsWithoutEmptyWake covers Bug 1B: after a
+// pane close the daemon settles the delivered event, so the delivered id left
+// behind in the session state can never be injected again. The waiter must
+// drop it instead of firing an empty [herdsman-wake] every poll.
+func TestWakeWaiterDropsStaleDeliveredIDsWithoutEmptyWake(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "f5555555-2222-3333-4444-555555555555"
+	statePath := sessionStatePath(dir, sessionID)
+	staleEvent := makeDoneEvent(9100, "窗格已关闭的结论。")
+	wakePrompts := []wakePrompt{}
+
+	writeStateFile(t, statePath, map[string]any{
+		"deliveredEventIds":       []any{float64(9100)},
+		"presentedEventIds":       []any{float64(9100)},
+		"retainedCandidateEvents": []any{staleEvent},
+		"turnEpoch":               float64(1),
+		"waiterEpoch":             float64(1),
+		"waiterPid":               float64(os.Getpid()),
+	})
+
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		if method == "agent.list" {
+			// The peer pane is closed: agent.list only knows the orchestrator
+			// itself, so the retained row is filtered out as ineligible.
+			return map[string]any{"agents": []any{
+				agentListEntry("agy", "idle", "2026-10-21T11:50:00.000Z", "wB:p1", "term_self"),
+			}}, nil
+		}
+		// The daemon no longer lists event 9100 (the pane-close settle).
+		return orchestratorStateResponse(sessionID, []any{}, 0), nil
+	}
+
+	result := agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+		Connect: client.connectCapturing,
+		Environment: mergeEnv(herdrEnv,
+			"HERDSMAN_AGY_SESSION_ID", sessionID,
+			"HERDSMAN_AGY_STATE_DIR", dir,
+			"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+		PollIntervalMs: floatPtr(20),
+		ReadPaneText:   func(string) (*string, error) { return nil, nil },
+		SocketPath:     "/tmp/herdsman.sock",
+		StateDir:       strPtr(dir),
+		TriggerWakePrompt: func(paneID, promptText string) error {
+			client.mu.Lock()
+			wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+			client.mu.Unlock()
+			return nil
+		},
+		WaitTimeoutMs: floatPtr(400),
+	})
+	if !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	client.mu.Lock()
+	prompts := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if len(prompts) != 0 {
+		t.Fatalf("wakePrompts = %+v, want none for the stale delivered id", prompts)
+	}
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds": []any{},
+		"presentedEventIds": []any{float64(9100)},
+	})
+}
+
+// --- stale-connState regression: a completion after an empty start wakes ----
+
+// TestWakeWaiterWakesWhenNewCompletionArrivesAfterEmptyStart is the regression
+// for the verify-peek stale snapshot defect: the waiter registers while
+// `agent.orchestrator.get` still reports `events: []` (so w.connState holds an
+// empty events list), and a peer completion lands on the *next* poll. The
+// verify peek after rearmDeliveredEvents used to run against that stale
+// startup snapshot, found no outcome, dropped the batch and swallowed the wake
+// prompt entirely. The peek has to see the latest orchestrator state instead.
+//
+// The scenario walks the real rearm path on purpose: 9100 stays in
+// deliveredEventIds across two rounds (its pane is alive in agent.list on the
+// first round while the daemon lists nothing for it, so it survives both the
+// eligibility filter and dropStaleDelivered), which arms
+// deliveredBatchGracePending once and then drives
+// hasUnackedDeliveredEvents -> rearmDeliveredEvents -> verifyPeek on the
+// second round. 9100 deliberately carries an *empty* completion text so the
+// projection permanently suppresses it: with it re-armed out of
+// presentedEventIds it is a candidate again, yet still yields no outcome on
+// its own. The fresh 9200 completion only exists inside that second round's
+// agent.orchestrator.get answer — never in the register-time connState,
+// never in retainedCandidates, and its terminal is already dead in
+// agent.list — so only a verify peek that reads the *latest* snapshot can
+// see the outcome. Reverting that call to the stale w.connState makes the
+// verify peek report zero outcomes: it runs clearStaleDeliveredEvents on the
+// 9100 it just re-armed and swallows this turn's wake entirely, which is
+// exactly what the deliveredEventIds assertion below pins down (the wake
+// prompt would only fire a poll later for 9200, after 9100 was dropped).
+func TestWakeWaiterWakesWhenNewCompletionArrivesAfterEmptyStart(t *testing.T) {
+	dir := t.TempDir()
+	sessionID := "f4444444-2222-3333-4444-555555555555"
+	statePath := sessionStatePath(dir, sessionID)
+	// 9100 was delivered by an earlier turn and never acked: it sits in
+	// deliveredEventIds with its record in retainedCandidates. Its pane is
+	// still alive during the first round (agent.list reports term_old), which
+	// is what keeps the delivered id eligible while the daemon lists nothing.
+	// The empty text keeps it out of the outcomes set for good: suppressed on
+	// sight, so it alone can never satisfy the verify peek.
+	deliveredEvent := makeDoneEvent(9100, "", "term_old")
+	// The fresh completion that arrives only after the waiter started, emitted
+	// by a different terminal that is already closed by the second round.
+	freshEvent := makeDoneEvent(9200, "启动后才完工的结论。")
+	wakePrompts := []wakePrompt{}
+
+	writeStateFile(t, statePath, map[string]any{
+		"deliveredEventIds":       []any{float64(9100)},
+		"presentedEventIds":       []any{float64(9100)},
+		"retainedCandidateEvents": []any{deliveredEvent},
+		"turnEpoch":               float64(1),
+		"waiterEpoch":             float64(1),
+		// waiterPid must match the running waiter's own pid: the loop's own
+		// superseded check exits early on a mismatch, long before the rearm /
+		// verifyPeek path this regression needs to exercise.
+		"waiterPid": float64(os.Getpid()),
+	})
+
+	// Round 1: the daemon lists nothing and agent.list still reports term_old
+	// alive — 9100 survives as a live-scope delivered row, the peek reports no
+	// outcome and the grace flag arms without ever reaching the draft check.
+	// Round 2: term_old is gone and agent.orchestrator.get now returns 9200.
+	// Peek 1 sees the outcome; the rearm + verifyPeek on the *latest* state
+	// must also see it for the wake to fire.
+	var getCalls atomic.Int64
+	client := &concClient{}
+	client.respond = func(method string, params any) (any, error) {
+		switch method {
+		case "agent.orchestrator.register":
+			return orchestratorStateResponse(sessionID, []any{}, 0), nil
+		case "agent.list":
+			agents := []any{
+				agentListEntry("agy", "idle", "2026-10-21T11:50:00.000Z", "wB:p1", "term_self"),
+			}
+			if getCalls.Load() < 2 {
+				agents = append(agents,
+					agentListEntry("pi", "idle", "2026-10-21T11:50:00.000Z", "wB:p9", "term_old"))
+			}
+			return map[string]any{"agents": agents}, nil
+		}
+		calls := getCalls.Add(1)
+		events := []any{}
+		if calls >= 2 {
+			events = append(events, freshEvent)
+		}
+		return orchestratorStateResponse(sessionID, events, 0), nil
+	}
+
+	result := agy.RunAgyHook(agy.HookWakeWaiter, "", agy.RunAgyHookOptions{
+		Connect: client.connectCapturing,
+		Environment: mergeEnv(herdrEnv,
+			"HERDSMAN_AGY_SESSION_ID", sessionID,
+			"HERDSMAN_AGY_STATE_DIR", dir,
+			"HERDSMAN_AGY_WAITER_EPOCH", "1"),
+		PollIntervalMs: floatPtr(20),
+		ReadPaneText:   func(string) (*string, error) { return nil, nil },
+		SocketPath:     "/tmp/herdsman.sock",
+		StateDir:       strPtr(dir),
+		TriggerWakePrompt: func(paneID, promptText string) error {
+			client.mu.Lock()
+			wakePrompts = append(wakePrompts, wakePrompt{paneID, promptText})
+			client.mu.Unlock()
+			return nil
+		},
+		WaitTimeoutMs: floatPtr(400),
+	})
+	if !isEmptyHookOutput(result) {
+		t.Fatalf("waiter result = %+v, want {}", result)
+	}
+	client.mu.Lock()
+	prompts := append([]wakePrompt{}, wakePrompts...)
+	client.mu.Unlock()
+	if want := []wakePrompt{{paneID: "wB:p1", promptText: "[herdsman-wake]"}}; !reflect.DeepEqual(prompts, want) {
+		t.Fatalf("wakePrompts = %+v, want exactly %+v (the verify peek must see the latest state)", prompts, want)
+	}
+	// The discriminating assertion: a stale-connState verify peek sees no
+	// outcome for the re-armed 9100 (it is suppressed and 9200 is invisible to
+	// it), so it runs clearStaleDeliveredEvents on it before a later poll ever
+	// wakes for 9200. With the verify peek on the *latest* state the outcome
+	// is visible on the spot and 9100 stays delivered-but-unacked — only the
+	// 9200 batch drives the wake.
+	assertStateMatches(t, readStateObject(t, statePath), map[string]any{
+		"deliveredEventIds": []any{float64(9100)},
+	})
 }

@@ -2486,6 +2486,310 @@ func compactHistoryPtr(history observability.CompactAgentHistory) *observability
 	return &history
 }
 
+// TestAgentOrchestratorServiceSameTurnPaneCloseAck covers Bug 1A: an explicit
+// `herdr pane close` in the same turn settles every delivered row
+// (delivery_attempts >= 1) as acked, and a Stop-hook ack of that row must
+// still advance the workspace cursor instead of dying on
+// ORCHESTRATOR_EVENT_INVALIDATED or ORCHESTRATOR_EVENT_OUT_OF_ORDER. Rows of
+// the dead pane that were never delivered stay unconsumed-retained but must
+// not freeze acked_event_id behind the closed pane.
+func TestAgentOrchestratorServiceSameTurnPaneCloseAck(t *testing.T) {
+	harness := openOrchestratorHarness(t)
+	if _, err := harness.service.Claim(observability.OrchestratorClaimInput{
+		AgentScope: orchestratorScope,
+		PaneID:     "wB:owner",
+		TerminalID: "term_owner",
+	}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// The worker pane produces two events: an intermediate update that is
+	// never delivered, then a final outcome that the orchestrator receives.
+	// Both carry a terminal `from: "working"` outcome payload, so the older row
+	// is exactly the residual a pre-fix close would have retained.
+	worker := harness.appendEvent(t, orchestratorAppendInput{terminalID: "term_worker"})
+	paneID := eventPaneID(worker)
+	final := harness.appendEvent(t, orchestratorAppendInput{terminalID: "term_worker"})
+	harness.setEventColumn(t, worker.ID, "payload_json", `{"from":"working"}`)
+	harness.setEventColumn(t, final.ID, "payload_json", `{"from":"working"}`)
+
+	// Only the final outcome reaches the owner: the earlier row stays
+	// undelivered, which is exactly the residual the bug report describes.
+	harness.setEventColumn(t, final.ID, "status", "delivered")
+	harness.setEventColumn(t, final.ID, "delivered_to_terminal_id", "term_owner")
+	harness.setEventColumn(t, final.ID, "delivery_attempts", 1)
+	harness.setEventColumn(t, final.ID, "last_attempt_at", time.Now().UnixMilli())
+
+	// Same-turn `herdr pane close`: step 0 settles the delivered row as acked
+	// and the undelivered intermediate row is invalidated with no retention
+	// (the pane already consumed a delivery, so nothing is left to retain).
+	acknowledge := true
+	if err := harness.agentEvents.InvalidatePane(db.InvalidatePaneInput{
+		AcknowledgeDelivered: &acknowledge,
+		HerdrSessionName:     orchestratorTestSession,
+		PaneID:               paneID,
+	}); err != nil {
+		t.Fatalf("invalidatePane: %v", err)
+	}
+	settledFinal, err := harness.agentEvents.Get(final.ID)
+	if err != nil {
+		t.Fatalf("get(final): %v", err)
+	}
+	if settledFinal.Status == nil || *settledFinal.Status != observability.AgentEventStatusAcked {
+		t.Fatalf("final.status = %v, want acked", settledFinal.Status)
+	}
+	settledWorker, err := harness.agentEvents.Get(worker.ID)
+	if err != nil {
+		t.Fatalf("get(worker): %v", err)
+	}
+	if settledWorker.Status == nil || *settledWorker.Status != observability.AgentEventStatusInvalidated ||
+		settledWorker.Deliverable != 0 {
+		t.Fatalf("worker = status %v deliverable %d, want invalidated/0",
+			settledWorker.Status, settledWorker.Deliverable)
+	}
+
+	// The Stop hook then acks the row it already presented: the close-settled
+	// row reads as an idempotent ack and the cursor advances past both events
+	// of the dead pane.
+	state, err := harness.service.Ack(observability.OrchestratorAckInput{
+		AgentScope: orchestratorScope,
+		EventID:    final.ID,
+		TerminalID: "term_owner",
+	})
+	if err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	if state.AckedEventID != final.ID {
+		t.Fatalf("ackedEventId = %d, want %d", state.AckedEventID, final.ID)
+	}
+}
+
+// TestInvalidatePaneRetainsOutcomeOnlyWhenNeverDelivered pins the step-2
+// retention rule of invalidatePaneCore: an explicit close retains the last
+// deliverable outcome only for a pane that never had a single delivery.
+func TestInvalidatePaneRetainsOutcomeOnlyWhenNeverDelivered(t *testing.T) {
+	t.Run("retains the outcome of a pane that was never delivered", func(t *testing.T) {
+		harness := openOrchestratorHarness(t)
+		event := harness.appendEvent(t, orchestratorAppendInput{
+			eventType:  eventTypePtr(observability.AgentEventDone),
+			from:       stringPtr("working"),
+			terminalID: "term_worker",
+		})
+		// The retention rule only matches terminal outcomes emitted from
+		// `working`; the default done payload carries no `from`, so spell it out.
+		harness.setEventColumn(t, event.ID, "payload_json",
+			`{"from":"working"}`)
+		acknowledge := true
+		if err := harness.agentEvents.InvalidatePane(db.InvalidatePaneInput{
+			AcknowledgeDelivered: &acknowledge,
+			HerdrSessionName:     orchestratorTestSession,
+			PaneID:               eventPaneID(event),
+		}); err != nil {
+			t.Fatalf("invalidatePane: %v", err)
+		}
+		stored, err := harness.agentEvents.Get(event.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if stored.Status == nil || *stored.Status != observability.AgentEventStatusInvalidated ||
+			stored.Deliverable != 1 {
+			t.Fatalf("event = status %v deliverable %d, want retained invalidated/1",
+				stored.Status, stored.Deliverable)
+		}
+	})
+
+	t.Run("does not retain an intermediate row once the pane had a delivery", func(t *testing.T) {
+		harness := openOrchestratorHarness(t)
+		first := harness.appendEvent(t, orchestratorAppendInput{terminalID: "term_worker"})
+		second := harness.appendEvent(t, orchestratorAppendInput{terminalID: "term_worker"})
+		// Both rows carry a `from: "working"` outcome payload, so without the
+		// "pane already delivered" exception the older row would be retained.
+		harness.setEventColumn(t, first.ID, "payload_json", `{"from":"working"}`)
+		harness.setEventColumn(t, second.ID, "payload_json", `{"from":"working"}`)
+		harness.setEventColumn(t, second.ID, "status", "delivered")
+		harness.setEventColumn(t, second.ID, "delivered_to_terminal_id", "term_owner")
+		harness.setEventColumn(t, second.ID, "delivery_attempts", 1)
+		harness.setEventColumn(t, second.ID, "last_attempt_at", time.Now().UnixMilli())
+
+		acknowledge := true
+		if err := harness.agentEvents.InvalidatePane(db.InvalidatePaneInput{
+			AcknowledgeDelivered: &acknowledge,
+			HerdrSessionName:     orchestratorTestSession,
+			PaneID:               eventPaneID(first),
+		}); err != nil {
+			t.Fatalf("invalidatePane: %v", err)
+		}
+		storedFirst, err := harness.agentEvents.Get(first.ID)
+		if err != nil {
+			t.Fatalf("get(first): %v", err)
+		}
+		if storedFirst.Status == nil || *storedFirst.Status != observability.AgentEventStatusInvalidated ||
+			storedFirst.Deliverable != 0 {
+			t.Fatalf("first = status %v deliverable %d, want invalidated/0 (no retention)",
+				storedFirst.Status, storedFirst.Deliverable)
+		}
+	})
+}
+
+// TestInFlightToolUseIdleIsNotDeliverable covers Bug 2: a pi-family agent's
+// `working -> idle` whose compact history ends on stopReason "toolUse" is a
+// mid-tool-call snapshot and must never reach the orchestrator, while the same
+// transition with a terminal stopReason keeps producing the normal idle wake.
+func TestInFlightToolUseIdleIsNotDeliverable(t *testing.T) {
+	history := func(stopReason string) observability.CompactAgentHistory {
+		base := withAssistantMessage("pi-jsonl", stringPtr("partial tool round"))
+		base.LastAssistantMessage.StopReason = stringPtr(stopReason)
+		return base
+	}
+
+	t.Run("toolUse working -> idle stays undeliverable", func(t *testing.T) {
+		harness := openOrchestratorHarness(t)
+		if _, err := harness.service.Claim(observability.OrchestratorClaimInput{
+			AgentScope: orchestratorScope,
+			PaneID:     "wB:owner",
+			TerminalID: "term_owner",
+		}); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		toolUse := history("toolUse")
+		toolUseEvent := harness.appendEvent(t, orchestratorAppendInput{
+			agent:          stringPtr("pi"),
+			compactHistory: &toolUse,
+			hasHistory:     true,
+			terminalID:     "term_worker",
+			from:           stringPtr("working"),
+			eventType:      eventTypePtr(observability.AgentEventIdle),
+		})
+
+		pending, err := harness.service.Pending(observability.OrchestratorPendingInput{
+			AgentScope: orchestratorScope,
+			TerminalID: "term_owner",
+		})
+		if err != nil {
+			t.Fatalf("pending: %v", err)
+		}
+		for _, event := range pending {
+			if event.ID == toolUseEvent.ID {
+				t.Fatalf("toolUse idle event %d was delivered, want suppressed", event.ID)
+			}
+		}
+		// The row itself stays pending for the daemon: it is excluded by the
+		// delivery predicate, not deleted.
+		stored, err := harness.agentEvents.Get(toolUseEvent.ID)
+		if err != nil {
+			t.Fatalf("get: %v", err)
+		}
+		if stored.Status == nil || *stored.Status != observability.AgentEventStatusPending {
+			t.Fatalf("status = %v, want pending (withheld, not settled)", stored.Status)
+		}
+	})
+
+	t.Run("stop working -> idle stays deliverable", func(t *testing.T) {
+		harness := openOrchestratorHarness(t)
+		if _, err := harness.service.Claim(observability.OrchestratorClaimInput{
+			AgentScope: orchestratorScope,
+			PaneID:     "wB:owner",
+			TerminalID: "term_owner",
+		}); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+		stop := history("stop")
+		stopEvent := harness.appendEvent(t, orchestratorAppendInput{
+			agent:          stringPtr("pi"),
+			compactHistory: &stop,
+			hasHistory:     true,
+			sessionPath:    stringPtr("/tmp/herdr-role-sessions/role-worker-fd92d978/session.jsonl"),
+			terminalID:     "term_worker",
+			from:           stringPtr("working"),
+			eventType:      eventTypePtr(observability.AgentEventIdle),
+		})
+
+		pending, err := harness.service.Pending(observability.OrchestratorPendingInput{
+			AgentScope: orchestratorScope,
+			TerminalID: "term_owner",
+		})
+		if err != nil {
+			t.Fatalf("pending: %v", err)
+		}
+		requirePendingIDs(t, pending, stopEvent.ID)
+	})
+}
+
+// TestRetainedPaneClosedRowBlocksOutOfOrderAck is the R4 regression: a
+// RETAINED_OUTCOME_PANE_CLOSED row (status='invalidated', deliverable=1) is
+// an unconsumed cross-pane result the owner still has to see, so it blocks a
+// higher-id `id <= eventId` cursor ack just like a pending row. The removed
+// isDeadPaneOrphan carve-out treated "the producer pane is closed" as
+// "already consumed", letting the cursor silently swallow the retained
+// outcome. The companion coverage for the opposite case — a pane that *was*
+// delivered before the explicit close settles as acked and does not block —
+// is TestAgentOrchestratorServiceSameTurnPaneCloseAck.
+func TestRetainedPaneClosedRowBlocksOutOfOrderAck(t *testing.T) {
+	harness := openOrchestratorHarness(t)
+	if _, err := harness.service.Claim(observability.OrchestratorClaimInput{
+		AgentScope: orchestratorScope,
+		PaneID:     "wB:owner",
+		TerminalID: "term_owner",
+	}); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+
+	// The low-id event belongs to a pane that is closed before it could ever
+	// be delivered: the explicit close retains its last deliverable outcome.
+	retained := harness.appendEvent(t, orchestratorAppendInput{
+		terminalID: "term_dead_pane",
+	})
+	harness.setEventColumn(t, retained.ID, "payload_json", `{"from":"working"}`)
+	// The higher-id event sits on a different, still-live pane: the owner
+	// tries to ack it over the retained row.
+	later := harness.appendEvent(t, orchestratorAppendInput{
+		terminalID: "term_live",
+	})
+
+	acknowledge := true
+	if err := harness.agentEvents.InvalidatePane(db.InvalidatePaneInput{
+		AcknowledgeDelivered: &acknowledge,
+		HerdrSessionName:     orchestratorTestSession,
+		PaneID:               eventPaneID(retained),
+	}); err != nil {
+		t.Fatalf("invalidatePane: %v", err)
+	}
+	stored, err := harness.agentEvents.Get(retained.ID)
+	if err != nil {
+		t.Fatalf("get(retained): %v", err)
+	}
+	if stored.Status == nil || *stored.Status != observability.AgentEventStatusInvalidated ||
+		stored.Deliverable != 1 {
+		t.Fatalf("retained = status %v deliverable %d, want retained invalidated/1",
+			stored.Status, stored.Deliverable)
+	}
+
+	// The retained row is the next deliverable for the scope, so the higher-id
+	// ack is out of order — the unconsumed result must not be cursor-swallowed.
+	_, err = harness.service.Ack(observability.OrchestratorAckInput{
+		AgentScope: orchestratorScope,
+		EventID:    later.ID,
+		TerminalID: "term_owner",
+	})
+	requireAckError(t, err, observability.AckEventOutOfOrder, observability.MsgAckOutOfOrder)
+
+	// Once the retained row itself settles (consumed and acked here), the same
+	// higher-id ack goes through: it was the blocker, not the acked event.
+	harness.setEventColumn(t, retained.ID, "status", "acked")
+	harness.setEventColumn(t, retained.ID, "deliverable", 0)
+	state, err := harness.service.Ack(observability.OrchestratorAckInput{
+		AgentScope: orchestratorScope,
+		EventID:    later.ID,
+		TerminalID: "term_owner",
+	})
+	if err != nil {
+		t.Fatalf("ack after retained row settled: %v", err)
+	}
+	if state.AckedEventID != later.ID {
+		t.Fatalf("ackedEventId = %d, want %d", state.AckedEventID, later.ID)
+	}
+}
+
 func eventTypePtr(eventType observability.AgentEventType) *observability.AgentEventType {
 	return &eventType
 }

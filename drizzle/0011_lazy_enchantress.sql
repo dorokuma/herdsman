@@ -1,1 +1,0 @@
-CREATE INDEX `agent_events_guard_scan_idx` ON `agent_events` (`agent_id`,`herdr_session_name`,`id`) WHERE status in ('delivered', 'acked');

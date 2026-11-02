@@ -1,15 +1,16 @@
+#!/bin/sh
 set -e
 
-bun_dir="$(command -v bun >/dev/null 2>&1 && dirname "$(command -v bun)" || true)"
-if [ -z "$bun_dir" ]; then
-  bun_dir="$(mise where bun 2>/dev/null || true)"
-fi
-[ -n "$bun_dir" ] || { echo "bun: not found on PATH（提交门禁靠 bun 跑 lint/typecheck/test）" >&2; exit 1; }
-export PATH="$bun_dir:$PATH"
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root/go"
 
-bun x lint-staged
-bun run typecheck
-bun run test
-bun run lint
-bun run format:check
-bun run db:check
+if [ -n "$(gofmt -l .)" ]; then
+  echo "gofmt: unformatted files under go/" >&2
+  gofmt -l . >&2
+  exit 1
+fi
+
+go vet -p 2 ./...
+go test -p 2 ./...
+go build -o /dev/null ./cmd/herdsman
+go build -o /dev/null ./cmd/herdsman-daemon

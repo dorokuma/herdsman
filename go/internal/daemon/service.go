@@ -950,6 +950,17 @@ func RunObservabilityDaemonService(options *DaemonServiceOptions) error {
 	if err := startupStep(watchManager.Start); err != nil {
 		return startupCause(err)
 	}
+	if err := startupStep(func() error {
+		// Re-arm a WakeWaiter for every agy main pane that was parked waiting for
+		// a wake when the previous daemon exited (task B): the waiter process
+		// dies with the old daemon's session and nothing re-arms it, so events
+		// that arrive now would be written to the DB but never pushed. Best
+		// effort — a session that fails to re-arm is logged inside and skipped.
+		RearmAgyWaiters(&RearmAgyWaitersOptions{Environment: environment})
+		return nil
+	}); err != nil {
+		return startupCause(err)
+	}
 	fmt.Fprintf(os.Stdout, "Herdsman daemon listening on %s\n", runtime.Paths.SocketPath)
 	return nil
 }

@@ -85,6 +85,13 @@
       "when": 1791816504631,
       "tag": "0011_lazy_enchantress",
       "breakpoints": true
+    },
+    {
+      "idx": 12,
+      "version": "6",
+      "when": 1791816504632,
+      "tag": "0012_agent_events_pane_idx",
+      "breakpoints": true
     }
   ]
 }

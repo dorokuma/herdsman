@@ -79,6 +79,10 @@ type obsRPCServerOptions struct {
 	turnCompletions     *observability.TurnCompletionRegistry
 	// warn replaces the server's console.warn sink; the default drops it.
 	warn func(message string, payload any)
+	// disconnectGraceMs overrides the server's reconnect window; 0 keeps the
+	// production default. Tests that need an owner without a live socket bump
+	// this so the owner survives the connector close.
+	disconnectGraceMs int
 }
 
 func obsOpenRPCServerWithoutClient(t *testing.T, options obsRPCServerOptions) obsRPCFixture {
@@ -102,6 +106,7 @@ func obsOpenRPCServerWithoutClient(t *testing.T, options obsRPCServerOptions) ob
 		ResolvePaneIdentity: options.resolvePaneIdentity,
 		SocketPath:          socketPath,
 		Stores:              obsRPCStores(harness),
+		DisconnectGraceMs:   options.disconnectGraceMs,
 		TurnCompletions:     options.turnCompletions,
 		Warn:                obsRPCWarn(options),
 	})
@@ -2070,6 +2075,56 @@ func TestObservabilityRpcServerWarnsOnMissingPaneCwd(t *testing.T) {
 		}
 	}
 	t.Fatalf("expected a pane cwd warning, got %v", warnings)
+}
+
+// TestObservabilityRpcServerWarnsWhenSkippingDeliveryWithoutLiveConnection is
+// the task-C regression for wake-miss2: publishAgentEvent used to return nil
+// silently when the orchestrator owner was still recorded but no live socket
+// remained (daemon restart / connector gone). Both skip branches now warn with
+// the eventId and the pane/terminal so a dropped wake is visible in the journal.
+func TestObservabilityRpcServerWarnsWhenSkippingDeliveryWithoutLiveConnection(t *testing.T) {
+	var (
+		mu       sync.Mutex
+		warnings []string
+	)
+	fixture := obsOpenRPCServerWithoutClient(t, obsRPCServerOptions{
+		// Keep the owner alive after the connector closes so the skip path is
+		// "owner present, socket absent" rather than "owner already released".
+		disconnectGraceMs: 60_000,
+		warn: func(message string, _ any) {
+			mu.Lock()
+			warnings = append(warnings, message)
+			mu.Unlock()
+		},
+	})
+	obsSeedRoutingAgents(t, fixture.harness)
+
+	owner := obsDial(t, fixture.socketPath)
+	obsRegisterClient(t, owner, "wB:p-a", "owner", obsWorkspaceB)
+	claimed := obsRequest(t, owner, "agent.orchestrator.set", map[string]any{"enabled": true})
+	assertObsSubset(t, claimed, map[string]any{"changed": true})
+	assertObsSubset(t, obsAt(t, claimed, "state", "owner"), map[string]any{"terminalId": "term_a"})
+	owner.clearNotifications()
+
+	// Drop the live socket while the disconnect grace keeps the owner recorded.
+	owner.close()
+	obsSocketTick()
+
+	event := obsAppendRoutedEvent(t, fixture.harness, "term_b", obsWorkspaceB)
+	fixture.server.PublishAgentEvent(event)
+	obsSocketTick()
+
+	mu.Lock()
+	defer mu.Unlock()
+	for _, message := range warnings {
+		if strings.Contains(message, "no live connection") &&
+			strings.Contains(message, "skipping delivery") &&
+			strings.Contains(message, fmt.Sprintf("eventId=%d", event.ID)) &&
+			strings.Contains(message, "term_a") {
+			return
+		}
+	}
+	t.Fatalf("expected a skipping-delivery warn for event %d / term_a, got %v", event.ID, warnings)
 }
 
 // ---------------------------------------------------------------------------

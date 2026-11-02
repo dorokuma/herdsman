@@ -188,6 +188,8 @@ var SchemaStatements = []string{
 	// The stale-baseline duplicate guard's window over one agent's newest
 	// delivered/acked rows (drizzle/0011).
 	"CREATE INDEX `agent_events_guard_scan_idx` ON `agent_events` (`agent_id`,`herdr_session_name`,`id`) WHERE status in ('delivered', 'acked')",
+	// Pane-scoped scan for the explicit-close orphan detection (drizzle/0012).
+	"CREATE INDEX `agent_events_pane_idx` ON `agent_events` (`herdr_session_name`,`pane_id`)",
 }
 
 // CreateSchema builds the consolidated schema on an empty database. It is the

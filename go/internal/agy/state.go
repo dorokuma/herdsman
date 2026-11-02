@@ -57,6 +57,15 @@ type SessionHookState struct {
 	TurnEpoch   *float64 `json:"turnEpoch,omitempty"`
 	WaiterEpoch *float64 `json:"waiterEpoch,omitempty"`
 	WaiterPID   *int     `json:"waiterPid,omitempty"`
+	// Herdr launch identity and the cwd the WakeWaiter must start in. Stop
+	// records these so a daemon restart can re-arm the waiter with the same
+	// HERDR_* environment and pane-cwd binding the original Stop spawn had;
+	// without them RunAgyHook exits immediately (no HERDR_ENV) or the
+	// connector pane-cwd check rejects the process.
+	HerdrSocketPath *string `json:"herdrSocketPath,omitempty"`
+	PaneID          *string `json:"paneId,omitempty"`
+	WorkspaceID     *string `json:"workspaceId,omitempty"`
+	WaiterCwd       *string `json:"waiterCwd,omitempty"`
 }
 
 // Delivered mirrors `sessionState.deliveredEventIds ?? []`.
@@ -201,6 +210,10 @@ var knownStateJSONKeys = []string{
 	"turnEpoch",
 	"waiterEpoch",
 	"waiterPid",
+	"herdrSocketPath",
+	"paneId",
+	"workspaceId",
+	"waiterCwd",
 }
 
 // writeSessionState mirrors writeSessionState: a mode-0600 temp file next to

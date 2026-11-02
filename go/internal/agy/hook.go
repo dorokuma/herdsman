@@ -1,10 +1,12 @@
 package agy
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
@@ -188,10 +190,12 @@ If no update is actionable, summarize the result briefly and stop.`
 // wakePolicyHeader mirrors the `[HERDSMAN AGENT UPDATES]` section header.
 const wakePolicyHeader = "[HERDSMAN AGENT UPDATES]"
 
-// suspectedUpstreamErrorWarning is the banner prepended to a delivered result
-// whose text matched an upstream model error pattern. Delivering the result
-// verbatim with this warning replaces the old behaviour of silently acking
-// the event without ever waking the main agent.
+// suspectedUpstreamErrorWarning is the banner appended to a delivered result
+// whose text matched an upstream model error pattern. It must sit *after* the
+// outcome list, never between the `[HERDSMAN AGENT UPDATES]` header and the
+// first `- ` line: the agy host applies injectSteps.ephemeralMessage only when
+// the header is immediately followed by an outcome line, so a banner in between
+// made the whole injected batch unparseable and the wake turn saw no body.
 const suspectedUpstreamErrorWarning = "⚠️ 该子代理的结果疑似包含模型/上游报错。不要据此自主做任何决定或后续动作，立即把情况告知用户并请求指示。"
 
 // upstreamErrorLogFile is the file each agy-state dir gets for the durable
@@ -306,6 +310,12 @@ func RunAgyHook(hookEventName HookEventName, rawStdin string, options RunAgyHook
 	}
 	launch, ok := ResolveHerdrLaunchIdentity(env)
 	if !ok {
+		// WakeWaiter is normally spawned with the pane's HERDR_* environment. A
+		// re-arm that forgets those variables used to exit here with a silent
+		// `{}` and leave a zombie under the daemon — surface the reason.
+		if hookEventName == HookWakeWaiter {
+			fmt.Fprintln(os.Stderr, "Herdsman agy WakeWaiter exited: missing HERDR_ENV launch identity (HERDR_SOCKET_PATH, HERDR_PANE_ID, HERDR_WORKSPACE_ID)")
+		}
 		return HookOutput{}
 	}
 
@@ -461,7 +471,9 @@ func (r *runner) runPreInvocation() HookOutput {
 		return HookOutput{}
 	}
 
-	batch, err := r.takeNextWakeBatch(client, connState, &sessionState)
+	// No flush ran this turn: nothing is freshly withheld, so the stale
+	// delivered sweep sees no just-confirmed ids to spare.
+	batch, err := r.takeNextWakeBatch(client, connState, &sessionState, nil)
 	if err != nil {
 		return HookOutput{}
 	}
@@ -536,11 +548,14 @@ func (r *runner) runStop() HookOutput {
 		return HookOutput{}
 	}
 
-	connState, err = r.flushDeliveredAcks(client, connState, &sessionState)
+	connState, unconfirmedDelivered, err := r.flushDeliveredAcks(client, connState, &sessionState, payloadOptionalString(r.payload, "transcriptPath"))
 	if err != nil {
 		return HookOutput{}
 	}
-	immediateBatch, err := r.takeNextWakeBatch(client, connState, &sessionState)
+	// The ids the transcript gate just withheld are still legitimately
+	// delivered-but-unacked: takeNextWakeBatch must not drop them as stale in
+	// the very same Stop that decided to wait for their re-injection.
+	immediateBatch, err := r.takeNextWakeBatch(client, connState, &sessionState, unconfirmedDelivered)
 	if err != nil {
 		return HookOutput{}
 	}
@@ -559,16 +574,26 @@ func (r *runner) runStop() HookOutput {
 		sessionState.TurnEpoch = &waiterEpoch
 		sessionState.WaiterEpoch = &waiterEpoch
 		sessionState.WaiterPID = nil
+		waiterCwd := ResolveWakeWaiterCwd(r.payload, &ResolveWakeWaiterCwdOptions{
+			BaseCwd:  nil,
+			GOOS:     r.options.GOOS,
+			PID:      r.pid,
+			ReadCwd:  r.options.ReadCwd,
+			ReadPPID: r.options.ReadPPID,
+		})
+		// Persist the Herdr launch identity and waiter cwd so a daemon restart
+		// can re-arm this waiter with the same env/cwd the Stop spawn used.
+		herdrSocketPath := r.launch.HerdrSocketPath
+		paneID := r.launch.PaneID
+		workspaceID := r.launch.WorkspaceID
+		sessionState.HerdrSocketPath = &herdrSocketPath
+		sessionState.PaneID = &paneID
+		sessionState.WorkspaceID = &workspaceID
+		sessionState.WaiterCwd = &waiterCwd
 		r.writeState(sessionState)
 
 		spawned := r.spawnWakeWaiter(SpawnWakeWaiterInput{
-			Cwd: ResolveWakeWaiterCwd(r.payload, &ResolveWakeWaiterCwdOptions{
-				BaseCwd:  nil,
-				GOOS:     r.options.GOOS,
-				PID:      r.pid,
-				ReadCwd:  r.options.ReadCwd,
-				ReadPPID: r.options.ReadPPID,
-			}),
+			Cwd:         waiterCwd,
 			Environment: r.env,
 			SessionID:   r.sessionID,
 			StateDir:    r.stateDir,
@@ -653,11 +678,36 @@ func isLocalOwner(connState ConnectionState) bool {
 }
 
 // flushDeliveredAcks mirrors flushDeliveredAcks.
+//
+// Delivery-confirmation gate for the `delivered` ids: an event lands in
+// `deliveredEventIds` the moment a hook returns its batch to the host
+// (PreInvocation injectSteps or Stop decision:continue), but the host can still
+// drop that ephemeralMessage — the batch only provably reached the agent once
+// it is recorded in the conversation transcript as an EPHEMERAL_MESSAGE
+// carrying `event: <id>`. Acking before that point is what lost event 80711:
+// the completion arrived mid-turn, the busy-turn PreInvocation reserved and
+// projected it, the host never applied the ephemeralMessage, and the next Stop
+// settled the ack anyway. So a delivered id is only acked once the transcript
+// already shows its injected batch; an unconfirmed delivered id stays
+// delivered-but-unacked and has its presented flag cleared so a later turn
+// re-projects and re-injects it. `pendingAck` ids (permanent suppressions that
+// were never injected) are settled unconditionally as before.
+//
+// When the transcript cannot be consulted (no path or an unreadable file) the
+// gate degrades to the pre-fix behaviour and acks normally: an environment
+// without a transcript must not deadlock deliveries forever. A transcript that
+// reads fine but simply lacks the batch means "not delivered yet".
+//
+// The returned set carries every delivered id the transcript gate just held
+// back: those ids are still legitimately delivered-but-unacked, so the
+// takeNextWakeBatch sweep of stale delivered entries must not mistake them for
+// daemon-swallowed rows.
 func (r *runner) flushDeliveredAcks(
 	client rpcClient,
 	connState ConnectionState,
 	sessionState *SessionHookState,
-) (ConnectionState, error) {
+	transcriptPath *string,
+) (ConnectionState, map[int64]struct{}, error) {
 	allToAck := mergeEventIDs(sessionState.PendingAck(), sessionState.Delivered())
 	// Nothing to settle, but a recorded deferral may have been resolved by the
 	// latest poll: drop it so it cannot hold back future acknowledgements forever.
@@ -666,17 +716,41 @@ func (r *runner) flushDeliveredAcks(
 			sessionState.SetDeferred(nil)
 			r.writeState(*sessionState)
 		}
-		return connState, nil
+		return connState, nil, nil
 	}
+	// `delivered` ids are gated on transcript confirmation; `pendingAck` is not.
+	deliveredIDs := idSet(sessionState.Delivered())
+	injectedEventIDs, transcriptChecked := injectedEventIDsInTranscript(transcriptPath)
 	// resolveMinHoldbackEventID tolerates its own agent.list failure, so it
 	// cannot fail the flush.
 	minHoldbackEventID := r.resolveMinHoldbackEventID(client, connState, sessionState)
 	presented := idSet(sessionState.Presented())
 	remaining := []int64{}
 	stillPendingAck := []int64{}
+	unconfirmedDelivered := map[int64]struct{}{}
 	ackedAny := false
 	for index := 0; index < len(allToAck); index++ {
 		eventID := allToAck[index]
+		// A delivered event the transcript does not yet show was never actually
+		// presented to the agent: keep it delivered-but-unacked. presented stays
+		// set so THIS turn does not instantly re-project it; rearmDeliveredEvents
+		// clears it on the next awaiting turn so the batch is re-injected then.
+		if _, isDelivered := deliveredIDs[eventID]; isDelivered && transcriptChecked {
+			if _, confirmed := injectedEventIDs[eventID]; !confirmed {
+				// Tighten the hold-back bound to this unconfirmed id: the ack RPC
+				// settles `id <= eventId`, so acknowledging any higher id in this
+				// same flush would cursor-swallow the event the transcript never
+				// confirmed. Higher ids are held in stillPendingAck below — already
+				// presented, never re-injected — and acked in order once this one
+				// re-arms, re-injects and confirms.
+				if eventID < minHoldbackEventID {
+					minHoldbackEventID = eventID
+				}
+				unconfirmedDelivered[eventID] = struct{}{}
+				remaining = append(remaining, eventID)
+				continue
+			}
+		}
 		if eventID >= minHoldbackEventID {
 			// Already presented, so it will never be injected again; only the RPC
 			// ack is postponed until the lower-id event stops blocking the cursor.
@@ -691,18 +765,38 @@ func (r *runner) flushDeliveredAcks(
 			continue
 		}
 		if isPermanentAckFailure(err) {
+			// Genuinely permanent failures (invalidated / not found / not in scope)
+			// can never land the ack; the id only survives in presentedEventIds so it
+			// is never injected twice.
 			presented[eventID] = struct{}{}
 			continue
 		}
+		if isOutOfOrderAckError(err) {
+			// ORCHESTRATOR_EVENT_OUT_OF_ORDER is recoverable: the daemon still lists
+			// a lower-id row as the current deliverable, so once that row settles the
+			// next flush can ack this id in order. Move it into pendingAck (already
+			// presented, never re-injected) instead of dropping it — dropping it here
+			// meant the high id could never be acked once the lower id cleared, while
+			// keeping it in deliveredEventIds drove empty [herdsman-wake] rounds.
+			presented[eventID] = struct{}{}
+			stillPendingAck = append(stillPendingAck, eventID)
+			continue
+		}
 		// Transient failure: keep this id and every later one for the next
-		// attempt. Ids above the hold-back bound stay in pendingAckEventIds so
-		// rearmDeliveredEvents can never re-inject them.
+		// attempt. Delivered ids stay delivered-but-unacked (the transcript gate
+		// owns them); every non-delivered id is an original pendingAck entry and
+		// goes back to stillPendingAck — already presented, never re-injected —
+		// so rearmDeliveredEvents can never re-inject it. Routing a pendingAck id
+		// into `remaining` would park it in deliveredEventIds, where a permanently
+		// suppressed event (never written into the injected batch) can never be
+		// transcript-confirmed and pins the gate forever.
 		for _, restID := range allToAck[index:] {
-			if restID >= minHoldbackEventID {
-				stillPendingAck = append(stillPendingAck, restID)
-			} else {
+			if _, isDelivered := deliveredIDs[restID]; isDelivered {
 				remaining = append(remaining, restID)
+				continue
 			}
+			presented[restID] = struct{}{}
+			stillPendingAck = append(stillPendingAck, restID)
 		}
 		break
 	}
@@ -711,13 +805,13 @@ func (r *runner) flushDeliveredAcks(
 	sessionState.SetPendingAck(stillPendingAck)
 	r.writeState(*sessionState)
 	if !ackedAny {
-		return connState, nil
+		return connState, unconfirmedDelivered, nil
 	}
 	result, err := client.Call("agent.orchestrator.get", map[string]any{})
 	if err != nil {
-		return connState, nil
+		return connState, unconfirmedDelivered, nil
 	}
-	return decodeConnectionState(result), nil
+	return decodeConnectionState(result), unconfirmedDelivered, nil
 }
 
 // waiterIdentity mirrors the `{ waiterEpoch, waiterPid }` object the TS
@@ -728,13 +822,18 @@ type waiterIdentity struct {
 }
 
 // peekResult mirrors the `{ hasDeferredWorking, hasOutcomes }` return of
-// peekNextWakeBatch.
+// peekNextWakeBatch, plus the superseded-turn signal an old waiter uses to stop
+// without touching shared state.
 type peekResult struct {
 	// HasDeferredWorking reports completions that are only suppressed because
 	// agent.list still lists the peer as working. The caller re-polls instead of
 	// treating the batch as consumed.
 	HasDeferredWorking bool
 	HasOutcomes        bool
+	// Superseded is set when the peek hit isWaiterSuperseded: a newer turn/waiter
+	// already owns the session state, so this waiter must exit immediately and
+	// must not run clearStaleDeliveredEvents against the new turn's batch.
+	Superseded bool
 }
 
 // peekNextWakeBatch mirrors peekNextWakeBatch: it only evaluates whether a
@@ -771,7 +870,7 @@ func (r *runner) peekNextWakeBatch(
 		// while this poll was in flight, and the on-disk copy is the newer one.
 		freshState := r.readState()
 		if isWaiterSuperseded(freshState, expectedWaiter) {
-			return peekResult{}, nil
+			return peekResult{Superseded: true}, nil
 		}
 		// No candidate does *not* mean nothing left to retain: a batch the Stop
 		// hook handed to the host is presented (so it is no longer a candidate)
@@ -780,12 +879,20 @@ func (r *runner) peekNextWakeBatch(
 		// batch when the host ignores `decision: continue` and the draft outlives
 		// the redelivery window.
 		retainedEvents := retainWakeCandidates(eligibleKnownEvents, presented, freshState.Delivered())
+		// A peek never runs in the same turn as a flush, so there is no
+		// just-withheld set to exempt: any delivered id absent from the latest
+		// eligible view is genuinely stale here.
+		stateDirty := r.dropStaleDelivered(&freshState, eligibleKnownEvents, nil)
 		if len(freshState.Deferred()) > 0 ||
 			retainedSnapshotKey(freshState.RetainedCandidates()) != retainedSnapshotKey(retainedEvents) {
 			freshState.SetDeferred(nil)
 			freshState.SetRetained(retainedEvents)
 			sessionState.SetDeferred(nil)
 			sessionState.SetRetained(retainedEvents)
+			stateDirty = true
+		}
+		if stateDirty {
+			sessionState.SetDelivered(freshState.Delivered())
 			r.writeState(freshState)
 		}
 		return peekResult{}, nil
@@ -801,15 +908,22 @@ func (r *runner) peekNextWakeBatch(
 		}
 	}
 	// An ack settles `id <= eventId`, so acknowledging a suppressed id above a
-	// still-deferred id would advance the cursor past the deferred event and
-	// permanently swallow it.
-	minDeferredID := minDeferredEventID(projection.DeferredWorkingEventIDs)
+	// still-deferred or still-delivered-but-unacked id would advance the cursor
+	// past it and permanently swallow it. The lower bound covers both the
+	// projection's own deferrals and every delivered id the latest state
+	// (sessionState plus the on-disk copy) still owes an ack for.
+	minHoldbackID := minDeferredEventID(projection.DeferredWorkingEventIDs)
+	for _, deliveredID := range mergeEventIDs(sessionState.Delivered(), r.readState().Delivered()) {
+		if deliveredID < minHoldbackID {
+			minHoldbackID = deliveredID
+		}
+	}
 	// Working-deferred completions must stay unacked and unpresented so a later
 	// poll can project them once agent.list catches up to idle/done.
 	heldAckEventIDs := []int64{}
 	if len(projection.Outcomes) == 0 {
 		for _, suppressedID := range projection.SuppressedEventIDs {
-			if suppressedID > minDeferredID {
+			if suppressedID > minHoldbackID {
 				// Held back: mark it presented (so the suppression is not logged or
 				// re-projected every poll) but leave the RPC ack for a later pass.
 				presented[suppressedID] = struct{}{}
@@ -835,7 +949,7 @@ func (r *runner) peekNextWakeBatch(
 	// await would drop those ids and let the next turn inject the batch twice,
 	// so a superseded waiter just backs off.
 	if isWaiterSuperseded(freshState, expectedWaiter) {
-		return peekResult{}, nil
+		return peekResult{Superseded: true}, nil
 	}
 	// Union, never an overwrite: ids that only the on-disk state knows about
 	// were written by a newer turn and must survive.
@@ -868,11 +982,16 @@ func (r *runner) peekNextWakeBatch(
 }
 
 // takeNextWakeBatch mirrors takeNextWakeBatch: it persists the presented and
-// delivered ids and renders the wake prompt text.
+// delivered ids and renders the wake prompt text. unconfirmedDelivered
+// carries the ids a same-turn flushDeliveredAcks just withheld from the
+// transcript gate: they are still legitimately delivered-but-unacked, so the
+// stale delivered sweep must not mistake them for daemon-swallowed rows and
+// drop them. Callers without a preceding flush pass nil.
 func (r *runner) takeNextWakeBatch(
 	client rpcClient,
 	connState ConnectionState,
 	sessionState *SessionHookState,
+	unconfirmedDelivered map[int64]struct{},
 ) (*string, error) {
 	ackedEventID := int64(0)
 	if connState.State != nil {
@@ -895,10 +1014,20 @@ func (r *runner) takeNextWakeBatch(
 		// flushDeliveredAcks settles the ack (or rearmDeliveredEvents makes it
 		// injectable again), otherwise a later turn cannot rebuild it.
 		retainedEvents := retainWakeCandidates(eligibleKnownEvents, presented, sessionState.Delivered())
+		// A deliveredEventIds entry the daemon no longer lists as deliverable
+		// (pane close settled it, a sibling owner consumed it, ...) can never be
+		// re-injected: it only survives as a stale id that keeps
+		// hasUnackedDeliveredEvents true and makes the WakeWaiter emit an empty
+		// [herdsman-wake] every poll. Drop it here; presentedEventIds still
+		// records it, so it is never injected twice.
+		stateDirty := r.dropStaleDelivered(sessionState, eligibleKnownEvents, unconfirmedDelivered)
 		if len(sessionState.Deferred()) > 0 ||
 			retainedSnapshotKey(sessionState.RetainedCandidates()) != retainedSnapshotKey(retainedEvents) {
 			sessionState.SetDeferred(nil)
 			sessionState.SetRetained(retainedEvents)
+			stateDirty = true
+		}
+		if stateDirty {
 			r.writeState(*sessionState)
 		}
 		return nil, nil
@@ -915,13 +1044,20 @@ func (r *runner) takeNextWakeBatch(
 		}
 	}
 	// An ack settles `id <= eventId`: acknowledging a suppressed id above a
-	// still-deferred id would advance the cursor past the deferred event and
-	// permanently swallow it.
-	minDeferredID := minDeferredEventID(projection.DeferredWorkingEventIDs)
+	// still-deferred or still-delivered-but-unacked id would advance the cursor
+	// past it and permanently swallow it. The delivered ids of this very turn
+	// (delivered-but-unacked after a previous take handed the batch to the
+	// host) hold the cursor exactly like a deferral does.
+	minHoldbackID := minDeferredEventID(projection.DeferredWorkingEventIDs)
+	for _, deliveredID := range sessionState.Delivered() {
+		if deliveredID < minHoldbackID {
+			minHoldbackID = deliveredID
+		}
+	}
 	if len(projection.Outcomes) == 0 {
 		heldAckEventIDs := []int64{}
 		for _, suppressedID := range projection.SuppressedEventIDs {
-			if suppressedID > minDeferredID {
+			if suppressedID > minHoldbackID {
 				// Presented so it is neither re-logged nor re-projected, but the
 				// RPC ack waits for flushDeliveredAcks until the deferral clears.
 				presented[suppressedID] = struct{}{}
@@ -959,7 +1095,14 @@ func (r *runner) takeNextWakeBatch(
 		presented[id] = struct{}{}
 	}
 	sessionState.SetPresented(lastN(idsOf(presented), 500))
-	sessionState.SetDelivered(mergeEventIDs(sessionState.Delivered(), deliveredIDs))
+	// Only real outcomes go to deliveredEventIds: a permanent suppression is
+	// never written into the injected batch, so the transcript-confirmation
+	// gate could never confirm it — a suppressed id above the batch's highest
+	// outcome would pin deliveredEventIds and re-drive empty wakes forever.
+	// It settles through pendingAckEventIds instead, like the held-back acks
+	// of the len(projection.Outcomes) == 0 branch above.
+	sessionState.SetDelivered(mergeEventIDs(sessionState.Delivered(), outcomeIDs))
+	sessionState.SetPendingAck(mergeEventIDs(sessionState.PendingAck(), projection.SuppressedEventIDs))
 	// Recorded for the acknowledgement hold-back bound; flushDeliveredAcks
 	// moves any id above it from deliveredEventIds into pendingAckEventIds.
 	sessionState.SetDeferred(projection.DeferredWorkingEventIDs)
@@ -982,6 +1125,80 @@ func (r *runner) takeNextWakeBatch(
 // ids are kept (see retainWakeCandidates), because those are the ones the
 // acknowledgement cursor must not pass.
 const retainedCandidateEventLimit = 100
+
+// dropStaleDelivered removes deliveredEventIds entries that the eligible
+// known-event set no longer contains: a delivered-but-unacked id that stopped
+// being deliverable (pane close settled it server-side, a sibling owner
+// consumed it) can never be injected again, but it keeps
+// hasUnackedDeliveredEvents true and makes the WakeWaiter prompt an empty
+// [herdsman-wake] every poll. presentedEventIds still records the id, so it
+// can never be injected twice. unconfirmedDelivered exempts ids a same-turn
+// flush just withheld from the transcript gate — they are still delivered,
+// not stale. Returns whether the state changed.
+func (r *runner) dropStaleDelivered(
+	sessionState *SessionHookState,
+	eligibleKnownEvents []observability.AgentEventRecord,
+	unconfirmedDelivered map[int64]struct{},
+) bool {
+	delivered := sessionState.Delivered()
+	if len(delivered) == 0 {
+		return false
+	}
+	eligibleIDs := make(map[int64]struct{}, len(eligibleKnownEvents))
+	for _, event := range eligibleKnownEvents {
+		eligibleIDs[event.ID] = struct{}{}
+	}
+	kept := make([]int64, 0, len(delivered))
+	for _, id := range delivered {
+		if _, live := eligibleIDs[id]; live {
+			kept = append(kept, id)
+			continue
+		}
+		if _, withheld := unconfirmedDelivered[id]; withheld {
+			kept = append(kept, id)
+		}
+	}
+	if len(kept) == len(delivered) {
+		return false
+	}
+	sessionState.SetDelivered(kept)
+	return true
+}
+
+// clearStaleDeliveredEvents re-reads the session state and removes the
+// deliveredEventIds entries that no longer resolve to an injectable event.
+// Called by the WakeWaiter after a peek confirmed the rearmed batch is empty.
+//
+// The waiter only ever re-arms the delivered ids it snapshotted before
+// rearmDeliveredEvents ran, so the cleanup is scoped to exactly that target
+// set: a delivered id a newer turn recorded in the meantime (or a concurrent
+// take that re-delivered a different batch) is never touched. The
+// isWaiterSuperseded re-check is the second guard against the same race: an
+// old waiter that already lost the turn exits before deleting anything.
+func (r *runner) clearStaleDeliveredEvents(expectedWaiter *waiterIdentity, targetIDs map[int64]struct{}) {
+	if len(targetIDs) == 0 {
+		return
+	}
+	sessionState := r.readState()
+	if isWaiterSuperseded(sessionState, expectedWaiter) {
+		return
+	}
+	delivered := sessionState.Delivered()
+	if len(delivered) == 0 {
+		return
+	}
+	kept := make([]int64, 0, len(delivered))
+	for _, id := range delivered {
+		if _, targeted := targetIDs[id]; !targeted {
+			kept = append(kept, id)
+		}
+	}
+	if len(kept) == len(delivered) {
+		return
+	}
+	sessionState.SetDelivered(kept)
+	r.writeState(sessionState)
+}
 
 // mergeEventIDs mirrors `[...new Set(lists.flatMap((list) => list ?? []))].sort((a, b) => a - b)`.
 func mergeEventIDs(lists ...[]int64) []int64 {
@@ -1305,6 +1522,20 @@ func projectAgyOutcomes(
 	liveWorkingTerminalIDs map[string]struct{},
 	warn func(message string),
 ) projection {
+	// An agent.idle carrying stopReason "toolUse" is a mid-tool-call snapshot,
+	// not a completion: it must never project as OutcomeCompleted, so it is
+	// suppressed up front before it can seed completedPanes / newestCompletionID.
+	toolUseIdleIDs := map[int64]struct{}{}
+	filtered := events[:0]
+	for _, event := range events {
+		if event.Type == observability.AgentEventIdle && isInFlightToolUseEvent(event) {
+			toolUseIdleIDs[event.ID] = struct{}{}
+			continue
+		}
+		filtered = append(filtered, event)
+	}
+	events = filtered
+
 	outcomes := []Outcome{}
 	suppressedEventIDs := []int64{}
 	deferredWorkingEventIDs := []int64{}
@@ -1426,8 +1657,18 @@ func projectAgyOutcomes(
 	return projection{
 		DeferredWorkingEventIDs: deferredWorkingEventIDs,
 		Outcomes:                outcomes,
-		SuppressedEventIDs:      suppressedEventIDs,
+		SuppressedEventIDs:      mergeEventIDs(suppressedEventIDs, idsOf(toolUseIdleIDs)),
 	}
+}
+
+// isInFlightToolUseEvent reports whether an agent event snapshot ends on
+// `lastAssistantMessage.stopReason == "toolUse"` — a pi-family multi-step
+// tool round still in flight, never a turn completion.
+func isInFlightToolUseEvent(event observability.AgentEventRecord) bool {
+	return event.CompactHistory != nil &&
+		event.CompactHistory.LastAssistantMessage != nil &&
+		event.CompactHistory.LastAssistantMessage.StopReason != nil &&
+		*event.CompactHistory.LastAssistantMessage.StopReason == "toolUse"
 }
 
 // logAgyEventSuppressed mirrors logAgyEventSuppressed: the console.warn line
@@ -1579,9 +1820,10 @@ func outcomeKind(event observability.AgentEventRecord) (OutcomeKind, bool) {
 // FormatAgyOutcomeUpdates mirrors formatAgyOutcomeUpdates.
 func FormatAgyOutcomeUpdates(outcomes []Outcome) string {
 	lines := make([]string, 0, len(outcomes))
+	hasSuspectedUpstreamError := false
 	for _, outcome := range outcomes {
 		if outcome.SuspectedUpstreamError {
-			lines = append(lines, suspectedUpstreamErrorWarning)
+			hasSuspectedUpstreamError = true
 		}
 		identity := outcome.Agent
 		if identity == "" {
@@ -1604,10 +1846,15 @@ func FormatAgyOutcomeUpdates(outcomes []Outcome) string {
 			if len(outcome.Text) > 0 {
 				body = "\n  last assistant (pre-round): " + outcome.Text
 			}
+			// The `  event: <id>` trailer must ride every outcome kind: the
+			// delivery-confirmation gate (injectedEventIDsInTranscript) only acks
+			// ids it can find on an injected line, so a failed/stalled outcome
+			// without it would never confirm and re-inject forever.
+			eventTrailer := "\n  event: " + strconv.FormatInt(outcome.EventID, 10)
 			if outcome.Kind == OutcomeFailed {
-				lines = append(lines, "- failed "+identity+" "+pane+"\n  reason: "+reason+body)
+				lines = append(lines, "- failed "+identity+" "+pane+"\n  reason: "+reason+body+eventTrailer)
 			} else {
-				lines = append(lines, "- stalled "+identity+" "+pane+"\n  reason: "+reason+" (结果未取到，需自读 pane)"+body)
+				lines = append(lines, "- stalled "+identity+" "+pane+"\n  reason: "+reason+" (结果未取到，需自读 pane)"+body+eventTrailer)
 			}
 		default:
 			excerpt := outcome.Text
@@ -1618,7 +1865,113 @@ func FormatAgyOutcomeUpdates(outcomes []Outcome) string {
 				"\n  last assistant: "+excerpt+"\n  event: "+strconv.FormatInt(outcome.EventID, 10))
 		}
 	}
-	return wakePolicy + "\n\n" + wakePolicyHeader + "\n" + strings.Join(lines, "\n")
+	// The warning banner is appended *after* the outcome list: placing it
+	// between the header and the first `- ` line made the injected
+	// ephemeralMessage unparseable to the agy host (event 80320's wake turn
+	// received zero body), so the banner now keeps the header→`- ` adjacency
+	// intact while still flagging the batch.
+	body := strings.Join(lines, "\n")
+	if hasSuspectedUpstreamError {
+		body += "\n" + suspectedUpstreamErrorWarning
+	}
+	return wakePolicy + "\n\n" + wakePolicyHeader + "\n" + body
+}
+
+// injectedEventIDPattern mirrors the `  event: <id>` line each delivered
+// outcome carries in its ephemeralMessage (FormatAgyOutcomeUpdates). The digits
+// are captured so the transcript can be scanned once for every delivered id.
+var injectedEventIDPattern = regexp.MustCompile(`(?m)^  event: (\d+)$`)
+
+// injectedEventIDsInTranscript returns the set of event ids the conversation
+// transcript proves reached the agent, plus whether the transcript could be
+// consulted at all. Every `\d+` captured off the `  event: <id>` trailer of an
+// injected message whose content carries the `[HERDSMAN AGENT UPDATES]` batch
+// counts. Two transcript entry types record an injected batch:
+// EPHEMERAL_MESSAGE (PreInvocation injectSteps) and SYSTEM_MESSAGE (the
+// `decision: continue` reason a Stop hook blocked termination with). Nothing
+// else qualifies — a `[herdsman-wake]` USER_INPUT is the trigger, not the
+// delivered body, and PLANNER_RESPONSE / GENERIC content is agent output.
+//
+// The compact transcript agy feeds the hook truncates oversized single
+// entries mid-content (`<truncated N bytes>`), which can cut the `  event: <id>`
+// line out of a delivered batch. When the transcript is `transcript.jsonl`
+// and a sibling `transcript_full.jsonl` exists, the untruncated file is read
+// instead.
+//
+// checked=false (no path or an unreadable file) tells the caller the gate
+// cannot run; checked=true with an empty set means "nothing delivered yet".
+func injectedEventIDsInTranscript(transcriptPath *string) (confirmed map[int64]struct{}, checked bool) {
+	confirmed = map[int64]struct{}{}
+	if transcriptPath == nil || *transcriptPath == "" {
+		return confirmed, false
+	}
+	path := *transcriptPath
+	var file *os.File
+	if filepath.Base(path) == "transcript.jsonl" {
+		// Prefer the untruncated sibling; fall back to the compact transcript
+		// when transcript_full.jsonl does not exist or cannot be opened.
+		file, _ = os.Open(filepath.Join(filepath.Dir(path), "transcript_full.jsonl"))
+	}
+	if file == nil {
+		var err error
+		file, err = os.Open(path)
+		if err != nil {
+			return confirmed, false
+		}
+	}
+	defer file.Close()
+	// Stream the scan: the previous implementation read transcript.jsonl and
+	// transcript_full.jsonl into memory in full, which peaked at hundreds of MB
+	// on long sessions. Only the lines that can carry an injected batch are
+	// parsed.
+	reader := bufio.NewReaderSize(file, 64*1024)
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			scanTranscriptLineForInjectedEvents(line, confirmed)
+		}
+		if err == nil {
+			continue
+		}
+		// err == io.EOF with a non-empty line is the unterminated tail line,
+		// already scanned above; any other read error means the transcript could
+		// not be fully consulted. Once the file opened successfully a mid-read
+		// failure is a *corrupt* transcript, not an absent one: conservatively
+		// treat the gate as checked-but-unconfirmed so a delivered id the scan
+		// never reached stays delivered-but-unacked for the next turn instead of
+		// degrading to a blind ack (the S-1 regression).
+		if err != io.EOF {
+			return confirmed, true
+		}
+		break
+	}
+	return confirmed, true
+}
+
+// scanTranscriptLineForInjectedEvents parses one transcript line and records
+// every `  event: <id>` trailer of an injected batch (an EPHEMERAL_MESSAGE or
+// SYSTEM_MESSAGE whose content carries the wake-policy header).
+func scanTranscriptLineForInjectedEvents(line string, confirmed map[int64]struct{}) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.Contains(trimmed, `"EPHEMERAL_MESSAGE"`) && !strings.Contains(trimmed, `"SYSTEM_MESSAGE"`) {
+		return
+	}
+	var entry map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &entry); err != nil {
+		return
+	}
+	if entry["type"] != "EPHEMERAL_MESSAGE" && entry["type"] != "SYSTEM_MESSAGE" {
+		return
+	}
+	content, ok := entry["content"].(string)
+	if !ok || !strings.Contains(content, wakePolicyHeader) {
+		return
+	}
+	for _, match := range injectedEventIDPattern.FindAllStringSubmatch(content, -1) {
+		if id, err := strconv.ParseInt(match[1], 10, 64); err == nil {
+			confirmed[id] = struct{}{}
+		}
+	}
 }
 
 // ReadLastAssistantTextFromTranscript mirrors readLastAssistantTextFromTranscript.
@@ -1832,6 +2185,27 @@ func isPermanentAckFailure(err error) bool {
 
 // permanentAckMessagePattern mirrors `/invalidated|not found|not in scope/i`.
 var permanentAckMessagePattern = regexp.MustCompile(`(?i)invalidated|not found|not in scope`)
+
+// isOutOfOrderAckError reports whether an ack rejection carries
+// ORCHESTRATOR_EVENT_OUT_OF_ORDER. Unlike the permanent codes this rejection is
+// recoverable — the daemon still has a lower-id deliverable row in front of
+// the acked one, so the next flush settles it once that row clears. Callers
+// keep the id in pendingAckEventIds (presented, never re-injected) instead of
+// dropping it as a permanent failure or letting it pin deliveredEventIds into
+// empty [herdsman-wake] rounds.
+func isOutOfOrderAckError(err error) bool {
+	if err == nil {
+		return false
+	}
+	rpcErr := &daemon.ObservabilityRpcError{}
+	if errors.As(err, &rpcErr) && rpcErr.Code != nil {
+		switch *rpcErr.Code {
+		case "ORCHESTRATOR_EVENT_OUT_OF_ORDER", "event_out_of_order":
+			return true
+		}
+	}
+	return false
+}
 
 // upstreamErrorTextPatterns and the excerpt normalization live here because the
 // projection is their only caller.

@@ -531,11 +531,22 @@ func (s *AgentOrchestratorService) ack(input OrchestratorAckInput) (AgentOrchest
 		*event.Status == AgentEventStatusInvalidated &&
 		event.DeliveredToTerminalID != nil &&
 		*event.DeliveredToTerminalID == input.TerminalID
+	// Same-turn pane close: an explicit `herdr pane close` runs
+	// invalidatePaneCore step 0, which settles every row with
+	// delivery_attempts >= 1 as `status = 'acked', deliverable = 0` while
+	// keeping `delivered_to_terminal_id`. The owner then runs its Stop hook and
+	// acks that very event: the row is already settled on the daemon side, so
+	// the ack is an idempotent no-op on the row — but it must still advance the
+	// workspace cursor instead of dying on AckEventInvalidated.
+	isAlreadyAckedToCaller := event.Status != nil &&
+		*event.Status == AgentEventStatusAcked &&
+		event.DeliveredToTerminalID != nil &&
+		*event.DeliveredToTerminalID == input.TerminalID
 
-	if !isPendingOrDelivered(event.Status) && !isInvalidatedDelivered {
+	if !isPendingOrDelivered(event.Status) && !isInvalidatedDelivered && !isAlreadyAckedToCaller {
 		return AgentOrchestratorState{}, NewOrchestratorAckError(AckEventInvalidated, MsgAckInvalidated)
 	}
-	if !isInvalidatedDelivered {
+	if !isInvalidatedDelivered && !isAlreadyAckedToCaller {
 		var eventAgent *AgentIndexRecord
 		if event.AgentID != nil {
 			eventAgent = s.safeGetAgent(*event.AgentID)
@@ -563,14 +574,25 @@ func (s *AgentOrchestratorService) ack(input OrchestratorAckInput) (AgentOrchest
 	// (acked/invalidated/failed/null), let the batch ack through: markAcked uses an
 	// id <= cursor so the intermediate delivered events get acknowledged too. This
 	// keeps one stuck delivered event from blocking the whole trailing batch.
+	//
+	// A retained row (status='invalidated', deliverable=1) of a pane that was
+	// closed before it could ever be delivered blocks the ack the same way a
+	// pending row does: it is an unconsumed cross-workspace result the owner
+	// still has to see, so an `id <= eventId` cursor ack must not swallow it.
+	// Rows of a pane that *was* delivered before the explicit close never reach
+	// this state — the close settles them as acked (consumedByExplicitClose) or
+	// the ack itself is idempotent (isAlreadyAckedToCaller) — so only genuinely
+	// undelivered retained rows land here, and they always block.
 	isUnconsumedRetained := next != nil &&
 		next.Status != nil && *next.Status == AgentEventStatusInvalidated &&
 		next.Deliverable == 1 &&
 		(next.DeliveredToTerminalID == nil || *next.DeliveredToTerminalID != input.TerminalID)
-	if next != nil &&
-		((next.Status != nil && *next.Status == AgentEventStatusPending) || isUnconsumedRetained) &&
-		input.EventID > next.ID {
-		return AgentOrchestratorState{}, NewOrchestratorAckError(AckEventOutOfOrder, MsgAckOutOfOrder)
+	if next != nil && input.EventID > next.ID {
+		blocks := (next.Status != nil && *next.Status == AgentEventStatusPending) ||
+			isUnconsumedRetained
+		if blocks {
+			return AgentOrchestratorState{}, NewOrchestratorAckError(AckEventOutOfOrder, MsgAckOutOfOrder)
+		}
 	}
 	if event.WorkspaceID == nil || *event.WorkspaceID != input.WorkspaceID {
 		// Cross-workspace ack (ownerless sibling workspace): settle only this single

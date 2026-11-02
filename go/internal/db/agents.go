@@ -409,21 +409,33 @@ func (s *AgentStore) MarkPaneClosed(input RetirePaneInput) error {
 // tombstone (no generation, i.e. LEGACY_CLOSE_WITHOUT_GENERATION) matches any
 // generation, mirroring AgentEventStore.InvalidatePane legacy semantics.
 func (s *AgentStore) IsPaneClosed(input IsPaneClosedInput) (bool, error) {
-	var marker int
-	err := s.db.QueryRow(
-		`select 1 from agent_pane_tombstones
-		 where herdr_session_name = ? and pane_id = ?
-		   and (pane_generation is ? or pane_generation is null)
-		 limit 1`,
-		input.HerdrSessionName, input.PaneID, input.PaneGeneration,
-	).Scan(&marker)
-	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
-	}
-	if err != nil {
+	closedAt, found, err := s.PaneClosedAt(input)
+	if err != nil || !found {
 		return false, err
 	}
-	return true, nil
+	return closedAt >= 0, nil
+}
+
+// PaneClosedAt mirrors the closedAt read behind isPaneClosed: the tombstone
+// timestamp of the newest matching row, found=false when the pane is not
+// recorded as closed. The ack path uses the timestamp to tell a freshly
+// closed pane's rows apart from rows of an older incarnation.
+func (s *AgentStore) PaneClosedAt(input IsPaneClosedInput) (int64, bool, error) {
+	var closedAt int64
+	err := s.db.QueryRow(
+		`select closed_at from agent_pane_tombstones
+		 where herdr_session_name = ? and pane_id = ?
+		   and (pane_generation is ? or pane_generation is null)
+		 order by closed_at desc limit 1`,
+		input.HerdrSessionName, input.PaneID, input.PaneGeneration,
+	).Scan(&closedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return closedAt, true, nil
 }
 
 // IsPaneClosedSince mirrors isPaneClosedSince: true when the pane is recorded as
