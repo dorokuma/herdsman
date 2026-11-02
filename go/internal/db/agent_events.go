@@ -60,6 +60,17 @@ func agentKindFromPayloadJSON(value *string) *string {
 	return &kind
 }
 
+// isInFlightToolUseHistory reports whether the compact history's last
+// assistant message ended on `stopReason == "toolUse"`: a pi-family agent
+// whose multi-step tool round is still in flight briefly reads `idle` to the
+// status watcher, and an agent.idle emitted from that snapshot must never
+// reach the orchestrator (it wakes the owner mid-tool-call).
+func isInFlightToolUseHistory(compactHistory *observability.CompactAgentHistory) bool {
+	return compactHistory != nil && compactHistory.LastAssistantMessage != nil &&
+		compactHistory.LastAssistantMessage.StopReason != nil &&
+		*compactHistory.LastAssistantMessage.StopReason == "toolUse"
+}
+
 // IsDeliverableAgentEvent mirrors isDeliverableAgentEvent: the single delivery
 // predicate shared by pending discovery and acknowledgement.
 //
@@ -95,7 +106,8 @@ func IsDeliverableAgentEvent(
 		event.TerminalID == nil ||
 		*event.TerminalID == ownerTerminalID ||
 		event.Type == observability.AgentEventStatusChanged ||
-		(event.Type == observability.AgentEventIdle && payloadFrom(event.Payload) != "working") {
+		(event.Type == observability.AgentEventIdle && payloadFrom(event.Payload) != "working") ||
+		(event.Type == observability.AgentEventIdle && isInFlightToolUseHistory(event.CompactHistory)) {
 		return false
 	}
 
@@ -432,6 +444,9 @@ func (s *AgentEventStore) invalidatePaneCore(input InvalidatePaneInput) error {
 		legacyOrMatched = "(pane_generation = ? or pane_generation is null or pane_generation < ?)"
 		legacyOrMatchedParams = []any{input.PaneGeneration, input.PaneGeneration}
 	}
+	// consumedByExplicitClose records whether step 0 settled at least one
+	// already-delivered row. Only meaningful on the explicit-close path.
+	consumedByExplicitClose := false
 	if input.AcknowledgeDelivered != nil && *input.AcknowledgeDelivered {
 		// Step 0 (explicit pane close only): rows that were already delivered
 		// are acked as implicitly consumed. An explicit tab close is the user
@@ -448,15 +463,21 @@ func (s *AgentEventStore) invalidatePaneCore(input InvalidatePaneInput) error {
 		// is handled by the step 2 retention rule. The crash/disconnect paths
 		// (reconciler, reclaimDelivered) never come through here, so their
 		// retention semantics are unchanged.
-		if _, err := s.db.Exec(
+		step0, err := s.db.Exec(
 			`update agent_events
 			    set status = 'acked', deliverable = 0, invalidated_reason = null
 			  where herdr_session_name = ? and pane_id = ? and status in ('pending', 'delivered')
 			    and delivery_attempts >= 1 and `+legacyOrMatched,
 			append([]any{input.HerdrSessionName, input.PaneID}, legacyOrMatchedParams...)...,
-		); err != nil {
+		)
+		if err != nil {
 			return err
 		}
+		affected, err := step0.RowsAffected()
+		if err != nil {
+			return err
+		}
+		consumedByExplicitClose = affected > 0
 	}
 	if _, err := s.db.Exec(
 		`update agent_events
@@ -476,11 +497,21 @@ func (s *AgentEventStore) invalidatePaneCore(input InvalidatePaneInput) error {
 	// already acked the delivered rows in step 0, so this rule only ever hits
 	// rows that were never delivered; the crash/disconnect paths do not look at
 	// that flag and keep the same semantics.
+	//
+	// Exception: when the explicit close already consumed a delivered row, the
+	// whole pane incarnation is settled — keeping an earlier undelivered
+	// intermediate event as RETAINED_OUTCOME_PANE_CLOSED would park an
+	// unconsumed retained row of a dead pane ahead of the ack cursor and block
+	// acked_event_id forever. Retention is reserved for a pane that never had
+	// a single delivery (its last deliverable outcome is the only update).
 	genCondition := "1 = 1"
 	genParams := []any{}
 	if !legacy {
 		genCondition = "pane_generation = ?"
 		genParams = []any{input.PaneGeneration}
+	}
+	if consumedByExplicitClose {
+		return nil
 	}
 	_, err = s.db.Exec(
 		`update agent_events

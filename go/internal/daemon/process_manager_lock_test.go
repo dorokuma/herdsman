@@ -32,6 +32,11 @@ const daemonWorkerEnv = "HERDSMAN_GO_DAEMON_WORKER"
 // TestMain doubles as the contender entry point: when lockWorkerEnv is set the
 // process behaves as a lock worker instead of running the suite.
 func TestMain(m *testing.M) {
+	// Fork-bomb fuse: a stray `agy-hook WakeWaiter` re-exec of this test binary
+	// would re-run the whole suite; exit before any worker-mode or test runs.
+	if len(os.Args) > 1 && os.Args[1] == "agy-hook" {
+		os.Exit(0)
+	}
 	if mode := os.Getenv(lockWorkerEnv); mode != "" {
 		runLockWorker(mode, os.Args[len(os.Args)-1])
 		os.Exit(0)
@@ -39,6 +44,23 @@ func TestMain(m *testing.M) {
 	if home := os.Getenv(daemonWorkerEnv); home != "" {
 		runDaemonWorker(home)
 		os.Exit(0)
+	}
+	// No host Herdr/Herdsman environment may leak into the suite (mirrors
+	// agy/main_test.go): under HERDR_ENV=1 a daemon test could bind a real pane
+	// or re-arm a real session's WakeWaiter.
+	for _, key := range []string{
+		"HERDR_ENV",
+		"HERDR_PANE_ID",
+		"HERDR_WORKSPACE_ID",
+		"HERDR_TAB_ID",
+		"HERDR_SOCKET_PATH",
+		"HERDSMAN_HOME",
+		"HERDSMAN_AUTO_ON",
+		"HERDSMAN_AGY_SESSION_ID",
+		"HERDSMAN_AGY_STATE_DIR",
+		"HERDSMAN_AGY_WAITER_EPOCH",
+	} {
+		os.Unsetenv(key)
 	}
 	os.Exit(m.Run())
 }

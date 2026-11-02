@@ -1107,9 +1107,9 @@ func writeStubScript(t *testing.T, directory, name, word string) string {
 	return path
 }
 
-// TestWrapperScript covers the CLI switch (go/scripts/herdsman): it routes
-// HERDSMAN_IMPL=ts|go to the right entrypoint and rejects any other value.
-// The isolated trial scripts (herdsman-go-trial / pig-trial) were removed.
+// TestWrapperScript covers the in-repo CLI wrapper (go/scripts/herdsman): it
+// execs the Go binary (HERDSMAN_GO_BIN override, repo go/bin fallback, then
+// the installed host binary) and rejects a missing binary with a clear error.
 func TestWrapperScript(t *testing.T) {
 	workingDir, err := os.Getwd()
 	if err != nil {
@@ -1126,39 +1126,10 @@ func TestWrapperScript(t *testing.T) {
 	}
 
 	tempDir := t.TempDir()
-	tsStub := writeStubScript(t, tempDir, "ts-stub.sh", "ts")
 	goStub := writeStubScript(t, tempDir, "go-stub.sh", "go")
 
-	t.Run("the ts branch runs the TypeScript entrypoint", func(t *testing.T) {
+	t.Run("the wrapper execs HERDSMAN_GO_BIN", func(t *testing.T) {
 		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
-			"HERDSMAN_IMPL":     "ts",
-			"HERDSMAN_NODE":     "/bin/sh",
-			"HERDSMAN_TS_ENTRY": tsStub,
-		})
-		if code != 0 {
-			t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
-		}
-		if strings.TrimSpace(stdout) != "ts" {
-			t.Fatalf("stdout = %q, want %q", stdout, "ts")
-		}
-	})
-
-	t.Run("the default branch is ts", func(t *testing.T) {
-		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
-			"HERDSMAN_NODE":     "/bin/sh",
-			"HERDSMAN_TS_ENTRY": tsStub,
-		})
-		if code != 0 {
-			t.Fatalf("exit code = %d, want 0 (stderr: %s)", code, stderr)
-		}
-		if strings.TrimSpace(stdout) != "ts" {
-			t.Fatalf("stdout = %q, want %q", stdout, "ts")
-		}
-	})
-
-	t.Run("the go branch runs the Go binary", func(t *testing.T) {
-		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
-			"HERDSMAN_IMPL":   "go",
 			"HERDSMAN_GO_BIN": goStub,
 		})
 		if code != 0 {
@@ -1169,8 +1140,8 @@ func TestWrapperScript(t *testing.T) {
 		}
 	})
 
-	t.Run("the go branch falls back to the installed binary", func(t *testing.T) {
-		stdout, stderr, code := runScript(t, wrapper, nil, map[string]string{"HERDSMAN_IMPL": "go"})
+	t.Run("the wrapper falls back to the installed binary", func(t *testing.T) {
+		stdout, stderr, code := runScript(t, wrapper, nil, map[string]string{})
 		installed := "/root/.local/lib/herdsman-go/herdsman"
 		_, installedErr := os.Stat(installed)
 		if installedErr == nil {
@@ -1180,6 +1151,9 @@ func TestWrapperScript(t *testing.T) {
 			if strings.Contains(stderr, "Go binary not found") {
 				t.Fatalf("stderr = %q, want the installed Go binary to be used", stderr)
 			}
+			if strings.TrimSpace(stdout) == "" {
+				t.Fatalf("stdout is empty; expected the installed Go binary output")
+			}
 			return
 		}
 		if code == 0 {
@@ -1187,18 +1161,6 @@ func TestWrapperScript(t *testing.T) {
 		}
 		if !strings.Contains(stderr, "Go binary not found") {
 			t.Fatalf("stderr = %q, want the missing-binary message", stderr)
-		}
-	})
-
-	t.Run("an unsupported implementation is rejected", func(t *testing.T) {
-		stdout, stderr, code := runScript(t, wrapper, []string{"daemon", "status"}, map[string]string{
-			"HERDSMAN_IMPL": "rust",
-		})
-		if code != 1 {
-			t.Fatalf("exit code = %d, want 1 (stdout: %s, stderr: %s)", code, stdout, stderr)
-		}
-		if !strings.Contains(stderr, "HERDSMAN_IMPL must be 'go' or 'ts'") {
-			t.Fatalf("stderr = %q, want the rejection message", stderr)
 		}
 	})
 }

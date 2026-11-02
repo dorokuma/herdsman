@@ -18,53 +18,34 @@ Detailed development and contribution guidelines are maintained across:
 
 ## Requirements
 
-Published npm package (running the TypeScript CLI):
+The repository is Go-only (`go/` module, `go1.26.4` toolchain via `go/go.mod`):
 
-- Node.js >= 22.12.0
+- Go >= 1.26
 - Herdr >= 0.7.0
-- Pi >= 0.80.6 when using `herdsman-pi`
-
-This host (zero-node since 2026-10-30):
-
-- The production CLI and daemon are the Go binaries under `/root/.local/lib/herdsman-go/` — no Node required.
-- Source builds and tests need Bun >= 1.4.0 (`packageManager: bun@1.4.4`; the TypeScript toolchain now runs on Bun).
+- Pi >= 0.80.6 when using the Go `herdsman-pi` extension from the `pi-extensions` repository
 
 ## Install
 
-```bash
-npm install --global @dorokuma/herdsman
-herdsman help
-```
-
-### Install from source
-
-This path is for local development only; it is not a production install channel. The production host runs the Go binaries under `/root/.local/lib/herdsman-go/` — see AGENTS.md「本机运维」.
-
-Source builds require Bun >= 1.4.0 (this repo's `packageManager` is `bun@1.4.4`).
+This host runs the Go binaries under `/root/.local/lib/herdsman-go/` (with `/root/.local/bin/herdsman` exec'ing the Go CLI). Install from source:
 
 ```bash
 git clone https://github.com/dorokuma/herdsman.git
-cd herdsman
-bun install
-bun run build
-npm install --global . --ignore-scripts
-herdsman help
+cd herdsman/go
+go build -o /tmp/herdsman ./cmd/herdsman
+go build -o /tmp/herdsman-daemon ./cmd/herdsman-daemon
+sudo install -m 0755 /tmp/herdsman /tmp/herdsman-daemon /root/.local/lib/herdsman-go/
 ```
-
-Note: `npm install --global` is the registry/distribution step and needs Node + npm on a machine that has them; this host has neither. On this host, `bun install` + `bun run build` produce `dist/`, and the entrypoint can also run under Bun (`bun ./dist/src/cli/herdsman.js help`).
 
 ## Start the daemon
 
 Herdsman agent commands and Pi notifications require the daemon. The daemon watches all running Herdr sessions reported by `herdr session list --json`, rescans them every 60 seconds, and does not index stopped Herdr sessions. Runtime files live in `~/.herdsman` by default. Set `HERDSMAN_HOME` to use another directory.
 
-On this host the production daemon is the Go binary `/root/.local/lib/herdsman-go/herdsman-daemon`, started directly by the systemd unit `herdsman.service`, which keeps it running: use `systemctl restart herdsman.service` to restart it. The npm-installed TypeScript daemon described in [docs/releasing.md](./docs/releasing.md) is the published-artifact channel for downstream hosts that have Node.js; this host no longer runs it.
+On this host the production daemon is the Go binary `/root/.local/lib/herdsman-go/herdsman-daemon`, started directly by the systemd unit `herdsman.service`, which keeps it running: use `systemctl restart herdsman.service` to restart it.
 
-For development or verification, run the entrypoint in the foreground with an explicit temporary data directory, so the production data directory is not used as scratch space. Either the Go binary or the Bun-built TypeScript entrypoint works:
+For development or verification, run the daemon entrypoint in the foreground with an explicit temporary data directory, so the production data directory is not used as scratch space:
 
 ```bash
 HERDSMAN_HOME=/tmp/herdsman-dev /root/.local/lib/herdsman-go/herdsman-daemon
-# or, after `bun run build`:
-HERDSMAN_HOME=/tmp/herdsman-dev bun ./dist/src/cli/herdsman-daemon.js
 ```
 
 ## Main commands
@@ -110,10 +91,10 @@ npx skills add ogulcancelik/herdr --skill herdr -g
 
 ## Pi extension
 
-Install the extension through Pi:
+Install the Go `herdsman-pi` extension through Pi from the `pi-extensions` repository:
 
 ```bash
-pi install npm:@dorokuma/herdsman-pi
+pi install github:dorokuma/pi-extensions/go/herdsman-pi
 ```
 
 The extension requires Pi 0.80.6 or newer and connects to the Herdsman daemon when Pi runs inside Herdr. Each connected Pi registers its exact Pi session path as presence identity, including while off. After a successful register it sends `agent.ping` at least every 30 seconds so the daemon heartbeat does not drop an idle connection. The extension sends no per-turn tool-result or message telemetry; after its own final assistant message is written to the session file it sends a turn-completion signal, so completed and blocked outcomes carry a non-empty final response.
@@ -138,40 +119,22 @@ Set `filter_upstream_errors: false` to restore waking on every outcome. `HERDSMA
 
 ## Herdr plugin
 
-Install the optional plugin from the GitHub release tag:
-
-```bash
-herdr plugin install dorokuma/herdsman/packages/herdsman-herdr-plugin --ref v0.15.2 --yes
-```
-
-Use the release tag that matches the installed Herdsman CLI version.
-
-The plugin connects to the Herdsman daemon and shows compact agent rows for the current Herdr workspace, including separate live-name and runtime-kind columns plus cached history excerpts. Herdr installs it from the repository subdirectory; it is not published to npm or required for the CLI and Pi extension.
-
-## Packages
-
-| Path | Distribution | Purpose |
-| --- | --- | --- |
-| repository root | npm: `@dorokuma/herdsman` | Herdsman CLI and daemon. |
-| `packages/herdsman-pi` | npm: `@dorokuma/herdsman-pi` | Pi extension for agent history and agent updates. |
-| `packages/herdsman-herdr-plugin` | GitHub release subdirectory | Optional Herdr UI integration; not an npm package. |
+The `herdsman-herdr-plugin` (an optional Herdr UI integration) is not part of this Go-only repository; install it from the `pi-extensions` distribution channel if needed.
 
 ## Development
 
-```bash
-bun install
-bun run check
-bun run build
-```
-
-See [Releasing Herdsman](./docs/releasing.md) for package validation, npm publication, and GitHub Release steps. Because the release commit on `main` must update the Herdr plugin `--ref <tag>` install command in `README.md` and `packages/herdsman-herdr-plugin/README.md` before the annotated git tag is created — so the tag snapshot itself seals the matching `--ref <tag>`, manifest versions, and `CHANGELOG.md` section — and the remote tag is pushed only after `main` is pushed and both npm packages are published and verified, `--ref <tag>` on `main` has a short structural window where the new tag is not yet resolvable on GitHub. Follow the release order in [docs/releasing.md](./docs/releasing.md) strictly: synchronize the four manifests, both README `--ref` lines, and `CHANGELOG.md` (recording only facts already true when the release commit is written), run `bun run check` / `bun run build` and isolated tarball checks, commit and push `main`, create and verify the local annotated tag snapshot, publish and verify both `@dorokuma/herdsman` and `@dorokuma/herdsman-pi` on npm, push the remote tag and create the GitHub Release (closing the `--ref` window; run `herdr plugin install` with the new `--ref <tag>` only after the remote tag and Release are live), and finally record the release under `.agents/notes/` as a separate commit on `main`. Published git tags, GitHub Releases, and already-released `CHANGELOG.md` sections are immutable and must never be rewritten, moved, or backfilled retroactively; record any post-release observations or wording corrections in `.agents/notes/` instead.
-
-DB schema changes require:
+All commands run from the `go/` directory:
 
 ```bash
-bun run db:generate
-bun run db:check
+cd go
+gofmt -l .          # must print nothing
+go vet ./...
+go test ./...
+go build -o /tmp/herdsman ./cmd/herdsman
+go build -o /tmp/herdsman-daemon ./cmd/herdsman-daemon
 ```
+
+`.husky/pre-commit` runs the same gate (`gofmt -l`, `go vet`, `go test`, both `go build` targets) before each commit. DB schema changes update `go/internal/db/schema.go` plus a new file under `go/internal/db/migrations/`; `sqlite_migrations_test.go` replays migrations against the schema to keep them in sync.
 
 ## License
 

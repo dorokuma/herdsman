@@ -1,57 +1,29 @@
 #!/bin/sh
-# herdsman — in-repo wrapper that switches the CLI between the TypeScript
-# entrypoint and the Go port.
+# herdsman — in-repo wrapper that execs the Go CLI binary.
 #
-# Why this file exists: the host runs the CLI through
-# /root/.local/bin/herdsman, a wrapper that execs the Go binary directly
-# (the npm global install it replaced was removed with Node on 2026-10-30).
-# Switching that symlink to this repo's binary would make a half-ported
-# daemon the production CLI, so the switch lives here, inside the
-# repository, and the host install is never touched.
-#
-#   HERDSMAN_IMPL=go  (default) exec the compiled Go binary
-#   HERDSMAN_IMPL=ts            exec the TS entrypoint — requires a Node
-#                               runtime (retired on this host: Node was
-#                               removed system-wide on 2026-10-30)
+# The repository is Go-only; the TypeScript entrypoint was removed with
+# chore/go-only-and-fix-wake. The host runs the CLI through
+# /root/.local/bin/herdsman, a wrapper that execs the Go binary directly;
+# this script exists for local development and tests inside the repo.
 #
 # Overrides (mainly for tests and out-of-tree builds):
-#   HERDSMAN_GO_BIN   path of the Go binary      (default: <repo>/go/bin/herdsman,
-#                    falling back to /root/.local/lib/herdsman-go/herdsman)
-#   HERDSMAN_TS_ENTRY path of the TS entrypoint  (default: <repo>/dist/src/cli/herdsman.js)
-#   HERDSMAN_NODE     node binary for the TS entrypoint (default: node — absent
-#                    on this host; ts only works where Node is still installed)
+#   HERDSMAN_GO_BIN   path of the Go binary (default: <repo>/go/bin/herdsman,
+#                     falling back to /root/.local/lib/herdsman-go/herdsman)
 set -eu
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/../.." && pwd)
-impl=${HERDSMAN_IMPL:-go}
 
-case "$impl" in
-  ts)
-    entry=${HERDSMAN_TS_ENTRY:-$repo_root/dist/src/cli/herdsman.js}
-    if [ ! -f "$entry" ]; then
-      echo "herdsman wrapper: TS entrypoint not found at $entry (build it with: bun run build)" >&2
-      exit 1
-    fi
-    exec "${HERDSMAN_NODE:-node}" "$entry" "$@"
-    ;;
-  go)
-    go_bin=${HERDSMAN_GO_BIN:-}
-    if [ -z "$go_bin" ]; then
-      if [ -x "$repo_root/go/bin/herdsman" ]; then
-        go_bin=$repo_root/go/bin/herdsman
-      elif [ -x /root/.local/lib/herdsman-go/herdsman ]; then
-        go_bin=/root/.local/lib/herdsman-go/herdsman
-      fi
-    fi
-    if [ -z "$go_bin" ] || [ ! -x "$go_bin" ]; then
-      echo "herdsman wrapper: Go binary not found (looked at HERDSMAN_GO_BIN, $repo_root/go/bin/herdsman, /root/.local/lib/herdsman-go/herdsman)" >&2
-      exit 1
-    fi
-    exec "$go_bin" "$@"
-    ;;
-  *)
-    echo "herdsman wrapper: HERDSMAN_IMPL must be 'go' or 'ts' (got '$impl')" >&2
-    exit 1
-    ;;
-esac
+go_bin=${HERDSMAN_GO_BIN:-}
+if [ -z "$go_bin" ]; then
+  if [ -x "$repo_root/go/bin/herdsman" ]; then
+    go_bin=$repo_root/go/bin/herdsman
+  elif [ -x /root/.local/lib/herdsman-go/herdsman ]; then
+    go_bin=/root/.local/lib/herdsman-go/herdsman
+  fi
+fi
+if [ -z "$go_bin" ] || [ ! -x "$go_bin" ]; then
+  echo "herdsman wrapper: Go binary not found (looked at HERDSMAN_GO_BIN, $repo_root/go/bin/herdsman, /root/.local/lib/herdsman-go/herdsman)" >&2
+  exit 1
+fi
+exec "$go_bin" "$@"

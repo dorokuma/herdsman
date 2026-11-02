@@ -15,6 +15,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"syscall"
+	"testing"
 	"time"
 	"unicode"
 
@@ -266,7 +267,7 @@ func (w *waiter) loop() error {
 				w.hasPushNotification.Load() ||
 				w.retryWakePending ||
 				w.deliveredBatchGracePending ||
-				!hasActivePeers) {
+				!hasActivePeers || hasUnackedDeliveredEvents) {
 				latestStateValue, callErr := w.client.Call("agent.orchestrator.get", map[string]any{})
 				if callErr != nil {
 					return callErr
@@ -283,6 +284,13 @@ func (w *waiter) loop() error {
 				})
 				if peekErr != nil {
 					return peekErr
+				}
+				if peekedBatch.Superseded {
+					// A newer turn/waiter owns the session state now: any further
+					// action of this loop (including clearStaleDeliveredEvents)
+					// would race it.
+					stop = true
+					return nil
 				}
 				hasWakeBatch = hasUnackedDeliveredEvents || peekedBatch.HasOutcomes
 				w.isFirstEventCheck = false
@@ -336,10 +344,59 @@ func (w *waiter) loop() error {
 							stop = true
 							return nil
 						}
-						// The stop hook marked the batch presented before returning it
-						// to the host; the turn started by this prompt has to receive
-						// it in PreInvocation, so re-arm the unacked batch first.
-						w.runner.rearmDeliveredEvents()
+						// Re-arm only a delivered-but-unacked batch: a fresh
+						// peekedBatch already proved it has an injectable outcome on
+						// the *latest* orchestrator state, so rearming and re-peeking
+						// would only re-verify what is already known.
+						if hasUnackedDeliveredEvents {
+							// The stop hook marked the batch presented before returning it
+							// to the host; the turn started by this prompt has to receive
+							// it in PreInvocation, so re-arm the unacked batch first.
+							// Snapshot the exact delivered ids this re-arm is about to
+							// expose: clearStaleDeliveredEvents below may only remove
+							// those, never ids a newer turn recorded in the meantime.
+							rearmTargets := idSet(sessionState.Delivered())
+							w.runner.rearmDeliveredEvents()
+							// Never emit a wake for a batch that is not actually
+							// injectable: rearm only helps when the unacked ids are still
+							// deliverable. Stale deliveredEventIds left behind by a pane
+							// close otherwise trigger an empty [herdsman-wake] every poll.
+							// The verify peek has to run against the *latest* orchestrator
+							// snapshot: the w.connState captured at waiter start still
+							// holds the events list of that moment (usually empty), so a
+							// completion that arrived later would peek as no outcome and
+							// the real wake would be swallowed.
+							rearmedState := readSessionState(w.stateDir, w.sessionID)
+							verifyPeek, verifyErr := w.runner.peekNextWakeBatch(
+								w.client, latestState, &rearmedState, &waiterIdentity{
+									waiterEpoch: w.waiterEpoch,
+									waiterPID:   w.runnerPID(),
+								})
+							if verifyErr != nil {
+								return verifyErr
+							}
+							if verifyPeek.Superseded {
+								// The verify peek hit a superseded state: the new turn owns
+								// the delivered ids this waiter just re-armed, so it must
+								// not run clearStaleDeliveredEvents (R3).
+								stop = true
+								return nil
+							}
+							if !verifyPeek.HasOutcomes {
+								// Nothing injectable: drop the stale delivered ids that
+								// rearm just exposed and keep standing by. Only the ids
+								// snapshotted for this very re-arm may be removed — a new
+								// turn's delivery arriving concurrently must survive.
+								w.runner.clearStaleDeliveredEvents(&waiterIdentity{
+									waiterEpoch: w.waiterEpoch,
+									waiterPID:   w.runnerPID(),
+								}, rearmTargets)
+								hasUnackedDeliveredEvents = false
+								hasWakeBatch = false
+								w.deliveredBatchGracePending = false
+								return nil
+							}
+						}
 						if promptErr := w.runner.triggerWakePrompt(w.runner.launch.PaneID, wakePromptText); promptErr != nil {
 							w.wakePromptFailures++
 							w.runner.warn(fmt.Sprintf(
@@ -798,6 +855,13 @@ func (r *runner) defaultSpawnWakeWaiter(input SpawnWakeWaiterInput) *SpawnWakeWa
 	if err != nil {
 		return nil
 	}
+	// Fork-bomb fuse: a test binary re-exec'd as `<pkg>.test agy-hook WakeWaiter`
+	// ignores the positional args and re-runs the whole suite, and every rerun
+	// spawns another detached waiter — an exponential process storm. Never spawn
+	// from a test binary; a test that needs the child injects SpawnWakeWaiter.
+	if testing.Testing() || isTestExecutable(executable) {
+		return nil
+	}
 	command := exec.Command(executable, "agy-hook", "WakeWaiter")
 	command.Dir = input.Cwd
 	command.Env = wakeWaiterEnvironment(input)
@@ -813,6 +877,16 @@ func (r *runner) defaultSpawnWakeWaiter(input SpawnWakeWaiterInput) *SpawnWakeWa
 	pid := command.Process.Pid
 	_ = command.Process.Release()
 	return &SpawnWakeWaiterResult{PID: &pid}
+}
+
+// isTestExecutable reports whether execPath is a Go test binary — the
+// `<pkg>.test` (or `<pkg>.test.exe` on Windows) shape `go test` produces.
+// defaultSpawnWakeWaiter re-execs os.Executable() as a WakeWaiter; when that is
+// a test binary the spawn would re-run the suite instead of the hook, so every
+// spawn site refuses it.
+func isTestExecutable(execPath string) bool {
+	base := filepath.Base(execPath)
+	return strings.HasSuffix(base, ".test") || strings.HasSuffix(base, ".test.exe")
 }
 
 // wakeWaiterEnvironment mirrors the env object of the TS spawn: the input

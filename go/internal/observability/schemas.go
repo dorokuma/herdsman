@@ -258,10 +258,10 @@ var AgentOrchestratorRegisterInputSchema = &ObjectSchema{
 			kind:  kindObjectUnion,
 			union: sessionRefUnionSchema,
 		},
-		"subscriberId":   str(1),
+		"subscriberId": str(1),
 		"subscriberKind": literals(
 			string(SubscriberPi), string(SubscriberPig), string(SubscriberAgy)),
-		"workspaceId":    str(1),
+		"workspaceId": str(1),
 	},
 }
 

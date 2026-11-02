@@ -1,0 +1,1 @@
+CREATE INDEX IF NOT EXISTS `agent_events_pane_idx` ON `agent_events` (`herdr_session_name`,`pane_id`);

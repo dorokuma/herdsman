@@ -126,6 +126,39 @@ func (s *AgentIndexService) appendStatusEvents(
 		attempts = *input.Attempts
 	}
 
+	// A pi-family `working -> idle` whose snapshot still reports
+	// `stopReason == "toolUse"` is an in-flight tool round, not a turn end: the
+	// agent is about to flip back to working, or the on-disk history will reach
+	// a terminal stopReason within the history-ready window. Wait briefly for
+	// either before letting the event append as a deliverable idle.
+	if input.To == AgentStatusIdle && input.From == AgentStatusWorking &&
+		isPiFamilyAgentKind(agentKind) &&
+		isInFlightToolUseCompactHistory(compactHistory) {
+		resolved, resolveErr := s.waitForInFlightToolUseResolution(
+			input.Agent, compactHistory, controller)
+		if resolveErr != nil {
+			return nil, false, resolveErr
+		}
+		switch resolved {
+		case inFlightToolUseAborted:
+			if err := s.throwIfShutdownAbort(controller); err != nil {
+				return nil, false, err
+			}
+			return nil, false, nil
+		case inFlightToolUseBackToWorking:
+			fmt.Fprintf(os.Stderr,
+				"Herdsman skipping agent.idle for an in-flight tool round that flipped"+
+					" back to working (agentId=%s, herdrSessionName=%s, paneId=%s)\n",
+				input.Agent.ID, input.Agent.HerdrSessionName, input.Agent.PaneID)
+			return nil, false, nil
+		case inFlightToolUseStillInFlight:
+			// The grace window expired and the round is still mid-tool-call: the
+			// appended agent.idle is excluded from delivery by the
+			// IsDeliverableAgentEvent toolUse guard, so it is recorded without
+			// waking the orchestrator.
+		}
+	}
+
 	if s.turnCompletions != nil &&
 		(input.To == AgentStatusDone || input.To == AgentStatusBlocked) &&
 		terminalID != "" && isPiFamilyAgentKind(agentKind) {
@@ -752,6 +785,110 @@ func (s *AgentIndexService) appendStatusEvents(
 // ---------------------------------------------------------------------------
 // Helpers local to #appendStatusEvents
 // ---------------------------------------------------------------------------
+
+// inFlightToolUseResolution mirrors the three ways the in-flight tool-use
+// grace wait can end.
+type inFlightToolUseResolution int
+
+const (
+	// inFlightToolUseResolved means the on-disk history reached a terminal
+	// stopReason (or the toolUse flag cleared): the plan appends normally.
+	inFlightToolUseResolved inFlightToolUseResolution = iota
+	// inFlightToolUseBackToWorking means the live agents row already reads
+	// working again: the idle event must not be appended at all.
+	inFlightToolUseBackToWorking
+	// inFlightToolUseStillInFlight means the grace window expired with the
+	// round still mid-tool-call: the event may be appended but the delivery
+	// predicate keeps it away from the orchestrator.
+	inFlightToolUseStillInFlight
+	// inFlightToolUseAborted means the wait was cut short by a pane close or a
+	// shutdown abort: the plan returns without appending.
+	inFlightToolUseAborted
+)
+
+// inFlightToolUseGrace* mirror the bounded "history ready" window a
+// working -> idle plan gets to let an in-flight toolUse snapshot settle.
+const (
+	inFlightToolUseGracePollMs    = int64(500)
+	inFlightToolUseGraceMaxWaitMs = int64(4_000)
+)
+
+// isInFlightToolUseCompactHistory reports whether a compact history's last
+// assistant message ended on stopReason "toolUse": a pi-family agent whose
+// multi-step tool round is still in flight.
+func isInFlightToolUseCompactHistory(compact *CompactAgentHistory) bool {
+	return compact != nil && compact.LastAssistantMessage != nil &&
+		compact.LastAssistantMessage.StopReason != nil &&
+		*compact.LastAssistantMessage.StopReason == "toolUse"
+}
+
+// waitForInFlightToolUseResolution polls inside the history-ready grace
+// window until the in-flight tool round resolves: the live agent row flips
+// back to working (skip the idle event entirely), the refreshed history
+// reaches a terminal/cleared stopReason (append normally), the pane
+// closes/aborts, or the window expires.
+func (s *AgentIndexService) waitForInFlightToolUseResolution(
+	agent AgentIndexRecord,
+	compactHistory *CompactAgentHistory,
+	controller *waiterController,
+) (inFlightToolUseResolution, error) {
+	deadline := s.now() + inFlightToolUseGraceMaxWaitMs
+	for {
+		closed, err := s.stores.Agents.IsPaneClosed(IsPaneClosedInput{
+			HerdrSessionName: agent.HerdrSessionName,
+			PaneID:           agent.PaneID,
+			PaneGeneration:   agent.PaneGeneration,
+		})
+		if err != nil {
+			return inFlightToolUseAborted, err
+		}
+		if closed || controller.Aborted() {
+			return inFlightToolUseAborted, nil
+		}
+		live, err := s.stores.Agents.FindByPane(FindAgentByPaneInput{
+			HerdrSessionName: agent.HerdrSessionName,
+			PaneID:           agent.PaneID,
+			PaneGeneration:   agent.PaneGeneration,
+		})
+		if err != nil {
+			return inFlightToolUseAborted, err
+		}
+		if live == nil {
+			return inFlightToolUseAborted, nil
+		}
+		if live.AgentStatus == AgentStatusWorking {
+			return inFlightToolUseBackToWorking, nil
+		}
+		refreshed, err := s.context.RefreshAgent(RefreshAgentContextInput{
+			Agent:           agent,
+			ForceRefresh:    boolPointer(true),
+			IdentityChanged: false,
+		})
+		if err != nil {
+			return inFlightToolUseAborted, err
+		}
+		fresh := refreshed.Snapshot.CompactHistory
+		if !isInFlightToolUseCompactHistory(&fresh) {
+			// The history settled out of the tool-use gap. The appended event keeps
+			// the *resolved* snapshot so its stopReason is the terminal one.
+			if compactHistory != nil {
+				*compactHistory = fresh
+			}
+			return inFlightToolUseResolved, nil
+		}
+		if s.now() >= deadline {
+			return inFlightToolUseStillInFlight, nil
+		}
+		remaining := deadline - s.now()
+		sleepMs := inFlightToolUseGracePollMs
+		if remaining < sleepMs {
+			sleepMs = remaining
+		}
+		if sleepMs > 0 {
+			s.sleep(sleepMs, controller.Done())
+		}
+	}
+}
 
 func (s *AgentIndexService) isPaneClosedFor(agent AgentIndexRecord) (bool, error) {
 	return s.stores.Agents.IsPaneClosed(IsPaneClosedInput{
