@@ -605,13 +605,15 @@ func (s *AgentIndexService) refreshHerdrSessionNow(
 	for _, agent := range snapshot.Agents {
 		snapshotAgents = append(snapshotAgents, withPaneRevision(agent, overlayByPane))
 	}
-	// A live pane that reports a pane_generation overrides any generation-less
-	// (legacy) close: drop the legacy tombstone before consulting isPaneClosed so
-	// the generation-carrying agent is indexed instead of being swallowed by the
-	// phantom close. Generation-scoped tombstones stay.
+	// A pane that shows up in the authoritative live snapshot is open, so any
+	// generation-less (legacy) close tombstone for it is stale: drop it before
+	// consulting isPaneClosed, or the pane's agent is swallowed by the phantom
+	// close. Herdr snapshot agents do not report pane_generation, so the clear
+	// must not be gated on the agent carrying one. Generation-scoped
+	// tombstones stay: a same-generation close still filters the agent below.
 	for _, agent := range snapshotAgents {
 		paneID := stringValue(agent["pane_id"])
-		if paneID != nil && paneGenerationOf(agent) != nil {
+		if paneID != nil {
 			if err := s.stores.Agents.ClearLegacyPaneTombstone(ClearLegacyPaneTombstoneInput{
 				HerdrSessionName: input.HerdrSessionName,
 				PaneID:           *paneID,

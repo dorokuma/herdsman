@@ -934,6 +934,111 @@ func TestIndexPaneClosedRetiresAgentAndReleasesScope(t *testing.T) {
 	}
 }
 
+// TestIndexLegacyTombstoneClearedByGenerationlessSnapshotAgent is the
+// regression test for the w61 disappearance: Herdr's `session.snapshot`
+// AgentInfo never reports `pane_generation`, so the snapshot-agent map of a
+// live pane is generation-less. A legacy (`pane_generation IS NULL`)
+// tombstone must still be cleared by that live pane — the snapshot is the
+// authoritative liveness proof — or the agent is swallowed by isPaneClosed,
+// never reaches the agents table, and the workspace vanishes from the daemon.
+func TestIndexLegacyTombstoneClearedByGenerationlessSnapshotAgent(t *testing.T) {
+	harness := openIdxHarness(t)
+	history := newIdxHistory("result")
+	holder := &idxSnapshotHolder{}
+	// The snapshot agent carries no pane_generation, exactly like a Herdr
+	// AgentInfo payload.
+	holder.set(idxOneAgent("working", 10, "claude", nil))
+	service, _ := newIdxService(t, harness, holder, history, nil)
+	if err := harness.agents.MarkPaneClosed(db.RetirePaneInput{
+		HerdrSessionName: "default",
+		PaneID:           "wJ:p2",
+		PaneGeneration:   nil,
+	}); err != nil {
+		t.Fatalf("markPaneClosed(legacy): %v", err)
+	}
+
+	refreshed, err := service.RefreshHerdrSession(turnSessionInput())
+	if err != nil {
+		t.Fatalf("refreshHerdrSession: %v", err)
+	}
+	if len(refreshed.Agents) != 1 {
+		t.Fatalf("refreshed.Agents = %d, want 1 (the live pane must clear the legacy tombstone)",
+			len(refreshed.Agents))
+	}
+	indexed, err := harness.agents.List(observability.AgentQueryScope{HerdrSessionName: idxStrPtr("default")})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(indexed) != 1 {
+		t.Fatalf("indexed agents = %d, want 1 (tombstoned pane swallowed the agent)", len(indexed))
+	}
+	closed, err := harness.agents.IsPaneClosed(db.IsPaneClosedInput{
+		HerdrSessionName: "default",
+		PaneID:           "wJ:p2",
+		PaneGeneration:   nil,
+	})
+	if err != nil {
+		t.Fatalf("isPaneClosed: %v", err)
+	}
+	if closed {
+		t.Fatal("isPaneClosed = true, want the legacy tombstone cleared")
+	}
+}
+
+// TestIndexGenerationScopedTombstoneStillFilters pins the non-regression: a
+// tombstone that names a generation still closes that generation of the pane.
+// Clearing the legacy tombstone on a live snapshot pane must not widen to a
+// generation-scoped one, so a snapshot agent reporting the closed generation
+// stays filtered.
+func TestIndexGenerationScopedTombstoneStillFilters(t *testing.T) {
+	harness := openIdxHarness(t)
+	history := newIdxHistory("result")
+	holder := &idxSnapshotHolder{}
+	holder.set(idxSnapshot([]any{idxAgent(map[string]any{
+		"agent_status":    "working",
+		"pane_generation": "gen-1",
+		"pane_id":         "wJ:p2",
+		"revision":        float64(10),
+		"terminal_id":     "term_claude",
+		"workspace_id":    "wJ",
+	})}, []any{map[string]any{"pane_id": "wJ:p2", "revision": float64(10)}}))
+	service, _ := newIdxService(t, harness, holder, history, nil)
+	if err := harness.agents.MarkPaneClosed(db.RetirePaneInput{
+		HerdrSessionName: "default",
+		PaneID:           "wJ:p2",
+		PaneGeneration:   idxStrPtr("gen-1"),
+	}); err != nil {
+		t.Fatalf("markPaneClosed(gen-1): %v", err)
+	}
+
+	refreshed, err := service.RefreshHerdrSession(turnSessionInput())
+	if err != nil {
+		t.Fatalf("refreshHerdrSession: %v", err)
+	}
+	if len(refreshed.Agents) != 0 {
+		t.Fatalf("refreshed.Agents = %d, want 0 (the generation tombstone still closes the pane)",
+			len(refreshed.Agents))
+	}
+	indexed, err := harness.agents.List(observability.AgentQueryScope{HerdrSessionName: idxStrPtr("default")})
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if len(indexed) != 0 {
+		t.Fatalf("indexed agents = %d, want 0", len(indexed))
+	}
+	closed, err := harness.agents.IsPaneClosed(db.IsPaneClosedInput{
+		HerdrSessionName: "default",
+		PaneID:           "wJ:p2",
+		PaneGeneration:   idxStrPtr("gen-1"),
+	})
+	if err != nil {
+		t.Fatalf("isPaneClosed: %v", err)
+	}
+	if !closed {
+		t.Fatal("isPaneClosed = false, want the generation-scoped tombstone kept")
+	}
+}
+
 // The in-flight refresh registry of AgentIndexService: callers that ask for the
 // same session in the same mutation epoch must share one refresh, exactly like
 // the TS hands every caller the same promise.
