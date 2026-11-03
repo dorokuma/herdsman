@@ -6,7 +6,7 @@ Herdsman 是一个 Go daemon / CLI，从 Herdr 管理的 coding agent 生成 age
 
 1. **构建・测试・静态检查**: 修改实现后必须在 `go/` 下通过 `gofmt -l .`（为空）、`go vet ./...`、`go test ./...`、`go build ./cmd/herdsman` 与 `go build ./cmd/herdsman-daemon`；这也是 `.husky/pre-commit` 的门禁。
 2. **提交规范**——commit message 须过全局 commit-msg hook：Conventional Commits 类型白名单、≤72 字、冒号后一空格、禁噪声词与密钥。
-3. **决策/踩坑须记 .agents/notes/**：重大决策、架构调整、方案否决、临时降级/workaround/特判必须记入 `.agents/notes/`（满足六触发之一即写，详见 [.agents/notes/README.md](.agents/notes/README.md)）。
+3. **决策/踩坑须记 .agents/notes/**：若本机维护了 `.agents/notes/` 目录（本机可选留存、不入 git、不随公开仓库分发），重大决策、架构调整、方案否决、临时降级/workaround/特判必须记入其中（满足六触发之一即写，触发条件见本机 `.agents/notes/README.md`）；没有该目录的主机可跳过本条。
 4. **未提交变更保护**: 不得回退用户或其他进程的未提交变更。`node_modules/`、`dist/`、`*.sqlite` 不要 commit。
 
 ## 本机运维 / Local Operations
@@ -25,8 +25,8 @@ Herdsman 是一个 Go daemon / CLI，从 Herdr 管理的 coding agent 生成 age
 ## 文档・索引 / Documentation Index
 
 - 现状文档: [README.md](README.md), [docs/plans/](docs/plans/), [docs/releasing.md](docs/releasing.md)
-- 决策・踩坑笔记: [.agents/notes/](.agents/notes/)（规约: [.agents/notes/README.md](.agents/notes/README.md)）
-- 写完笔记刷新索引：scripts/notes-index.sh（本地生成 INDEX.md，不入 git）
+- 决策・踩坑笔记: `.agents/notes/`（本机可选留存、不入 git、不随公开仓库分发；规约见本机 `.agents/notes/README.md`）
+- 写完笔记刷新索引：scripts/notes-index.sh（本地生成 INDEX.md，不入 git；仅在本机存在 `.agents/notes/` 时适用）
 
 ## 关联仓库 / Related Repositories
 

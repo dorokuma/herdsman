@@ -3,6 +3,7 @@ dist/
 *.sqlite
 *.sqlite-*
 .DS_Store
-.agents/notes/INDEX.md
+.agents/notes/
+go/reports/
 *.db
 *.db-*

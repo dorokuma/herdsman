@@ -14,7 +14,7 @@ Detailed development and contribution guidelines are maintained across:
 
 - [AGENTS.md](./AGENTS.md): agent instructions, operational rules, and verification commands.
 - [docs/plans/](./docs/plans/): active architecture plans, progress tracking, and design specifications.
-- [.agents/notes/README.md](./.agents/notes/README.md): trigger criteria, templates, and conventions for architectural decisions and workarounds.
+- `.agents/notes/` is an optional, host-local scratchpad for architectural decisions and workarounds. It is untracked and not distributed with the public repository, so clones do not carry it.
 
 ## Requirements
 

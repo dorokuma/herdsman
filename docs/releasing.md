@@ -1,5 +1,7 @@
 # Releasing Herdsman
 
+> **Historical reference**: this document records the npm dual-package release procedure from before the repository cut over to a Go-only architecture (`f0f3d73`). It is kept for reference only. Note also that `.agents/notes/` is now listed in `.gitignore` — it lives as untracked host-local storage and is no longer committed or pushed; every instruction below that asks to commit or push a note is superseded by "record it locally only".
+
 Herdsman publishes two npm packages and one GitHub-distributed Herdr integration.
 
 | Artifact | Distribution |
@@ -40,7 +42,7 @@ Reading that failure as "not logged in" would abort a release that can publish p
 
 Account posture — verified email and write 2FA — is outside what the automated gate can cover: the token cannot read the account profile, so no command listed here can prove it. The write path has at least been exercised for real: the registry accepted both `npm publish` PUTs for 0.13.2, a real exercise of publish rights (the same token had already carried a successful two-package release, 0.12.1, on 2026-09-28). A rejected publish changes nothing in the registry, so fix the account and retry the same version. The account-level check surface is `https://www.npmjs.com/settings/dorokuma/profile`; a page-level check there **has not been recorded yet** and remains a one-time action to do — do it no later than the next release (a suggested time, not a gate) — whoever performs it records who, when, and what they saw in the same release note that carries the limitation below.
 
-Skipping `npm profile get` is a permanent known limitation of the automation token, not a per-release deviation: record it **once** in a release note under `.agents/notes/`, with the `E403` output above as evidence, and do not re-record it on every release. The same note holds the account-level check above — not a completed confirmation but its state (not recorded yet) and, once performed, who did it, when, and what they saw — so the limitation and the confirmation live in a single record instead of two. That note is the one created by the `Record the release in .agents/notes/` step of `## Publish the tag and GitHub Release`.
+Skipping `npm profile get` is a permanent known limitation of the automation token, not a per-release deviation: record it **once** in a release note under `.agents/notes/` — when a local `.agents/notes/` directory exists on the releasing host; the note is local-only and is never committed or pushed — with the `E403` output above as evidence, and do not re-record it on every release. The same note holds the account-level check above — not a completed confirmation but its state (not recorded yet) and, once performed, who did it, when, and what they saw — so the limitation and the confirmation live in a single record instead of two. That note is the one created by the `Record the release in .agents/notes/` step of `## Publish the tag and GitHub Release`.
 
 Confirm the version does not exist:
 
@@ -109,7 +111,7 @@ A released version section carries facts that hold **at the moment the release c
 
 Inside a version section that has not been published yet, every line has to describe only what already holds at the moment the commit is written. Do not use tense words such as `已发布` / `released` there, and do not preset events that have not happened yet: the 0.13.2 wording "随发布提交同步至本版本创建的 `v0.13.2`" is the counter-example — the tag it names did not exist when that line was written, so the line asserted an outcome the commit itself could not show. The "版本与引用同步" line is bounded by the same moment; the 0.12.1 section is the precedent for the recommended form, a plain description of the current state that makes no claim about what the release will produce.
 
-Registry-side facts only become true after publication: that npm `latest` advanced from A to B in both packages, that both packages are visible, that the pushed tag points at the release commit. Keep them out of the CHANGELOG release commit — state them in the GitHub Release body (see `## Publish the tag and GitHub Release`) and in the release note under `.agents/notes/` created when the release ends, or when the release aborts having touched the registry, a tag, or a Release (see `## Recover from a partial publication`).
+Registry-side facts only become true after publication: that npm `latest` advanced from A to B in both packages, that both packages are visible, that the pushed tag points at the release commit. Keep them out of the CHANGELOG release commit — state them in the GitHub Release body (see `## Publish the tag and GitHub Release`) and in the release note under `.agents/notes/` (local-only, never committed) created when the release ends, or when the release aborts having touched the registry, a tag, or a Release (see `## Recover from a partial publication`).
 
 Reserve **未发布** for version sections that have not been published yet. The reason is that the repository is committed and pushed before the artifacts exist in the registry: any line asserting where the release stands can contradict the registry in that window, and aborting or re-versioning a release then costs an extra corrective commit. `CHANGELOG.md` is part of the release commit (see the `git add` list below), so it must be final before that commit. In the release commit itself no release-status word may remain: a `未发布` marker left from an earlier bump is deleted there by default — or replaced with one of the fact lines above — because the release commit is final, and both the tag snapshot and the Release are taken from it. `未发布` therefore serves only a bump that has not shipped yet, and is cleared as soon as its section enters the release commit.
 
@@ -267,7 +269,7 @@ test -f "$REGISTRY_TMP/pi-prefix/node_modules/@dorokuma/herdsman-pi/src/index.ts
 
 Write release notes to `/tmp/herdsman-$VERSION-release-notes.md`. Include both npm install commands, package-content changes, validation, and the fact that Herdr still installs its plugin from GitHub.
 
-This section is not finished until the note commit from the Record step below has landed on `origin/main`.
+The release is not finished until the local release note from the Record step below exists on the releasing host.
 
 The Release body also carries the registry-side facts, which are true and checkable by this point: `dist-tags.latest` advanced from the previous version to `$VERSION` in both packages, both `@dorokuma/herdsman@$VERSION` and `@dorokuma/herdsman-pi@$VERSION` are visible in the registry, and the pushed tag `$TAG` points at the release commit.
 
@@ -291,9 +293,9 @@ git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}"
 test -z "$(git status --porcelain)"
 ```
 
-**Record the release in `.agents/notes/`.** The release is not finished until its release note exists under `.agents/notes/`. Name it after the directory's convention — `YYYYMMDD-slug.md`, release date plus a short slug, as in `.agents/notes/README.md` — and reuse the front matter of the neighbouring notes (`status`, `supersedes`, `superseded_by`, `模块`; see `.agents/notes/_template.md`).
+**Record the release in `.agents/notes/`.** The release is not finished until its release note exists under `.agents/notes/` on the releasing host — only when that directory exists there; it is untracked host-local storage, so the note is written locally and is never committed or pushed. Name it after the directory's convention — `YYYYMMDD-slug.md`, release date plus a short slug, as in `.agents/notes/README.md` — and reuse the front matter of the neighbouring notes (`status`, `supersedes`, `superseded_by`, `模块`; see `.agents/notes/_template.md`).
 
-The note lands as its own commit on `main` — `docs(release): record $VERSION` — pushed on its own; after that push, re-verify `git status --porcelain` is empty and `HEAD` equals `origin/main`, and the release is not finished until the note lands. Do not fold it into the release commit: the staged set for that commit is pinned to the four manifests plus both READMEs plus `CHANGELOG.md`, and the registry, Release, and deployment facts do not exist at the moment the release commit is written. A note that lands after the release still lands as that same separate commit and must not alter the frozen tag or Release snapshot. The `git status --porcelain` gate above covers the release commit only; the note file is expected to be the sole content of its own commit.
+The note lives only on the local host — it is not committed to `main` and not pushed; the release is not finished until the note file exists locally. Do not fold it into the release commit: the staged set for that commit is pinned to the four manifests plus both READMEs plus `CHANGELOG.md`, and the registry, Release, and deployment facts do not exist at the moment the release commit is written. A note written after the release still lives only on the local host and must not alter the frozen tag or Release snapshot. The `git status --porcelain` gate above covers the release commit only; the note file is untracked and stays outside every commit.
 
 The note records at least:
 
@@ -304,15 +306,15 @@ The note records at least:
 - the deployment facts and their acceptance outcome, when the release was deployed: the pinned install command and prefix, the restart (`MainPID` before and after, exit code), the three complete-release checks (`npm view … version` for both packages and `git ls-remote --tags --exit-code`), and any post-deployment baseline numbers — every measured number carries its UTC timestamp and the copy-pasteable command that produced it. A release that was not deployed records that fact instead.
 
 ```bash
-# Completion check: run after the note commit has been pushed.
+# Completion check: run after the local release note has been written.
 test -z "$(git status --porcelain)"
 test "$(git rev-parse HEAD)" = "$(git rev-parse origin/main)"
-git log -1 --format=%s origin/main | grep -F "docs(release): record $VERSION"
+ls ".agents/notes/" | grep -F "$VERSION"
 ```
 
-These three commands are the completion criterion for the release, and they run after this step so that anyone can re-run them after the fact rather than trusting the releaser's self-check; no earlier step in this section may carry the assertion, because it must fail before the note commit exists. This check applies to a completed release; a long-term abort writes its note with a different subject and is covered by the relevant abort section instead.
+These three commands are the completion criterion for the release, and they run after this step so that anyone on the releasing host can re-run them after the fact rather than trusting the releaser's self-check; no earlier step in this section may carry the assertion, because it must fail before the local note exists. This check applies to a completed release; a long-term abort writes its note with a different filename (the note is never committed, so there is no commit subject) and is covered by the relevant abort section instead.
 
-An aborted release writes this note too whenever the abort touched the registry, a tag, or a Release — a clean abort that touched none of those has no account to keep and may skip it (see `## Recover from a partial publication`).
+An aborted release writes this local note too whenever the abort touched the registry, a tag, or a Release — a clean abort that touched none of those has no account to keep and may skip it (see `## Recover from a partial publication`).
 
 ## Recover from a partial publication
 
@@ -374,4 +376,4 @@ The corrective commit has to cover every artifact that would otherwise point at 
 - the four manifest version fields: keeping `$VERSION` there or rolling them back to the last released version is a user decision, in the same sense as the version level in step 4 — the agent proposes and must not settle it alone; state the outcome in the corrective commit, because a manifest version no artifact carries is what the next release has to reconcile. Until that decision has been made, keep `$VERSION` and say so in the corrective commit;
 - where the next release continues from: the last complete release remains the baseline, and the version number for this abandoned work is once again a user decision under the same rule as step 4.
 
-The aborted release gets the release note described in `## Publish the tag and GitHub Release`, with a different subject: where a successful release records what shipped, an abort records the abort itself and the registry state at the moment of the decision — the `latest` values before and after the rollback, the last complete release, and the incomplete version being written off — plus the corrective commit that carried the wording change.
+The aborted release gets the release note described in `## Publish the tag and GitHub Release`, with a different local filename (the note is never committed, so there is no commit subject): where a successful release records what shipped, an abort records the abort itself and the registry state at the moment of the decision — the `latest` values before and after the rollback, the last complete release, and the incomplete version being written off — plus the corrective commit that carried the wording change.
