@@ -1,5 +1,10 @@
 ## [Unreleased]
 
+## 0.15.3
+
+- legacy 墓碑吞活跃 pane 修复（`go/internal/observability/agent_index_service.go`、`go/internal/db/agents.go`，`158fe7e`、`a9ffeac`，合并 `04b2f72`）：daemon 重启后 `pane_generation IS NULL` 的 legacy 墓碑行会永久吞掉活跃 pane、导致 workspace 从 daemon 消失；`agent_index_service.go` 放宽清墓碑条件，`agents.go` store 层 `ReplaceForSession` 语义对齐。
+- 范围：本版本包含 `v0.15.2` 之后的全部内容——`158fe7e`、`a9ffeac` 与合并提交 `04b2f72`；仅 `go/**` 改动；无 schema 变更、无迁移。
+
 ## 0.15.2
 
 - daemon 全量 Go 移植入库（`go/`，`go-port` 分支合并 `9f483a5`）：`go/internal` 下 agenthistory / agy / cli / config / daemon / db / herdr / observability / shared 各包完整镜像 TS daemon 行为（`go.mod` / `go.sum` / `go/cmd/herdsman` / `go/cmd/herdsman-daemon` / `go/scripts/herdsman`），配套 Go 侧单测与集成测试及批次报告 `go/reports/batch-5-herdsmand.md`；期间附带 `7e1a6cc`（impl 切换与隔离试运行脚本）、`6943993` / `dfc841b`（pig-trial 启动器加入后移除）等试运行脚手架。
