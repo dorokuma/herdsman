@@ -255,17 +255,16 @@ func (s *AgentStore) ReplaceForSession(
 			}
 		}
 
-		// A live snapshot that carries a pane_generation proves the pane is open
-		// again: drop any generation-less (legacy) close tombstone for that pane
-		// so it can no longer block this pane. Generation-scoped tombstones stay.
+		// Every matched snapshot carries a paneID, so each live pane clears any
+		// generation-less (legacy) close tombstone for it, mirroring the
+		// service-layer clear in refreshHerdrSessionNow: a pane in the live
+		// snapshot is open again. Generation-scoped tombstones stay.
 		for _, entry := range matched {
-			if paneGeneration(entry.snapshot.agent) != nil {
-				if err := s.ClearLegacyPaneTombstone(ClearLegacyPaneTombstoneInput{
-					HerdrSessionName: input.HerdrSessionName,
-					PaneID:           entry.snapshot.paneID,
-				}); err != nil {
-					return err
-				}
+			if err := s.ClearLegacyPaneTombstone(ClearLegacyPaneTombstoneInput{
+				HerdrSessionName: input.HerdrSessionName,
+				PaneID:           entry.snapshot.paneID,
+			}); err != nil {
+				return err
 			}
 		}
 
@@ -467,11 +466,11 @@ func (s *AgentStore) IsPaneClosedSince(input IsPaneClosedInput) (bool, error) {
 	return true, nil
 }
 
-// ClearLegacyPaneTombstone mirrors clearLegacyPaneTombstone: a live pane that
-// reports a pane_generation proves the pane is open again, so an earlier
-// LEGACY_CLOSE_WITHOUT_GENERATION tombstone must not keep blocking it (active
-// generation beats a generation-less close). Generation-scoped tombstones are
-// untouched.
+// ClearLegacyPaneTombstone mirrors clearLegacyPaneTombstone: a live pane
+// proves the pane is open again, so an earlier
+// LEGACY_CLOSE_WITHOUT_GENERATION tombstone must not keep blocking it (an
+// active pane beats a generation-less close). Generation-scoped tombstones
+// are untouched.
 func (s *AgentStore) ClearLegacyPaneTombstone(input ClearLegacyPaneTombstoneInput) error {
 	_, err := s.db.Exec(
 		`delete from agent_pane_tombstones

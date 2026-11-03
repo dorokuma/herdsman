@@ -675,6 +675,42 @@ func TestAgentStorePaneTombstones(t *testing.T) {
 		}
 	})
 
+	t.Run("clears a legacy tombstone for a live pane without a generation", func(t *testing.T) {
+		agents, _, _, _ := openAgentHarness(t)
+		if err := agents.MarkPaneClosed(RetirePaneInput{
+			HerdrSessionName: "default",
+			PaneID:           "wA:p1",
+		}); err != nil {
+			t.Fatalf("markPaneClosed: %v", err)
+		}
+
+		// A real Herdr snapshot carries no pane_generation; the live pane alone
+		// must clear the legacy tombstone, matching the service-layer clear.
+		snapshot := HerdrAgentLike{
+			"agent":        "pi",
+			"agent_status": "working",
+			"pane_id":      "wA:p1",
+			"terminal_id":  "term_1",
+			"workspace_id": "wA",
+		}
+		if _, err := agents.ReplaceForSession(ReplaceAgentsForSessionInput{
+			Agents:           []HerdrAgentLike{snapshot},
+			HerdrSessionName: "default",
+		}); err != nil {
+			t.Fatalf("replaceForSession: %v", err)
+		}
+		cleared, err := agents.IsPaneClosed(IsPaneClosedInput{
+			HerdrSessionName: "default",
+			PaneID:           "wA:p1",
+		})
+		if err != nil {
+			t.Fatalf("isPaneClosed: %v", err)
+		}
+		if cleared {
+			t.Fatalf("a live snapshot pane must beat a generation-less close")
+		}
+	})
+
 	t.Run("scopes a generation tombstone to its own generation", func(t *testing.T) {
 		agents, _, _, _ := openAgentHarness(t)
 		if err := agents.MarkPaneClosed(RetirePaneInput{
