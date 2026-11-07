@@ -2,6 +2,7 @@
 
 - 移除 husky：`core.hooksPath` 不再指向 `.husky/_`，hooks 改走全局 `/root/.git-hooks`（修复 worktree 中 husky hooks 不执行）；`.husky/` 目录删除。
 - 新增根目录 `Makefile`，`make check` 为唯一检查入口（gofmt、`go vet`、`go test -race`、两个 `cmd` 的 `go build`）；CI（`.github/workflows/ci.yml`）改调 `make check`；README/AGENTS 文档同步。
+- 去掉原 pre-commit 的 `go test -p 2`，测试统一为与 CI 一致的 `go test -race ./...`（有意变更）；提交前不再本地运行 Go 门禁，由 `make check`（CI 与合并前门禁）负责。
 
 ## 0.15.3
 

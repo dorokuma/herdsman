@@ -1,7 +1,7 @@
 .PHONY: check
 
 check:
-	@unformatted=$$(gofmt -l go/); \
+	@unformatted=$$(gofmt -l go/) || { echo "gofmt failed"; exit 1; }; \
 	if [ -n "$$unformatted" ]; then \
 		echo "unformatted files:"; \
 		echo "$$unformatted"; \

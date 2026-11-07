@@ -123,18 +123,18 @@ The `herdsman-herdr-plugin` (an optional Herdr UI integration) is not part of th
 
 ## Development
 
-All commands run from the `go/` directory:
+Run `make check` from the repository root; it is the single gate for everything below (full gate includes `-race`). Individual commands, from `go/`:
 
 ```bash
 cd go
 gofmt -l .          # must print nothing
 go vet ./...
-go test ./...
+go test -race ./...
 go build -o /tmp/herdsman ./cmd/herdsman
 go build -o /tmp/herdsman-daemon ./cmd/herdsman-daemon
 ```
 
-`make check` is the single check entry (gofmt, `go vet`, `go test -race`, both `go build` targets); CI and gates call it, and global git hooks scan commit messages and credentials at commit time. DB schema changes update `go/internal/db/schema.go` plus a new file under `go/internal/db/migrations/`; `sqlite_migrations_test.go` replays migrations against the schema to keep them in sync.
+`make check` is the single check entry (gofmt, `go vet`, `go test -race`, both `go build` targets); it is the only repo-enforced gate, run by CI on push and pull requests. Commit message and credential scanning at commit time uses the maintainer's own global git hooks (`/root/.git-hooks` on this host), which are not distributed with the repository. DB schema changes update `go/internal/db/schema.go` plus a new file under `go/internal/db/migrations/`; `sqlite_migrations_test.go` replays migrations against the schema to keep them in sync.
 
 ## License
 
