@@ -1,5 +1,8 @@
 ## [Unreleased]
 
+- 移除 husky：`core.hooksPath` 不再指向 `.husky/_`，hooks 改走全局 `/root/.git-hooks`（修复 worktree 中 husky hooks 不执行）；`.husky/` 目录删除。
+- 新增根目录 `Makefile`，`make check` 为唯一检查入口（gofmt、`go vet`、`go test -race`、两个 `cmd` 的 `go build`）；CI（`.github/workflows/ci.yml`）改调 `make check`；README/AGENTS 文档同步。
+
 ## 0.15.3
 
 - legacy 墓碑吞活跃 pane 修复（`go/internal/observability/agent_index_service.go`、`go/internal/db/agents.go`，`158fe7e`、`a9ffeac`，合并 `04b2f72`）：daemon 重启后 `pane_generation IS NULL` 的 legacy 墓碑行会永久吞掉活跃 pane、导致 workspace 从 daemon 消失；`agent_index_service.go` 放宽清墓碑条件，`agents.go` store 层 `ReplaceForSession` 语义对齐。

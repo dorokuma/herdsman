@@ -7,25 +7,10 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: go
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
           go-version-file: go/go.mod
-      - name: gofmt
-        run: |
-          unformatted=$(gofmt -l .)
-          if [ -n "$unformatted" ]; then
-            echo "unformatted files:"
-            echo "$unformatted"
-            exit 1
-          fi
-      - name: vet
-        run: go vet ./...
-      - name: test
-        run: go test -race ./...
-      - name: build
-        run: go build ./cmd/herdsman ./cmd/herdsman-daemon
+      - name: check
+        run: make check

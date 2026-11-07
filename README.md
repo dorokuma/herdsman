@@ -134,7 +134,7 @@ go build -o /tmp/herdsman ./cmd/herdsman
 go build -o /tmp/herdsman-daemon ./cmd/herdsman-daemon
 ```
 
-`.husky/pre-commit` runs the same gate (`gofmt -l`, `go vet`, `go test`, both `go build` targets) before each commit. DB schema changes update `go/internal/db/schema.go` plus a new file under `go/internal/db/migrations/`; `sqlite_migrations_test.go` replays migrations against the schema to keep them in sync.
+`make check` is the single check entry (gofmt, `go vet`, `go test -race`, both `go build` targets); CI and gates call it, and global git hooks scan commit messages and credentials at commit time. DB schema changes update `go/internal/db/schema.go` plus a new file under `go/internal/db/migrations/`; `sqlite_migrations_test.go` replays migrations against the schema to keep them in sync.
 
 ## License
 
