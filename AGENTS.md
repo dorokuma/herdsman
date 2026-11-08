@@ -1,10 +1,11 @@
 # AGENTS.md
+档位：L2
 
 Herdsman 是一个 Go daemon / CLI，从 Herdr 管理的 coding agent 生成 agent snapshot、`agent.*` event 和 orchestrator notification。请先用 `README.md` 确认用法，只有在需要判断规格时才看 `docs/plans/`。
 
 ## 铁律 / Iron Rules
 
-1. **构建・测试・静态检查**: 修改实现后必须在 `go/` 下通过 `gofmt -l .`（为空）、`go vet ./...`、`go test ./...`、`go build ./cmd/herdsman` 与 `go build ./cmd/herdsman-daemon`；这也是 `.husky/pre-commit` 的门禁。
+1. **构建・测试・静态检查**: `make check` 是唯一检查入口（gofmt、`go vet`、`go test -race`、两个 `go build`），也是仓库级唯一强制门禁，CI 在 push/PR 上调用它；提交信息与凭据扫描仅由维护者本机（本机）的全局 git hooks `/root/.git-hooks` 在提交时执行，不随仓库分发。
 2. **提交规范**——commit message 须过全局 commit-msg hook：Conventional Commits 类型白名单、≤72 字、冒号后一空格、禁噪声词与密钥。
 3. **决策/踩坑须记 .agents/notes/**：若本机维护了 `.agents/notes/` 目录（本机可选留存、不入 git、不随公开仓库分发），重大决策、架构调整、方案否决、临时降级/workaround/特判必须记入其中（满足六触发之一即写，触发条件见本机 `.agents/notes/README.md`）；没有该目录的主机可跳过本条。
 4. **未提交变更保护**: 不得回退用户或其他进程的未提交变更。`node_modules/`、`dist/`、`*.sqlite` 不要 commit。
@@ -35,18 +36,18 @@ Herdsman 是一个 Go daemon / CLI，从 Herdr 管理的 coding agent 生成 age
 
 ## 常用命令
 
-以下命令都在仓库根的 `go/` 目录下执行：
+以下命令都在仓库根的 `go/` 目录下执行（完整门禁用仓库根的 `make check`，它依次跑 `gofmt -l`、`go vet ./...`、`go test -race ./...` 与两个 `cmd` 的 `go build`）：
 
 - `gofmt -l .`: 列出未格式化文件，必须为空（修复用 `gofmt -w <file>`）。
 - `go vet ./...`: 静态检查。
-- `go test ./...`: 全量单测与集成测试。
+- `go test -race ./...`: 全量单测与集成测试（完整门禁含 `-race`，以 `make check` 为准）。
 - `go build -o /tmp/herdsman ./cmd/herdsman`: 编译 CLI 二进制。
 - `go build -o /tmp/herdsman-daemon ./cmd/herdsman-daemon`: 编译 daemon 二进制。
 - `HERDSMAN_HOME=/tmp/herdsman-smoke /tmp/herdsman-daemon`: 用临时数据目录前台起开发 daemon（随后 `/tmp/herdsman daemon status` 验证）。
 
 ## 验证步骤
 
-- 修改实现后必须通过 `gofmt -l .` 为空、`go vet ./...`、`go test ./...`。
+- 修改实现后须通过仓库根的 `make check`（依次跑 `gofmt -l` 为空、`go vet ./...`、`go test -race ./...` 与两个 `cmd` 的 `go build`），以它为准。
 - 涉及 CLI/daemon entrypoint 的改动还要 `go build` 两个 `cmd` 目标并做临时 `HERDSMAN_HOME` 冒烟。
 - 改了 DB schema 相关行为时确认 `go/internal/db/schema.go` 的 `SchemaStatements` 与 `go/internal/db/migrations/` 的迁移重放保持一致——`sqlite_migrations_test.go` 会强制比对。
 - 本机 PATH 上无 node/pnpm/npm/bun；工具链只有 Go，无需再为运行时前置 PATH。
@@ -54,7 +55,7 @@ Herdsman 是一个 Go daemon / CLI，从 Herdr 管理的 coding agent 生成 age
 本机（生产机）运行时事实，照它选运行时，不要对着版本号猜：
 
 - 生产 CLI / daemon：Go 二进制 `/root/.local/lib/herdsman-go/{herdsman,herdsman-daemon}`，daemon 由 `herdsman.service` 的 `ExecStart` 直连；无 Node 参与。
-- 提交门禁：`.husky/pre-commit` 是纯 POSIX `sh`，进入 `go/` 后跑 `gofmt -l .`（为空）、`go vet ./...`、`go test ./...`、`go build ./cmd/herdsman`、`go build ./cmd/herdsman-daemon`。
+- 提交门禁：`make check` 是仓库级唯一强制门禁，CI 在 push/PR 上调用它；提交信息与凭据扫描仅由维护者本机的全局 git hooks（`/root/.git-hooks`，不随仓库分发）在提交时执行。
 
 ## 重要路径
 
