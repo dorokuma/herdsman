@@ -311,13 +311,14 @@ func TestDiscoveryRefusesASymlinkedOrGroupWritableAgyConversationDatabase(t *tes
 
 func TestDiscoveryReportsAndRefusesAnOfficialIDForAnyOtherAgent(t *testing.T) {
 	resetDiscoveryFailureMemory()
-	// Only pi (official path) and agy (official id) are supported agents. Every
-	// other agent is refused with the same fail-closed warning, whether or not
-	// Herdr has an integration for it — this is a deliberate, documented limit.
+	// Only pi (official path), agy and claude (official ids) are supported
+	// agents. Every other agent is refused with the same fail-closed warning,
+	// whether or not Herdr has an integration for it — this is a deliberate,
+	// documented limit.
 	homeDir := t.TempDir()
 	records := captureDiscoveryWarnings(t)
 
-	for _, agent := range []string{"claude", "codex", "opencode", "grok", "gemini", "omp"} {
+	for _, agent := range []string{"codex", "opencode", "grok", "gemini", "omp"} {
 		if got := DiscoverAgentHistory(AgentHistoryLookupInput{
 			Agent: strp(agent),
 			AgentSession: &observability.AgentSessionRef{
@@ -391,8 +392,14 @@ func TestHistorySourceFromSessionRefMapsTheSupportedAgentsAndNothingElse(t *test
 	}); got != SourceAntigravitySQLite {
 		t.Fatalf("antigravity_cli source = %q, want %q", got, SourceAntigravitySQLite)
 	}
+	if got := HistorySourceFromSessionRef(observability.AgentSessionRef{
+		Agent: "claude", Kind: observability.SessionRefID,
+		Source: "dispatch-agent:claude", Value: agyTestID,
+	}); got != SourceClaudeJSONL {
+		t.Fatalf("claude source = %q, want %q", got, SourceClaudeJSONL)
+	}
 	// Everything else is `unknown`, which no reader accepts.
-	for _, agent := range []string{"claude", "codex", "gemini", "grok", "omp", "opencode"} {
+	for _, agent := range []string{"codex", "gemini", "grok", "omp", "opencode"} {
 		if got := source(agent, observability.SessionRefPath); got != SourceUnknown {
 			t.Fatalf("agent %q source = %q, want %q", agent, got, SourceUnknown)
 		}
@@ -788,7 +795,6 @@ func TestAnOfficialIDIsNeverResolvedByWalkingASessionDirectory(t *testing.T) {
 		detail string
 	}{
 		{"codex", "is not a supported herdsman history agent"},
-		{"claude", "is not a supported herdsman history agent"},
 		// pi *is* supported, so its id-shaped value must not be described as an
 		// unsupported agent: it is the documented gap (no id-based derivation).
 		{"pi", "reported an id; herdsman has no id-based session-file derivation"},
@@ -807,8 +813,8 @@ func TestAnOfficialIDIsNeverResolvedByWalkingASessionDirectory(t *testing.T) {
 		}
 		requireWarning(t, *records, testCase.detail)
 	}
-	if len(*records) != 3 {
-		t.Fatalf("warnings = %d, want 3: %+v", len(*records), *records)
+	if len(*records) != 2 {
+		t.Fatalf("warnings = %d, want 2: %+v", len(*records), *records)
 	}
 	for _, record := range *records {
 		if record.warning.PaneID == nil || *record.warning.PaneID != "wA:p1" {

@@ -7,6 +7,7 @@ type HistorySource string
 
 const (
 	SourceAntigravitySQLite HistorySource = "antigravity-sqlite"
+	SourceClaudeJSONL       HistorySource = "claude-jsonl"
 	SourcePiJSONL           HistorySource = "pi-jsonl"
 	SourceUnknown           HistorySource = "unknown"
 )

@@ -239,14 +239,28 @@ var piPresenceSessionRefAgySchema = &ObjectSchema{
 	},
 }
 
+// piPresenceSessionRefClaudeSchema is the `agent: "claude"` branch: `kind` is
+// id|path. Claude Code registers through the one-shot `herdsman register-claude`
+// CLI, which reports the conversation id (kind "id") herdsman resolves under the
+// deterministic claude-projects root.
+var piPresenceSessionRefClaudeSchema = &ObjectSchema{
+	Name: "piPresenceSessionRefSchema[claude]",
+	Properties: map[string]*fieldSpec{
+		"agent":  literals(string(SubscriberClaude)),
+		"kind":   literals(string(SessionRefID), string(SessionRefPath)),
+		"source": str(1),
+		"value":  str(1),
+	},
+}
+
 // AgentOrchestratorRegisterInputSchema mirrors agentOrchestratorRegisterInputSchema,
-// including the pi/agy sessionRef union. The union is modelled as a nested
+// including the pi/agy/claude sessionRef union. The union is modelled as a nested
 // anyOf check so `sessionRef` keeps the discriminator semantics exactly.
 //
-// `sessionRef.agent` (the session's own identity, "pi" | "pig") and
-// `subscriberKind` (the terminal's subscription kind, "pi" | "pig" | "agy")
-// are validated independently on purpose: there is no cross-field equality
-// constraint, so a mixed deployment (e.g. a Go extension that reports
+// `sessionRef.agent` (the session's own identity) and
+// `subscriberKind` (the terminal's subscription kind, "pi" | "pig" | "agy" |
+// "claude") are validated independently on purpose: there is no cross-field
+// equality constraint, so a mixed deployment (e.g. a Go extension that reports
 // `agent: "pig"` while subscribing as `subscriberKind: "pi"`) still
 // registers.
 var AgentOrchestratorRegisterInputSchema = &ObjectSchema{
@@ -260,14 +274,20 @@ var AgentOrchestratorRegisterInputSchema = &ObjectSchema{
 		},
 		"subscriberId": str(1),
 		"subscriberKind": literals(
-			string(SubscriberPi), string(SubscriberPig), string(SubscriberAgy)),
+			string(SubscriberPi), string(SubscriberPig), string(SubscriberAgy),
+			string(SubscriberClaude)),
 		"workspaceId": str(1),
 	},
 }
 
-// sessionRefUnionSchema validates the pi|agy union by trying each branch.
+// sessionRefUnionSchema validates the pi|agy|claude union by trying each
+// branch.
 var sessionRefUnionSchema = &objectUnionSchema{
-	branches: []*ObjectSchema{piPresenceSessionRefPiSchema, piPresenceSessionRefAgySchema},
+	branches: []*ObjectSchema{
+		piPresenceSessionRefPiSchema,
+		piPresenceSessionRefAgySchema,
+		piPresenceSessionRefClaudeSchema,
+	},
 }
 
 // objectUnionSchema is a Type.Union of objects: `anyOf` semantics.

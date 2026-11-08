@@ -504,7 +504,52 @@ func (s *ObservabilityRpcServer) handleOrchestratorRegister(
 	if state != nil {
 		currentOwner = state.Owner
 	}
-	if !presenceIsAgy(presence) {
+	// Claude Code identifies its session by the CC conversation uuid, not by a
+	// session file path: only `agent: "claude", kind: "id", uuid value` binds.
+	claudeRefBindable := registrationInput.SessionRef.Agent == string(observability.SubscriberClaude) &&
+		registrationInput.SessionRef.Kind == observability.SessionRefID &&
+		isUuidLikeSessionID(registrationInput.SessionRef.Value)
+	// The lease decision also gates the session-ref registration: a claude
+	// registration whose lease was refused — a terminal actually running pi,
+	// or a ref that cannot bind — must not reach registerPiSessionRef either,
+	// or its ref would be stashed in pendingPiSessionRefs for a terminal that
+	// never runs claude.
+	claudeLeaseGranted := false
+	if presenceIsClaude(presence) {
+		// A Claude Code registration is a one-shot `herdsman register-claude` CLI
+		// call: the socket closes right after the RPC returns, so the terminal
+		// needs the same socket-less lease agy gets, or the closed connection
+		// would read as a disconnect and start reclaiming. The lease is gated
+		// the same way agy's is: a claude presence whose sessionRef cannot bind
+		// (wrong agent, non-id kind, or a non-uuid value) grants no lease, and
+		// neither does a terminal that is actually running pi — otherwise the
+		// one-shot registration would leave a connection-less presence behind
+		// that never times out.
+		leaseGranted := claudeRefBindable
+		if leaseGranted {
+			isPi, err := s.isPiTerminal(presence.HerdrSessionName, presence.PaneID, presence.TerminalID)
+			if err != nil {
+				return nil, err
+			}
+			leaseGranted = !isPi
+		}
+		claudeLeaseGranted = leaseGranted
+		if leaseGranted {
+			paneGeneration, err := s.resolvePaneGeneration(
+				presence.HerdrSessionName,
+				presence.PaneID,
+				presence.TerminalID,
+			)
+			if err != nil {
+				return nil, err
+			}
+			s.agyPresenceByTerminal[presenceKey] = agyTerminalLease{
+				PaneGeneration: paneGeneration,
+				Presence:       presence,
+			}
+			s.cancelGraceForTerminal(presence.HerdrSessionName, presence.TerminalID)
+		}
+	} else if !presenceIsAgy(presence) {
 		delete(s.agyPresenceByTerminal, presenceKey)
 		s.cancelGraceForTerminal(presence.HerdrSessionName, presence.TerminalID)
 	} else if currentOwner != nil && currentOwner.TerminalID == presence.TerminalID {
@@ -532,7 +577,7 @@ func (s *ObservabilityRpcServer) handleOrchestratorRegister(
 
 	if hasPrevious &&
 		terminalPresenceKey(previous.HerdrSessionName, previous.TerminalID) != presenceKey &&
-		!presenceIsAgy(previous) {
+		!presenceIsAgy(previous) && !presenceIsClaude(previous) {
 		if err := s.scheduleDisconnect(previous); err != nil {
 			return nil, err
 		}
@@ -559,6 +604,9 @@ func (s *ObservabilityRpcServer) handleOrchestratorRegister(
 		} else {
 			shouldRegisterSessionRef = false
 		}
+	}
+	if presenceIsClaude(presence) {
+		shouldRegisterSessionRef = claudeLeaseGranted
 	}
 	if shouldRegisterSessionRef {
 		// TS awaits registerPiSessionRef here, then publishes each changed scope.
@@ -1182,6 +1230,14 @@ func isUuidLikeSessionID(value string) bool {
 // presenceIsAgy reports the TS `presence.subscriberKind === "agy"`.
 func presenceIsAgy(presence PiPresence) bool {
 	return presence.SubscriberKind != nil && *presence.SubscriberKind == observability.SubscriberAgy
+}
+
+// presenceIsClaude reports `presence.subscriberKind === "claude"`: the one-shot
+// Claude Code registration, which is exempt from every socket-disconnect
+// recovery exactly like agy (its socket is closed by design right after the
+// register RPC returns).
+func presenceIsClaude(presence PiPresence) bool {
+	return presence.SubscriberKind != nil && *presence.SubscriberKind == observability.SubscriberClaude
 }
 
 // subscriberKindValue keeps the optional subscriberKind absent when the client

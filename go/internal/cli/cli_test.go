@@ -1164,3 +1164,102 @@ func TestWrapperScript(t *testing.T) {
 		}
 	})
 }
+
+// ---------------------------------------------------------------------------
+// register-claude
+// ---------------------------------------------------------------------------
+
+func TestParseCliArgsRegisterClaude(t *testing.T) {
+	sessionID := "3A4B5C6D-7E8F-4A1B-9C2D-3E4F5A6B7C8D"
+	command, err := ParseCliArgs([]string{"register-claude", "--session-id", sessionID}, map[string]string{
+		"HERDR_ENV":          "1",
+		"HERDR_PANE_ID":      "wB:p1",
+		"HERDR_SOCKET_PATH":  "/tmp/h.sock",
+		"HERDR_WORKSPACE_ID": "wB",
+	})
+	if err != nil {
+		t.Fatalf("ParseCliArgs: %v", err)
+	}
+	if command.Command != CommandRegisterClaude {
+		t.Fatalf("command = %q, want register-claude", command.Command)
+	}
+	if command.SessionID != "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d" {
+		t.Fatalf("sessionId = %q, want lowercased uuid", command.SessionID)
+	}
+	if command.HerdrSocketPath != "/tmp/h.sock" || command.PaneID != "wB:p1" ||
+		command.WorkspaceID == nil || *command.WorkspaceID != "wB" {
+		t.Fatalf("identity = %+v, want the env pane identity", command)
+	}
+}
+
+func TestParseCliArgsRegisterClaudeRejectsBadInput(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		args []string
+	}{
+		{"missing session id", []string{"register-claude"}},
+		{"non-uuid", []string{"register-claude", "--session-id", "not-a-uuid"}},
+		{"path injection", []string{"register-claude", "--session-id", "../escape"}},
+		{"extra arg", []string{"register-claude", "--session-id", "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d", "extra"}},
+	} {
+		if _, err := ParseCliArgs(tc.args, map[string]string{}); err == nil {
+			t.Fatalf("%s: ParseCliArgs(%v) = nil error, want a rejection", tc.name, tc.args)
+		}
+	}
+}
+
+// S3: a half-dead Herdr env (a leftover HERDR_PANE_ID with no
+// HERDR_SOCKET_PATH/HERDR_WORKSPACE_ID) is never mixed with the resolved
+// identity. The whole pane tuple comes from `herdr pane current --current` +
+// `herdr session list --json`, or the registration would bind this pane into
+// another session's socket.
+func TestRunCliCommandRegisterClaudeAdoptsTheResolvedPaneTuple(t *testing.T) {
+	original := claudeHerdrCommand
+	t.Cleanup(func() { claudeHerdrCommand = original })
+	claudeHerdrCommand = func(args ...string) ([]byte, error) {
+		if len(args) == 3 && args[0] == "pane" && args[1] == "current" && args[2] == "--current" {
+			return []byte(`{"result":{"pane":{"pane_id":"wZ:p9","terminal_id":"term_9","workspace_id":"wZ"}}}`), nil
+		}
+		if len(args) == 3 && args[0] == "session" && args[1] == "list" && args[2] == "--json" {
+			return []byte(`{"sessions":[{"default":true,"name":"main","running":true,"session_dir":"/tmp/main","socket_path":"/tmp/main.sock"}]}`), nil
+		}
+		return nil, errors.New("unexpected herdr probe: " + strings.Join(args, " "))
+	}
+
+	command, err := ParseCliArgs(
+		[]string{"register-claude", "--session-id", "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d"},
+		// Only a stale pane id survives; the socket path and workspace are gone.
+		map[string]string{"HERDR_PANE_ID": "stale:pane"},
+	)
+	if err != nil {
+		t.Fatalf("ParseCliArgs: %v", err)
+	}
+	client := &fakeClient{}
+	client.respond = func(method string, params any) (any, error) {
+		return map[string]any{}, nil
+	}
+	output := []string{}
+	err = RunCliCommand(command, RunCliDeps{
+		Connect:     func(string, func(string, any)) (RpcClientLike, error) { return client, nil },
+		Environment: map[string]string{"HERDR_PANE_ID": "stale:pane"},
+		Output:      func(line string) { output = append(output, line) },
+		SocketPath:  "/tmp/herdsman.sock",
+	})
+	if err != nil {
+		t.Fatalf("RunCliCommand: %v", err)
+	}
+
+	var params map[string]any
+	for _, call := range client.calls {
+		if call.Method == "agent.orchestrator.register" {
+			params, _ = call.Params.(map[string]any)
+		}
+	}
+	if params == nil {
+		t.Fatalf("client calls = %+v, want agent.orchestrator.register", client.calls)
+	}
+	if params["paneId"] != "wZ:p9" || params["workspaceId"] != "wZ" ||
+		params["herdrSocketPath"] != "/tmp/main.sock" {
+		t.Fatalf("register params = %+v, want the resolved pane tuple, no stale env identity", params)
+	}
+}

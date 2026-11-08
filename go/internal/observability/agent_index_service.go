@@ -127,6 +127,41 @@ type planWindowTracker struct {
 	idleStartedAt int64
 }
 
+// claudePendingUnmountedTTLMs is the startup window a registered claude ref
+// waits in for Herdr to identify the claude process: an unmounted ref whose
+// terminal still shows no claude label once the window is over is a failed
+// launch (the pane died during the preamble, or claude never started), not a
+// slow one, and must be retired instead of leaving its session id behind to
+// re-bind the next unregistered claude that opens on the terminal id.
+const claudePendingUnmountedTTLMs int64 = 120_000
+
+// pendingSessionRef is the pendingPiSessionRefs map value: the registered ref
+// plus the lifecycle markers the refresh loop and the liveness sweep consult.
+//   - Seq is a monotonic registration sequence allocated under s.mu: every
+//     guarded write/delete compares Seq, so a registration that lands while
+//     another operation runs outside the lock (SetSessionRefByTerminal) is
+//     never overwritten by the older call's tail.
+//   - RegisteredAtMs is the s.now() timestamp of the registration, the base
+//     of the unmounted startup window.
+//   - SeenInSnapshot records whether the terminal has ever appeared in a
+//     refresh snapshot while this registration was pending: a terminal that
+//     leaves the snapshot after being seen has closed, while one never seen
+//     yet is a registration that merely predates its first snapshot.
+//   - ClaudeMounted separates the startup window (the registration arrived
+//     before Herdr identified the claude process, so the ref waits for its
+//     first claude-labelled snapshot) from a mounted registration, whose
+//     terminal leaving the snapshot — or keeping its terminal while the
+//     claude process exits to a bare shell or another agent — must retire
+//     the ref instead of letting it re-bind the next unregistered claude
+//     session that opens on the terminal.
+type pendingSessionRef struct {
+	Ref            AgentSessionRef
+	Seq            uint64
+	RegisteredAtMs int64
+	SeenInSnapshot bool
+	ClaudeMounted  bool
+}
+
 // RefreshSource is one awaitable refreshHerdrSession call: the Go form of the
 // promise refreshHerdrSession hands back in TS. Concurrent callers that observe
 // the same mutation epoch receive the same *RefreshSource, exactly as the TS
@@ -231,7 +266,10 @@ type AgentIndexService struct {
 	// mutationEpochBySession mirrors #mutationEpochBySession.
 	mutationEpochBySession map[string]int
 	// pendingPiSessionRefs mirrors #pendingPiSessionRefs.
-	pendingPiSessionRefs map[string]AgentSessionRef
+	pendingPiSessionRefs map[string]pendingSessionRef
+	// nextPendingSeq allocates the monotonic pendingSessionRef.Seq every
+	// pending-ref CAS is keyed on.
+	nextPendingSeq uint64
 	// planTailByAgent mirrors #planTailByAgent.
 	planTailByAgent map[string]chan struct{}
 	// refreshInFlightBySession mirrors #refreshInFlightBySession.
@@ -266,7 +304,7 @@ func NewAgentIndexService(options AgentIndexServiceOptions) (*AgentIndexService,
 		guardWindowSaturatedAgents: map[string]struct{}{},
 		salvageWindowSaturatedKeys: map[string]struct{}{},
 		mutationEpochBySession:     map[string]int{},
-		pendingPiSessionRefs:       map[string]AgentSessionRef{},
+		pendingPiSessionRefs:       map[string]pendingSessionRef{},
 		planTailByAgent:            map[string]chan struct{}{},
 		refreshInFlightBySession:   map[string]*refreshInFlight{},
 		sessionOperationTail:       map[string]chan struct{}{},
@@ -536,6 +574,7 @@ func (s *AgentIndexService) DrainInFlightPlans() {
 func (s *AgentIndexService) refreshHerdrSessionNow(
 	input RefreshInput,
 ) (*AgentIndexRefreshFastResult, error) {
+	nowMs := s.now()
 	client, err := s.clientFactory(input.SocketPath)
 	if err != nil {
 		return nil, err
@@ -656,6 +695,24 @@ func (s *AgentIndexService) refreshHerdrSessionNow(
 	if err != nil {
 		return nil, err
 	}
+	// The terminals the snapshot itself reported an agent_session for: an
+	// official report supersedes a registered ref (the store prefers it too),
+	// so a pending claude ref for that terminal is dropped instead of retained.
+	officialSessionTerminals := map[string]struct{}{}
+	// snapshotTerminals is every terminal the live snapshot still reports, used
+	// to tell a pane that closed (no terminal row at all) from a pane whose
+	// claude process exited while the terminal itself is still open.
+	snapshotTerminals := map[string]struct{}{}
+	for _, agent := range liveSnapshotAgents {
+		terminalID := stringValue(agent["terminal_id"])
+		if terminalID == nil {
+			continue
+		}
+		snapshotTerminals[*terminalID] = struct{}{}
+		if session, present := agent["agent_session"].(map[string]any); present && session != nil {
+			officialSessionTerminals[*terminalID] = struct{}{}
+		}
+	}
 	agents := make([]AgentIndexRecord, 0, len(indexedAgents))
 	for _, agent := range indexedAgents {
 		if agent.TerminalID == nil {
@@ -663,18 +720,75 @@ func (s *AgentIndexService) refreshHerdrSessionNow(
 			continue
 		}
 		key := terminalSessionKey(input.HerdrSessionName, *agent.TerminalID)
+		_, terminalInSnapshot := snapshotTerminals[*agent.TerminalID]
 		s.mu.Lock()
 		pending, ok := s.pendingPiSessionRefs[key]
-		if ok {
-			delete(s.pendingPiSessionRefs, key)
+		if ok && terminalInSnapshot && !pending.SeenInSnapshot {
+			// The terminal is observable in this snapshot while its ref is still
+			// pending: remember the observation so the liveness sweep can tell a
+			// terminal that closed after being seen from one that simply has not
+			// shown up in a snapshot yet (the registration predates its first
+			// observed pane).
+			pending.SeenInSnapshot = true
+			s.pendingPiSessionRefs[key] = pending
 		}
 		s.mu.Unlock()
 		if !ok {
 			agents = append(agents, agent)
 			continue
 		}
+		pendingIsClaude := strings.EqualFold(pending.Ref.Agent, string(SubscriberClaude))
+		if pendingIsClaude {
+			// A registered claude sessionRef outlives one refresh round: CC never
+			// reports its own agent_session, so the ref is re-mounted on every
+			// refresh whose snapshot still identifies the pane as claude, and is
+			// only dropped once Herdr reports an official agent_session for the
+			// terminal (which then wins in mapAgent anyway).
+			if _, hasOfficial := officialSessionTerminals[*agent.TerminalID]; hasOfficial {
+				// CAS guard: the pending snapshot was read outside the lock
+				// and s.mu was released during SetSessionRefByTerminal, so a
+				// concurrent RegisterPiSessionRef may have replaced the entry
+				// with a new SessionRef (and a larger Seq). Only delete when the
+				// map still holds the entry this round snapshotted — never evict
+				// a newer registration.
+				s.mu.Lock()
+				if cur, stillOk := s.pendingPiSessionRefs[key]; stillOk && cur.Seq == pending.Seq {
+					delete(s.pendingPiSessionRefs, key)
+				}
+				s.mu.Unlock()
+				agents = append(agents, agent)
+				continue
+			}
+			agentIsClaude := agent.Agent != nil && strings.EqualFold(*agent.Agent, string(SubscriberClaude))
+			if !agentIsClaude {
+				// Herdr has not identified a claude process on the terminal yet
+				// (the agent label is absent or still another kind): the
+				// registration stays pending until a claude-labelled snapshot
+				// arrives, instead of being written as an incompatible hint.
+				// A mounted ref is different: the claude process the ref was
+				// bound to is gone (exited to a bare shell or replaced by another
+				// agent), so the registration must be retired — keeping it would
+				// re-bind the old session id onto the next unregistered claude
+				// that opens on this terminal.
+				if pending.ClaudeMounted {
+					s.mu.Lock()
+					if cur, stillOk := s.pendingPiSessionRefs[key]; stillOk && cur.Seq == pending.Seq {
+						delete(s.pendingPiSessionRefs, key)
+					}
+					s.mu.Unlock()
+				}
+				agents = append(agents, agent)
+				continue
+			}
+		} else {
+			s.mu.Lock()
+			if cur, stillOk := s.pendingPiSessionRefs[key]; stillOk && cur.Seq == pending.Seq {
+				delete(s.pendingPiSessionRefs, key)
+			}
+			s.mu.Unlock()
+		}
 		updated, err := s.stores.Agents.SetSessionRefByTerminal(SetSessionRefByTerminalInput{
-			AgentSession:     pending,
+			AgentSession:     pending.Ref,
 			HerdrSessionName: input.HerdrSessionName,
 			TerminalID:       *agent.TerminalID,
 		})
@@ -685,8 +799,62 @@ func (s *AgentIndexService) refreshHerdrSessionNow(
 			agents = append(agents, agent)
 			continue
 		}
+		if pendingIsClaude {
+			// The ref just mounted onto a claude-labelled snapshot: mark the
+			// pending entry mounted so the liveness sweep (below) can tell it
+			// apart from a ref still waiting through the startup window. The
+			// same Seq CAS guard applies: a re-registered ref must not be
+			// overwritten by the stale snapshot taken before the lock.
+			s.mu.Lock()
+			if cur, stillOk := s.pendingPiSessionRefs[key]; stillOk && cur.Seq == pending.Seq {
+				cur.ClaudeMounted = true
+				s.pendingPiSessionRefs[key] = cur
+			}
+			s.mu.Unlock()
+		}
 		agents = append(agents, *updated)
 	}
+	// The pending-ref liveness sweep. Two retirements happen here:
+	//   - a mounted claude ref (or any ref that had already been observed in a
+	//     snapshot) whose terminal left the snapshot entirely — the pane (and
+	//     its terminal) closed — is retired so a new terminal that reuses the
+	//     id cannot inherit the old session;
+	//   - an unmounted ref retires once its startup window is over: a claude
+	//     process that never appeared within claudePendingUnmountedTTLMs of
+	//     registration is a failed launch, not a slow one, and leaving it
+	//     would let the stale session id bind a later unregistered claude.
+	// Only an unmounted, never-observed ref still inside its window stays
+	// pending — the register-claude arrived before the first snapshot that
+	// would carry its new pane, so it waits for the next snapshot.
+	// The other mounted-ref exits (agent label lost, official agent_session)
+	// are handled inside the terminal loop above.
+	s.mu.Lock()
+	for key, pending := range s.pendingPiSessionRefs {
+		sessionName, terminalID := splitTerminalSessionKey(key)
+		if sessionName != input.HerdrSessionName {
+			continue
+		}
+		if _, present := snapshotTerminals[terminalID]; present {
+			// The terminal is live in this snapshot: record the observation
+			// (covers pending entries whose terminal has no agent row and never
+			// entered the loop above), then retire an unmounted ref whose
+			// startup window expired without a claude label ever appearing.
+			if !pending.SeenInSnapshot {
+				pending.SeenInSnapshot = true
+				s.pendingPiSessionRefs[key] = pending
+			}
+			if !pending.ClaudeMounted &&
+				nowMs-pending.RegisteredAtMs > claudePendingUnmountedTTLMs {
+				delete(s.pendingPiSessionRefs, key)
+			}
+			continue
+		}
+		if pending.ClaudeMounted || pending.SeenInSnapshot ||
+			nowMs-pending.RegisteredAtMs > claudePendingUnmountedTTLMs {
+			delete(s.pendingPiSessionRefs, key)
+		}
+	}
+	s.mu.Unlock()
 	scopes := map[string]AgentScope{}
 	events := []AgentEventRecord{}
 	statusEventPlans := []StatusEventPlan{}
@@ -1117,6 +1285,16 @@ func (s *AgentIndexService) registerPiSessionRefNow(
 			return &PiSessionRefRegistrationResult{ContextChangedScopes: []AgentScope{}}, nil
 		}
 	}
+	// The sequence number and registration timestamp are allocated up front:
+	// every pending-map write/delete this call performs below is CAS-guarded
+	// on mySeq, so a newer registration that lands while this call runs
+	// outside s.mu (inside SetSessionRefByTerminal) is never overwritten or
+	// deleted by this call's tail.
+	s.mu.Lock()
+	s.nextPendingSeq++
+	mySeq := s.nextPendingSeq
+	registeredAtMs := s.now()
+	s.mu.Unlock()
 	previous, err := s.stores.Agents.FindByTerminal(FindAgentByTerminalInput{
 		HerdrSessionName: input.HerdrSessionName,
 		TerminalID:       input.TerminalID,
@@ -1125,10 +1303,19 @@ func (s *AgentIndexService) registerPiSessionRefNow(
 		return nil, err
 	}
 	if previous == nil {
-		s.mu.Lock()
-		s.pendingPiSessionRefs[key] = input.SessionRef
-		s.mu.Unlock()
-		return &PiSessionRefRegistrationResult{ContextChangedScopes: []AgentScope{}}, nil
+		// No agent row for the terminal yet: the registration predates the
+		// first snapshot that would carry its pane, so it stashes unseen.
+		return s.stashPendingRef(key, input.SessionRef, mySeq, registeredAtMs, false), nil
+	}
+	if strings.EqualFold(input.SessionRef.Agent, string(SubscriberClaude)) &&
+		(previous.Agent == nil || !strings.EqualFold(*previous.Agent, string(SubscriberClaude))) {
+		// Herdr has not identified a claude process on this terminal yet: writing
+		// the ref now would fail the store's same-agent compatibility gate, so
+		// the registration waits as pending until a claude-labelled snapshot
+		// arrives (the refresh loop keeps it and re-mounts it then). The agent
+		// row itself proves the terminal was observed in a snapshot, so the
+		// stashed ref is marked seen.
+		return s.stashPendingRef(key, input.SessionRef, mySeq, registeredAtMs, true), nil
 	}
 	agent, err := s.stores.Agents.SetSessionRefByTerminal(SetSessionRefByTerminalInput{
 		AgentSession:     input.SessionRef,
@@ -1138,9 +1325,39 @@ func (s *AgentIndexService) registerPiSessionRefNow(
 	if err != nil {
 		return nil, err
 	}
-	s.mu.Lock()
-	delete(s.pendingPiSessionRefs, key)
-	s.mu.Unlock()
+	if strings.EqualFold(input.SessionRef.Agent, string(SubscriberClaude)) {
+		// Unlike a consumed pi ref, a mounted claude ref stays pending: CC never
+		// reports its own agent_session, so the refresh loop re-mounts the
+		// registered ref on every claude-labelled snapshot until an official
+		// session arrives. ClaudeMounted mirrors whether the ref landed: a nil
+		// agent (the compatibility gate rejected the write, e.g. the terminal
+		// carries a stale label the store refuses) stays in the pre-mount
+		// window, exactly like a ref that was stashed before the snapshot
+		// identified the claude process. The terminal is carrying an agent row
+		// right now, so the ref is marked seen; the Seq CAS protects a newer
+		// registration that landed while SetSessionRefByTerminal ran outside
+		// the lock.
+		s.mu.Lock()
+		if cur, ok := s.pendingPiSessionRefs[key]; !ok || cur.Seq <= mySeq {
+			s.pendingPiSessionRefs[key] = pendingSessionRef{
+				Ref:            input.SessionRef,
+				Seq:            mySeq,
+				RegisteredAtMs: registeredAtMs,
+				SeenInSnapshot: true,
+				ClaudeMounted:  agent != nil,
+			}
+		}
+		s.mu.Unlock()
+	} else {
+		// A consumed non-claude ref clears only a pending entry older than this
+		// call: a newer pending registration that landed during the lock-free
+		// SetSessionRefByTerminal has a larger Seq and must be kept.
+		s.mu.Lock()
+		if cur, ok := s.pendingPiSessionRefs[key]; ok && cur.Seq <= mySeq {
+			delete(s.pendingPiSessionRefs, key)
+		}
+		s.mu.Unlock()
+	}
 	if agent == nil || sameAgentSession(previous.AgentSession, agent.AgentSession) {
 		result := &PiSessionRefRegistrationResult{ContextChangedScopes: []AgentScope{}}
 		if agent != nil {
@@ -1162,6 +1379,34 @@ func (s *AgentIndexService) registerPiSessionRefNow(
 		result.ContextChangedScopes = []AgentScope{}
 	}
 	return result, nil
+}
+
+// stashPendingRef registers sessionRef as the pending ref of one terminal,
+// the branch registerPiSessionRefNow shares for "agent row missing" and
+// "agent not yet identified as claude".
+func (s *AgentIndexService) stashPendingRef(
+	key string,
+	sessionRef AgentSessionRef,
+	seq uint64,
+	registeredAtMs int64,
+	seenInSnapshot bool,
+) *PiSessionRefRegistrationResult {
+	s.mu.Lock()
+	// A newly registered (or re-registered) ref starts unmounted: it has not
+	// been bound to a claude-labelled snapshot yet, so it survives the
+	// liveness sweep until its first mount — bounded by the unmounted
+	// startup window. The Seq CAS never lets this write roll back a newer
+	// registration that landed in the meantime.
+	if cur, ok := s.pendingPiSessionRefs[key]; !ok || cur.Seq <= seq {
+		s.pendingPiSessionRefs[key] = pendingSessionRef{
+			Ref:            sessionRef,
+			Seq:            seq,
+			RegisteredAtMs: registeredAtMs,
+			SeenInSnapshot: seenInSnapshot,
+		}
+	}
+	s.mu.Unlock()
+	return &PiSessionRefRegistrationResult{ContextChangedScopes: []AgentScope{}}
 }
 
 // ---------------------------------------------------------------------------
@@ -1530,6 +1775,14 @@ func sameAgentSession(left *AgentSessionRef, right *AgentSessionRef) bool {
 
 func terminalSessionKey(herdrSessionName string, terminalID string) string {
 	return herdrSessionName + "\x00" + terminalID
+}
+
+// splitTerminalSessionKey reverses terminalSessionKey.
+func splitTerminalSessionKey(key string) (herdrSessionName string, terminalID string) {
+	if index := strings.IndexByte(key, '\x00'); index >= 0 {
+		return key[:index], key[index+1:]
+	}
+	return key, ""
 }
 
 func scopeOf(agent AgentIndexRecord) AgentScope {

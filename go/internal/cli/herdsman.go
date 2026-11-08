@@ -10,19 +10,24 @@ package cli
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"math"
 	"os"
+	"os/exec"
+	"regexp"
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/dorokuma/herdsman/go/internal/agy"
 	"github.com/dorokuma/herdsman/go/internal/config"
 	"github.com/dorokuma/herdsman/go/internal/daemon"
+	"github.com/dorokuma/herdsman/go/internal/herdr"
 	"github.com/dorokuma/herdsman/go/internal/observability"
 )
 
@@ -30,19 +35,21 @@ import (
 const (
 	currentHerdrWorkspaceError = "agent command requires HERDR_ENV=1 with HERDR_WORKSPACE_ID, --workspace <id>, --session <name>, or --all."
 	currentHerdrPaneError      = "orchestrator command requires HERDR_ENV=1 with HERDR_SOCKET_PATH, HERDR_PANE_ID, and HERDR_WORKSPACE_ID."
+	registerClaudePaneError    = "register-claude requires HERDR_ENV=1 with HERDR_SOCKET_PATH, HERDR_PANE_ID, and HERDR_WORKSPACE_ID, or a resolvable `herdr pane current --current`."
 )
 
 // CommandKind is the `command` discriminator of the TS CliCommand union.
 type CommandKind string
 
 const (
-	CommandDaemon       CommandKind = "daemon"
-	CommandAgentList    CommandKind = "agent-list"
-	CommandAgentGet     CommandKind = "agent-get"
-	CommandAgentRead    CommandKind = "agent-read"
-	CommandOrchestrator CommandKind = "orchestrator"
-	CommandAgyHook      CommandKind = "agy-hook"
-	CommandHelp         CommandKind = "help"
+	CommandDaemon         CommandKind = "daemon"
+	CommandAgentList      CommandKind = "agent-list"
+	CommandAgentGet       CommandKind = "agent-get"
+	CommandAgentRead      CommandKind = "agent-read"
+	CommandOrchestrator   CommandKind = "orchestrator"
+	CommandAgyHook        CommandKind = "agy-hook"
+	CommandRegisterClaude CommandKind = "register-claude"
+	CommandHelp           CommandKind = "help"
 )
 
 // CliCommand mirrors the TS CliCommand union in one struct: every field is only
@@ -58,6 +65,7 @@ type CliCommand struct {
 	JSON             bool
 	Limit            *int
 	PaneID           string
+	SessionID        string
 	Target           string
 	Text             bool
 	WorkspaceID      *string
@@ -107,10 +115,40 @@ func ParseCliArgs(args []string, environment map[string]string) (CliCommand, err
 			Command:       CommandAgyHook,
 			HookEventName: agy.HookEventName(hookEventName),
 		}, nil
+
+	case "register-claude":
+		sessionID, hasSessionID, err := rest.takeOptionValue("--session-id")
+		if err != nil {
+			return CliCommand{}, err
+		}
+		if !hasSessionID {
+			return CliCommand{}, errors.New("register-claude requires --session-id <uuid>")
+		}
+		if err := rest.rejectExtra(); err != nil {
+			return CliCommand{}, err
+		}
+		normalized := strings.ToLower(sessionID)
+		if !claudeSessionIDPattern.MatchString(normalized) {
+			return CliCommand{}, fmt.Errorf("register-claude --session-id is not a uuid: %s", sessionID)
+		}
+		command := CliCommand{Command: CommandRegisterClaude, SessionID: normalized}
+		// The Herdr pane identity is preferentially read off the launch env; any
+		// missing piece is resolved lazily by runClaudeRegister through
+		// `herdr pane current --current` (nested shells often lack HERDR_ENV).
+		command.HerdrSocketPath = environment["HERDR_SOCKET_PATH"]
+		command.PaneID = environment["HERDR_PANE_ID"]
+		command.WorkspaceID = optionalString(environment["HERDR_WORKSPACE_ID"])
+		return command, nil
 	}
 
 	return CliCommand{}, fmt.Errorf("Unknown command: %s", command)
 }
+
+// claudeSessionIDPattern is the CC conversation-id shape: a uuid in the
+// canonical 8-4-4-4-12 hex form (validated on the lowercased value).
+var claudeSessionIDPattern = regexp.MustCompile(
+	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
+)
 
 // parseOrchestratorCommand mirrors parseOrchestratorCommand.
 func parseOrchestratorCommand(
@@ -259,6 +297,7 @@ func HelpText() string {
 		"  herdsman agent list [--all] [--workspace <id>] [--session <name>] [--json]",
 		"  herdsman agent get <target> [--workspace <id>] [--session <name>] [--json]",
 		"  herdsman agent read <target> [--limit N] [--workspace <id>] [--session <name>] [--json]",
+		"  herdsman register-claude --session-id <uuid>",
 		"  herdsman agy-hook <PreInvocation|Stop|WakeWaiter>",
 		"  herdsman help",
 		"",
@@ -337,11 +376,155 @@ func RunCliCommand(command CliCommand, deps RunCliDeps) error {
 		return err
 	}
 	defer client.Close()
+	if command.Command == CommandRegisterClaude {
+		result, err := runClaudeRegister(command, deps, client)
+		if err != nil {
+			return err
+		}
+		encoded, err := marshalJS(result)
+		if err != nil {
+			return err
+		}
+		deps.Output(encoded)
+		return nil
+	}
 	result, err := dispatchRPCCommand(command, client)
 	if err != nil {
 		return err
 	}
 	return printResult(command, result, deps.Output)
+}
+
+// runClaudeRegister performs the one-shot Claude Code registration: the pane
+// identity comes from the launch env first, with `herdr pane current --current`
+// as the fallback for shells that never saw HERDR_ENV. The CLI exits after the
+// register RPC returns; the daemon treats subscriberKind "claude" like agy's
+// socket-less presence, so the closed connection is not a disconnect.
+func runClaudeRegister(command CliCommand, deps RunCliDeps, client RpcClientLike) (any, error) {
+	socketPath := command.HerdrSocketPath
+	paneID := command.PaneID
+	workspaceID := derefOptional(command.WorkspaceID)
+	if socketPath == "" || paneID == "" || workspaceID == "" {
+		// The environment identity is only trusted as a complete tuple: a
+		// half-dead Herdr env (a nested shell that kept HERDR_PANE_ID but lost
+		// HERDR_SOCKET_PATH, or the env of a different Herdr session) must not
+		// be mixed with the resolved identity — mixing registers this pane
+		// into another session's socket.
+		pane, err := resolveCurrentHerdrPane(deps.Environment)
+		if err != nil {
+			return nil, errors.New(registerClaudePaneError)
+		}
+		resolvedSocketPath, err := resolveCurrentHerdrSocketPath(deps.Environment)
+		if err != nil {
+			return nil, errors.New(registerClaudePaneError)
+		}
+		socketPath = resolvedSocketPath
+		paneID = pane.PaneID
+		workspaceID = pane.WorkspaceID
+		if socketPath == "" || paneID == "" || workspaceID == "" {
+			return nil, errors.New(registerClaudePaneError)
+		}
+	}
+	return client.Call("agent.orchestrator.register", map[string]any{
+		"herdrSocketPath": socketPath,
+		"paneId":          paneID,
+		"sessionRef": map[string]any{
+			"agent":  "claude",
+			"kind":   "id",
+			"source": "dispatch-agent:claude",
+			"value":  command.SessionID,
+		},
+		"subscriberId":   "claude:" + command.SessionID,
+		"subscriberKind": "claude",
+		"workspaceId":    workspaceID,
+	})
+}
+
+// herdrPaneCurrent mirrors the pane object `herdr pane current --current`
+// reports under result.pane: only the three fields the registration needs are
+// decoded.
+type herdrPaneCurrent struct {
+	PaneID      string `json:"pane_id"`
+	TerminalID  string `json:"terminal_id"`
+	WorkspaceID string `json:"workspace_id"`
+}
+
+// claudeHerdrCommandTimeoutMs caps each `herdr` CLI probe: the register command
+// must answer quickly and never park on a wedged herdr.
+const claudeHerdrCommandTimeoutMs = 2_000
+
+// claudeHerdrCommand is the exec seam the pane/session probes go through; tests
+// replace it with a stub.
+var claudeHerdrCommand = func(args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(
+		context.Background(), claudeHerdrCommandTimeoutMs*time.Millisecond)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "herdr", args...)
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		return cmd.Process.Kill()
+	}
+	return cmd.Output()
+}
+
+// resolveCurrentHerdrPane runs `herdr pane current --current` and decodes the
+// pane identity out of its result wrapper. The environment is only consulted
+// for nothing at the moment — the parameter documents where a future override
+// would read from and keeps the seam symmetric with resolveCurrentHerdrSocketPath.
+func resolveCurrentHerdrPane(environment map[string]string) (herdrPaneCurrent, error) {
+	_ = environment
+	out, err := claudeHerdrCommand("pane", "current", "--current")
+	if err != nil {
+		return herdrPaneCurrent{}, err
+	}
+	var envelope struct {
+		Result struct {
+			Pane herdrPaneCurrent `json:"pane"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(out, &envelope); err != nil {
+		return herdrPaneCurrent{}, err
+	}
+	if envelope.Result.Pane.PaneID == "" || envelope.Result.Pane.WorkspaceID == "" {
+		return herdrPaneCurrent{}, errors.New("herdr pane current returned no pane identity")
+	}
+	return envelope.Result.Pane, nil
+}
+
+// resolveCurrentHerdrSocketPath finds the socket path of the current Herdr
+// session through `herdr session list --json`: the session marked default wins,
+// and a session without a default marker falls back to the first running one.
+// The probe shares the claudeHerdrCommand seam with resolveCurrentHerdrPane so
+// one stub covers both in tests; it keeps the runner's timeout and SIGKILL
+// kill semantics.
+func resolveCurrentHerdrSocketPath(environment map[string]string) (string, error) {
+	_ = environment
+	out, err := claudeHerdrCommand("session", "list", "--json")
+	if err != nil {
+		return "", err
+	}
+	entries, err := herdr.NormalizeHerdrSessionList(string(out))
+	if err != nil {
+		return "", err
+	}
+	fallback := ""
+	for _, entry := range entries {
+		if !entry.Running {
+			continue
+		}
+		if entry.Default != nil && *entry.Default {
+			return entry.SocketPath, nil
+		}
+		if fallback == "" {
+			fallback = entry.SocketPath
+		}
+	}
+	if fallback == "" {
+		return "", errors.New("herdr session list reported no running session")
+	}
+	return fallback, nil
 }
 
 // dispatchRPCCommand mirrors dispatchRpcCommand.

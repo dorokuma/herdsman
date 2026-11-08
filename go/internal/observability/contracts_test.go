@@ -78,9 +78,9 @@ func TestAgentOrchestratorRegisterInputSchemaValidatesConnectionBoundRPC(t *test
 			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
 			"sessionRef":{"agent":"pi","kind":"id","source":"herdr:pi","value":"/tmp/pi-session.jsonl"},
 			"subscriberId":"pi-session","subscriberKind":"pi","workspaceId":"wB"}`, false},
-		{"pi sessionRef with agent=claude", `{
+		{"pi sessionRef with agent=codex", `{
 			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
-			"sessionRef":{"agent":"claude","kind":"path","source":"herdr:pi","value":"/tmp/pi-session.jsonl"},
+			"sessionRef":{"agent":"codex","kind":"path","source":"herdr:pi","value":"/tmp/pi-session.jsonl"},
 			"subscriberId":"pi-session","subscriberKind":"pi","workspaceId":"wB"}`, false},
 		{"empty sessionRef value", `{
 			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
@@ -95,8 +95,20 @@ func TestAgentOrchestratorRegisterInputSchemaValidatesConnectionBoundRPC(t *test
 			"subscriberId":"pi-session","subscriberKind":"pi","workspaceId":"wB"}`, false},
 		{"subscriberKind claude", `{
 			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
+			"sessionRef":{"agent":"claude","kind":"id","source":"dispatch-agent:claude","value":"4f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f"},
+			"subscriberId":"claude:4f0f0f0f-0f0f-4f0f-8f0f-0f0f0f0f0f0f","subscriberKind":"claude","workspaceId":"wB"}`, true},
+		{"claude sessionRef with kind=path", `{
+			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
+			"sessionRef":{"agent":"claude","kind":"path","source":"dispatch-agent:claude","value":"/tmp/x.jsonl"},
+			"subscriberId":"claude:x","subscriberKind":"claude","workspaceId":"wB"}`, true},
+		{"subscriberKind claude with pi sessionRef", `{
+			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
 			"sessionRef":{"agent":"pi","kind":"path","source":"herdr:pi","value":"/tmp/pi-session.jsonl"},
-			"subscriberId":"pi-session","subscriberKind":"claude","workspaceId":"wB"}`, false},
+			"subscriberId":"pi-session","subscriberKind":"claude","workspaceId":"wB"}`, true},
+		{"subscriberKind unknown", `{
+			"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
+			"sessionRef":{"agent":"pi","kind":"path","source":"herdr:pi","value":"/tmp/pi-session.jsonl"},
+			"subscriberId":"pi-session","subscriberKind":"codex","workspaceId":"wB"}`, false},
 		{"autoResume with no sessionRef", `{
 			"autoResume":true,"herdrSocketPath":"/tmp/herdr.sock","paneId":"wB:p1",
 			"subscriberId":"pi-session-1","subscriberKind":"pi","workspaceId":"wB"}`, false},

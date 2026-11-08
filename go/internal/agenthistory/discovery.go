@@ -15,7 +15,7 @@ import (
 
 // Session discovery, ported from src/agent-history/discovery.ts.
 //
-// Herdsman supports session history for exactly two agents, by decision:
+// Herdsman supports session history for exactly three agents, by decision:
 //
 //  1. `pi` — Herdr's own integration reports the session file itself, so the
 //     official `agent_session.kind == "path"` value is used as-is after the
@@ -25,6 +25,13 @@ import (
 //     deterministic candidate per configured agy home (primary `HOME` first,
 //     followed by `AGY_EXTRA_HOMES` / `DEFAULT_AGY_EXTRA_HOMES`):
 //     - `agy` -> `<home>/.gemini/antigravity-cli/conversations/<id>.db`
+//  3. `claude` — Claude Code registers its session id through the one-shot
+//     `herdsman register-claude` CLI (subscriberKind "claude", kind "id"), and
+//     the dispatch runtime keeps the JSONL transcripts under a deterministic
+//     root, so the id resolves to `<root>/<project-dir>/<id>.jsonl` by
+//     enumerating the root's first-level project directories for an exact
+//     match:
+//     - `claude` -> `<claudeProjectsRoot>/<project-dir>/<id>.jsonl`
 //
 // Every other agent — whether or not Herdr has an integration for it — is
 // deliberately not resolved: herdsman does not walk agent directories, rank
@@ -44,16 +51,24 @@ var DefaultAgyExtraHomes = []string{"/root/.agy-pro-home"}
 // homes, consulted when no explicit list is passed.
 const AgyExtraHomesEnv = "AGY_EXTRA_HOMES"
 
+// DefaultClaudeProjectsRoot is the deterministic root the dispatch runtime
+// writes Claude Code project transcripts under: every CC session of a role is
+// `<root>/<project-dir>/<session-id>.jsonl`. Tests inject their own root through
+// AgentHistoryLookupInput.ClaudeProjectsRoot or the service options, so the
+// real /tmp directory is never touched by a test.
+const DefaultClaudeProjectsRoot = "/tmp/herdr-role-sessions/claude-projects"
+
 // AgentHistoryLookupInput mirrors AgentHistoryLookupInput. Optional fields are
 // nil when absent; ExtraHomeDirs is nil only when the caller did not provide a
 // list (a non-nil empty slice is an explicit override).
 type AgentHistoryLookupInput struct {
-	Agent            *string
-	AgentSession     *observability.AgentSessionRef
-	ExtraHomeDirs    []string
-	HerdrSessionName *string
-	HomeDir          *string
-	PaneID           *string
+	Agent              *string
+	AgentSession       *observability.AgentSessionRef
+	ClaudeProjectsRoot *string
+	ExtraHomeDirs      []string
+	HerdrSessionName   *string
+	HomeDir            *string
+	PaneID             *string
 }
 
 // DiscoverOptions mirrors `{ force?: boolean }`.
@@ -207,6 +222,7 @@ func DiscoveryLookupKey(input AgentHistoryLookupInput) string {
 		kind,
 		source,
 		value,
+		claudeProjectsRootOf(input.ClaudeProjectsRoot),
 		homeDirOrEnv(input.HomeDir),
 		strings.Join(resolveAgyExtraHomesFromEnv(input.ExtraHomeDirs), ":"),
 	}, "\x00")
@@ -311,12 +327,20 @@ func DiscoverAgentHistory(input AgentHistoryLookupInput, options DiscoverOptions
 		}
 	}
 	resolved := resolveSessionFileById(sessionFileByIDInput{
-		extraHomeDirs: input.ExtraHomeDirs,
-		homeDir:       input.HomeDir,
-		session:       session,
+		claudeProjectsRoot: input.ClaudeProjectsRoot,
+		extraHomeDirs:      input.ExtraHomeDirs,
+		homeDir:            input.HomeDir,
+		session:            session,
 	})
 	if resolved.ref != nil {
 		return resolved.ref
+	}
+	if resolved.transient {
+		// A claude-jsonl id resolves to a file CC itself creates on startup, so a
+		// lookup that lands before the first record is a timing miss, not a real
+		// failure: it must not enter the 60-second negative cache (a task that
+		// finishes inside five seconds would otherwise never be read).
+		return nil
 	}
 	return fail(resolved.detail)
 }
@@ -387,9 +411,10 @@ func ResolveAgySessionCandidates(input AgySessionCandidatesInput) AgySessionCand
 }
 
 type sessionFileByIDInput struct {
-	extraHomeDirs []string
-	homeDir       *string
-	session       *observability.AgentSessionRef
+	claudeProjectsRoot *string
+	extraHomeDirs      []string
+	homeDir            *string
+	session            *observability.AgentSessionRef
 }
 
 func resolveSessionFileById(input sessionFileByIDInput) sessionFileResolution {
@@ -409,19 +434,112 @@ func resolveSessionFileById(input sessionFileByIDInput) sessionFileResolution {
 		}
 		return sessionFileResolution{detail: resolved.Detail, ref: ref}
 	}
+	if source == SourceClaudeJSONL {
+		return ResolveClaudeSessionFile(ClaudeSessionFileInput{
+			ID:                 input.session.Value,
+			ClaudeProjectsRoot: input.claudeProjectsRoot,
+		})
+	}
 	if source != SourceUnknown {
 		return miss(fmt.Sprintf(
-			"%s reported an id; herdsman has no id-based session-file derivation for it (only agy does)",
+			"%s reported an id; herdsman has no id-based session-file derivation for it (only agy and claude do)",
 			input.session.Agent))
 	}
 	return miss(fmt.Sprintf(
-		"%s is not a supported herdsman history agent (only pi and agy are)",
+		"%s is not a supported herdsman history agent (only pi, agy and claude are)",
 		input.session.Agent))
 }
 
+// claudeProjectsRootOf resolves the effective claude projects root: an injected
+// root wins, otherwise the deterministic dispatch-runtime default.
+func claudeProjectsRootOf(root *string) string {
+	if root != nil && *root != "" {
+		return *root
+	}
+	return DefaultClaudeProjectsRoot
+}
+
+// ClaudeSessionFileInput mirrors the resolveClaudeSessionFile input.
+type ClaudeSessionFileInput struct {
+	ID                 string
+	ClaudeProjectsRoot *string
+}
+
+// ResolveClaudeSessionFile resolves one Claude Code session id to its JSONL
+// transcript: only the first-level project directories of the claude projects
+// root are enumerated, and only an exact `<project-dir>/<id>.jsonl` name match
+// is a candidate. Each candidate is verified through containedFileRef
+// (`safeOfficialSessionPath` + `isInside`) against the projects root.
+//
+// `transient` marks the "file not created yet" miss: CC writes the transcript
+// on session start, so a lookup that lands a moment earlier must not count as
+// a real failure (DiscoverAgentHistory skips the 60s negative cache for it).
+func ResolveClaudeSessionFile(input ClaudeSessionFileInput) sessionFileResolution {
+	id := input.ID
+	miss := func(detail string) sessionFileResolution {
+		return sessionFileResolution{detail: detail, ref: nil}
+	}
+	if !isUuidLike(id) {
+		return miss(fmt.Sprintf("claude session id is not a uuid: %s", id))
+	}
+	id = strings.ToLower(id)
+	root := claudeProjectsRootOf(input.ClaudeProjectsRoot)
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return sessionFileResolution{
+			detail:    fmt.Sprintf("claude: cannot list projects root %s: %v", root, err),
+			ref:       nil,
+			transient: os.IsNotExist(err),
+		}
+	}
+	fileName := id + ".jsonl"
+	missDetails := []string{}
+	sawCandidate := false
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+		candidate := filepath.Join(root, entry.Name(), fileName)
+		if _, statErr := os.Lstat(candidate); statErr != nil {
+			continue
+		}
+		sawCandidate = true
+		resolution := containedFileRef(containedFileRefInput{
+			candidate: candidate,
+			id:        id,
+			label:     "claude",
+			root:      filepath.Join(root, entry.Name()),
+			source:    SourceClaudeJSONL,
+		})
+		if resolution.ref != nil {
+			return sessionFileResolution{detail: resolution.detail, ref: resolution.ref}
+		}
+		missDetails = append(missDetails, resolution.detail)
+	}
+	if sawCandidate {
+		// A matching file exists but failed the safety gate: a real failure,
+		// reported and cached like every other unresolvable official value.
+		return sessionFileResolution{
+			detail:    strings.Join(missDetails, "; "),
+			ref:       nil,
+			transient: false,
+		}
+	}
+	// No candidate file exists yet: the transcript has not been created, so the
+	// miss is transient (it would stop being transient the moment the file
+	// appears). A directory that cannot even be listed was already reported as
+	// transient above only for ENOENT.
+	return sessionFileResolution{
+		detail:    fmt.Sprintf("claude: no %s transcript under %s", fileName, root),
+		ref:       nil,
+		transient: true,
+	}
+}
+
 type sessionFileResolution struct {
-	detail string
-	ref    *HistoryRef
+	detail    string
+	ref       *HistoryRef
+	transient bool
 }
 
 type containedFileRefInput struct {
@@ -508,10 +626,12 @@ var nonSegmentSeparator = func(r rune) bool {
 // HistorySourceFromSessionRef mirrors historySourceFromSessionRef: maps an
 // official `agent_session` to the reader that can read it. `pi` and `pig`
 // (PiG, which emits the same pi-jsonl session format and herdsman protocol)
-// share the `pi-jsonl` reader; `agy` is the other supported agent. Everything else is
-// `unknown`, which every reader rejects. `source` looks like `herdr:<agent>`,
-// so segments are matched whole — `herdr:copilot` contains "pi" and must
-// never be read as a pi session.
+// share the `pi-jsonl` reader; `agy` resolves to `antigravity-sqlite` and
+// `claude` (Claude Code, registered via `herdsman register-claude`) to
+// `claude-jsonl`. Everything else is `unknown`, which every reader rejects.
+// `source` looks like `herdr:<agent>` or `dispatch-agent:<agent>`, so segments
+// are matched whole — `herdr:copilot` contains "pi" and must never be read as
+// a pi session.
 func HistorySourceFromSessionRef(ref observability.AgentSessionRef) HistorySource {
 	segments := []string{}
 	if agent := strings.ToLower(ref.Agent); agent != "" {
@@ -534,6 +654,9 @@ func HistorySourceFromSessionRef(ref observability.AgentSessionRef) HistorySourc
 	}
 	if has("agy", "antigravity", "antigravity_cli", "antigravity-cli") {
 		return SourceAntigravitySQLite
+	}
+	if has("claude") {
+		return SourceClaudeJSONL
 	}
 	if has("pi", "pig") {
 		return SourcePiJSONL

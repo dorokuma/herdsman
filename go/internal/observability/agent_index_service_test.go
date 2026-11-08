@@ -366,6 +366,9 @@ func newIdxService(
 		if options.Sleep != nil {
 			serviceOptions.Sleep = options.Sleep
 		}
+		if options.Now != nil {
+			serviceOptions.Now = options.Now
+		}
 	}
 	service, err := observability.NewAgentIndexService(serviceOptions)
 	if err != nil {
@@ -1093,4 +1096,394 @@ func TestRefreshHerdrSessionSourceSharesOneRefreshPerEpoch(t *testing.T) {
 	if got := len(history.recordedCalls()); got != 1 {
 		t.Fatalf("history resolutions = %d, want 1 (the refresh was not shared)", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Claude sessionRef registration retention
+// ---------------------------------------------------------------------------
+
+// idxClaudeSessionRef is the ref `herdsman register-claude` hands the daemon.
+func idxClaudeSessionRef() observability.AgentSessionRef {
+	return observability.AgentSessionRef{
+		Agent:  "claude",
+		Kind:   observability.SessionRefID,
+		Source: "dispatch-agent:claude",
+		Value:  "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d",
+	}
+}
+
+// idxClaudeAgentSession reads back the indexed agent_session of one terminal.
+func idxClaudeAgentSession(
+	t *testing.T,
+	harness *idxHarness,
+	terminalID string,
+) *observability.AgentSessionRef {
+	t.Helper()
+	agent, err := harness.agents.FindByTerminal(db.FindAgentByTerminalInput{
+		HerdrSessionName: "default",
+		TerminalID:       terminalID,
+	})
+	if err != nil {
+		t.Fatalf("findByTerminal(%s): %v", terminalID, err)
+	}
+	if agent == nil {
+		t.Fatalf("agent for terminal %s not found", terminalID)
+	}
+	return agent.AgentSession
+}
+
+func idxRegisterClaude(t *testing.T, service *observability.AgentIndexService, terminalID string) {
+	t.Helper()
+	if _, err := service.RegisterPiSessionRef(observability.RegisterPiSessionRefInput{
+		HerdrSessionName: "default",
+		SessionRef:       idxClaudeSessionRef(),
+		TerminalID:       terminalID,
+	}); err != nil {
+		t.Fatalf("registerPiSessionRef: %v", err)
+	}
+}
+
+// A registered claude sessionRef mounts on the snapshot refresh that carries
+// the terminal, and stays re-mounted on every later refresh: CC never reports
+// an official agent_session, so the pending registration must not be consumed
+// by the first mount.
+func TestIndexClaudeSessionRefMountsAndIsRetainedAcrossRefreshes(t *testing.T) {
+	harness := openIdxHarness(t)
+	history := newIdxHistory("result")
+	holder := &idxSnapshotHolder{}
+	holder.set(idxOneAgent("working", 10, "claude", nil))
+	service, _ := newIdxService(t, harness, holder, history, nil)
+
+	idxRegisterClaude(t, service, "term_claude")
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession: %v", err)
+	}
+	got := idxClaudeAgentSession(t, harness, "term_claude")
+	if got == nil || got.Kind != observability.SessionRefID ||
+		got.Value != "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d" {
+		t.Fatalf("agentSession after mount = %+v, want the registered claude id ref", got)
+	}
+
+	// A later refresh without the ref would drop the hint if the pending
+	// registration had been consumed: the retained pending ref re-mounts it.
+	for round := 0; round < 2; round++ {
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(round %d): %v", round, err)
+		}
+		got := idxClaudeAgentSession(t, harness, "term_claude")
+		if got == nil || got.Value != "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d" {
+			t.Fatalf("agentSession after round %d = %+v, want retained", round, got)
+		}
+	}
+}
+
+// A registration that lands while the terminal still carries another agent
+// label stays pending; the first claude-labelled snapshot mounts it.
+func TestIndexClaudeSessionRefWaitsForTheClaudeLabel(t *testing.T) {
+	harness := openIdxHarness(t)
+	history := newIdxHistory("result")
+	holder := &idxSnapshotHolder{}
+	holder.set(idxOneAgent("working", 10, "pi", nil))
+	service, _ := newIdxService(t, harness, holder, history, nil)
+
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession: %v", err)
+	}
+	idxRegisterClaude(t, service, "term_claude")
+	if got := idxClaudeAgentSession(t, harness, "term_claude"); got != nil {
+		t.Fatalf("agentSession while labelled pi = %+v, want nil", got)
+	}
+
+	// Herdr identifies the process as claude on the next snapshot: the pending
+	// registration mounts now.
+	holder.set(idxOneAgent("working", 11, "claude", nil))
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession(claude label): %v", err)
+	}
+	got := idxClaudeAgentSession(t, harness, "term_claude")
+	if got == nil || got.Value != "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d" {
+		t.Fatalf("agentSession after claude snapshot = %+v, want mounted", got)
+	}
+}
+
+// S1: a mounted claude ref is bound to the claude process it was registered
+// against, not to the terminal. When the terminal leaves the snapshot (pane
+// closed) or the claude process exits to a bare shell — or the label flips to
+// another agent — the mounted registration must be retired. Otherwise a new
+// unregistered claude that opens on the same terminal would inherit the old
+// session id.
+func TestIndexClaudeSessionRefDoesNotRebindAfterClaudeExit(t *testing.T) {
+	harness := openIdxHarness(t)
+	history := newIdxHistory("result")
+	holder := &idxSnapshotHolder{}
+	holder.set(idxOneAgent("working", 10, "claude", nil))
+	service, _ := newIdxService(t, harness, holder, history, nil)
+	refresh := func() {
+		t.Helper()
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession: %v", err)
+		}
+	}
+	register := func(value string) {
+		t.Helper()
+		ref := idxClaudeSessionRef()
+		ref.Value = value
+		if _, err := service.RegisterPiSessionRef(observability.RegisterPiSessionRefInput{
+			HerdrSessionName: "default",
+			SessionRef:       ref,
+			TerminalID:       "term_claude",
+		}); err != nil {
+			t.Fatalf("registerPiSessionRef: %v", err)
+		}
+	}
+	newRefValue := func() string { return "9f8e7d6c-5b4a-4f3e-8d2c-1b0a9f8e7d6c" }
+
+	// The registration lands and mounts onto the claude-labelled snapshot.
+	register("3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d")
+	refresh()
+	if got := idxClaudeAgentSession(t, harness, "term_claude"); got == nil {
+		t.Fatal("agentSession after the mount = nil, want the registered ref")
+	}
+
+	// The pane (and its terminal) closes: the mounted registration must die
+	// with it instead of waiting for the next claude on the terminal id.
+	holder.set(idxSnapshot([]any{}, []any{}))
+	refresh()
+	// A bare claude that reappears on the same terminal stays unregistered.
+	holder.set(idxOneAgent("working", 10, "claude", nil))
+	refresh()
+	if got := idxClaudeAgentSession(t, harness, "term_claude"); got != nil {
+		t.Fatalf("agentSession after the terminal reappeared = %+v, want nil (old ref must not re-bind)", got)
+	}
+
+	// A fresh registration still binds normally to the same terminal.
+	register(newRefValue())
+	refresh()
+	if got := idxClaudeAgentSession(t, harness, "term_claude"); got == nil || got.Value != newRefValue() {
+		t.Fatalf("agentSession after a fresh registration = %+v, want %s", got, newRefValue())
+	}
+
+	// The claude process exits to a bare shell while the terminal stays open:
+	// the mounted registration must be retired the same way.
+	holder.set(idxSnapshot([]any{idxAgent(map[string]any{
+		"agent":        nil,
+		"agent_status": "idle",
+		"pane_id":      "wJ:p2",
+		"terminal_id":  "term_claude",
+		"workspace_id": "wJ",
+	})}, []any{map[string]any{"pane_id": "wJ:p2", "revision": float64(12)}}))
+	refresh()
+	// Another bare claude on the same terminal must not inherit the old ref.
+	holder.set(idxOneAgent("working", 13, "claude", nil))
+	refresh()
+	if got := idxClaudeAgentSession(t, harness, "term_claude"); got != nil {
+		t.Fatalf("agentSession on the new claude process = %+v, want nil (old ref must not re-bind)", got)
+	}
+}
+
+// An official agent_session reported by Herdr wins over the registered ref and
+// ends the retention: the pending entry is dropped instead of overwriting the
+// official report on every refresh.
+func TestIndexClaudeSessionRefYieldsToAnOfficialAgentSession(t *testing.T) {
+	harness := openIdxHarness(t)
+	history := newIdxHistory("result")
+	official := map[string]any{
+		"agent":  "claude",
+		"kind":   "id",
+		"source": "herdr:claude",
+		"value":  "official-session",
+	}
+	holder := &idxSnapshotHolder{}
+	holder.set(idxSnapshot([]any{idxAgent(map[string]any{
+		"agent":        "claude",
+		"agent_status": "working",
+		"pane_id":      "wJ:p2",
+		"terminal_id":  "term_claude",
+		"workspace_id": "wJ",
+	})}, []any{map[string]any{"pane_id": "wJ:p2", "revision": float64(10)}}))
+	service, _ := newIdxService(t, harness, holder, history, nil)
+
+	idxRegisterClaude(t, service, "term_claude")
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession: %v", err)
+	}
+	if got := idxClaudeAgentSession(t, harness, "term_claude"); got == nil {
+		t.Fatal("agentSession after first mount = nil, want the registered ref")
+	}
+
+	// The next snapshot reports an official agent_session: it wins, and the
+	// pending registration stops re-mounting.
+	holder.set(idxSnapshot([]any{idxAgent(map[string]any{
+		"agent":         "claude",
+		"agent_session": official,
+		"agent_status":  "working",
+		"pane_id":       "wJ:p2",
+		"terminal_id":   "term_claude",
+		"workspace_id":  "wJ",
+	})}, []any{map[string]any{"pane_id": "wJ:p2", "revision": float64(11)}}))
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession(official): %v", err)
+	}
+	got := idxClaudeAgentSession(t, harness, "term_claude")
+	if got == nil || got.Value != "official-session" {
+		t.Fatalf("agentSession with official report = %+v, want the official ref", got)
+	}
+}
+
+// A registered claude ref whose terminal is closed before Herdr ever identifies
+// the claude process — sbx/claude failed to launch after the shell preamble and
+// the pane closed — must be retired once the terminal leaves the snapshot, even
+// though the ref never mounted. The old sweep only retired mounted refs, so the
+// stale UUID survived and bound the next unregistered claude that opened on the
+// reused terminal id.
+func TestIndexClaudeSessionRefUnmountedRetiresWhenTheTerminalCloses(t *testing.T) {
+	harness := openIdxHarness(t)
+	history := newIdxHistory("result")
+	holder := &idxSnapshotHolder{}
+	// The terminal is a bare shell (agent: nil): register-claude already ran
+	// its preamble but claude has not started, so the ref is still unmounted.
+	// The agent row makes the registration "seen in snapshot" — a later
+	// absence is the terminal closing, not the ref outrunning its first
+	// snapshot.
+	holder.set(idxSnapshot([]any{idxAgent(map[string]any{
+		"agent":        nil,
+		"agent_status": "idle",
+		"pane_id":      "wJ:p2",
+		"terminal_id":  "term_claude",
+		"workspace_id": "wJ",
+	})}, []any{map[string]any{"pane_id": "wJ:p2", "revision": float64(10)}}))
+	service, _ := newIdxService(t, harness, holder, history, nil)
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession(bare shell): %v", err)
+	}
+	idxRegisterClaude(t, service, "term_claude")
+
+	// The pane (and its terminal) closes before claude starts: the unmounted
+	// registration must die with it instead of waiting forever for a
+	// claude-labelled snapshot.
+	holder.set(idxSnapshot([]any{}, []any{}))
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession(pane closed): %v", err)
+	}
+
+	// A bare claude that reappears on the same terminal id must not inherit
+	// the retired registration.
+	holder.set(idxOneAgent("working", 10, "claude", nil))
+	if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+		t.Fatalf("refreshHerdrSession(new claude): %v", err)
+	}
+	if got := idxClaudeAgentSession(t, harness, "term_claude"); got != nil {
+		t.Fatalf("agentSession on the new claude = %+v, want nil (unmounted ref must not re-bind)", got)
+	}
+}
+
+// An unmounted claude ref carries a startup window: if the terminal still shows
+// no claude label — or never reached a snapshot at all — once
+// claudePendingUnmountedTTLMs has elapsed, the launch is a failure, not a slow
+// start, and the registration retires instead of leaving its session id behind.
+// A ref still inside its window keeps waiting and mounts normally.
+func TestIndexClaudeSessionRefUnmountedRetiresAfterTheStartupWindow(t *testing.T) {
+	clock := func() (func() int64, *int64) {
+		nowMs := int64(1_000_000)
+		return func() int64 { return nowMs }, &nowMs
+	}
+
+	t.Run("terminal stays a bare shell past the window", func(t *testing.T) {
+		harness := openIdxHarness(t)
+		history := newIdxHistory("result")
+		holder := &idxSnapshotHolder{}
+		holder.set(idxSnapshot([]any{idxAgent(map[string]any{
+			"agent":        nil,
+			"agent_status": "idle",
+			"pane_id":      "wJ:p2",
+			"terminal_id":  "term_claude",
+			"workspace_id": "wJ",
+		})}, []any{map[string]any{"pane_id": "wJ:p2", "revision": float64(10)}}))
+		now, nowMs := clock()
+		service, _ := newIdxService(t, harness, holder, history, &observability.AgentIndexServiceOptions{Now: now})
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(bare shell): %v", err)
+		}
+		idxRegisterClaude(t, service, "term_claude")
+
+		// The terminal stays a bare shell while the startup window expires:
+		// the registration retires on this refresh.
+		*nowMs += 120_001
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(after window): %v", err)
+		}
+
+		// An unregistered claude on the same terminal must not inherit the
+		// expired registration.
+		holder.set(idxOneAgent("working", 11, "claude", nil))
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(new claude): %v", err)
+		}
+		if got := idxClaudeAgentSession(t, harness, "term_claude"); got != nil {
+			t.Fatalf("agentSession on the new claude = %+v, want nil (expired ref must not re-bind)", got)
+		}
+	})
+
+	t.Run("terminal never reaches a snapshot past the window", func(t *testing.T) {
+		harness := openIdxHarness(t)
+		history := newIdxHistory("result")
+		holder := &idxSnapshotHolder{}
+		holder.set(idxSnapshot([]any{}, []any{}))
+		now, nowMs := clock()
+		service, _ := newIdxService(t, harness, holder, history, &observability.AgentIndexServiceOptions{Now: now})
+		// The registration arrives before any snapshot carries its terminal:
+		// it stashes unseen and waits inside the startup window.
+		idxRegisterClaude(t, service, "term_claude")
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(empty, inside window): %v", err)
+		}
+
+		// The first-snapshot window expires without the terminal ever
+		// appearing: the unseen registration retires.
+		*nowMs += 120_001
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(after window): %v", err)
+		}
+
+		// The terminal finally shows up running an unregistered claude: it
+		// must not inherit the expired registration.
+		holder.set(idxOneAgent("working", 10, "claude", nil))
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(new claude): %v", err)
+		}
+		if got := idxClaudeAgentSession(t, harness, "term_claude"); got != nil {
+			t.Fatalf("agentSession on the new claude = %+v, want nil (expired ref must not re-bind)", got)
+		}
+	})
+
+	t.Run("inside the window the ref mounts normally", func(t *testing.T) {
+		harness := openIdxHarness(t)
+		history := newIdxHistory("result")
+		holder := &idxSnapshotHolder{}
+		holder.set(idxSnapshot([]any{idxAgent(map[string]any{
+			"agent":        nil,
+			"agent_status": "idle",
+			"pane_id":      "wJ:p2",
+			"terminal_id":  "term_claude",
+			"workspace_id": "wJ",
+		})}, []any{map[string]any{"pane_id": "wJ:p2", "revision": float64(10)}}))
+		now, nowMs := clock()
+		service, _ := newIdxService(t, harness, holder, history, &observability.AgentIndexServiceOptions{Now: now})
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(bare shell): %v", err)
+		}
+		idxRegisterClaude(t, service, "term_claude")
+
+		// 500ms later the claude label shows up, well inside the window: the
+		// registration mounts normally.
+		*nowMs += 500
+		holder.set(idxOneAgent("working", 11, "claude", nil))
+		if _, err := service.RefreshHerdrSession(turnSessionInput()); err != nil {
+			t.Fatalf("refreshHerdrSession(claude label): %v", err)
+		}
+		got := idxClaudeAgentSession(t, harness, "term_claude")
+		if got == nil || got.Value != "3a4b5c6d-7e8f-4a1b-9c2d-3e4f5a6b7c8d" {
+			t.Fatalf("agentSession inside the window = %+v, want the registered ref mounted", got)
+		}
+	})
 }
