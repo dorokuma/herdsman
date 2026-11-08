@@ -175,10 +175,23 @@ type graceTimer struct {
 	handle any
 }
 
-// agyTerminalLease mirrors the TS AgyTerminalLease.
+// agyTerminalLease mirrors the TS AgyTerminalLease. The name is historical:
+// the map below also carries the Claude Code short-connection lease, because a
+// `herdsman register-claude` socket closes right after the register RPC and
+// needs the same socket-less presence.
 type agyTerminalLease struct {
 	PaneGeneration *string
 	Presence       PiPresence
+}
+
+// leaseAgentKind reports the agent kind a lease grants presence to. The
+// subscriberKind the terminal registered with is the lease's own kind ("agy" or
+// "claude"); a persisted-owner lease built during startup grace is agy's.
+func leaseAgentKind(lease agyTerminalLease) string {
+	if lease.Presence.SubscriberKind != nil {
+		return string(*lease.Presence.SubscriberKind)
+	}
+	return string(observability.SubscriberAgy)
 }
 
 // ObservabilityRpcServer ports the TS class of the same name.
@@ -695,7 +708,10 @@ func (s *ObservabilityRpcServer) reconcileAgentLocationsLocked(
 			}
 			continue
 		}
-		if agent.Agent != nil && *agent.Agent != "agy" {
+		// A lease ends the moment the pane runs a different agent kind than the
+		// one the lease was granted to: a pane reused by another agent can no
+		// longer stand in for the short-connection subscriber.
+		if agent.Agent != nil && *agent.Agent != leaseAgentKind(lease) {
 			delete(s.agyPresenceByTerminal, key)
 			if len(s.socketsByTerminal[key]) == 0 {
 				released, err := s.releaseCurrentOwnersForTerminal(
@@ -1197,9 +1213,10 @@ func (s *ObservabilityRpcServer) isPiTerminal(
 	return false, nil
 }
 
-// hasTerminalPresence mirrors #hasTerminalPresence: a live Pi socket, or an Agy
-// lease whose pane is still open. The lease is refreshed and dropped in place,
-// exactly like the TS mutation of the stored lease object.
+// hasTerminalPresence mirrors #hasTerminalPresence: a live Pi socket, or a
+// socket-less lease (Agy, or Claude Code's one-shot registration) whose pane is
+// still open. The lease is refreshed and dropped in place, exactly like the TS
+// mutation of the stored lease object.
 func (s *ObservabilityRpcServer) hasTerminalPresence(
 	herdrSessionName string,
 	terminalID string,
@@ -1225,7 +1242,7 @@ func (s *ObservabilityRpcServer) hasTerminalPresence(
 		lease.PaneGeneration = indexed.PaneGeneration
 		s.agyPresenceByTerminal[key] = lease
 	}
-	expired := indexed != nil && indexed.Agent != nil && *indexed.Agent != "agy"
+	expired := indexed != nil && indexed.Agent != nil && *indexed.Agent != leaseAgentKind(lease)
 	if !expired {
 		closed, closeErr := s.stores.Agents.IsPaneClosedSince(db.IsPaneClosedInput{
 			HerdrSessionName: presence.HerdrSessionName,

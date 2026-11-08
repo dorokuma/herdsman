@@ -57,10 +57,11 @@ type HistoryDiscovery func(input AgentHistoryLookupInput, options DiscoverOption
 
 // AgentHistoryServiceOptions mirrors the createAgentHistoryService options.
 type AgentHistoryServiceOptions struct {
-	Cache    HistoryCacheStore
-	Discover HistoryDiscovery
-	HomeDir  *string
-	Readers  []HistoryReader
+	Cache              HistoryCacheStore
+	ClaudeProjectsRoot *string
+	Discover           HistoryDiscovery
+	HomeDir            *string
+	Readers            []HistoryReader
 }
 
 // ResolvedCompactAgentHistory mirrors ResolvedCompactAgentHistory.
@@ -105,17 +106,23 @@ type AgentHistoryService struct {
 
 // CreateAgentHistoryService mirrors createAgentHistoryService.
 func CreateAgentHistoryService(options AgentHistoryServiceOptions) *AgentHistoryService {
-	// Exactly two agents have a reader: pi (official session file path) and agy
-	// (official conversation id). Everything else resolves to `unknown` and is
-	// rejected here, so a pane for another agent reports no history.
+	// Exactly three agents have a reader: pi (official session file path), agy
+	// (official conversation id) and claude (registered conversation id under
+	// the deterministic claude-projects root). Everything else resolves to
+	// `unknown` and is rejected here, so a pane for another agent reports no
+	// history.
 	readers := options.Readers
 	if readers == nil {
-		readers = []HistoryReader{NewPiHistoryReader(), NewAntigravityHistoryReader()}
+		readers = []HistoryReader{
+			NewPiHistoryReader(),
+			NewAntigravityHistoryReader(),
+			NewClaudeHistoryReader(),
+		}
 	}
 	discover := options.Discover
 	if discover == nil {
 		discover = func(input AgentHistoryLookupInput, discoverOptions DiscoverOptions) *HistoryRef {
-			return DiscoverAgentHistory(withHomeDir(input, options.HomeDir), discoverOptions)
+			return DiscoverAgentHistory(withServiceRoots(input, options), discoverOptions)
 		}
 	}
 	service := &AgentHistoryService{options: options, readers: readers, discover: discover}
@@ -128,9 +135,21 @@ func CreateAgentHistoryService(options AgentHistoryServiceOptions) *AgentHistory
 		if options.Discover != nil {
 			return false
 		}
-		return DiscoveryFailureFresh(withHomeDir(input, options.HomeDir), time.Now().UnixMilli())
+		return DiscoveryFailureFresh(withServiceRoots(input, options), time.Now().UnixMilli())
 	}
 	return service
+}
+
+// withServiceRoots injects the service-level roots (home and the claude
+// projects root) into the lookup input; an explicit per-lookup root always
+// wins over the service one.
+func withServiceRoots(input AgentHistoryLookupInput, options AgentHistoryServiceOptions) AgentHistoryLookupInput {
+	input = withHomeDir(input, options.HomeDir)
+	if options.ClaudeProjectsRoot != nil && *options.ClaudeProjectsRoot != "" &&
+		(input.ClaudeProjectsRoot == nil || *input.ClaudeProjectsRoot == "") {
+		input.ClaudeProjectsRoot = options.ClaudeProjectsRoot
+	}
+	return input
 }
 
 func withHomeDir(input AgentHistoryLookupInput, homeDir *string) AgentHistoryLookupInput {

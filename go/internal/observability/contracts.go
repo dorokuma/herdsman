@@ -70,6 +70,7 @@ type AgentHistoryRefSource string
 
 const (
 	HistorySourceAntigravitySQLite AgentHistoryRefSource = "antigravity-sqlite"
+	HistorySourceClaudeJSONL       AgentHistoryRefSource = "claude-jsonl"
 	HistorySourcePiJSONL           AgentHistoryRefSource = "pi-jsonl"
 	HistorySourceUnknown           AgentHistoryRefSource = "unknown"
 )
@@ -95,9 +96,10 @@ const (
 type SubscriberKind string
 
 const (
-	SubscriberPi  SubscriberKind = "pi"
-	SubscriberPig SubscriberKind = "pig"
-	SubscriberAgy SubscriberKind = "agy"
+	SubscriberPi     SubscriberKind = "pi"
+	SubscriberPig    SubscriberKind = "pig"
+	SubscriberAgy    SubscriberKind = "agy"
+	SubscriberClaude SubscriberKind = "claude"
 )
 
 // AgentOrchestratorChangeReason mirrors the orchestrator change reason union.

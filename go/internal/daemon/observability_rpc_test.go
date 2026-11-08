@@ -1987,7 +1987,7 @@ func TestObservabilityRpcServerResolvesStalePaneAlias(t *testing.T) {
 	assertObsContains(t, "unregistered herdr socket", err.Error(), "running session")
 
 	_, err = client.request("agent.orchestrator.register", obsRegisterWith(
-		obsHerdrSocketPath, "wB:p1", "bad-kind", "claude", obsWorkspaceB,
+		obsHerdrSocketPath, "wB:p1", "bad-kind", "codex", obsWorkspaceB,
 	))
 	if err == nil {
 		t.Fatalf("unsupported subscriber kind: expected a rejection")
