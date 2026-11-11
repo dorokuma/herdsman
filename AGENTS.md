@@ -1,7 +1,7 @@
 # AGENTS.md
 档位：L2
 
-> **已归档（2026-11-11）**：本仓库是老 herdr 时代的工具，能力已被 herdr-core（`hc`）取代，转为只读历史留存，不再开发/发布/部署；归档决策见 `.agents/notes/20261111-archived-superseded-by-herdr-core.md`。
+> **已归档（2026-11-11）**：本仓库是老 herdr 时代的工具，能力已被 herdr-core（`hc`）取代，转为只读历史留存，不再开发/发布/部署；归档决策见 `.agents/notes/20261111-archived-superseded-by-herdr-core.md`（该文件本机留存、不入 git）。
 
 Herdsman 是一个 Go daemon / CLI，从 Herdr 管理的 coding agent 生成 agent snapshot、`agent.*` event 和 orchestrator notification。请先用 `README.md` 确认用法，只有在需要判断规格时才看 `docs/plans/`。
 
