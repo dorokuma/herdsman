@@ -2,6 +2,10 @@
 
 # Herdsman
 
+## 归档状态（2026-11-11）
+
+This repository is archived. Herdsman was a daemon from the legacy Herdr era that produced agent status snapshots, `agent.*` events, and orchestrator notifications for AI coding agents. Its capabilities have been superseded by herdr-core (`hc`, providing `hc ls` / `hc get` / `hc wait` / `hc read` / `hc exec`). Before archiving, the runtime state on this host was verified as fully drained: zero running processes, zero active services, and zero installed binaries. The repository is retained read-only as historical record — no further development, releases, or deployments are planned. See `.agents/notes/20261111-archived-superseded-by-herdr-core.md` for the archival decision record.
+
 Herdsman is a daemon-backed observability layer for coding agents running in Herdr. It provides two interfaces over the same durable agent index: pull-based CLI access to structured history, and owner-scoped Pi notifications with cached context and automatic wake.
 
 Herdr's `herdr agent read` reads terminal streams or scrollback. Herdsman instead reads agent session data so callers can retrieve work status, structured message excerpts, compact tool results, and unread outcomes without parsing terminal output. Herdsman is read-only; use the official Herdr CLI or skill for agent start, prompts, waits, pane operations, and terminal control.
