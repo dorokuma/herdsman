@@ -1,5 +1,9 @@
 ## [Unreleased]
 
+### Changed
+
+- 仓库归档（2026-11-11）：herdsman 是老 herdr 时代的工具，能力已被 herdr-core（`hc`，`hc ls` / `hc get` / `hc wait` / `hc read` / `hc exec`）取代；本机运行态已确认为零进程、零服务、零安装二进制；仓库转为只读历史留存，不再开发、不再发布、不再部署。README 顶部新增归档状态节、AGENTS.md 顶部新增归档声明，决策记录见 `.agents/notes/20261111-archived-superseded-by-herdr-core.md`（该文件本机留存、不入 git）。
+
 - 移除 husky：`core.hooksPath` 不再指向 `.husky/_`，hooks 改走全局 `/root/.git-hooks`（修复 worktree 中 husky hooks 不执行）；`.husky/` 目录删除。
 - 新增根目录 `Makefile`，`make check` 为唯一检查入口（gofmt、`go vet`、`go test -race`、两个 `cmd` 的 `go build`）；CI（`.github/workflows/ci.yml`）改调 `make check`；README/AGENTS 文档同步。
 - 去掉原 pre-commit 的 `go test -p 2`，测试统一为与 CI 一致的 `go test -race ./...`（有意变更）；提交前不再本地运行 Go 门禁，由 `make check`（CI 与合并前门禁）负责。
