@@ -40,3 +40,7 @@ Legacy `herdr` and `herdsman` have been replaced by `herdr-core` (`hc`). Use `hc
    hc kill <address-or-name>
    hc rm <address-or-name>
    ```
+   Only clean up child terminals this session started: `parent` in `hc ls`
+   must equal your own terminal id (`$HC_TERMINAL_ID`). Never touch terminals
+   owned by other sessions, and do not run `hc server stop`/`hc server restart`
+   or any other service lifecycle command.
