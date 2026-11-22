@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72" width="72" height="72" role="img" aria-label="herdsman">
+  <!-- herdsman archived mark: observation radar node, dark theme -->
+  <rect x="4" y="4" width="64" height="64" rx="16" fill="#1c1f24"/>
+  <g fill="none" stroke="#8ba3bb" stroke-linecap="round">
+    <circle cx="36" cy="36" r="20" stroke-width="2" stroke-opacity="0.35"/>
+    <circle cx="36" cy="36" r="12.5" stroke-width="2" stroke-opacity="0.55"/>
+    <circle cx="36" cy="36" r="5.5" stroke-width="2" stroke-opacity="0.8"/>
+  </g>
+  <path d="M36 36 L50 22" stroke="#8ba3bb" stroke-width="2" stroke-linecap="round"/>
+  <path d="M36 16 A20 20 0 0 1 56 36 Z" fill="#8ba3bb" fill-opacity="0.14"/>
+  <circle cx="36" cy="36" r="2.4" fill="#a7bfd4"/>
+  <circle cx="50" cy="22" r="3" fill="#a7bfd4"/>
+</svg>
